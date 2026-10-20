@@ -1,12 +1,10 @@
 //! `Tuner` trait and backends: linux-dvb, satipc, netceiver and file-replay.
 
-/// Placeholder scaffolding until the M4 implementation lands.
-pub fn placeholder() {}
+mod file;
+mod tuner;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_is_linked() {
-        super::placeholder();
-    }
-}
+pub use file::{FileReplayConfig, FileReplayTuner, Pacing};
+pub use tuner::{
+    DeliverySystem, PID_ALL, PidSet, Polarization, Result, SignalStatus, TS_PACKET_SIZE, TsBuf,
+    TuneParams, Tuner, TunerError,
+};
