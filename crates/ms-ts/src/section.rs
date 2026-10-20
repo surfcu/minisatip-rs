@@ -108,7 +108,11 @@ impl SectionAssembler {
             return;
         };
         let mut index = if ts.pusi() {
-            let pointer = payload[0] as usize;
+            // A PUSI packet whose adaptation field fills it has no pointer_field.
+            let Some(&pointer) = payload.first() else {
+                return;
+            };
+            let pointer = pointer as usize;
             let start = 1 + pointer;
             if start > payload.len() {
                 return;
@@ -210,5 +214,19 @@ mod tests {
     #[test]
     fn empty_input_has_no_parity_change() {
         assert!(!wait_pusi(&[], &[0x1FFF]));
+    }
+
+    // Fuzzer crash: PUSI set, adaptation field (183 bytes) leaves an empty payload.
+    #[test]
+    fn pusi_with_empty_payload_does_not_panic() {
+        let mut packet = [0xFFu8; 188];
+        packet[..5].copy_from_slice(&[0x47, 0x40, 0x11, 0x30, 183]);
+        packet[5] = 0x00;
+        let mut pushed = SectionAssembler::new(true);
+        let mut sections = 0;
+        pushed.push(&packet, &mut |_| sections += 1);
+        assert_eq!(sections, 0);
+        let mut assembled = SectionAssembler::new(true);
+        assert!(assembled.assemble_packet(&packet).is_none());
     }
 }
