@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "rs/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, clippy and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  cross:
+    name: cross (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            toolchain: stable
+            build_std: false
+            experimental: false
+          - target: armv7-unknown-linux-musleabihf
+            toolchain: stable
+            build_std: false
+            experimental: false
+          - target: aarch64-unknown-linux-musl
+            toolchain: stable
+            build_std: false
+            experimental: false
+          # mipsel is tier 3: no prebuilt std, so nightly + build-std only.
+          # Cross images/toolchains for it are best-effort, hence allowed to fail.
+          - target: mipsel-unknown-linux-musl
+            toolchain: nightly
+            build_std: true
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable targets)
+        if: ${{ !matrix.build_std }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Rust (nightly + rust-src for build-std)
+        if: ${{ matrix.build_std }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rust-src
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (stable targets)
+        if: ${{ !matrix.build_std }}
+        run: cross build --release -p minisatip --target ${{ matrix.target }}
+
+      - name: Build (tier-3 target, nightly + build-std)
+        if: ${{ matrix.build_std }}
+        run: >-
+          cross +nightly build -Zbuild-std=std,panic_abort
+          --release -p minisatip --target ${{ matrix.target }}
+
+      - name: Report stripped binary size
+        run: |
+          binary="target/${{ matrix.target }}/release/minisatip"
+          size=$(stat -c '%s' "$binary")
+          echo "${{ matrix.target }}: ${size} bytes"
+          {
+            echo "### ${{ matrix.target }}"
+            echo ""
+            echo "Stripped binary: **${size} bytes**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cpp-reference:
+    name: C++ reference build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out C++ reference
+        uses: actions/checkout@v4
+        with:
+          repository: catalinii/minisatip
+          path: cpp-reference
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev libdvbcsa-dev libxml2-dev zlib1g-dev cmake
+
+      - name: Build
+        working-directory: cpp-reference
+        run: |
+          if [ -x ./configure ]; then
+            ./configure && make -j"$(nproc)"
+          else
+            # Upstream master uses CMake; keep the configure path for the fork.
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build -j"$(nproc)"
+          fi
+
+      - name: Collect binary
+        run: |
+          mkdir -p artifacts
+          if [ -f cpp-reference/minisatip ]; then
+            cp cpp-reference/minisatip artifacts/minisatip
+          else
+            cp cpp-reference/build/minisatip artifacts/minisatip
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: minisatip-cpp-reference
+          path: artifacts/minisatip
+          if-no-files-found: error
