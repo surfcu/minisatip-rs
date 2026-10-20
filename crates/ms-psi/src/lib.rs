@@ -1,12 +1,6 @@
 //! PAT/PMT/CAT/SDT parsing, versioning and DVB charset tables.
 
-/// Placeholder scaffolding until the M2 implementation lands.
-pub fn placeholder() {}
+mod charset;
+mod charset_tables;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_is_linked() {
-        super::placeholder();
-    }
-}
+pub use charset::{CharsetOverride, dvb_get_string};

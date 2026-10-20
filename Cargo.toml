@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/ms-ts",
     "crates/ms-psi",
+    "crates/ms-psi/gen-charset",
     "crates/ms-tuner",
     "crates/ms-sched",
     "crates/ms-ca",
