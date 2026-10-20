@@ -9,6 +9,9 @@ version = "0.1.0"
 [[package]]
 name = "minisatip"
 version = "0.1.0"
+dependencies = [
+ "ms-config",
+]
 
 [[package]]
 name = "ms-ca"
