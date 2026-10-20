@@ -37,6 +37,9 @@ version = "0.1.0"
 [[package]]
 name = "ms-psi"
 version = "0.1.0"
+dependencies = [
+ "ms-ts",
+]
 
 [[package]]
 name = "ms-sched"
