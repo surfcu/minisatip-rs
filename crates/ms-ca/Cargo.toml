@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+ms-psi = { path = "../ms-psi" }
+
+[dev-dependencies]
+ms-ts = { path = "../ms-ts" }
+
 [lints]
 workspace = true
