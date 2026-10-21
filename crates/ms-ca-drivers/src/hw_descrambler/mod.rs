@@ -33,6 +33,19 @@ pub const MAX_ADAPTERS: i32 = 100;
 /// `TABLES_RESULT_OK` returned by the CA hooks.
 pub const TABLES_RESULT_OK: i32 = 0;
 
+/// `ioctl` return value: `0` on success, `-1` on failure.
+fn result_code(result: &io::Result<()>) -> i32 {
+    if result.is_ok() { 0 } else { -1 }
+}
+
+/// The C++ `res < 0 ? strerror(errno) : " SUCCESS"` suffix.
+fn result_suffix(result: &io::Result<()>) -> std::borrow::Cow<'_, str> {
+    match result {
+        Ok(()) => std::borrow::Cow::Borrowed(" SUCCESS"),
+        Err(error) => std::borrow::Cow::Owned(ms_log::strerror(error)),
+    }
+}
+
 /// Fields of a logical adapter the descrambler reads (`adapter`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HwAdapter {
@@ -181,8 +194,14 @@ impl<D: CaDevice> HwDescrambler<D> {
     /// hooks (`add_ca(&hw_ca_op)`) are active.
     pub fn register(&self, registry: &mut AlgoRegistry) -> bool {
         if !self.enabled {
+            ms_log::log!(
+                "hw_descrambler: --hw-descrambler not enabled, hardware descrambler disabled"
+            );
             return false;
         }
+        ms_log::log!(
+            "hw_descrambler: Initializing Hardware Descrambler (--hw-descrambler enabled)"
+        );
         for algo in [Algo::Csa, Algo::Aes128Ecb, Algo::Aes128Cbc] {
             registry.register(AlgoOp {
                 algo,
@@ -194,6 +213,11 @@ impl<D: CaDevice> HwDescrambler<D> {
 
     /// `hw_create_key`.
     pub fn create_key(cw: &mut HwCw) {
+        ms_log::log!(
+            "hw_descrambler: hw_create_key cw_id = {}, algo = {}",
+            cw.id,
+            cw.algo.raw()
+        );
         cw.key = Some(HwKey {
             ca_fd: None,
             adapter_id: -1,
@@ -224,14 +248,46 @@ impl<D: CaDevice> HwDescrambler<D> {
         if let Some(fd) = self.adapters.get(&pa).and_then(|ca| ca.ca_fd) {
             return Some(fd);
         }
+        let alt_path = format!("/dev/ci{pa}");
         let mut opened = self.dev.open(path);
         if matches!(&opened, Err(e) if e.kind() == io::ErrorKind::NotFound) {
-            opened = self.dev.open(&format!("/dev/ci{pa}"));
+            opened = self.dev.open(&alt_path);
+            if let Ok(fd) = &opened {
+                ms_log::log!(
+                    "hw_descrambler: opened fallback {} (ca_fd = {}) for adapter {}",
+                    alt_path,
+                    fd.0,
+                    pa
+                );
+            }
         }
-        let fd = opened.ok()?;
+        let fd = match opened {
+            Ok(fd) => fd,
+            Err(error) => {
+                ms_log::log!(
+                    "hw_descrambler: failed to open {}: {} (errno {})",
+                    path,
+                    ms_log::strerror(&error),
+                    ms_log::errno(&error)
+                );
+                return None;
+            }
+        };
         let num = match self.dev.get_descr_info(fd) {
-            Ok(info) => i32::try_from(info.num).unwrap_or(-1),
-            Err(_) => DEFAULT_MAX_DESCRAMBLERS,
+            Ok(info) if info.num > 0 => {
+                ms_log::log!(
+                    "hw_descrambler: CA_GET_DESCR_INFO returned {} hardware descrambler slots",
+                    info.num
+                );
+                i32::try_from(info.num).unwrap_or(-1)
+            }
+            _ => {
+                ms_log::log!(
+                    "hw_descrambler: CA_GET_DESCR_INFO unavailable, defaulting to {} slots",
+                    DEFAULT_MAX_DESCRAMBLERS
+                );
+                DEFAULT_MAX_DESCRAMBLERS
+            }
         };
         let ca = self.state(pa)?;
         ca.ca_fd = Some(fd);
@@ -240,6 +296,13 @@ impl<D: CaDevice> HwDescrambler<D> {
         } else {
             DEFAULT_MAX_DESCRAMBLERS
         };
+        ms_log::log!(
+            "hw_descrambler: successfully opened shared {} (ca_fd = {}, max slots = {}) for physical adapter {}",
+            path,
+            fd.0,
+            ca.num_descramblers,
+            pa
+        );
         Some(fd)
     }
 
@@ -259,16 +322,35 @@ impl<D: CaDevice> HwDescrambler<D> {
         if let Some(i) = ca.pmt_slots[..max].iter().position(|s| *s == Some(pmt_id)) {
             return Some(i);
         }
-        let free = ca.pmt_slots[..max].iter().position(Option::is_none)?;
+        let Some(free) = ca.pmt_slots[..max].iter().position(Option::is_none) else {
+            ms_log::log!(
+                "hw_descrambler: Error: all slots full on physical adapter {} for PMT {}",
+                pa,
+                pmt_id
+            );
+            return None;
+        };
         ca.pmt_slots[free] = Some(pmt_id);
+        ms_log::log!(
+            "hw_descrambler: Allocated hardware descrambler slot index {} for PMT {} on physical adapter {}",
+            free,
+            pmt_id,
+            pa
+        );
         Some(free)
     }
 
     fn release_slot(&mut self, pa: i32, pmt_id: usize) {
         let Some(ca) = self.state(pa) else { return };
         let max = ca.max_desc();
-        if let Some(slot) = ca.pmt_slots[..max].iter_mut().find(|s| **s == Some(pmt_id)) {
-            *slot = None;
+        if let Some(i) = ca.pmt_slots[..max].iter().position(|s| *s == Some(pmt_id)) {
+            ms_log::log!(
+                "hw_descrambler: Released hardware descrambler slot index {} for PMT {} on physical adapter {}",
+                i,
+                pmt_id,
+                pa
+            );
+            ca.pmt_slots[i] = None;
         }
     }
 
@@ -291,14 +373,30 @@ impl<D: CaDevice> HwDescrambler<D> {
 
     /// `hw_set_cw`: programs mode, PIDs and key of `cw` into the PMT's slot.
     pub fn set_cw(&mut self, cw: &mut HwCw, pmt: &HwPmt, reg: &HwRegistry) {
-        if !self.enabled || cw.key.is_none() || cw.algo == Algo::CsaIcam {
+        if !self.enabled {
+            ms_log::log!("hw_descrambler: --hw-descrambler not enabled, skipping hw_set_cw");
+            return;
+        }
+        if cw.key.is_none() {
+            ms_log::log!("hw_descrambler: hw_set_cw key or pmt is nullptr");
+            return;
+        }
+        if cw.algo == Algo::CsaIcam {
+            ms_log::log!(
+                "hw_descrambler: ICAM mode (CA_ALGO_DVBCSA_ICAM) not supported by hardware descrambler"
+            );
             return;
         }
         let Some(ad) = pmt.adapter.and_then(|id| reg.adapter(id)).copied() else {
+            ms_log::log!(
+                "hw_descrambler: adapter for PMT {} not found",
+                pmt.adapter.map_or(-1, |id| id as i32)
+            );
             return;
         };
         let path = ca_device_path(&ad);
         let Some(fd) = self.get_or_open_ca_fd(ad.pa, &path) else {
+            ms_log::log!("hw_descrambler: unable to obtain ca_fd for {}", path);
             return;
         };
         let num_descramblers = self.max_slots(ad.pa);
@@ -309,38 +407,73 @@ impl<D: CaDevice> HwDescrambler<D> {
         key.pmt_id = Some(pmt.id);
         key.num_descramblers = num_descramblers;
         key.slot_index = slot.map_or(-1, |s| s as i32);
-        let Some(slot) = slot else { return };
+        let Some(slot) = slot else {
+            ms_log::log!(
+                "hw_descrambler: slot allocation failed for PMT {} on adapter {}",
+                pmt.id,
+                ad.pa
+            );
+            return;
+        };
         let index = slot as u32;
 
-        // Results are only logged in C++; a failing ioctl does not stop the sequence.
-        let _ = self.dev.set_descr_mode(
-            fd,
-            &CaDescrMode {
-                index,
-                algo: cw.algo.raw(),
-                cipher_mode: u32::from(cw.algo == Algo::Aes128Cbc),
-            },
+        ms_log::log!(
+            "hw_descrambler: hw_set_cw called for PMT {}, adapter {} (pa {}, ca {}), slot {}/{}, algo {}, parity {}",
+            pmt.id,
+            pmt.adapter.map_or(-1, |id| id as i32),
+            ad.pa,
+            ad.fe,
+            slot as i32,
+            num_descramblers,
+            cw.algo.raw(),
+            cw.parity
+        );
+
+        // A failing ioctl does not stop the sequence.
+        let mode = CaDescrMode {
+            index,
+            algo: cw.algo.raw(),
+            cipher_mode: u32::from(cw.algo == Algo::Aes128Cbc),
+        };
+        let result = self.dev.set_descr_mode(fd, &mode);
+        ms_log::log!(
+            "hw_descrambler: CA_SET_DESCR_MODE ioctl (slot={}, algo={}, mode={}) -> result={}{}",
+            mode.index,
+            mode.algo,
+            mode.cipher_mode,
+            result_code(&result),
+            result_suffix(&result)
         );
         for &pid in &pmt.stream_pids {
-            let _ = self.dev.set_pid(
-                fd,
-                &CaPid {
-                    pid: u32::from(pid),
-                    index: slot as i32,
-                },
+            let cmd = CaPid {
+                pid: u32::from(pid),
+                index: slot as i32,
+            };
+            let result = self.dev.set_pid(fd, &cmd);
+            ms_log::log!(
+                "hw_descrambler: CA_SET_PID ioctl (pid={}, slot={}) -> result={}{}",
+                cmd.pid,
+                cmd.index,
+                result_code(&result),
+                result_suffix(&result)
             );
         }
         let parity = u32::from(cw.parity);
         if cw.algo == Algo::Csa {
             let mut word = [0u8; 8];
             word.copy_from_slice(&cw.cw[..8]);
-            let _ = self.dev.set_descr(
-                fd,
-                &CaDescr {
-                    index,
-                    parity,
-                    cw: word,
-                },
+            let descr = CaDescr {
+                index,
+                parity,
+                cw: word,
+            };
+            let result = self.dev.set_descr(fd, &descr);
+            ms_log::log!(
+                "hw_descrambler: CA_SET_DESCR (DVBCSA) ioctl (slot={}, parity={}) -> result={}{}",
+                descr.index,
+                descr.parity,
+                result_code(&result),
+                result_suffix(&result)
             );
             return;
         }
@@ -351,11 +484,25 @@ impl<D: CaDevice> HwDescrambler<D> {
             data_len: 16,
             data: cw.cw,
         };
-        let _ = self.dev.set_descr_data(fd, &data);
+        let result = self.dev.set_descr_data(fd, &data);
+        ms_log::log!(
+            "hw_descrambler: CA_SET_DESCR_DATA (AES Key) ioctl (slot={}, parity={}) -> result={}{}",
+            data.index,
+            data.parity,
+            result_code(&result),
+            result_suffix(&result)
+        );
         if cw.algo == Algo::Aes128Cbc {
             data.data_type = DATA_TYPE_IV;
             data.data = cw.iv;
-            let _ = self.dev.set_descr_data(fd, &data);
+            let result = self.dev.set_descr_data(fd, &data);
+            ms_log::log!(
+                "hw_descrambler: CA_SET_DESCR_DATA (AES IV) ioctl (slot={}, parity={}) -> result={}{}",
+                data.index,
+                data.parity,
+                result_code(&result),
+                result_suffix(&result)
+            );
         }
     }
 
@@ -392,7 +539,7 @@ impl<D: CaDevice> HwDescrambler<D> {
     }
 
     /// `hw_ca_add_pmt`: retargets the bound set; PIDs the update dropped are unbound.
-    pub fn add_pmt(&mut self, ad: &HwAdapter, pmt: &HwPmt, _update: bool, reg: &HwRegistry) -> i32 {
+    pub fn add_pmt(&mut self, ad: &HwAdapter, pmt: &HwPmt, update: bool, reg: &HwRegistry) -> i32 {
         if !self.enabled {
             return TABLES_RESULT_OK;
         }
@@ -407,6 +554,13 @@ impl<D: CaDevice> HwDescrambler<D> {
             }
             None => BTreeSet::new(),
         };
+        ms_log::log!(
+            "hw_descrambler: PMT {} {}: {} pids bound, {} removed",
+            pmt.id,
+            if update { "update" } else { "add" },
+            current.len(),
+            removed.len()
+        );
         Self::drop_held_pids(ad, pmt, reg, &mut removed);
         self.unbind_pids(ad.pa, &ca_device_path(ad), &removed);
         TABLES_RESULT_OK
@@ -417,6 +571,12 @@ impl<D: CaDevice> HwDescrambler<D> {
         if !self.enabled {
             return 0;
         }
+        ms_log::log!(
+            "hw_descrambler: hw_ca_del_pmt called for PMT {} on physical adapter {} (logical {})",
+            pmt.id,
+            ad.pa,
+            ad.id
+        );
         let mut bound = self
             .state(ad.pa)
             .and_then(|ca| ca.bound_pids.remove(&pmt.id))
@@ -440,6 +600,11 @@ impl<D: CaDevice> HwDescrambler<D> {
             ca.pmt_slots = [None; MAX_SLOTS];
             ca.bound_pids.clear();
             if let Some(fd) = fd {
+                ms_log::log!(
+                    "hw_descrambler: closing shared ca_fd {} for physical adapter {}",
+                    fd.0,
+                    ad.pa
+                );
                 self.dev.close(fd);
             }
         }

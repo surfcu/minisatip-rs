@@ -403,6 +403,8 @@ impl SessionManager {
             .filter(|stream| stream.enabled)
         {
             if slot.timeout_ms == TIMEOUT_FORCED {
+                // stream.cpp:1347.
+                ms_log::log!("Stream forced close requested for sid {}", slot.id);
                 expired.push(slot.id);
                 continue;
             }
@@ -412,6 +414,14 @@ impl SessionManager {
             if slot.timeout_ms != 0
                 && now - slot.rtime_ms > i64::from(slot.timeout_ms) + TIMEOUT_GRACE_MS
             {
+                // stream.cpp:1367 (note the space before the comma in C++).
+                ms_log::log!(
+                    "Stream timeout sid {}, closing (ctime {} , sid->rtime {}, sid->timeout {})",
+                    slot.id,
+                    now,
+                    slot.rtime_ms,
+                    slot.timeout_ms
+                );
                 expired.push(slot.id);
             }
         }
@@ -457,11 +467,15 @@ impl SessionManager {
 
     /// Allocates an empty or disabled slot, like the C++ `streams_add`.
     pub fn add_stream(&mut self) -> Option<StreamId> {
-        let index = (0..STREAM_SLOTS).find(|index| {
+        let Some(index) = (0..STREAM_SLOTS).find(|index| {
             self.streams[*index]
                 .as_ref()
                 .is_none_or(|stream| !stream.enabled)
-        })?;
+        }) else {
+            // stream.cpp:614 (`LOG_AND_RETURN(-1, "streams_add failed")`).
+            ms_log::log!("streams_add failed");
+            return None;
+        };
         let id = index as StreamId;
         let session_id = self.next_session_id;
         self.next_session_id += 1;
@@ -493,11 +507,42 @@ impl SessionManager {
         method: &str,
     ) -> Option<StreamId> {
         let existing = current.filter(|id| self.slot_index(*id).is_some());
+        // stream.cpp:175: `s->sid`, `s->id` and `s->sock`. The Rust backend has
+        // no socket-table index, so `sock_id` is -1; `self.sock` is `s->sock`.
+        ms_log::log!(
+            "Setup stream sid {} parameters, sock_id {}, handle {}",
+            current.unwrap_or(-1),
+            -1,
+            self.sock
+        );
         let id = match existing {
             Some(id) => id,
-            None => self.add_stream()?,
+            None => {
+                let Some(id) = self.add_stream() else {
+                    // stream.cpp:181.
+                    ms_log::log_and_return!(None, "Could not add a new stream");
+                };
+                // stream.cpp:199 (the stream timeout socket has no Rust port,
+                // so the handle stays `self.sock`).
+                ms_log::log!(
+                    "Setup stream done: sid {} for sock {} handle {}",
+                    id,
+                    -1,
+                    self.sock
+                );
+                id
+            }
         };
-        let index = self.slot_index(id)?;
+        let Some(index) = self.slot_index(id) else {
+            // stream.cpp:203.
+            ms_log::log_and_return!(
+                None,
+                "stream sid {} not enabled for sock_id {} handle {}",
+                id,
+                -1,
+                self.sock
+            );
+        };
         let params = match existing {
             Some(_) => {
                 let mut params = self.streams[index].as_ref()?.params.clone();
@@ -566,11 +611,32 @@ impl SessionManager {
                 stream.stream_type = StreamType::Http;
             }
             if stream.stream_type == StreamType::None {
-                return Err(PlayError::new(454, None));
+                // stream.cpp:250.
+                ms_log::log_and_return!(
+                    Err(PlayError::new(454, None)),
+                    "No Transport header was specified, for stream sid {}",
+                    id
+                );
             }
         }
 
         let mut adapter = self.streams[index].as_ref().expect("checked slot").adapter;
+        // stream.cpp:254: the Rust backend has no `rsock`/`rsock_id`/socket
+        // index, so those print -1; `handle` is `self.sock` (C++ `s->sock`).
+        let stream_type = self.streams[index]
+            .as_ref()
+            .expect("checked slot")
+            .stream_type;
+        ms_log::log!(
+            "Play for stream sid {}, type {}, rsock {}, adapter {}, sock_id {}, rsock_id {}, handle {}",
+            id,
+            stream_type_number(stream_type),
+            -1,
+            adapter,
+            -1,
+            -1,
+            self.sock
+        );
         let params = self.streams[index]
             .as_ref()
             .expect("checked slot")
@@ -594,9 +660,15 @@ impl SessionManager {
                 if let Some(stream) = self.streams[index].as_mut() {
                     stream.do_play = true;
                 }
-                return Ok(());
+                // stream.cpp:286.
+                ms_log::log_and_return!(
+                    Ok(()),
+                    "Tune requested with no real parameters, ignoring ..."
+                );
             }
             if adapter >= 0 {
+                // stream.cpp:290.
+                ms_log::log!("slave stream tuning to a new frequency, finding a new adapter");
                 self.sched.close_adapter_for_stream(id, adapter);
                 if let Some(stream) = self.streams[index].as_mut() {
                     stream.adapter = -1;
@@ -605,6 +677,8 @@ impl SessionManager {
             let Some(aid) = self.sched.get_free_adapter(&params) else {
                 return Err(self.allocation_error(index, &params));
             };
+            // stream.cpp:295.
+            ms_log::log!("Got adapter {} on sid {} socket {}", aid, id, -1);
             if let Some(stream) = self.streams[index].as_mut() {
                 stream.adapter = aid as i32;
             }
@@ -673,6 +747,8 @@ impl SessionManager {
 
     /// Closes a stream and releases its adapter.
     pub fn close_stream(&mut self, id: StreamId) {
+        // stream.cpp:352: logged before the validity check.
+        ms_log::log!("closing stream {}", id);
         let Some(index) = self.slot_index(id) else {
             return;
         };
@@ -696,6 +772,8 @@ impl SessionManager {
         if let (Some((sock, streamid)), Some(listener)) = (srt_socket, self.srt.as_ref()) {
             listener.return_socket(sock, &streamid);
         }
+        // stream.cpp:408.
+        ms_log::log!("closed stream {}", id);
     }
 
     /// Sets `-r` (`opts.rrtp`) and the `opts.disc_host` fallback used by
@@ -719,6 +797,12 @@ impl SessionManager {
         peer_port: u16,
     ) -> Result<(), TransportError> {
         let Some(index) = self.slot_index(id) else {
+            // stream.cpp:457: `s->id` has no Rust counterpart, so sock_id is -1.
+            ms_log::log!(
+                "Error: No stream to set transport to, sock_id {}, arg {} ",
+                -1,
+                if value.is_empty() { "NULL" } else { value }
+            );
             return Err(TransportError);
         };
         let spec = parse_transport(value);
@@ -726,6 +810,12 @@ impl SessionManager {
         match spec.kind {
             // stream.cpp:470-481: TCP takes the RTSP peer and ignores port tokens.
             TransportKind::Tcp => {
+                // stream.cpp:471.
+                ms_log::log!(
+                    "Assuming RTSP over TCP for stream sid {}, arg {}",
+                    id,
+                    value
+                );
                 stream.stream_type = StreamType::RtspTcp;
                 stream.remote_host = peer_host.to_owned();
                 stream.remote_port = peer_port;
@@ -738,27 +828,56 @@ impl SessionManager {
         }
         match spec.kind {
             TransportKind::Srt => {
+                // stream.cpp:466: logged before `decode_transport_srt`.
+                ms_log::log!(
+                    "Assuming SRT transport for stream sid {}, arg {}",
+                    id,
+                    value
+                );
                 #[cfg(not(feature = "srt"))]
                 {
                     // C++ DISABLE_SRT builds reject the transport (stream.cpp:412).
                     let _ = &spec.srt_streamid;
+                    // stream.cpp:446.
+                    ms_log::log0!("SRT not supported, install libsrt-openssl-dev");
                     return Err(TransportError);
                 }
                 #[cfg(feature = "srt")]
                 {
-                    let Some(streamid) = spec.srt_streamid.as_deref() else {
-                        return Err(TransportError);
-                    };
+                    // stream.cpp:416.
                     let Some(listener) = self.srt.as_ref() else {
-                        return Err(TransportError);
+                        ms_log::log_and_return!(
+                            Err(TransportError),
+                            "SRT listener not initialized"
+                        );
+                    };
+                    // stream.cpp:429.
+                    let Some(streamid) = spec.srt_streamid.as_deref() else {
+                        ms_log::log_and_return!(
+                            Err(TransportError),
+                            "SRT transport missing srt_streamid= parameter"
+                        );
                     };
                     let sock = listener.take(streamid);
                     if sock == SRT_INVALID_SOCK {
-                        return Err(TransportError);
+                        // stream.cpp:436.
+                        ms_log::log_and_return!(
+                            Err(TransportError),
+                            "Failed finding pending SRT socket for sid {}, srt_streamid {}",
+                            id,
+                            streamid
+                        );
                     }
                     stream.srt_sock = sock;
                     stream.srt_streamid = streamid.to_owned();
                     stream.stream_type = StreamType::RtspSrt;
+                    // stream.cpp:441.
+                    ms_log::log!(
+                        "SRT stream setup for sid {}, srt_streamid='{}', srt_sock={} (from pending)",
+                        id,
+                        streamid,
+                        sock
+                    );
                 }
             }
             TransportKind::Tcp | TransportKind::Udp => {}
@@ -799,14 +918,47 @@ impl SessionManager {
             dest = self.disc_host.clone();
         }
 
+        // stream.cpp:511: `p.type` (0/1/2) and `p.ttl`, with the resolved target.
+        let type_number = match spec.mode {
+            Some(TransportMode::Multicast) => 1,
+            Some(TransportMode::Unicast) => 2,
+            None => 0,
+        };
+        ms_log::log!(
+            "decode_transport ->type {}, ttl {} new socket to: {}:{}",
+            type_number,
+            spec.ttl.unwrap_or(0),
+            dest,
+            port
+        );
+
         let stream = self.streams[index].as_mut().expect("checked slot");
         match stream.stream_type {
             // A stream with another transport keeps it (stream.cpp:513-547).
             StreamType::RtspTcp | StreamType::RtspSrt | StreamType::Http => return Ok(()),
             StreamType::RtspUdp if stream.remote_port == port && stream.remote_host == dest => {
+                // stream.cpp:519: `handle` (`sid->rsock`) is not modelled here.
+                ms_log::log!(
+                    "Transport for this connection is already setup to {}:{}, leaving as it is: sid = {}, handle {}",
+                    dest,
+                    port,
+                    stream.id,
+                    -1
+                );
                 return Ok(());
             }
-            StreamType::RtspUdp | StreamType::None => {}
+            StreamType::RtspUdp => {
+                // stream.cpp:525: `closing %d` is `sid->rsock`.
+                ms_log::log!(
+                    "Stream has already a transport header associated with it to {}:{} - sid = {} type = {}, closing {}",
+                    stream.remote_host,
+                    stream.remote_port,
+                    stream.id,
+                    stream_type_number(stream.stream_type),
+                    -1
+                );
+            }
+            StreamType::None => {}
         }
         stream.stream_type = StreamType::RtspUdp;
         stream.remote_host = dest.clone();
@@ -814,7 +966,7 @@ impl SessionManager {
         let id = stream.id;
 
         // A new UDP target closes other streams sending to it (stream.cpp:591-605).
-        let duplicates: Vec<StreamId> = self
+        let duplicates: Vec<(StreamId, i32)> = self
             .streams
             .iter()
             .flatten()
@@ -824,9 +976,18 @@ impl SessionManager {
                     && other.remote_port == port
                     && other.remote_host == dest
             })
-            .map(|other| other.id)
+            .map(|other| (other.id, other.adapter))
             .collect();
-        for other in duplicates {
+        for (other, aid) in duplicates {
+            // stream.cpp:598.
+            ms_log::log!(
+                "Detected stream with the same destination as sid {}: sid {} -> {}:{}, aid: {}",
+                id,
+                other,
+                dest,
+                port,
+                aid
+            );
             self.close_stream(other);
         }
         Ok(())
@@ -1003,7 +1164,15 @@ impl SessionManager {
                 inversion_name(params.specinv),
             ),
         };
-        format!("{body}{}", self.stream_pids_text(id, aid, params, use_ad))
+        let description = format!("{body}{}", self.stream_pids_text(id, aid, params, use_ad));
+        ms_log::logl!(
+            ms_log::LOG_ADAPTER,
+            "describe_adapter: sid {} aid {} => {}",
+            id,
+            aid,
+            description
+        );
+        description
     }
 
     fn stream_pids_text(
@@ -1172,6 +1341,12 @@ impl StreamBackend for SessionManager {
         });
         // C++ `find_session_id` refreshes `sid->rtime` (stream.cpp:1438).
         if let Some(id) = found {
+            // stream.cpp:1439 (space before the comma is in the C++ text).
+            ms_log::log!(
+                "recovered session id from a closed connection, sid {} , id: {}",
+                id,
+                session_id
+            );
             self.touch_stream(id);
         }
         found
@@ -1201,7 +1376,10 @@ impl StreamBackend for SessionManager {
     fn set_session_id(&mut self, id: StreamId, session_id: i64) {
         if let Some(index) = self.slot_index(id)
             && let Some(stream) = self.streams[index].as_mut()
+            && stream.session_id != session_id
         {
+            // stream.cpp:1414.
+            ms_log::log!("Forcing session id {} on stream sid {}", session_id, id);
             stream.session_id = session_id;
         }
     }
@@ -1211,6 +1389,14 @@ impl StreamBackend for SessionManager {
         if let Some(index) = self.slot_index(id)
             && let Some(stream) = self.streams[index].as_mut()
         {
+            // minisatip.cpp:1268-1271; that file's DEFAULT_LOG is LOG_HTTP.
+            ms_log::logl!(
+                ms_log::LOG_HTTP,
+                "Updating sid {} time to {}, current time {}",
+                id,
+                now,
+                now
+            );
             stream.touched = true;
             stream.rtime_ms = now;
         }
@@ -1317,6 +1503,17 @@ fn delivery_system_code(sys: DeliverySystem) -> i32 {
         DeliverySystem::DvbT2 => 16,
         DeliverySystem::DvbC2 => 19,
         DeliverySystem::Undefined | DeliverySystem::Other(_) => 0,
+    }
+}
+
+/// Numeric `sid->type` (`STREAM_*`, stream.h:20-23), used in log values.
+fn stream_type_number(stream_type: StreamType) -> i32 {
+    match stream_type {
+        StreamType::Http => 1,
+        StreamType::RtspUdp => 2,
+        StreamType::RtspTcp => 3,
+        StreamType::RtspSrt => 4,
+        StreamType::None => 0,
     }
 }
 

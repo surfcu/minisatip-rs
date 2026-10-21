@@ -19,6 +19,7 @@ libc = "0.2"
 ms-ca = { path = "../ms-ca" }
 ms-ca-drivers = { path = "../ms-ca-drivers" }
 ms-config = { path = "../ms-config" }
+ms-log = { path = "../ms-log" }
 ms-net = { path = "../ms-net" }
 ms-psi = { path = "../ms-psi" }
 ms-sched = { path = "../ms-sched" }

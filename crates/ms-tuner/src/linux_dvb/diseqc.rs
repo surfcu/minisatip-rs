@@ -1,8 +1,11 @@
 //! DiSEqC 1.0/1.1, unicable (EN 50494), JESS (EN 50607) and `setup_switch` LNB sharing.
 
 use super::consts::{SWITCH_JESS, SWITCH_UNICABLE};
-use super::device::{DiseqcMessage, MiniCmd, SecDevice, Tone, Voltage};
+use super::device::{DiseqcMessage, MiniCmd, SecDevice, Tone, Voltage, error_parts};
 use super::transponder::{DiseqcParams, DvbTransponder, lnb_hiband, lnb_int_freq};
+
+/// `#define DEFAULT_LOG LOG_DVB` (dvb.cpp:53).
+const DEFAULT_LOG: u32 = ms_log::LOG_DVB;
 
 /// Last switch state sent by an adapter (`old_pol`, `old_hiband`, `old_diseqc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +29,8 @@ impl Default for SwitchState {
 /// The master adapter as seen by a slave in `setup_switch`.
 #[derive(Debug)]
 pub struct MasterView<'a> {
+    /// `master->id`, used by the C++ log messages.
+    pub id: i32,
     /// The master's cached switch state; the slave updates it.
     pub state: &'a mut SwitchState,
     /// `!master->sid_cnt` and no other slave marked in `master->used`.
@@ -35,6 +40,8 @@ pub struct MasterView<'a> {
 /// Per-call inputs of `setup_switch` besides the transponder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwitchOptions {
+    /// `ad->id`, used by the C++ log messages.
+    pub own_id: i32,
     /// Resend even when nothing changed (lock recovery).
     pub force: bool,
     /// `ad->tune_time != 0`: the adapter already tuned once since it was opened.
@@ -44,20 +51,46 @@ pub struct SwitchOptions {
 }
 
 /// `diseqc_cmd` (dvb.cpp:949): send `cmd` `times` times with the `-q` delays.
+///
+/// `name` is the C++ `str` argument ("committed", "uncommitted", ...), logged on
+/// failure.
 pub fn diseqc_cmd<S: SecDevice + ?Sized>(
     dev: &mut S,
     times: i32,
+    name: &str,
     cmd: &DiseqcMessage,
     d: &DiseqcParams,
 ) {
     dev.sleep_ms(d.before_cmd);
     for i in 0..times {
-        let _ = dev.send_master_cmd(cmd);
+        if let Err(error) = dev.send_master_cmd(cmd) {
+            let fd = dev.log_fd();
+            let (_, text) = error_parts(&error);
+            ms_log::log!(
+                "send_diseqc: FE_DISEQC_SEND_MASTER_CMD {} failed for fd {}: {}",
+                name,
+                fd,
+                text
+            );
+        }
         dev.sleep_ms(if i > 0 {
             d.after_repeated_cmd
         } else {
             d.after_cmd
         });
+    }
+}
+
+/// Committed/uncommitted positions used by `send_diseqc` and its log line.
+fn diseqc_positions(pos: i32, d: &DiseqcParams) -> (i32, i32) {
+    let mut committed_no = d.committed_no;
+    if committed_no == 0 && d.uncommitted_no == 0 {
+        committed_no = 1;
+    }
+    if d.uncommitted_no > 0 && committed_no > 0 {
+        (pos % 4, pos / 4)
+    } else {
+        (pos, pos)
     }
 }
 
@@ -68,15 +101,7 @@ pub fn diseqc_messages(
     hiband: i32,
     d: &DiseqcParams,
 ) -> (DiseqcMessage, DiseqcMessage) {
-    let mut committed_no = d.committed_no;
-    if committed_no == 0 && d.uncommitted_no == 0 {
-        committed_no = 1;
-    }
-    let (mut posu, mut posc) = (pos, pos);
-    if d.uncommitted_no > 0 && committed_no > 0 {
-        posc = pos % 4;
-        posu = pos / 4;
-    }
+    let (posc, posu) = diseqc_positions(pos, d);
     let committed = DiseqcMessage {
         msg: [
             0xe0,
@@ -117,26 +142,53 @@ pub fn send_diseqc<S: SecDevice + ?Sized>(
         committed_no = 1;
     }
     let (cmd, uncmd) = diseqc_messages(pos, pol, hiband, d);
+    let (posc, posu) = diseqc_positions(pos, d);
     let voltage = if pol != 0 { Voltage::V18 } else { Voltage::V13 };
+    let fd = dev.log_fd();
 
+    ms_log::logm!(
+        "send_diseqc fd {}, pos = {} (c {} u {}), pol = {}, hiband = {}",
+        fd,
+        pos,
+        posc,
+        posu,
+        pol,
+        hiband
+    );
     dev.wakeup(voltage);
-    let _ = dev.set_tone(Tone::Off);
-    let _ = dev.set_voltage(voltage);
+    if let Err(error) = dev.set_tone(Tone::Off) {
+        let (_, text) = error_parts(&error);
+        ms_log::log!("send_diseqc: FE_SET_TONE failed for fd {}: {}", fd, text);
+    }
+    if let Err(error) = dev.set_voltage(voltage) {
+        let (_, text) = error_parts(&error);
+        ms_log::log!("send_diseqc: FE_SET_VOLTAGE failed for fd {}: {}", fd, text);
+    }
 
     if d.fast == 0 || pos_change {
         if uncommitted_first {
-            diseqc_cmd(dev, d.uncommitted_no, &uncmd, d);
+            diseqc_cmd(dev, d.uncommitted_no, "uncommitted", &uncmd, d);
         }
-        diseqc_cmd(dev, committed_no, &cmd, d);
+        diseqc_cmd(dev, committed_no, "committed", &cmd, d);
         if !uncommitted_first {
-            diseqc_cmd(dev, d.uncommitted_no, &uncmd, d);
+            diseqc_cmd(dev, d.uncommitted_no, "uncommitted", &uncmd, d);
         }
         dev.sleep_ms(d.after_switch);
-        let _ = dev.send_burst(if pos & 1 != 0 { MiniCmd::B } else { MiniCmd::A });
+        if let Err(error) = dev.send_burst(if pos & 1 != 0 { MiniCmd::B } else { MiniCmd::A }) {
+            let (_, text) = error_parts(&error);
+            ms_log::log!(
+                "send_diseqc: FE_DISEQC_SEND_BURST failed for fd {}: {}",
+                fd,
+                text
+            );
+        }
     }
 
     dev.sleep_ms(d.after_burst);
-    let _ = dev.set_tone(if hiband != 0 { Tone::On } else { Tone::Off });
+    if let Err(error) = dev.set_tone(if hiband != 0 { Tone::On } else { Tone::Off }) {
+        let (_, text) = error_parts(&error);
+        ms_log::log!("send_diseqc: FE_SET_TONE failed for fd {}: {}", fd, text);
+    }
     dev.sleep_ms(d.after_tone);
 }
 
@@ -195,21 +247,40 @@ pub fn jess_message(
 // Shared tail of send_unicable/send_jess (dvb.cpp:1063-1083, 1110-1132).
 fn send_single_cable<S: SecDevice + ?Sized>(
     dev: &mut S,
+    name: &str,
     cmd: &DiseqcMessage,
     d: &DiseqcParams,
     tuned_before: bool,
 ) -> i32 {
+    let fd = dev.log_fd();
     dev.wakeup(Voltage::V13);
     if !tuned_before {
-        let _ = dev.set_voltage(Voltage::V13);
-        let _ = dev.set_tone(Tone::Off);
+        if let Err(error) = dev.set_voltage(Voltage::V13) {
+            let (_, text) = error_parts(&error);
+            ms_log::log!(
+                "{}: pre voltage  SEC_VOLTAGE_13 failed for fd {}: {}",
+                name,
+                fd,
+                text
+            );
+        }
+        if let Err(error) = dev.set_tone(Tone::Off) {
+            let (_, text) = error_parts(&error);
+            ms_log::log!("{}: FE_SET_TONE failed for fd {}: {}", name, fd, text);
+        }
         dev.sleep_ms(d.after_tone);
     }
-    if d.only13v == 0 {
-        let _ = dev.set_voltage(Voltage::V18);
+    if d.only13v == 0
+        && let Err(error) = dev.set_voltage(Voltage::V18)
+    {
+        let (_, text) = error_parts(&error);
+        ms_log::log!("{}: FE_SET_VOLTAGE failed for fd {}: {}", name, fd, text);
     }
-    diseqc_cmd(dev, d.committed_no, cmd, d);
-    let _ = dev.set_voltage(Voltage::V13);
+    diseqc_cmd(dev, d.committed_no, name, cmd, d);
+    if let Err(error) = dev.set_voltage(Voltage::V13) {
+        let (_, text) = error_parts(&error);
+        ms_log::log!("{}: FE_SET_VOLTAGE failed for fd {}: {}", name, fd, text);
+    }
     d.ufreq.wrapping_mul(1000)
 }
 
@@ -224,7 +295,24 @@ pub fn send_unicable<S: SecDevice + ?Sized>(
     tuned_before: bool,
 ) -> i32 {
     let cmd = unicable_message(freq_mhz, pos, pol, hiband, d);
-    send_single_cable(dev, &cmd, d, tuned_before)
+    let fd = dev.log_fd();
+    ms_log::logm!(
+        "send_unicable fd {}, freq {}, ufreq {}, pos = {}, pol = {}, hiband = {}, slot {}, pin {}, diseqc => {:02x} {:02x} {:02x} {:02x} {:02x}",
+        fd,
+        freq_mhz,
+        d.ufreq,
+        pos,
+        pol,
+        hiband,
+        d.uslot,
+        d.pin,
+        cmd.msg[0],
+        cmd.msg[1],
+        cmd.msg[2],
+        cmd.msg[3],
+        cmd.msg[4]
+    );
+    send_single_cable(dev, "send_unicable", &cmd, d, tuned_before)
 }
 
 /// `send_jess` (dvb.cpp:1086): returns the user-band frequency in kHz.
@@ -238,7 +326,24 @@ pub fn send_jess<S: SecDevice + ?Sized>(
     tuned_before: bool,
 ) -> i32 {
     let cmd = jess_message(freq_mhz, pos, pol, hiband, d);
-    send_single_cable(dev, &cmd, d, tuned_before)
+    let fd = dev.log_fd();
+    ms_log::logm!(
+        "send_jess fd {}, freq {}, ufreq {}, pos = {}, pol = {}, hiband = {}, slot {}, pin {}, diseqc => {:02x} {:02x} {:02x} {:02x} {:02x}",
+        fd,
+        freq_mhz,
+        d.ufreq,
+        pos,
+        pol,
+        hiband,
+        d.uslot,
+        d.pin,
+        cmd.msg[0],
+        cmd.msg[1],
+        cmd.msg[2],
+        cmd.msg[3],
+        cmd.msg[4]
+    );
+    send_single_cable(dev, "send_jess", &cmd, d, tuned_before)
 }
 
 /// `setup_switch` (dvb.cpp:1135): drives the LNB/switch and returns the IF in kHz, or -1.
@@ -275,6 +380,17 @@ pub fn setup_switch<S: SecDevice + ?Sized>(
             None => changed(own) || opts.force,
             Some(m) => {
                 if changed(&*m.state) && !m.idle {
+                    ms_log::log!(
+                        "Slave adapter {} wants to change the paramters of the master adapter {}: pol {} {}, hiband {} {}, diseqc {} {} ",
+                        opts.own_id,
+                        m.id,
+                        pol,
+                        own.pol,
+                        hiband,
+                        own.hiband,
+                        diseqc,
+                        own.diseqc
+                    );
                     return -1;
                 }
                 m.idle
@@ -283,6 +399,19 @@ pub fn setup_switch<S: SecDevice + ?Sized>(
         if do_setup_switch {
             let pos_change = opts.force || own.diseqc != diseqc;
             send_diseqc(dev, diseqc, pos_change, pol, hiband, d, opts.diseqc_multi);
+        } else if master.is_none() {
+            ms_log::logm!(
+                "Skip sending diseqc commands since the switch position doesn't need to be changed: pol {}, hiband {}, switch position {}",
+                pol,
+                hiband,
+                diseqc
+            );
+        } else if let Some(m) = &master {
+            ms_log::logm!(
+                "Slave adapter {} not sending switch updates using master {}",
+                opts.own_id,
+                m.id
+            );
         }
     }
 

@@ -95,9 +95,16 @@ impl PendingPool {
     /// Applies the C++ pre-accept rules (`srt_accept_poll`, srt.cpp:100).
     pub fn accept(&mut self, streamid: Option<&str>, sock: i32) -> AcceptDecision {
         let Some(streamid) = streamid.filter(|value| !value.is_empty()) else {
+            // srt.cpp:104
+            ms_log::log!("SRT accept: empty streamid, rejecting connection");
             return AcceptDecision::Rejected;
         };
         if self.sockets.len() >= SRT_PENDING_MAX {
+            // srt.cpp:112
+            ms_log::log!(
+                "SRT accept: pending pool full ({}), rejecting connection",
+                SRT_PENDING_MAX
+            );
             return AcceptDecision::Rejected;
         }
         let mut replaced = SRT_INVALID_SOCK;
@@ -108,6 +115,13 @@ impl PendingPool {
             self.sockets.remove(streamid);
         }
         self.sockets.insert(streamid.to_owned(), sock);
+        // srt.cpp:127
+        ms_log::log!(
+            "SRT accepted connection srt_sock={}, streamid='{}' ({} pending)",
+            sock,
+            streamid,
+            self.sockets.len()
+        );
         AcceptDecision::Accepted { replaced }
     }
 
@@ -195,19 +209,39 @@ impl<O: SrtOps + 'static> SrtListener<O> {
         }
         let listener = self.ops.create_socket();
         if listener == SRT_INVALID_SOCK {
-            return Err(SrtError::CreateSocket);
+            // srt.cpp:154
+            ms_log::log_and_return!(
+                Err(SrtError::CreateSocket),
+                "SRT listener: srt_create_socket failed: {}",
+                ms_srt::last_error()
+            );
         }
         if !self.ops.bind_acquire(listener, udp_fd) {
             self.ops.close(listener);
-            return Err(SrtError::Bind);
+            // srt.cpp:166
+            ms_log::log_and_return!(
+                Err(SrtError::Bind),
+                "SRT listener: srt_bind_acquire failed: {}",
+                ms_srt::last_error()
+            );
         }
         if !self.ops.set_accept_callback(listener, self.pending.clone()) {
             self.ops.close(listener);
-            return Err(SrtError::AcceptCallback);
+            // srt.cpp:176
+            ms_log::log_and_return!(
+                Err(SrtError::AcceptCallback),
+                "SRT listener: srt_listen_callback failed: {}",
+                ms_srt::last_error()
+            );
         }
         if !self.ops.listen(listener, SRT_LISTEN_BACKLOG) {
             self.ops.close(listener);
-            return Err(SrtError::Listen);
+            // srt.cpp:184
+            ms_log::log_and_return!(
+                Err(SrtError::Listen),
+                "SRT listener: srt_listen failed: {}",
+                ms_srt::last_error()
+            );
         }
         self.pending.lock().expect("pending pool").drain();
         if let Some(handle) = self.drain.take() {
@@ -262,6 +296,12 @@ impl<O: SrtOps + 'static> SrtListener<O> {
         }
         if !self.ops.is_connected(sock) {
             self.ops.close(sock);
+            // srt.cpp:78
+            ms_log::log!(
+                "SRT socket {} closed (not connected), streamid='{}'",
+                sock,
+                streamid
+            );
             return;
         }
         let old = self
@@ -272,6 +312,12 @@ impl<O: SrtOps + 'static> SrtListener<O> {
         if old != SRT_INVALID_SOCK {
             self.ops.close(old);
         }
+        // srt.cpp:94
+        ms_log::log!(
+            "SRT socket {} returned to pending pool for reuse, streamid='{}'",
+            sock,
+            streamid
+        );
     }
 
     /// Sends TS data with the C++ chunking and error handling.

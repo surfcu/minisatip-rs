@@ -127,11 +127,22 @@ pub fn resolve_bind_opts<L: DevLookup + ?Sized>(
     let has_dev = opts.bind_dev.is_some();
 
     if has_dev && (has_bind || has_http) {
+        // socketworks.cpp:153. The command line is rejected while parsing, in
+        // `ms_config::parse`, which emits the C++ LOG there and mirrors the
+        // C++ FAIL("Invalid bind configuration") that follows it; by the time
+        // this function runs the conflict is already gone.
         return Err(BindDevError::Conflict);
     }
     if has_dev {
         let dev = opts.bind_dev.as_deref().unwrap_or_default();
-        let ip = get_dev_ip(lookup, Some(dev), INET_ADDRSTRLEN)?;
+        // socketworks.cpp:157-160.
+        let ip = match get_dev_ip(lookup, Some(dev), INET_ADDRSTRLEN) {
+            Ok(ip) => ip,
+            Err(error) => {
+                ms_log::log!("Cannot resolve --bind-dev {}", dev);
+                return Err(error);
+            }
+        };
         opts.derived_dev_ip = Some(ip.clone());
         opts.bind = Some(ip.clone());
         opts.bind_http = Some(ip);
@@ -178,7 +189,11 @@ pub fn set_socket_bind_dev<O: BindDevOps + ?Sized>(
 ) -> BindDevStatus {
     match bind_dev {
         None | Some("") => BindDevStatus::Unset,
-        Some(dev) if dev.len() >= IF_NAMESIZE => BindDevStatus::Failed,
+        Some(dev) if dev.len() >= IF_NAMESIZE => {
+            // socketworks.cpp:184-187.
+            ms_log::log!("Device name {} too long", dev);
+            BindDevStatus::Failed
+        }
         Some(dev) => sock.set_bind_dev(dev),
     }
 }

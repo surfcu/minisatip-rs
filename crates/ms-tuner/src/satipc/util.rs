@@ -178,12 +178,16 @@ pub fn delsys_name(sys: DeliverySystem) -> &'static str {
 pub fn random_u32() -> u32 {
     use std::io::Read;
 
+    const URANDOM: &str = "/dev/urandom";
     let mut bytes = [0u8; 4];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_ok()
-    {
-        return u32::from_ne_bytes(bytes);
+    match std::fs::File::open(URANDOM) {
+        Ok(mut file) => match file.read_exact(&mut bytes) {
+            Ok(()) => return u32::from_ne_bytes(bytes),
+            // utils.cpp:797
+            Err(_) => ms_log::log!("cannot read from {}", URANDOM),
+        },
+        // utils.cpp:792
+        Err(_) => ms_log::log!("cannot open {}", URANDOM),
     }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

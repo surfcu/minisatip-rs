@@ -2,10 +2,20 @@
 
 #![allow(unsafe_code)]
 
+use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ms_log::{Backend, Timestamp};
+
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static SYSLOG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Mirrors libc's process-wide syslog connection state, so `become_daemon`
+/// can close it before its descriptor sweep and the next line reopens it
+/// with the C++ options (`minisatip.cpp:1919-1923`).
+static SYSLOG_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// C++ `app_name` (`minisatip.cpp:78`).
+const APP_NAME: &str = "minisatip";
 
 extern "C" fn on_signal(_signal: libc::c_int) {
     // Async-signal-safe: only an atomic store.
@@ -18,8 +28,14 @@ pub fn install_shutdown_handlers() {
     // function with the C signal signature.
     unsafe {
         let handler = on_signal as *const () as libc::sighandler_t;
-        libc::signal(libc::SIGINT, handler);
-        libc::signal(libc::SIGTERM, handler);
+        // utils.cpp:224
+        if libc::signal(libc::SIGINT, handler) == libc::SIG_ERR {
+            ms_log::log!("Could not set signal SIGINT");
+        }
+        // utils.cpp:228
+        if libc::signal(libc::SIGTERM, handler) == libc::SIG_ERR {
+            ms_log::log!("Could not set signal SIGTERM");
+        }
     }
 }
 
@@ -85,6 +101,13 @@ pub fn remove_pid_file() {
 pub fn become_daemon(log_file: &str) -> Result<(), String> {
     kill_previous_instance();
 
+    // utils.cpp:300
+    ms_log::log!(
+        "running {} in background and logging to {}",
+        APP_NAME,
+        log_file
+    );
+
     // SAFETY: fork(2) has no preconditions; the parent leaves immediately.
     match unsafe { libc::fork() } {
         -1 => return Err("fork failed".to_owned()),
@@ -109,6 +132,13 @@ pub fn become_daemon(log_file: &str) -> Result<(), String> {
     }
     // SAFETY: umask(2) has no preconditions.
     unsafe { libc::umask(0) };
+
+    // Drop the syslog socket before the sweep closes it behind libc's back;
+    // the next syslog line reopens it (C++ opens syslog after daemonising).
+    if SYSLOG_OPEN.swap(false, Ordering::SeqCst) {
+        // SAFETY: closelog(3) has no preconditions.
+        unsafe { libc::closelog() };
+    }
 
     // SAFETY: sysconf only reads the descriptor limit.
     let max_fd = match unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } {
@@ -178,41 +208,80 @@ fn kill_previous_instance() {
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     if exe == invoked {
+        // utils.cpp:294
+        ms_log::log!("Found {} running with pid {}, killing....", APP_NAME, pid);
         // SAFETY: kill(2) only signals the pid recorded in our pid file.
         unsafe { libc::kill(pid, libc::SIGINT) };
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
-/// `openlog(app_name, LOG_NDELAY | LOG_NOWAIT | LOG_PID | (slog > 1 ?
-/// LOG_PERROR : 0), LOG_DAEMON)` (minisatip.cpp:1919-1923).
-pub fn open_syslog(app_name: &str, perror: bool) {
-    let Ok(name) = std::ffi::CString::new(app_name) else {
-        return;
-    };
-    let options = libc::LOG_NDELAY
-        | libc::LOG_NOWAIT
-        | libc::LOG_PID
-        | if perror { libc::LOG_PERROR } else { 0 };
-    // SAFETY: the name is NUL-terminated and outlives the call; openlog copies it.
-    unsafe { libc::openlog(name.as_ptr(), options, libc::LOG_DAEMON) };
-    SYSLOG_ENABLED.store(true, Ordering::SeqCst);
+/// The real backend: local time through `localtime_r` and lines through
+/// syslog when `-g` is active.
+///
+/// `openlog` runs lazily on the first syslog line, and again after
+/// `become_daemon` closed it (C++ opens it in `main` after daemonising,
+/// `minisatip.cpp:1919-1923`).
+pub struct SysLogBackend {
+    perror: bool,
 }
 
-/// Writes an error diagnostic through syslog when `-g` is active, otherwise
-/// to stderr (`LOG` with `opts.slog`, minisatip.cpp:1919-1923).
-pub fn log_error(args: std::fmt::Arguments<'_>) {
-    let message = std::fmt::format(args);
-    if !SYSLOG_ENABLED.load(Ordering::SeqCst) {
-        eprintln!("{message}");
-        return;
+impl SysLogBackend {
+    /// `slog` is `opts.slog`: more than one `-g` also mirrors lines to stderr.
+    pub fn new(slog: u32) -> Self {
+        Self { perror: slog > 1 }
     }
-    let Ok(message) = std::ffi::CString::new(message) else {
-        return;
-    };
-    // SAFETY: "%s" is NUL-terminated and `message` is a NUL-terminated string;
-    // syslog copies both before returning.
-    unsafe { libc::syslog(libc::LOG_ERR, c"%s".as_ptr(), message.as_ptr()) };
+}
+
+impl Backend for SysLogBackend {
+    fn timestamp(&self) -> Timestamp {
+        // SAFETY: gettimeofday only writes into the provided timeval.
+        let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+        // SAFETY: `tv` is a valid, writable timeval.
+        if unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) } != 0 {
+            return Timestamp::fallback();
+        }
+        // SAFETY: localtime_r only reads the time_t and writes into `tm`.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: `tm` is a valid, writable tm and `tv.tv_sec` is its time_t.
+        if unsafe { libc::localtime_r(&tv.tv_sec, &mut tm) }.is_null() {
+            return Timestamp::fallback();
+        }
+        Timestamp::new(
+            tm.tm_mday.max(0) as u32,
+            (tm.tm_mon + 1).max(0) as u32,
+            tm.tm_hour.max(0) as u32,
+            tm.tm_min.max(0) as u32,
+            tm.tm_sec.max(0) as u32,
+            u32::try_from(tv.tv_usec / 1000).unwrap_or(0),
+        )
+    }
+
+    fn syslog(&self, line: &str) {
+        if !SYSLOG_OPEN.swap(true, Ordering::SeqCst) {
+            let options = libc::LOG_NDELAY
+                | libc::LOG_NOWAIT
+                | libc::LOG_PID
+                | if self.perror { libc::LOG_PERROR } else { 0 };
+            // SAFETY: the identifier is a static NUL-terminated C string;
+            // openlog keeps the pointer, which stays valid for the process.
+            unsafe { libc::openlog(c"minisatip".as_ptr(), options, libc::LOG_DAEMON) };
+        }
+        // C++ passes the line to "%s", which stops at a NUL; strip any so the
+        // whole line reaches syslog.
+        let clean: String = line.chars().filter(|c| *c != '\0').collect();
+        let Ok(message) = CString::new(clean) else {
+            return;
+        };
+        // SAFETY: "%s" is a static NUL-terminated format string and `message`
+        // is NUL-terminated; syslog copies both before returning.
+        unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), message.as_ptr()) };
+    }
+}
+
+/// Writes a diagnostic through the logger (`LOG0` for runtime failures).
+pub fn log_error(args: std::fmt::Arguments<'_>) {
+    ms_log::log0!("{args}");
 }
 
 /// Formats `time_running` like minisatip.cpp:1549-1552.

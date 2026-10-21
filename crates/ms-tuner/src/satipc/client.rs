@@ -8,9 +8,13 @@ use std::fmt::Write as _;
 use std::time::Instant;
 
 use super::util::{
-    c_text, delsys_name, header_parameter, is_rtsp_response, parse_int, split, starts_with_ci,
+    c_text, delsys_code, delsys_name, header_parameter, is_rtsp_response, parse_int, split,
+    starts_with_ci,
 };
 use crate::tuner::{DeliverySystem, PID_ALL, PidSet, Polarization, TuneParams};
+
+/// `satipc.cpp`'s `#define DEFAULT_LOG LOG_SATIPC`.
+const DEFAULT_LOG: u32 = ms_log::LOG_SATIPC;
 
 /// `SATIP_MAX_STRENGTH`.
 pub const MAX_STRENGTH: i32 = 255;
@@ -351,17 +355,24 @@ impl Client {
             self.option_no_setup = true;
         }
         if text.contains("enigma") && !self.restart_when_tune {
+            // satipc.cpp:137-139
+            ms_log::log!(
+                "Setting adapter {} to restart every time the transponder is changed",
+                self.id
+            );
             self.restart_when_tune = true;
             if self.transport == Transport::Udp {
                 self.transport = Transport::Tcp;
                 self.restart_needed = true;
+                // satipc.cpp:144
+                ms_log::log!("adapter {} is not RTSP over TCP, switching", self.id);
             }
             self.option_no_setup = true;
         }
     }
 
     // Fatal rejection: release the server session and park the adapter.
-    fn give_up(&mut self) {
+    fn give_up(&mut self, rc: i32) {
         if self.stream_id != -1 {
             self.state = State::Teardown;
             self.send_teardown();
@@ -369,6 +380,8 @@ impl Client {
             self.state = State::Inactive;
         }
         self.err = true;
+        // satipc.cpp:168
+        ms_log::log!("satipc {}: request failed fatally (rc {})", self.id, rc);
     }
 
     fn handle_setup(&mut self, text: &str) {
@@ -392,11 +405,20 @@ impl Client {
             if self.stream_id == -1 {
                 self.stream_id = parse_int(sid, 0);
             }
+            // satipc.cpp:203-204
+            ms_log::log!(
+                "satipc: session set for adapter {} to {} with stream_id {}",
+                self.id,
+                self.session,
+                self.stream_id
+            );
         }
     }
 
     fn handle_play(&mut self) {
         if self.ignore_packets {
+            // satipc.cpp:213
+            ms_log::log!("accepting packets from RTSP server");
             self.ignore_packets = false;
             // src_satipc.cpp:211-216: flush until the new transponder shows up.
             self.wait_new_stream = true;
@@ -415,6 +437,14 @@ impl Client {
             return ReplyOutcome::Handled;
         }
         if !is_rtsp_response(buf) {
+            // satipc.cpp:238-239; socket ids have no equivalent.
+            let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+            ms_log::log!(
+                "satipc: RTSP header not complete: {} len {}\n{}",
+                0,
+                len,
+                String::from_utf8_lossy(&buf[..len])
+            );
             return ReplyOutcome::Incomplete;
         }
         let text = c_text(buf);
@@ -423,6 +453,16 @@ impl Client {
             .find("RTSP/1.0")
             .map_or(0, |pos| parse_int(text.get(pos + 9..).unwrap_or(""), 0));
         let is_transport = text.contains("Transport:");
+        // satipc.cpp:250-253, 254
+        ms_log::log!(
+            "satipc_reply (adapter {}): sock {} (receiving from handle {}, state {}): [[ code {} ]]",
+            self.id,
+            0,
+            0,
+            self.state as u8,
+            rc
+        );
+        ms_log::logm!("{}", text);
         self.handle_client_capabilities(&text);
         if self.last_cmd == LastCmd::Describe {
             self.set_adapter_signal(&text);
@@ -463,12 +503,19 @@ impl Client {
                 self.force_pids = true;
             }
         } else if rc == 403 || rc == 500 {
-            self.give_up();
+            if rc == 403 {
+                // satipc.cpp:301
+                if let Some(oor) = body_param(&text, "Out-of-Range:") {
+                    let attrs = oor.split(['\r', '\n']).next().unwrap_or("");
+                    ms_log::log!("satipc {}: server reports {}", self.id, attrs);
+                }
+            }
+            self.give_up(rc);
         } else if rc == 503 || rc == 405 || rc == 400 {
             let no_more_pids =
                 rc == 503 && body_param(&text, "No-More:").is_some_and(|v| v.contains("pids"));
             if no_more_pids {
-                self.give_up();
+                self.give_up(rc);
             } else {
                 if self.err {
                     self.state = State::Inactive;
@@ -481,10 +528,34 @@ impl Client {
                 if !self.err {
                     self.force_pids = true;
                 }
+                // satipc.cpp:324
+                ms_log::log!("satipc {}: request rejected (rc {}), retrying", self.id, rc);
             }
-        } else if rc != 200 && rc != 0 {
-            self.err = true;
+        } else if rc != 200 {
+            if rc != 0 {
+                self.err = true;
+                // satipc.cpp:329
+                ms_log::log!("marking device {} as error, rc = {}", self.id, rc);
+            } else {
+                // satipc.cpp:332-334
+                ms_log::log!(
+                    "marking device {} not as error but reply is unexpected, rc = {}",
+                    self.id,
+                    rc
+                );
+            }
         }
+
+        // satipc.cpp:336-339
+        ms_log::log!(
+            "satipc {}, expect_reply {}, want_tune {} want commit {}, state {}, is_transport {}",
+            self.id,
+            i32::from(self.expect_reply),
+            i32::from(self.want_tune),
+            i32::from(self.want_commit),
+            self.state as u8,
+            i32::from(is_transport)
+        );
 
         if rc == 200 {
             if is_transport {
@@ -524,8 +595,22 @@ impl Client {
             quality = 7;
         }
         if self.ignore_signal {
+            // satipc.cpp:606-607
+            ms_log::log!(
+                "satipc: Ignoring server signal status since both strength_multiplier and snr_multiplier are 0"
+            );
             strength = MAX_STRENGTH;
             quality = MAX_QUALITY;
+        }
+        if self.strength != strength || self.snr != quality {
+            // satipc.cpp:613-617
+            ms_log::log!(
+                "satipc: Received signal status from the server for adapter {}, stength={} status={} quality={}",
+                self.id,
+                strength,
+                status,
+                quality
+            );
         }
         self.strength = strength;
         self.status = status != 0;
@@ -535,8 +620,23 @@ impl Client {
     /// `satipc_rtcp_reply` signal part: parses the `SES1` APP payload.
     pub fn rtcp_reply(&mut self, b: &[u8]) {
         self.rtsp_socket_closed = false;
-        if b.len() >= 24 && b[0] == 0x80 && b[1] == 0xC8 && self.transport == Transport::Udp {
-            self.repno = self.repno.wrapping_add(1);
+        if b.len() >= 24 && b[0] == 0x80 && b[1] == 0xC8 {
+            let rp = u32::from_ne_bytes([b[20], b[21], b[22], b[23]]);
+            if self.transport == Transport::Udp {
+                self.repno = self.repno.wrapping_add(1);
+                if self.repno.is_multiple_of(100) {
+                    // satipc.cpp:642-646; ad->pid_err is not modelled.
+                    let missing = rp.wrapping_sub(self.rcvp) as i32;
+                    ms_log::log!(
+                        "satipc: rtp report, adapter {}: rtcp missing packets {}, rtp missing {}, rtp ooo {}, pid unknown {}",
+                        self.id,
+                        missing,
+                        self.rtp_miss,
+                        self.rtp_ooo,
+                        0
+                    );
+                }
+            }
         }
         let (mut sm, mut rp) = (0usize, 0usize);
         while sm < b.len() {
@@ -544,6 +644,8 @@ impl Client {
                 sm += 1;
                 continue;
             }
+            // satipc.cpp:655
+            ms_log::debugm!("satipc: satipc_rtcp_reply SES1 match at {}", sm);
             sm += 4;
             if b.len() >= sm + 4 && b[sm] == 0 && b[sm + 1] == 0 {
                 rp = (usize::from(b[sm + 2]) << 8) | usize::from(b[sm + 3]);
@@ -578,6 +680,15 @@ impl Client {
 
     /// `satipc_close_rtsp`: the media socket was closed.
     pub fn on_data_closed(&mut self) {
+        // satipc.cpp:438-440; socket id/handle have no Rust equivalent.
+        ms_log::log!(
+            "adapter {} satip rtsp sock {}, handle {}, keep_open {}, restart_needed {}",
+            self.id,
+            0,
+            0,
+            i32::from(self.keep_adapter_open),
+            i32::from(self.restart_needed)
+        );
         if self.keep_adapter_open || self.restart_needed {
             self.close_rtsp_socket();
         } else {
@@ -614,13 +725,37 @@ impl Client {
             return 0;
         }
         if self.expect_reply && self.tick() - self.last_response_sent > self.timeout_ms {
+            // satipc.cpp:497-499
+            ms_log::log!(
+                "satipc {}: no response was received from the server for more than {} ms, closing connection",
+                self.id,
+                self.tick() - self.last_response_sent
+            );
             self.restart_needed = true;
             self.state = State::DISCONNECTED;
             self.close_data();
         }
         if self.want_tune || !self.apid.is_empty() || !self.dpid.is_empty() {
+            // satipc.cpp:506-508
+            ms_log::log!(
+                "satipc {} no timeout will be performed as we have operations in queue tune {} lap {} ldp {}",
+                self.id,
+                i32::from(self.want_tune),
+                self.apid.len(),
+                self.dpid.len()
+            );
             return 0;
         }
+        // satipc.cpp:573-576; socket id/handle have no Rust equivalent.
+        ms_log::log!(
+            "satipc: Sent keep-alive to the satip server {}:{}, adapter {}, socket_id {}, handle {}, timeout {}",
+            self.host,
+            self.port,
+            self.id,
+            0,
+            0,
+            self.fe_timeout_ms
+        );
         self.http_request(None, "OPTIONS");
         0
     }
@@ -660,6 +795,8 @@ impl Client {
         if !self.enabled {
             return;
         }
+        // satipc.cpp:954
+        ms_log::log!("satip device {}:{} is closing", self.host, self.port);
         if self.state == State::Play {
             self.state = State::Teardown;
             self.request();
@@ -673,6 +810,13 @@ impl Client {
         if !self.enabled {
             return;
         }
+        // satipc.cpp:979-980
+        ms_log::log!(
+            "satip device {}:{} going to standby (expect_reply {})",
+            self.host,
+            self.port,
+            i32::from(self.expect_reply)
+        );
         if self.state == State::Play {
             self.state = State::Teardown;
             self.request();
@@ -682,6 +826,8 @@ impl Client {
         self.apid.clear();
         self.dpid.clear();
         if self.restart_when_tune {
+            // satipc.cpp:989
+            ms_log::log!("All stream closed, restarting satip adapter {}", self.id);
             self.restart_needed = true;
             self.close_data();
             self.state = State::DISCONNECTED;
@@ -699,12 +845,31 @@ impl Client {
 
     /// `satipc_set_pid`: queues `pid` for `addpids`; returns the filter id.
     pub fn set_pid(&mut self, pid: u16) -> i32 {
+        // satipc.cpp:1410-1411
+        let err = if self.enabled {
+            i32::from(self.err)
+        } else {
+            -2
+        };
+        ms_log::log!(
+            "satipc: set_pid for adapter {}, pid {}, err {} (lap={})",
+            self.id,
+            pid,
+            err,
+            self.apid.len()
+        );
         if !self.enabled || self.err {
             return 0;
         }
         let aid = self.id as i32;
         if let Some(i) = self.dpid.iter().position(|p| *p == pid) {
             self.dpid.swap_remove(i);
+            // satipc.cpp:1420-1422
+            ms_log::logm!(
+                "satipc: set_pid for pid {} already in the delete list! (ldp={})",
+                pid,
+                self.dpid.len()
+            );
             return aid + 100;
         }
         self.apid.push(pid);
@@ -712,12 +877,32 @@ impl Client {
     }
 
     /// `satipc_del_filters`: queues `pid` for `delpids`.
-    pub fn del_filters(&mut self, _fd: i32, pid: u16) -> i32 {
+    pub fn del_filters(&mut self, fd: i32, pid: u16) -> i32 {
+        // satipc.cpp:1434-1436
+        let aid = fd - 100;
+        let err = if self.enabled {
+            i32::from(self.err)
+        } else {
+            -2
+        };
+        ms_log::log!(
+            "satipc: del_pid for aid {}, pid {}, err {} (ldp={})",
+            aid,
+            pid,
+            err,
+            self.dpid.len()
+        );
         if !self.enabled || self.err {
             return 0;
         }
         if let Some(i) = self.apid.iter().position(|p| *p == pid) {
             self.apid.swap_remove(i);
+            // satipc.cpp:1445-1447
+            ms_log::logm!(
+                "satipc: del_pid for pid {} already in the add list! (lap={})",
+                pid,
+                self.apid.len()
+            );
             return 0;
         }
         self.dpid.push(pid);
@@ -953,13 +1138,26 @@ impl Client {
             DeliverySystem::DvbT2 | DeliverySystem::DvbT | DeliverySystem::Other(8) => {
                 self.t2_url()
             }
-            _ => String::new(),
+            _ => {
+                // satipc.cpp:1706
+                ms_log::log!("No system specified {}", delsys_code(self.sys0));
+                String::new()
+            }
         }
     }
 
     /// `http_request`: formats a request and queues it on the RTSP socket.
     pub fn http_request(&mut self, url: Option<&str>, method: &str) {
-        if !self.enabled || self.expect_reply {
+        if !self.enabled {
+            return;
+        }
+        if self.expect_reply {
+            // satipc.cpp:1614; glibc prints "(null)" for the NULL url.
+            ms_log::log!(
+                "http_request: not sending method {}: url {}",
+                method,
+                url.unwrap_or("(null)")
+            );
             return;
         }
         let mut headers = String::new();
@@ -1018,10 +1216,23 @@ impl Client {
             self.host, self.port, self.cseq
         );
         self.cseq = self.cseq.wrapping_add(1);
+        // satipc.cpp:1677-1679; the remote socket handle is not tracked here.
+        let remote_socket = if self.rtsp_connected { 0 } else { -1 };
+        ms_log::log!(
+            "satipc_http_request (adapter {}): sock {}: [[ {} {} ]]",
+            self.id,
+            remote_socket,
+            method,
+            url
+        );
+        ms_log::logm!("{}", request);
         if self.rtsp_connected {
             self.ops.push_back(Op::Send(request.into_bytes()));
             self.expect_reply = true;
             self.last_response_sent = self.tick();
+        } else {
+            // satipc.cpp:1686
+            ms_log::log!("http_request: remote socket is -1");
         }
     }
 
@@ -1037,9 +1248,12 @@ impl Client {
     }
 
     /// `satipc_send_play`.
+    // C++ LOG_AND_RETURN(0, ...) in a void function returns `()`.
+    #[allow(clippy::unused_unit)]
     fn send_play(&mut self) {
         if !self.want_tune && self.apid.is_empty() && self.dpid.is_empty() && !self.force_pids {
-            return;
+            // satipc.cpp:1793
+            ms_log::log_and_return!((), "adapter {}: Nothing to commit", self.id);
         }
         let mut url = String::new();
         let mut use_pids = false;
@@ -1059,6 +1273,13 @@ impl Client {
     fn send_teardown(&mut self) {
         if self.stream_id != -1 {
             self.http_request(None, "TEARDOWN");
+        } else {
+            // satipc.cpp:1814-1815
+            ms_log::log!(
+                "Unable to send TEARDOWN for adapter {} (stream_id {})",
+                self.id,
+                self.stream_id
+            );
         }
         self.session.clear();
         self.stream_id = -1;
@@ -1080,7 +1301,24 @@ impl Client {
 
     /// `satipc_request`: sends what the state and flags call for.
     pub fn request(&mut self) {
-        if !self.enabled || self.rtsp_socket_closed {
+        if !self.enabled {
+            return;
+        }
+        // satipc.cpp:1845-1851
+        ms_log::log!(
+            "satipc: request for adapter {}, state {}, freq {}, pids to add {}, pids to delete {}, expect_reply {}, want_tune {}, last_cmd {}, sent_transport {}, closed_rtsp {}",
+            self.id,
+            self.state as u8,
+            self.tp.freq,
+            self.apid.len(),
+            self.dpid.len(),
+            i32::from(self.expect_reply),
+            i32::from(self.want_tune),
+            self.last_cmd as u8,
+            i32::from(self.sent_transport),
+            i32::from(self.rtsp_socket_closed)
+        );
+        if self.rtsp_socket_closed {
             return;
         }
         if self.tp.freq == 0 && matches!(self.state, State::Inactive | State::Setup | State::Play) {
@@ -1113,6 +1351,12 @@ impl Client {
             self.ops.push_back(Op::OpenSrt);
             return;
         }
+        // satipc.cpp:1900
+        ms_log::logm!(
+            "satipc: for adapter {}, executing state {}",
+            self.id,
+            self.state as u8
+        );
         match self.state {
             State::Setup => self.send_setup(),
             State::Play => self.send_play(),
@@ -1123,10 +1367,20 @@ impl Client {
     }
 
     /// `satipc_commit`.
+    #[allow(clippy::unused_unit)] // C++ LOG_AND_RETURN(0, ...) returns `()`.
     pub fn commit(&mut self) {
         if !self.enabled {
-            return;
+            // satipc.cpp:1927
+            ms_log::log_and_return!((), "No satip client found for adapter {}", self.id);
         }
+        // satipc.cpp:1929-1932
+        ms_log::log!(
+            "satipc: commit on freq {}, sys {} for adapter {} (expect reply {})",
+            self.tp.freq / 1000,
+            delsys_code(self.tp.msys),
+            self.id,
+            i32::from(self.expect_reply)
+        );
         self.want_commit = true;
         self.request();
     }
@@ -1136,6 +1390,15 @@ impl Client {
         if !self.enabled {
             return 1;
         }
+        // satipc.cpp:1942-1945
+        ms_log::log!(
+            "satipc: tuning to freq {}, sys {} for adapter {} (state {}, expect_reply {})",
+            self.tp.freq / 1000,
+            delsys_code(self.tp.msys),
+            self.id,
+            self.state as u8,
+            i32::from(self.expect_reply)
+        );
         self.err = false;
         self.want_commit = false;
         self.want_tune = true;
@@ -1144,6 +1407,8 @@ impl Client {
         self.dpid.clear();
         if self.restart_when_tune {
             if !self.rtsp_socket_closed {
+                // satipc.cpp:1955
+                ms_log::log!("Restart needed for satip adapter {}", self.id);
                 self.state = State::Teardown;
                 self.request();
                 self.restart_needed = true;

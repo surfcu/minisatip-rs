@@ -1,6 +1,9 @@
 //! Status/variables API: the C++ symbol tables (`src/api/variables.cpp`).
 //! [`CBuf`] reproduces `snprintf`/`strlcatf` truncation so output matches byte for byte.
 
+/// `#define DEFAULT_LOG LOG_UTILS` in `utils.cpp:63`, for its `DEBUGM` site.
+const DEFAULT_LOG: u32 = ms_log::LOG_UTILS;
+
 /// `VAR_UINT8` (variables.h:6).
 pub const VAR_UINT8: i32 = 1;
 /// `VAR_INT8`.
@@ -286,9 +289,14 @@ impl<'a> SymbolTable<'a> {
     /// `process_file` (utils.cpp:379-421): returns the body bytes and whether
     /// C++ flushed mid-file (no Content-Length, `\r\n\r\n` appended).
     pub fn process_file(&self, data: &[u8]) -> (Vec<u8>, bool) {
+        // utils.cpp:385 (`%p` of the template buffer has no Rust equivalent;
+        // it is normalised to 0x0).
+        ms_log::log!("processing_file 0x0 len {}:", data.len());
         let mut out = Vec::with_capacity(data.len());
         let mut io = 0usize;
         let mut flushed = false;
+        // Start of the bytes written since the last flush (`outp` in C++).
+        let mut tail_start = 0usize;
         let mut i = 0;
         while i < data.len() {
             let lv = if data[i] == b'$' {
@@ -307,12 +315,15 @@ impl<'a> SymbolTable<'a> {
             }
             if io > PROCESS_FILE_BUF - 100 {
                 flushed = true;
+                tail_start = out.len();
                 io = 0;
             }
             i += 1;
         }
         if flushed {
             out.extend_from_slice(b"\r\n\r\n");
+            // utils.cpp:419: DEBUGM("%s", outp) after the trailing CRLF pair.
+            ms_log::debugm!("{}", String::from_utf8_lossy(cstr(&out[tail_start..])));
         } else {
             // http_response(..., outp, 0, 0) sends strlen(outp) bytes.
             let end = out.iter().position(|b| *b == 0).unwrap_or(out.len());
@@ -562,11 +573,20 @@ impl CBuf {
 
     /// `ptr += escape_json_string(buf + ptr, len - ptr, src, sl)`
     /// (variables.cpp:171-187), including its `strlcatf(dest, sl, ...)` bug.
+    // The C++ `LOG_AND_RETURN` sits in a void function, so it returns `()`.
+    #[allow(clippy::unused_unit)]
     pub fn escape_json(&mut self, src: &[u8]) {
         let base = self.ptr;
         let dl = self.buf.len() as i64 - base as i64;
         if dl < 2 {
-            return;
+            // variables.cpp:174 (`__FUNCTION__` and `%s` of `src`).
+            ms_log::log_and_return!(
+                (),
+                "{}: dl {} < 2 for {}",
+                "escape_json_string",
+                dl,
+                String::from_utf8_lossy(cstr(src))
+            );
         }
         let sl = src.len() as i64;
         self.write_at(base, b"\"");

@@ -107,8 +107,12 @@ impl Dvbca {
         let (requests, rx) = mpsc::channel();
         let (tx, notices) = mpsc::channel();
         let thread = thread::Builder::new()
-            .name("dvbca".to_owned())
-            .spawn(move || Worker::new(settings, opener, clock, tx).run(&rx))?;
+            // ca.cpp:4076 names the CI poller thread `CA_poll`.
+            .name("CA_poll".to_owned())
+            .spawn(move || {
+                ms_log::set_thread_name("CA_poll");
+                Worker::new(settings, opener, clock, tx).run(&rx)
+            })?;
         Ok(Self {
             requests,
             notices,
@@ -479,12 +483,8 @@ impl Worker {
                     }
                 }
                 HostEvent::CaSessionClosed => capmt.state = ms_ca::CaState::Inactive,
-                HostEvent::MmiMenu { lines } => {
-                    crate::sys::log_error(format_args!("minisatip: CA {id} MMI: {lines:?}"))
-                }
-                HostEvent::MmiEnquiry { text, .. } => {
-                    crate::sys::log_error(format_args!("minisatip: CA {id} MMI enquiry: {text}"))
-                }
+                // The C++ MMI logs live in APP_MMI_handler (en50221/apps.rs).
+                HostEvent::MmiMenu { .. } | HostEvent::MmiEnquiry { .. } => {}
                 HostEvent::CloseRequested => {}
             }
         }

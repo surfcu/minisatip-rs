@@ -6,6 +6,7 @@ mod parse;
 mod usage;
 
 pub use getopt::OptError;
+pub use ms_log::{ALL_LOG_MODULES, LOG_LEVELS};
 pub use options::{
     ADAPTER_BUFFER, AbsoluteSource, AdapterTimeout, CaChannels, CaPin, DVB_CHARSET_AUTO,
     DVB_CHARSET_LATIN1, DVR_BUFFER, DeliverySystem, DelsysConfig, DiseqcConfig, DiseqcMulti,
@@ -13,7 +14,5 @@ pub use options::{
     MAX_SOURCES, Options, SATIP_STR_LEN, SignalForce, SignalMultiplier, SlaveConfig,
     UnicableConfig, UnicableKind,
 };
-pub use parse::{
-    ALL_LOG_MODULES, ParseOutcome, parse_args, parse_dvbapi_opt, parse_sdt_charset_opt,
-};
+pub use parse::{ParseOutcome, parse_args, parse_dvbapi_opt, parse_sdt_charset_opt};
 pub use usage::{BUILT_INFO, USAGE, VERSION_BANNER, usage_text};

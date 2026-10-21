@@ -8,6 +8,9 @@ use crate::DeliverySystem;
 use super::consts::*;
 use super::device::{DvbDevice, FrontendInfo};
 
+/// `#define DEFAULT_LOG LOG_DVB` (dvb.cpp:53).
+const DEFAULT_LOG: u32 = ms_log::LOG_DVB;
+
 /// C++ scans `adapterN/frontendM` with both indices below `MAX_ADAPTERS`.
 pub const MAX_DVB_ADAPTERS: u32 = 100;
 
@@ -52,6 +55,12 @@ pub struct ProbedFrontend {
 pub trait FrontendProbe {
     /// Opens `adapterN/frontendM`, or returns `None` when it cannot be opened.
     fn probe(&self, adapter: u32, frontend: u32) -> Option<ProbedFrontend>;
+
+    /// [`probe`](Self::probe) with the logical adapter id `dvb_delsys` logs.
+    fn probe_with_id(&self, adapter: u32, frontend: u32, aid: i32) -> Option<ProbedFrontend> {
+        let _ = aid;
+        self.probe(adapter, frontend)
+    }
 }
 
 /// One discovered frontend, numbered like the C++ adapter table.
@@ -78,6 +87,10 @@ pub fn enumerate(tree: &dyn DeviceTree, probe: &dyn FrontendProbe) -> Vec<DvbFro
     for path_adapter in 0..MAX_DVB_ADAPTERS {
         for path_frontend in 0..MAX_DVB_ADAPTERS {
             if tree.writable(&sec_path(path_adapter, path_frontend)) {
+                ms_log::log!(
+                    "{} device found, this is a DDCI device",
+                    sec_path(path_adapter, path_frontend)
+                );
                 continue;
             }
             let nodes = [
@@ -88,7 +101,14 @@ pub fn enumerate(tree: &dyn DeviceTree, probe: &dyn FrontendProbe) -> Vec<DvbFro
             if !nodes.iter().all(|present| *present) {
                 continue;
             }
-            let probed = probe.probe(path_adapter, path_frontend).unwrap_or_default();
+            let probed = probe
+                .probe_with_id(path_adapter, path_frontend, found.len() as i32)
+                .unwrap_or_default();
+            ms_log::logm!(
+                "find_dvb_adapter: adding {} {} to the list of devices",
+                path_adapter,
+                path_frontend
+            );
             found.push(DvbFrontend {
                 adapter: found.len() as u32,
                 path_adapter,
@@ -102,18 +122,59 @@ pub fn enumerate(tree: &dyn DeviceTree, probe: &dyn FrontendProbe) -> Vec<DvbFro
 }
 
 /// Queries capabilities through an already-open device (`dvb_delsys`).
-pub fn probe_device<D: DvbDevice + ?Sized>(dev: &mut D) -> ProbedFrontend {
+///
+/// `aid` is the logical adapter id the C++ function receives and logs.
+pub fn probe_device<D: DvbDevice + ?Sized>(dev: &mut D, aid: i32) -> ProbedFrontend {
     // `dvb_delsys` queries DTV_ENUM_DELSYS before FE_GET_INFO (dvb.cpp:1868-1884).
-    let enumerated = dev.enum_delsys().unwrap_or_default();
-    let info = dev.get_info().unwrap_or_default();
-    let systems = if enumerated.is_empty() {
-        systems_from_info(&info)
+    let enumerated = match dev.enum_delsys() {
+        Ok(systems) => systems,
+        Err(_) => {
+            ms_log::log!("unable to query frontend, perhaps DVB-API < 5.5 ?");
+            Vec::new()
+        }
+    };
+    let info = match dev.get_info() {
+        Ok(info) => info,
+        Err(error) => {
+            let fd = dev.log_fd();
+            let (_, text) = super::device::error_parts(&error);
+            ms_log::log!(
+                "FE_GET_INFO failed for adapter {}, fd {}: {} ",
+                aid,
+                fd,
+                text
+            );
+            FrontendInfo::default()
+        }
+    };
+    ms_log::log!(
+        "Detected adapter {} handle {} DVB Card Name: {}",
+        aid,
+        dev.log_fd(),
+        info.name
+    );
+    let systems: Vec<DeliverySystem> = if enumerated.is_empty() {
+        let systems = systems_from_info(&info);
+        // The C++ `default:` arm is the only one that logs and returns empty.
+        if systems.is_empty() && !matches!(info.fe_type, FE_OFDM | FE_QAM | FE_QPSK | FE_ATSC) {
+            ms_log::log!("no available delivery system for adapter {}", aid);
+        }
+        systems
     } else {
         enumerated
             .into_iter()
             .filter_map(delivery_system_from_number)
             .collect()
     };
+    for system in &systems {
+        let number = super::transponder::delsys_number(*system).unwrap_or(SYS_UNDEFINED);
+        ms_log::log!(
+            "Detected delivery system for adapter {}: {} [{}]",
+            aid,
+            crate::names::fe_delsys(number),
+            number
+        );
+    }
     ProbedFrontend {
         name: info.name,
         systems,

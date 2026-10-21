@@ -85,3 +85,37 @@ capture and covers OPTIONS, DESCRIBE, SETUP, PLAY (RTP/UDP), TEARDOWN and the
 ```sh
 cargo test -p minisatip --test smoke
 ```
+
+## Logging
+
+Log output follows the C++ reference and is implemented by `ms-log`:
+
+```sh
+minisatip -f -l http,pmt -v stream
+```
+
+- `-l module1,module2` raises the listed modules to the normal log level.
+  The module names are `general`, `http`, `socketworks`, `stream`, `adapter`,
+  `satipc`, `pmt`, `tables`, `dvbapi`, `lock`, `netceiver`, `ca`, `socket`,
+  `utils`, `dmx`, `ssdp`, `dvb`, `ddci`; `-l all` enables every module.
+  Listing an unknown name logs `module <name> not recognised`.
+- `-v module1,module2` raises the listed modules to the debug level and implies
+  `-l` for them (debug output is a superset). Both options accumulate, and
+  `-v all` enables every debug module.
+- With neither option the mask is empty and only the always-on `LOG0` lines
+  print, exactly as in C++.
+- `-f` keeps the process in the foreground and writes to stdout. Without `-f`
+  the binary daemonises and stdout/stderr are redirected to `-F file`
+  (default `/tmp/minisatip.log`), appending when the file already exists.
+- `-g` writes through syslog (ident `minisatip`, `LOG_NOTICE`) instead of
+  stdout; `-gg` also mirrors the lines to stderr (`LOG_PERROR`).
+
+A foreground line looks like
+
+```text
+[22/10 14:07:09.042 main]: Running mode: foreground
+```
+
+The bracketed fields are the local timestamp with milliseconds and the thread
+name. The main thread is `main`, each adapter data-plane thread is `AD<n>`, the
+CI poller is `CA_poll`, and the listener threads use their own names.

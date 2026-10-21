@@ -81,15 +81,29 @@ pub fn find_netcv_adapters(
     };
     let Some(cfg) = cfg else { return Ok(out) };
     if !api.interface_ready(&cfg.ifname) {
+        ms_log::log!("network interface {} not available", cfg.ifname);
         return Err(NetcvError::InterfaceUnavailable(cfg.ifname.clone()));
     }
     // Failures are only logged in C++.
-    let _ = api.recv_init(&cfg.ifname, MCLI_PORT);
-    let _ = api.api_sock_init(API_SOCK_NAMESPACE);
+    if api.recv_init(&cfg.ifname, MCLI_PORT) != 0 {
+        ms_log::log!("Netceiver init failed");
+    }
+    if api.api_sock_init(API_SOCK_NAMESPACE) != 0 {
+        ms_log::log!("Netceiver API socket init failed");
+    }
 
+    // netceiver.cpp:437-447: one stringstream line: the search text, one "##"
+    // per poll, then the newline before the "Found NetCeiver" lines.
+    let mut dbuf = format!(
+        "REEL: Search for {} Netceiver{} on {}... ",
+        cfg.count,
+        if cfg.count == 1 { "" } else { "s" },
+        cfg.ifname
+    );
     let mut n = 0;
     let list = loop {
         api.sleep_ms(250);
+        dbuf.push_str("##");
         let list = api.netceivers();
         let more = list.len() < cfg.count && n < 19;
         n += 1;
@@ -98,6 +112,17 @@ pub fn find_netcv_adapters(
         }
     };
     api.lock_list();
+    dbuf.push('\n');
+    for nc in &list {
+        dbuf.push_str(&format!("Found NetCeiver: {} \n", nc.uuid));
+        for tuner in &nc.tuners {
+            dbuf.push_str(&format!(
+                "\tTuner: {}, Type {}\n",
+                tuner.name, tuner.fe_type
+            ));
+        }
+    }
+    ms_log::log!("{}", dbuf);
 
     let mut counts = [0i32; 5];
     let mut total = 0;
@@ -114,6 +139,7 @@ pub fn find_netcv_adapters(
 
     let mut i = 0;
     let mut na = a_count;
+    let mut dbuf = String::from("netceiver: adding ");
     for _ in 0..total {
         while i < FE_DVBS2 as usize && counts[MAP_TYPE[i] as usize] == 0 {
             i += 1;
@@ -126,6 +152,14 @@ pub fn find_netcv_adapters(
         if na >= max_adapters {
             break;
         }
+        // The C++ stringstream entry is keyed by the adapter id, not by type order.
+        dbuf.push_str(&match MAP_TYPE[i] {
+            FE_DVBS2 => format!("[AD{na} DVB-S2] "),
+            FE_QPSK => format!("[AD{na} DVB-S] "),
+            FE_QAM => format!("[AD{na} DVB-C] "),
+            FE_OFDM => format!("[AD{na} DVB-T] "),
+            _ => String::new(),
+        });
         out.adapters.push(NetcvAdapter {
             id: na,
             fe_type: MAP_TYPE[i],
@@ -134,6 +168,7 @@ pub fn find_netcv_adapters(
         na += 1;
         out.a_count = na;
     }
+    ms_log::log!("{}", dbuf);
     api.unlock_list();
     out.netceivers = list;
     Ok(out)

@@ -16,6 +16,9 @@ use fifo::Fifo;
 pub use psi::{LocalTime, buffer_to_ts, pid_from_ts, set_pid_ts};
 use psi::{dvb_put_string, ymd_to_mjd};
 
+/// `#define DEFAULT_LOG LOG_DDCI` (ddci.cpp:54).
+const DEFAULT_LOG: u32 = ms_log::LOG_DDCI;
+
 pub const MAX_CHANNELS_ON_CI: usize = 8;
 pub const DDCI_BUFFER: usize = 20000 * 188;
 pub const MAX_ADAPTERS: usize = 100;
@@ -138,7 +141,7 @@ impl DdciDevice {
     /// `find_ddci_pid`: the first DDCI-side pid from `pid` up that is free.
     fn find_ddci_pid(&self, pid: u16) -> i32 {
         if pid > 8191 {
-            return -1;
+            ms_log::log_and_return!(-1, "pid {} invalid", pid);
         }
         (i32::from(pid)..8191)
             .find(|&p| self.get_ddci_pid(p).is_none())
@@ -201,6 +204,26 @@ pub struct TsBuffer {
 /// Write side of the CI device (`writev` on `ad2->fe`).
 pub trait CiWriter {
     fn writev(&mut self, iov: &[&[u8]]) -> isize;
+
+    /// `errno` left by the last failed `writev`, for the incomplete-write log.
+    fn last_errno(&self) -> i32 {
+        0
+    }
+
+    /// `strerror(errno)` of the last failed `writev`.
+    fn last_error(&self) -> &str {
+        ""
+    }
+
+    /// `ad->fe` of the CI adapter.
+    fn fd(&self) -> i32 {
+        -1
+    }
+
+    /// `ad->fe_sock` of the CI adapter (always -1 in `ddci_open_device`).
+    fn socket(&self) -> i32 {
+        -1
+    }
 }
 
 /// All DDCI devices plus the global state ddci.cpp shares with the rest of C++.
@@ -372,10 +395,22 @@ impl Ddci {
         let m = d.mapping.get_mut(&(ad, pid)).expect("just inserted");
         let ddci_pid = m.ddci_pid;
         if ddci_pid == -1 {
-            return -1;
+            ms_log::log_and_return!(
+                -1,
+                "could not add pid {} and ad {} to the mapping table",
+                pid,
+                ad
+            );
         }
         if m.pmt.contains(&pmt) {
             // Already mapped: re-sends keep the stored PCR pid.
+            ms_log::logm!(
+                "Adapter {} pid {} already mapped to pmt {}, already added {}",
+                ad,
+                pid,
+                pmt,
+                u8::from(m.pid_added)
+            );
             return ddci_pid;
         }
         let add_pid = m.pmt.is_empty();
@@ -399,7 +434,44 @@ impl Ddci {
         if add_pid {
             self.mark_pid_add(DDCI_SID, d_id as u16, ddci_pid as u16);
         }
+        // `m->ad`/`m->pid` are the entry's own (ad, pid).
+        ms_log::log!(
+            "mapped adapter {} ({}) pid {} ({}) to {}, pmt {}",
+            ad,
+            ad,
+            pid,
+            pid,
+            ddci_pid,
+            pmt
+        );
         ddci_pid
+    }
+
+    /// `dump_mapping_table`: the debug dump of every enabled device's mappings.
+    fn dump_mapping_table(&self) {
+        // The C++ builds the per-entry PMT list only when the mask is on.
+        if !ms_log::enabled(DEFAULT_LOG) {
+            return;
+        }
+        ms_log::logm!("Mapping Table for all devices");
+        for d in self.devices.values().filter(|d| d.enabled) {
+            for m in d.mapping.values() {
+                let mut out = String::new();
+                for elem in &m.pmt {
+                    out.push_str(&format!("{elem} "));
+                }
+                ms_log::logm!(
+                    "DD {}, ddpid {}, adapter {} pid {}, rewrite {}: {} PMTS {}",
+                    m.ddci,
+                    m.ddci_pid,
+                    m.ad,
+                    m.pid,
+                    u8::from(m.rewrite),
+                    m.pmt.len(),
+                    out
+                );
+            }
+        }
     }
 
     /// `get_pid_mapping_allddci`.
@@ -410,15 +482,31 @@ impl Ddci {
             .find_map(|d| d.mapping.get(&(ad, pid)))
     }
 
-    fn release_mapping_entry(&mut self, dev_id: i32, ad: u16, m: &Mapping) {
-        if self.find_pid(dev_id as u16, m.ddci_pid as u16).is_some() {
-            self.mark_pid_deleted(dev_id as u16, DDCI_SID, m.ddci_pid as u16);
+    fn release_mapping_entry(&mut self, dev_id: i32, ad: u16, pmt: i32, m: &Mapping) {
+        let pid = m.pid;
+        let ddci_pid = m.ddci_pid;
+        ms_log::log!(
+            "Deleting ad {} pmt {} pid {} ddci_pid {}",
+            ad,
+            pmt,
+            pid,
+            ddci_pid
+        );
+        if self.find_pid(dev_id as u16, ddci_pid as u16).is_some() {
+            self.mark_pid_deleted(dev_id as u16, DDCI_SID, ddci_pid as u16);
         }
         if let Some(f) = m.filter_id {
             self.filters.remove(&f);
         }
         if m.pid_added {
-            self.mark_pid_deleted(ad, DDCI_SID, m.pid);
+            ms_log::logm!(
+                "Marking pid {} deleted on adapter {} (initial ad {} pid {})",
+                ddci_pid,
+                dev_id,
+                ad,
+                pid
+            );
+            self.mark_pid_deleted(ad, DDCI_SID, pid);
         }
     }
 
@@ -442,7 +530,7 @@ impl Ddci {
             d.mapping.remove(&(ad, m.pid));
         }
         for m in released {
-            self.release_mapping_entry(dev_id, ad, &m);
+            self.release_mapping_entry(dev_id, ad, pmt, &m);
         }
     }
 
@@ -474,7 +562,7 @@ impl Ddci {
         }
         let n = released.len();
         for m in released {
-            self.release_mapping_entry(dev_id, ad, &m);
+            self.release_mapping_entry(dev_id, ad, pmt.id, &m);
         }
         n
     }
@@ -492,6 +580,13 @@ impl Ddci {
             }
             for &(caid, mask) in self.caid_masks.get(&i).map_or(&[][..], Vec::as_slice) {
                 if pmt.match_caid(caid, mask) {
+                    ms_log::log!(
+                        "DDCI {} CAID {:04X} and mask {:04X} matched PMT {}",
+                        i,
+                        caid,
+                        mask,
+                        pmt.id
+                    );
                     c.ddci.push(i as u8);
                     c.sid = pmt.sid;
                     c.name = pmt.name.chars().take(49).collect();
@@ -505,18 +600,29 @@ impl Ddci {
     }
 
     /// `find_ddci_for_pmt`: the least used ready candidate, the first on a tie.
-    fn find_ddci_for_pmt(&self, c: &Channel) -> Result<i32, TablesResult> {
+    fn find_ddci_for_pmt(&self, c: &Channel, pmt: &Program) -> Result<i32, TablesResult> {
         let mut best: Option<(i32, i32)> = None;
         let (mut saw_full, mut saw_initializing) = (false, false);
         for &cand in &c.ddci {
             let Some(d) = self.get_ddci(i32::from(cand)) else {
+                ms_log::log!("find_ddci_for_pmt: DDCI {} not enabled, skipping", cand);
                 continue;
             };
             if d.channels >= d.max_channels as i32 {
+                ms_log::log!(
+                    "find_ddci_for_pmt: DDCI {} cannot be used for PMT {}, pid {}, sid, {} (used channels {} max {}), skipping",
+                    cand,
+                    pmt.id,
+                    pmt.pid,
+                    pmt.sid,
+                    d.channels,
+                    d.max_channels
+                );
                 saw_full = true;
                 continue;
             }
             if self.is_ca_initializing(usize::from(cand)) {
+                ms_log::log!("find_ddci_for_pmt: DDCI {} is initializing, skipping", cand);
                 saw_initializing = true;
                 continue;
             }
@@ -525,9 +631,47 @@ impl Ddci {
             }
         }
         match best {
-            Some((id, _)) => Ok(id),
-            None if saw_initializing || saw_full => Err(TablesResult::Retry),
-            None => Err(TablesResult::NoRetry),
+            Some((id, channels)) => {
+                ms_log::log!(
+                    "find_ddci_for_pmt: Using DDCI {}, running {} channels",
+                    id,
+                    channels
+                );
+                Ok(id)
+            }
+            None => {
+                // The C++ returns on the initializing case before checking full.
+                if saw_initializing {
+                    ms_log::log!(
+                        "find_ddci_for_pmt: DDCI for PMT {} (sid {}) is initializing, retrying",
+                        pmt.id,
+                        pmt.sid
+                    );
+                    return Err(TablesResult::Retry);
+                }
+                if saw_full {
+                    ms_log::log!(
+                        "find_ddci_for_pmt: all DDCIs full for PMT {} (sid {}), retrying",
+                        pmt.id,
+                        pmt.sid
+                    );
+                    return Err(TablesResult::Retry);
+                }
+                if c.ddci.is_empty() {
+                    ms_log::log!(
+                        "find_ddci_for_pmt: no suitable DDCI found for PMT {} (sid {}): not mapped to any DDCI device in ddci.conf",
+                        pmt.id,
+                        pmt.sid
+                    );
+                } else {
+                    ms_log::log!(
+                        "find_ddci_for_pmt: no suitable DDCI found for PMT {} (sid {})",
+                        pmt.id,
+                        pmt.sid
+                    );
+                }
+                Err(TablesResult::NoRetry)
+            }
         }
     }
 
@@ -550,8 +694,8 @@ impl Ddci {
 
     /// `ddci_process_pmt`.
     pub fn process_pmt(&mut self, ad: u16, pmt: &Program, update: bool) -> TablesResult {
-        let _ = update;
         if self.get_ddci(i32::from(ad)).is_some() {
+            ms_log::log!("Skip processing pmt for ddci adapter {}", ad);
             return TablesResult::Ok;
         }
         let registered = self.find_registered_ddci(pmt.id);
@@ -559,12 +703,34 @@ impl Ddci {
         if ddid == -1 {
             ddid = self.is_pmt_running(pmt);
         }
+        ms_log::log!(
+            "ddci_process_pmt: adapter {}, pmt {}, pid {}, sid {}, ddid {}, update {}, name: {}",
+            ad,
+            pmt.id,
+            pmt.pid,
+            pmt.sid,
+            ddid,
+            u8::from(update),
+            pmt.name
+        );
         if registered == -1 {
             let channel = match self.channels.get(&pmt.sid) {
                 Some(c) => c.clone(),
                 None => match self.create_channel_for_pmt(pmt) {
-                    Err(r) => return r,
-                    Ok(c) if c.ddci.is_empty() => return TablesResult::NoRetry,
+                    Err(r) => {
+                        ms_log::log_and_return!(
+                            r,
+                            "DDCI not ready or busy at the moment: {}",
+                            if r == TablesResult::NoRetry {
+                                "no retry"
+                            } else {
+                                "retry"
+                            }
+                        );
+                    }
+                    Ok(c) if c.ddci.is_empty() => {
+                        ms_log::log_and_return!(TablesResult::NoRetry, "no suitable DDCI found");
+                    }
                     Ok(c) => {
                         self.channels.insert(pmt.sid, c.clone());
                         c
@@ -572,7 +738,7 @@ impl Ddci {
                 },
             };
             if ddid == -1 {
-                match self.find_ddci_for_pmt(&channel) {
+                match self.find_ddci_for_pmt(&channel, pmt) {
                     Ok(id) => ddid = id,
                     Err(TablesResult::Retry) => {
                         // Unlocked candidates may predate a DDCI that became ready since.
@@ -588,6 +754,11 @@ impl Ddci {
             return TablesResult::Retry;
         }
         if self.get_ddci(ddid).is_none() {
+            ms_log::log!(
+                "Could not find ddci device for adapter {}, ddci {}",
+                ad,
+                ddid
+            );
             return TablesResult::NoRetry;
         }
         let dev = ddid as usize;
@@ -604,8 +775,14 @@ impl Ddci {
         if pos.is_none() {
             pos = d.slots().find(|&i| d.pmt[i].id == -1);
         }
+        let d_id = d.id;
         let Some(pos) = pos else {
-            return TablesResult::Retry;
+            ms_log::log_and_return!(
+                TablesResult::Retry,
+                "No free slot found for pmt {} on DDCI {}",
+                pmt.id,
+                d_id
+            );
         };
         d.pmt[pos].id = pmt.id;
         d.pmt[pos].last_pmt = 0;
@@ -617,16 +794,37 @@ impl Ddci {
             d.channels += 1;
             d.psi_changed = true;
         }
+        // C++ `count_new`: mappings this call creates, for the summary log.
+        // `has_pid_mapping` only tells that the entry was absent entirely.
+        let mut mapped = 0;
         // Mandatory pids; some CAMs need the TDT to wake up. Pid 0 comes from post_tune.
         for pid in [1u16, 20] {
             let d = self.devices.get_mut(&dev).unwrap();
             if !d.mapping.contains_key(&(pmt.adapter, pid)) {
+                ms_log::log!(
+                    "Mapping mandatory PID {} to PMT {} on DDCI {}",
+                    pid,
+                    pmt.id,
+                    d.id
+                );
+                mapped += 1;
                 if pid == 1 {
                     d.cat_processed = false;
                 }
                 self.add_pid_mapping_table(ad, pid, pmt.id, dev, true);
             }
         }
+        {
+            let d = &self.devices[&dev];
+            ms_log::log!(
+                "found DDCI {} for pmt {}, running channels {}, max_channels {}",
+                ddid,
+                pmt.id,
+                d.channels,
+                d.max_channels
+            );
+        }
+        count_new_mapping(&self.devices[&dev], ad, pmt.pid, pmt, &mut mapped);
         self.add_pid_mapping_table(ad, pmt.pid, pmt.id, dev, false);
         if let Some(m) = self
             .devices
@@ -638,25 +836,55 @@ impl Ddci {
             m.rewrite = false; // the PMT pid is regenerated, not forwarded
         }
         for ca in &pmt.caids {
+            ms_log::logm!("DD {} adding ECM pid {}", self.devices[&dev].id, ca.pid);
+            count_new_mapping(&self.devices[&dev], ad, ca.pid, pmt, &mut mapped);
             self.add_pid_mapping_table(ad, ca.pid, pmt.id, dev, true);
         }
         for s in &pmt.streams {
+            ms_log::logm!(
+                "DD {} adding stream pid {} {}",
+                self.devices[&dev].id,
+                s.pid,
+                if s.pid == pmt.pcr_pid { "PCR" } else { "" }
+            );
+            count_new_mapping(&self.devices[&dev], ad, s.pid, pmt, &mut mapped);
             let ddci_pid = self.add_pid_mapping_table(ad, s.pid, pmt.id, dev, false);
             if s.pid == pmt.pcr_pid {
                 self.devices.get_mut(&dev).unwrap().pmt[pos].pcr_pid = ddci_pid;
             }
         }
         // A re-send doubles as the update path; on first adds it heals stale entries.
-        self.unmap_removed_pids(dev, ad, pmt);
+        let unmapped = self.unmap_removed_pids(dev, ad, pmt);
+        ms_log::log!(
+            "DDCI {}: PMT {} {} on slot {} (+{} -{} pids), keeping ddci pids",
+            self.devices[&dev].id,
+            pmt.id,
+            if update { "update" } else { "add" },
+            pos,
+            mapped,
+            unmapped
+        );
+        self.dump_mapping_table();
         TablesResult::Ok
     }
 
     /// `ddci_del_pmt`.
     pub fn del_pmt(&mut self, ad: u16, pmt: &Program) {
         if self.get_ddci(i32::from(ad)).is_some() {
+            ms_log::log!("Skip deleting pmt for ddci adapter {}", ad);
             return;
         }
-        let Some(ddci) = self.get_pid_mapping_allddci(ad, pmt.pid).map(|m| m.ddci) else {
+        let Some((ddci, ddci_pid)) = self
+            .get_pid_mapping_allddci(ad, pmt.pid)
+            .map(|m| (m.ddci, m.ddci_pid))
+        else {
+            self.dump_mapping_table();
+            ms_log::log!(
+                "ddci_del_pmt: pid mapping for adapter {}, pmt {} and pid {} not found",
+                ad,
+                pmt.id,
+                pmt.pid
+            );
             // No mapping: still free a slot this PMT holds, or it leaks.
             for d in self.devices.values_mut().filter(|d| d.enabled) {
                 for j in d.slots() {
@@ -673,6 +901,7 @@ impl Ddci {
             return;
         };
         if self.get_ddci(ddci).is_none() {
+            ms_log::log!("ddci_del_pmt: ddci {} already disabled", ddci);
             return;
         }
         let dev = ddci as usize;
@@ -691,7 +920,19 @@ impl Ddci {
             }
             d.psi_changed = true;
         }
+        ms_log::log!(
+            "ddci_del_pmt: deleting pmt id {}, sid {} ({:X}), pid {}, ddci {}, name {}, held a slot {}, running channels {}",
+            pmt.id,
+            pmt.sid,
+            pmt.sid,
+            ddci_pid,
+            ddci,
+            pmt.name,
+            u8::from(was_registered),
+            d.channels
+        );
         self.del_pmt_mapping_table(dev, ad, pmt.id);
+        self.dump_mapping_table();
     }
 
     // ---- generated tables ----
@@ -708,6 +949,11 @@ impl Ddci {
                 continue;
             };
             let Some(m) = d.mapping.get(&(pmt.adapter, pmt.pid)) else {
+                ms_log::log!(
+                    "adapter {} pid {} not found in the mapping table",
+                    pmt.adapter,
+                    pmt.pid
+                );
                 continue;
             };
             b.extend_from_slice(&pmt.sid.to_be_bytes());
@@ -717,6 +963,14 @@ impl Ddci {
         b[2] |= (len1 >> 8) as u8;
         b[3] |= len1 as u8;
         let crc = crc32_mpeg2(&b[1..len1]);
+        ms_log::logm!(
+            "ddci_create_pat: transponder {} version {}, len {}",
+            d.tid,
+            d.ver,
+            len1
+        );
+        let desc = format!("PAT Created CRC {crc:08X}: ");
+        ms_log::hexdump!(&desc, &b[1..len1]);
         b.extend_from_slice(&crc.to_be_bytes());
         b
     }
@@ -750,7 +1004,13 @@ impl Ddci {
             let Some(pmt) = programs.get(d.pmt[i].id) else {
                 continue;
             };
+            ms_log::logm!("Adding PMT {} to SDT, sid {}", d.pmt[i].id, pmt.sid);
             if !d.mapping.contains_key(&(pmt.adapter, pmt.pid)) {
+                ms_log::log!(
+                    "adapter {} pid {} not found in the mapping table",
+                    pmt.adapter,
+                    pmt.pid
+                );
                 continue;
             }
             b.extend_from_slice(&pmt.sid.to_be_bytes());
@@ -824,10 +1084,26 @@ impl Ddci {
         b.push(dp.pcr_pid as u8);
         let start_pi_len = b.len();
         b.extend_from_slice(&[0, 0]);
+        ms_log::logm!(
+            "ddci_create_pmt: PMT {} AD {}, pid: {:04X} ({}), ver {}, sid {:04X} ({}) {} {}",
+            pmt.id,
+            pmt.adapter,
+            pmt.pid,
+            pmt.pid,
+            dp.ver,
+            pmt.sid,
+            pmt.sid,
+            if pmt.name.is_empty() { "" } else { "channel:" },
+            pmt.name
+        );
         let mut pi_len = 0usize;
         for ca in &pmt.caids {
             let private = ca.private_data.len();
             if b.len() + 10 + private > pmt_size {
+                ms_log::log!(
+                    "ddci_create_pmt: truncating PMT {} program CA list, buffer full",
+                    pmt.id
+                );
                 break;
             }
             b.push(0x09);
@@ -836,6 +1112,12 @@ impl Ddci {
             b.extend_from_slice(&Self::safe_get_pid_mapping(d, pmt.adapter, ca.pid).to_be_bytes());
             b.extend_from_slice(&ca.private_data);
             pi_len += 6 + private;
+            ms_log::logm!(
+                "ddci_create_pmt: pmt {} added caid {:04X}, pid {:04X}",
+                pmt.id,
+                ca.caid,
+                ca.pid
+            );
         }
         b[start_pi_len..start_pi_len + 2].copy_from_slice(&(pi_len as u16).to_be_bytes());
         let multiple = self.ca_multiple_pmt(d.id) > 0;
@@ -845,11 +1127,20 @@ impl Ddci {
                 let pids = self.adapters.get(&pmt.adapter).map(|a| &a.client_pids);
                 let owned = pids.and_then(|p| p.get(&s.pid).or_else(|| p.get(&8192)));
                 if owned != Some(&true) {
+                    ms_log::logm!(
+                        "ddci_create_pmt: adapter {} pid {} not requested by the client",
+                        pmt.adapter,
+                        s.pid
+                    );
                     continue;
                 }
             }
             let es_info_len: usize = s.descriptors.iter().map(|d| d.data.len() + 2).sum();
             if b.len() + 9 + es_info_len > pmt_size {
+                ms_log::log!(
+                    "ddci_create_pmt: truncating PMT {} stream list, buffer full",
+                    pmt.id
+                );
                 break;
             }
             b.push(s.stream_type);
@@ -869,12 +1160,25 @@ impl Ddci {
                     b.extend_from_slice(&desc.data);
                 }
             }
+            ms_log::logm!(
+                "ddci_create_pmt: pmt {} added pid {:04X}, type {:02X}, es_len {}",
+                pmt.id,
+                s.pid,
+                s.stream_type,
+                es_info_len
+            );
         }
         let section_len = (4 + b.len() - start_pmt) as u16;
         b[start_pmt - 2..start_pmt].copy_from_slice(&section_len.to_be_bytes());
         let mut crc = crc32_mpeg2(&b[1..]);
         // The user may have added or removed pids: a content change bumps the version.
         if dp.crc != crc {
+            ms_log::logm!(
+                "ddci_create_pmt: PMT {} content changed, bumping ver {} -> {}",
+                pmt.id,
+                dp.ver,
+                (dp.ver + 1) & 0xF
+            );
             dp.ver = (dp.ver + 1) & 0xF;
             b[start_pmt + 2] = ((dp.ver << 1) | 0x01) as u8;
             crc = crc32_mpeg2(&b[1..]);
@@ -911,6 +1215,13 @@ impl Ddci {
             return;
         }
         let id = dpmt.id;
+        ms_log::log!(
+            "DD {}: naming PMT {} (sid {}) {}",
+            self.devices[&dev].id,
+            dpmt.id,
+            dpmt.sid,
+            pmt.name
+        );
         let dpmt = programs.get_mut(id).unwrap();
         dpmt.name = pmt.name.clone();
         dpmt.provider = pmt.provider.clone();
@@ -975,6 +1286,13 @@ impl Ddci {
             if let Some(ddci_pid) = mapped {
                 let at = pos.clamp(0, len as isize) as usize;
                 pos += buffer_to_ts(&mut dst[at..], &psi, &mut dp.cc, ddci_pid as u16).max(0);
+            } else {
+                ms_log::log!(
+                    "ddci_add_psi: could not find PMT {} adapter {} and pid {} to mapping table",
+                    slot.id,
+                    pmt.adapter,
+                    pmt.pid
+                );
             }
             let eit = self.create_eit(pmt.sid, dp.ver);
             let d = self.devices.get_mut(&dev).unwrap();
@@ -991,6 +1309,7 @@ impl Ddci {
         let d = self.devices.get_mut(&dev).unwrap();
         let lbuf = ad.buf.len();
         let mut i = 0usize;
+        let mut popped = 0usize;
         while i + DVB_FRAME < lbuf {
             if i < ad.rlen && pid_from_ts(&ad.buf[i..]) != 0x1FFF {
                 i += DVB_FRAME;
@@ -1001,10 +1320,18 @@ impl Ddci {
             if n == 0 {
                 break;
             }
+            popped += n;
             let pid = pid_from_ts(&ad.buf[i..]);
             let dpid = mapping[usize::from(pid)];
             if dpid == 0 {
                 // Not mapped to this adapter: drop it and reuse the slot.
+                ms_log::debugm!(
+                    "Skipping pid {}, ddci_pid {} on adapter {} DDCI {}",
+                    pid,
+                    dpid,
+                    ad.id,
+                    d.id
+                );
                 set_pid_ts(&mut ad.buf[i..], 0x1FFF);
                 continue;
             }
@@ -1012,8 +1339,30 @@ impl Ddci {
             if i >= ad.rlen {
                 ad.rlen = i + DVB_FRAME;
             }
+            ms_log::debugm!(
+                "DDCI {} pid {} -> AD {} pid {}, pos {}, len {}, left {} [ri {}]",
+                d.id,
+                pid,
+                ad.id,
+                dpid,
+                i / DVB_FRAME,
+                n,
+                d.fifo.write_index.wrapping_sub(*ri),
+                *ri
+            );
+            ms_log::dump_packets!("DDCI -> AD", &ad.buf[i..i + DVB_FRAME], i as i64);
             i += DVB_FRAME;
         }
+        ms_log::debugm!(
+            "popped {} bytes from fifo up to index {}, rlen {}, lbuf {}, left in fifo {}",
+            popped,
+            i,
+            ad.rlen,
+            lbuf,
+            d.fifo
+                .write_index
+                .wrapping_sub(d.read_index[usize::from(ad.id)])
+        );
     }
 
     /// `ddci_process_ts`: sends the adapter's mapped packets plus PSI to the CI, then pulls CAM output back.
@@ -1030,6 +1379,7 @@ impl Ddci {
         if !d.enabled || !self.adapters.contains_key(&(d.id as u16)) {
             return;
         }
+        let dev_id = d.id;
         let mut ad_dd = [0u16; 8192];
         let mut dd_ad = [0u16; 8192];
         let mut ec = 0;
@@ -1037,6 +1387,13 @@ impl Ddci {
             ad_dd[usize::from(m.pid)] = m.ddci_pid as u16;
             dd_ad[(m.ddci_pid as usize) & 0x1FFF] = m.pid;
             ec += 1;
+            ms_log::debugm!(
+                "Using pid {} in adapter {} as pid {} in DDCI {}",
+                m.pid,
+                ad.id,
+                m.ddci_pid,
+                dev_id
+            );
         }
         let d = self.devices.get_mut(&dev).unwrap();
         if ec == 0 {
@@ -1052,13 +1409,23 @@ impl Ddci {
         while i + DVB_FRAME <= ad.rlen {
             let b = &mut ad.buf[i..i + DVB_FRAME];
             if b[0] == 0x47 {
-                let dpid = ad_dd[usize::from(pid_from_ts(b))];
+                let pid = pid_from_ts(b);
+                let dpid = ad_dd[usize::from(pid)];
                 if dpid != 0 {
+                    ms_log::dump_packets!("ddci_process_ts -> DD", &b[..DVB_FRAME], i as i64);
                     set_pid_ts(b, dpid);
                     match runs.last_mut() {
                         Some((s, l)) if *s + *l == i => *l += DVB_FRAME,
                         _ => runs.push((i, DVB_FRAME)),
                     }
+                    ms_log::debugm!(
+                        "pos {} of {}, mapping pid {} to {}, buf pos {}",
+                        runs.len() - 1,
+                        ad.rlen / DVB_FRAME,
+                        pid,
+                        dpid,
+                        i / DVB_FRAME
+                    );
                 }
             }
             i += DVB_FRAME;
@@ -1066,6 +1433,7 @@ impl Ddci {
         if !runs.is_empty() {
             let mut psi = vec![0u8; MAX_CHANNELS_ON_CI * 1500 - 1];
             let psi_len = self.add_psi(dev, &mut psi, ad.id, programs);
+            ms_log::hexdump!("PSI -> ", &psi[..usize::try_from(psi_len).unwrap_or(0)]);
             // Every write ends with a null packet: the FPGA reads in 128 byte units (#1437).
             let mut null_tail = [0xFFu8; DVB_FRAME];
             null_tail[..4].copy_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
@@ -1074,7 +1442,28 @@ impl Ddci {
                 iov.push(&psi[..psi_len as usize]);
             }
             iov.push(&null_tail);
-            ci.writev(&iov);
+            let bytes: usize = iov.iter().map(|s| s.len()).sum();
+            ms_log::debugm!(
+                "writing {} bytes to DDCI device {}, fd {}, sock {}",
+                bytes,
+                dev_id,
+                ci.fd(),
+                ci.socket()
+            );
+            let rb = ci.writev(&iov);
+            if rb != bytes as isize {
+                ms_log::log!(
+                    "ddci_process_ts: write incomplete to DDCI {},fd {}, wrote {} out of {} (iop {}{}), errno {}: {}",
+                    dev_id,
+                    ci.fd(),
+                    rb,
+                    bytes,
+                    iov.len(),
+                    if iov.len() > 1024 { " > IOV_MAX" } else { "" },
+                    ci.last_errno(),
+                    ci.last_error()
+                );
+            }
         }
         // The written packets become null packets in the adapter buffer.
         for &(s, l) in &runs {
@@ -1109,7 +1498,19 @@ impl Ddci {
     /// `ddci_read_sec_data`: CAM output into the device FIFO.
     pub fn push_from_cam(&mut self, dev: usize, ts: &[u8]) {
         if let Some(d) = self.devices.get_mut(&dev) {
-            d.fifo.push(ts);
+            let left = d.fifo.push(ts);
+            if left == 0 {
+                ms_log::log!("dropping {} bytes for ddci_adapter {}", left, d.id);
+            }
+            ms_log::debugm!(
+                "pushed {} bytes to the adapter buffer from {} [write_index {}]",
+                left,
+                ts.len(),
+                d.fifo.write_index
+            );
+            let buffered = &d.fifo.raw_data()[..188.min(d.fifo.raw_data().len())];
+            ms_log::dump_packets!("DDCI ->FIFO ", buffered, 0);
+            ms_log::dump_packets!("SOURCE ", &ts[..188.min(ts.len())], 0);
         }
     }
 
@@ -1121,24 +1522,40 @@ impl Ddci {
         let Some(d) = self.devices.get(&dev) else {
             return;
         };
-        if !d.enabled || d.cat_processed || d.disable_cat || section.len() < 8 {
+        if !d.enabled {
+            ms_log::log!("DDCI {} no longer enabled, not processing CAT", d.id);
+            return;
+        }
+        if d.cat_processed || d.disable_cat || section.len() < 8 {
             return;
         }
         let cat_len = (usize::from(section[1] & 0x0F) << 8) | usize::from(section[2]);
+        let cat_ver = (section[5] & 0x3E) >> 1;
+        ms_log::log!("CAT DDCI {} ver {}, len {}", d.id, cat_ver, cat_len);
         if cat_len > 1500 {
             return;
         }
         let b = &section[8..];
         let mut emm = Vec::new();
         let mut i = 0;
+        let mut k = 0;
         while i + 4 < cat_len && i + 1 < b.len() {
             let es_len = usize::from(b[i + 1]) + 2;
             if b[i] == 9 && i + 5 < b.len() {
-                emm.push((u16::from(b[i + 4] & 0x1F) << 8) | u16::from(b[i + 5]));
+                let caid = u16::from(b[i + 2]) * 256 + u16::from(b[i + 3]);
+                let pid = (u16::from(b[i + 4] & 0x1F) << 8) | u16::from(b[i + 5]);
+                ms_log::log!("CAT pos {} caid {:04X}, pid {}", k, caid, pid);
+                emm.push(pid);
             }
             i += es_len;
+            k += 1;
         }
-        if emm.iter().any(|&p| d.get_ddci_pid(i32::from(p)).is_some()) {
+        let duplicate = emm
+            .iter()
+            .find(|&&p| d.get_ddci_pid(i32::from(p)).is_some())
+            .copied();
+        if let Some(p) = duplicate {
+            ms_log::log!("CAT pid {} already in use, skipping CAT", p);
             self.devices.get_mut(&dev).unwrap().cat_processed = true;
             return;
         }
@@ -1163,6 +1580,7 @@ impl Ddci {
     /// `save_channels`: never overwrites an existing ddci.conf.
     pub fn save_channels(&self, path: &Path) -> io::Result<()> {
         if path.exists() {
+            ms_log::log!("{} already exists, not saving", path.display());
             return Ok(());
         }
         let mut s = String::from(
@@ -1196,14 +1614,33 @@ impl Ddci {
             c.sid = sid as u16;
             c.locked = true;
             n += 1;
-            for item in list.trim().split(',') {
+            let mut shown = String::new();
+            for (i, item) in list.trim().split(',').enumerate() {
                 let v = parse_int(item, -1);
                 if v != -1 {
+                    // C++ separates on the argument index, even after a skip.
+                    if i > 0 {
+                        shown.push(',');
+                    }
+                    shown.push_str(&v.to_string());
                     c.ddci.push(v as u8);
                 }
             }
+            ms_log::logm!("Adding channel {}: DDCIs: {}", c.sid, shown);
         }
+        ms_log::log!("Loaded {} channels from {}", n, path.display());
         Ok(n)
+    }
+}
+
+/// `count_new` in `ddci_process_pmt`: counts the mappings a call creates.
+fn count_new_mapping(d: &DdciDevice, ad: u16, pid: u16, pmt: &Program, mapped: &mut usize) {
+    if !d
+        .mapping
+        .get(&(ad, pid))
+        .is_some_and(|m| m.pmt.contains(&pmt.id))
+    {
+        *mapped += 1;
     }
 }
 

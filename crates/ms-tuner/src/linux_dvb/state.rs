@@ -1,7 +1,11 @@
 //! Per-adapter DVB state and the ports of `dvb_tune` / `dvb_get_signal`.
 
 use super::consts::*;
-use super::device::{DtvProperty, DvbDevice};
+use super::device::{DtvProperty, DvbDevice, error_parts};
+use crate::names;
+
+/// `#define DEFAULT_LOG LOG_DVB` (dvb.cpp:53).
+const DEFAULT_LOG: u32 = ms_log::LOG_DVB;
 use super::diseqc::{MasterView, SwitchOptions, setup_switch};
 use super::signal::{
     LOCK_RETRY_INITIAL_MS, LOCK_RETRY_INTERVAL_MS, LOCK_RETRY_MAX, NEW_SIGNAL, OLD_SIGNAL,
@@ -17,6 +21,10 @@ use super::transponder::{DiseqcParams, DvbTransponder, db_snr_map};
 #[derive(Debug, Clone)]
 pub struct AdapterState {
     pub id: i32,
+    /// `/dev/dvb/adapterN` number (`ad->pa`), used by `dvb_name`'s log line.
+    pub pa: i32,
+    /// `frontendM` number (`ad->fn`), used by the demux log lines.
+    pub fn_num: i32,
     /// Frontend fd (`ad->fe`); `<= 0` means no usable frontend.
     pub fe: i32,
     pub sid_cnt: i32,
@@ -51,6 +59,8 @@ impl Default for AdapterState {
     fn default() -> Self {
         Self {
             id: 0,
+            pa: 0,
+            fn_num: 0,
             fe: 0,
             sid_cnt: 0,
             master_source: -1,
@@ -110,6 +120,7 @@ impl AdapterState {
             diseqc: self.old_diseqc,
         };
         let options = SwitchOptions {
+            own_id: self.id,
             force,
             tuned_before: self.tune_time != 0,
             diseqc_multi: self.diseqc_multi,
@@ -141,16 +152,22 @@ impl AdapterState {
         }
         self.tp = tp.clone();
 
-        // FE_SET_PROPERTY DTV_CLEAR: failure is only logged in C++.
-        let _ = dev.set_properties(&[DtvProperty::new(DTV_CLEAR, 0)]);
+        let clear_start = dev.now_ms();
+        if let Err(error) = dev.set_properties(&[DtvProperty::new(DTV_CLEAR, 0)]) {
+            let (errno, text) = error_parts(&error);
+            ms_log::log!("dvb_tune: DTV_CLEAR failed {} {}, continuing", errno, text);
+        }
+        let bclear = dev.now_ms() - clear_start;
 
         let mut freq = tp.freq.unwrap_or(0);
         let mut props: Vec<DtvProperty> = Vec::with_capacity(20);
         let add = |props: &mut Vec<DtvProperty>, prop: DtvProperty| props.push(prop);
         match tp.sys.unwrap_or(SYS_UNDEFINED) {
             SYS_DVBS | SYS_DVBS2 => {
+                let bpol = dev.now_ms();
                 freq = self.setup_switch(dev, false, master);
                 if !(MIN_FRQ_DVBS..=MAX_FRQ_DVBS).contains(&freq) {
+                    ms_log::log!("Frequency {} is not within range ", freq);
                     return -403;
                 }
                 add(
@@ -178,9 +195,25 @@ impl AdapterState {
                         DtvProperty::new(DTV_SCRAMBLING_SEQUENCE_INDEX, pls),
                     );
                 }
+                ms_log::log!(
+                    "tuning to {}({}) pol: {} ({}) sr:{} fec:{} delsys:{} mod:{} rolloff:{} pilot:{}, ts clear={}, ts pol={}",
+                    tp.freq.unwrap_or(0),
+                    freq,
+                    names::fe_pol(tp.pol.unwrap_or(0)),
+                    tp.pol.unwrap_or(0),
+                    tp.sr.unwrap_or(0),
+                    names::fe_fec(tp.fec.unwrap_or(FEC_AUTO)),
+                    names::fe_delsys(tp.sys.unwrap_or(SYS_UNDEFINED)),
+                    names::fe_modulation(tp.mtype.unwrap_or(QAM_AUTO)),
+                    names::fe_rolloff(tp.ro.unwrap_or(ROLLOFF_AUTO)),
+                    names::fe_pilot(tp.plts.unwrap_or(PILOT_AUTO)),
+                    bclear,
+                    bpol
+                );
             }
             SYS_DVBT | SYS_DVBT2 => {
                 if !(MIN_FRQ_DVBT..=MAX_FRQ_DVBT).contains(&freq) {
+                    ms_log::log!("Frequency {} is not within range ", tp.freq.unwrap_or(0));
                     return -403;
                 }
                 freq *= 1000;
@@ -211,9 +244,22 @@ impl AdapterState {
                 if let Some(plp) = tp.plp_isi {
                     add(&mut props, DtvProperty::new(DTV_STREAM_ID, plp & 0xFF));
                 }
+                ms_log::log!(
+                    "tuning to {} delsys: {} bw:{} inversion:{} mod:{} fec:{} guard:{} transmission: {}, ts clear = {}",
+                    freq,
+                    names::fe_delsys(tp.sys.unwrap_or(SYS_UNDEFINED)),
+                    tp.bw.unwrap_or(8_000_000),
+                    names::fe_inversion(tp.inversion.unwrap_or(INVERSION_AUTO)),
+                    names::fe_modulation(tp.mtype.unwrap_or(QAM_AUTO)),
+                    names::fe_fec(tp.fec.unwrap_or(FEC_AUTO)),
+                    names::fe_guard_interval(tp.gi.unwrap_or(GUARD_INTERVAL_AUTO)),
+                    names::fe_transmission_mode(tp.tmode.unwrap_or(TRANSMISSION_MODE_AUTO)),
+                    bclear
+                );
             }
             SYS_DVBC2 | SYS_DVBC_ANNEX_A => {
                 if !(MIN_FRQ_DVBC..=MAX_FRQ_DVBC).contains(&freq) {
+                    ms_log::log!("Frequency {} is not within range ", tp.freq.unwrap_or(0));
                     return -403;
                 }
                 freq *= 1000;
@@ -225,15 +271,34 @@ impl AdapterState {
                     let stream_id = (plp & 0xFF) | ((tp.ds.unwrap_or(0) & 0xFF) << 8);
                     add(&mut props, DtvProperty::new(DTV_STREAM_ID, stream_id));
                 }
+                ms_log::log!(
+                    "tuning to {} sr:{} specinv:{} delsys:{} mod:{} ts clear = {}",
+                    freq,
+                    tp.sr.unwrap_or(0),
+                    names::fe_inversion(tp.inversion.unwrap_or(INVERSION_AUTO)),
+                    names::fe_delsys(tp.sys.unwrap_or(SYS_UNDEFINED)),
+                    names::fe_modulation(tp.mtype.unwrap_or(QAM_AUTO)),
+                    bclear
+                );
             }
             SYS_ATSC | SYS_DVBC_ANNEX_B => {
                 if !(MIN_FRQ_DVBC..=MAX_FRQ_DVBC).contains(&freq) {
+                    ms_log::log!("Frequency {} is not within range ", tp.freq.unwrap_or(0));
                     return -403;
                 }
                 freq *= 1000;
+                ms_log::log!(
+                    "tuning to {} delsys:{} mod:{} specinv:{} ts clear = {}",
+                    freq,
+                    names::fe_delsys(tp.sys.unwrap_or(SYS_UNDEFINED)),
+                    names::fe_modulation(tp.mtype.unwrap_or(QAM_AUTO)),
+                    names::fe_inversion(tp.inversion.unwrap_or(INVERSION_AUTO)),
+                    bclear
+                );
             }
             SYS_ISDBT => {
                 if !(MIN_FRQ_DVBT..=MAX_FRQ_DVBT).contains(&freq) {
+                    ms_log::log!("Frequency {} is not within range ", tp.freq.unwrap_or(0));
                     return -403;
                 }
                 freq *= 1000;
@@ -242,8 +307,23 @@ impl AdapterState {
                     DtvProperty::new(DTV_BANDWIDTH_HZ, tp.bw.unwrap_or(8_000_000)),
                 );
                 add(&mut props, DtvProperty::new(DTV_ISDBT_PARTIAL_RECEPTION, 0));
+                ms_log::log!(
+                    "tuning to {} delsys: {} bw:{} inversion:{} , ts clear = {}",
+                    freq,
+                    names::fe_delsys(tp.sys.unwrap_or(SYS_UNDEFINED)),
+                    tp.bw.unwrap_or(8_000_000),
+                    names::fe_inversion(tp.inversion.unwrap_or(INVERSION_AUTO)),
+                    bclear
+                );
             }
-            _ => {}
+            _ => {
+                ms_log::log!(
+                    "tuning to unknown delsys: {} freq {} ts clear = {}",
+                    names::fe_delsys(tp.sys.unwrap_or(SYS_UNDEFINED)),
+                    freq,
+                    bclear
+                );
+            }
         }
 
         add(&mut props, DtvProperty::new(DTV_FREQUENCY, freq));
@@ -265,7 +345,11 @@ impl AdapterState {
         while dev.get_event().is_ok() {}
 
         // Two attempts, like dvb.cpp:1525-1529.
-        if dev.set_properties(&props).is_err() && dev.set_properties(&props).is_err() {
+        if dev.set_properties(&props).is_err()
+            && let Err(error) = dev.set_properties(&props)
+        {
+            let (errno, text) = error_parts(&error);
+            ms_log::log!("dvb_tune: set property failed {} {}", errno, text);
             return -500;
         }
 
@@ -296,7 +380,7 @@ impl AdapterState {
         if self.strength_multiplier != 0.0 || self.snr_multiplier != 0.0 {
             let frontend_open = self.fe > 0;
             let v5 = if self.new_gs != OLD_SIGNAL {
-                signal_v5(dev, frontend_open, self.db_snr_map)
+                signal_v5(dev, self.id, frontend_open, self.db_snr_map)
             } else {
                 None
             };
@@ -307,13 +391,15 @@ impl AdapterState {
                 self.new_gs = OLD_SIGNAL;
                 raw = signal_v3(
                     dev,
+                    self.id,
+                    self.pa,
                     frontend_open,
                     &mut self.snr_calib,
                     &mut self.strength_warned,
                     self.force_tuner_signal,
                 );
                 if self.force_tuner_signal != TUNER_FORCE_NO {
-                    adapt_signal(self.force_tuner_signal, self.db_snr_map, &mut raw);
+                    adapt_signal(self.id, self.force_tuner_signal, self.db_snr_map, &mut raw);
                 }
             }
             status = raw.status;
@@ -321,7 +407,7 @@ impl AdapterState {
         } else {
             status_valid = false;
             if self.lock_retry_armed
-                && let Some(read) = read_status(dev, self.fe > 0)
+                && let Some(read) = read_status(dev, self.id, self.fe > 0)
             {
                 status = read;
                 status_valid = true;
@@ -329,6 +415,7 @@ impl AdapterState {
             if !status_valid {
                 status = 1;
             }
+            ms_log::logm!("Signal metrics are not retrieved as both multipliers are 0");
         }
 
         let mut strength = raw.strength;
@@ -415,6 +502,11 @@ impl AdapterState {
         if !self.lock_retry_update(now, status_valid) {
             return;
         }
+        ms_log::log!(
+            "ad {} has no lock, resending the switch commands (retry {})",
+            self.id,
+            self.lock_retries
+        );
         self.setup_switch(dev, true, master);
     }
 }

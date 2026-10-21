@@ -198,6 +198,8 @@ pub enum CaEvent {
     SetFilter {
         /// Filter id to pass back with each section.
         id: FilterId,
+        /// Index of the filter in the driver's key table.
+        slot: usize,
         /// PMT slot id of the service owning the filter.
         pmt_id: usize,
         /// Adapter the PID is read from.

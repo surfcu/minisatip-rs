@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ms-log = { path = "../ms-log" }
 ms-ts = { path = "../ms-ts" }
 
 [lints]

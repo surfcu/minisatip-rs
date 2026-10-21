@@ -3,6 +3,9 @@
 use super::consts::*;
 use crate::{DeliverySystem, PidSet, Polarization, TuneParams};
 
+/// `#define DEFAULT_LOG LOG_DVB` (dvb.cpp:53).
+const DEFAULT_LOG: u32 = ms_log::LOG_DVB;
+
 /// `struct diseqc` (dvb.h:286): switch, LNB and timing parameters of one adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiseqcParams {
@@ -211,7 +214,10 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
         SYS_DVBC_ANNEX_A | SYS_DVBC_ANNEX_B => match mtype {
             QAM_256 => 340,
             QAM_64 => 300,
-            _ => 360,
+            _ => {
+                ms_log::log!("get_db_snr_map -> DVB-C modulation SNR scale not tested!!");
+                360
+            }
         },
         SYS_DVBS => match mtype {
             QPSK => match fec {
@@ -220,9 +226,16 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_3_4 => 100,
                 FEC_5_6 => 110,
                 FEC_7_8 => 120,
-                _ => 130,
+                FEC_AUTO => 130,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-S modulation SNR scale not tested!!");
+                    130
+                }
             },
-            _ => 800,
+            _ => {
+                ms_log::log!("get_db_snr_map -> DVB-S modulation SNR scale unkown!!");
+                800
+            }
         },
         SYS_DVBS2 => match mtype {
             QPSK => match fec {
@@ -233,7 +246,11 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_5_6 => 120,
                 FEC_8_9 => 130,
                 FEC_9_10 => 135,
-                _ => 130,
+                FEC_AUTO => 130,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-S2 modulation SNR scale not tested!!");
+                    130
+                }
             },
             PSK_8 => match fec {
                 FEC_1_2 => 128,
@@ -243,9 +260,16 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_5_6 => 175,
                 FEC_8_9 => 190,
                 FEC_9_10 => 200,
-                _ => 180,
+                FEC_AUTO => 180,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-S2 modulation SNR scale not tested!!");
+                    180
+                }
             },
-            _ => 800,
+            _ => {
+                ms_log::log!("get_db_snr_map -> DVB-S2 modulation SNR scale unkown!!");
+                800
+            }
         },
         SYS_DVBT => match mtype {
             QPSK => match fec {
@@ -254,7 +278,10 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_3_4 => 72,
                 FEC_5_6 => 85,
                 FEC_7_8 => 92,
-                _ => 110,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-T modulation SNR scale not tested!!");
+                    110
+                }
             },
             QAM_16 => match fec {
                 FEC_1_2 => 98,
@@ -262,7 +289,10 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_3_4 => 134,
                 FEC_5_6 => 148,
                 FEC_7_8 => 157,
-                _ => 180,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-T modulation SNR scale not tested!!");
+                    180
+                }
             },
             QAM_64 => match fec {
                 FEC_1_2 => 140,
@@ -270,9 +300,15 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_3_4 => 249,
                 FEC_5_6 => 213,
                 FEC_7_8 => 220,
-                _ => 250,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-T modulation SNR scale not tested!!");
+                    250
+                }
             },
-            _ => 800,
+            _ => {
+                ms_log::log!("get_db_snr_map -> DVB-T modulation SNR scale unkown!!");
+                800
+            }
         },
         SYS_DVBT2 => match mtype {
             QPSK => match fec {
@@ -282,7 +318,10 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_3_4 => 76,
                 FEC_4_5 => 89,
                 FEC_5_6 => 98,
-                _ => 110,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-T2 modulation SNR scale not tested!!");
+                    110
+                }
             },
             QAM_16 => match fec {
                 FEC_1_2 => 81,
@@ -291,7 +330,10 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_3_4 => 133,
                 FEC_4_5 => 147,
                 FEC_5_6 => 156,
-                _ => 180,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-T2 modulation SNR scale not tested!!");
+                    180
+                }
             },
             QAM_64 => match fec {
                 FEC_1_2 => 126,
@@ -300,7 +342,10 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_3_4 => 182,
                 FEC_4_5 => 197,
                 FEC_5_6 => 207,
-                _ => 230,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-T2 modulation SNR scale not tested!!");
+                    230
+                }
             },
             QAM_256 => match fec {
                 FEC_1_2 => 165,
@@ -309,13 +354,32 @@ pub fn db_snr_map(tp: &DvbTransponder) -> f32 {
                 FEC_3_4 => 229,
                 FEC_4_5 => 246,
                 FEC_5_6 => 256,
-                _ => 280,
+                _ => {
+                    ms_log::log!("get_db_snr_map -> DVB-T2 modulation SNR scale not tested!!");
+                    280
+                }
             },
-            _ => 800,
+            _ => {
+                ms_log::log!("get_db_snr_map -> DVB-T2 modulation SNR scale unkown!!");
+                800
+            }
         },
-        _ => 800,
+        _ => {
+            ms_log::log!("get_db_snr_map -> Modulation SNR scale unkown!!");
+            800
+        }
     };
-    (f64::from(top) / 10.0) as f32
+    let db_map = (f64::from(top) / 10.0) as f32;
+    ms_log::logm!(
+        "get_db_snr_map -> src={}, fe={}, msys={}, mtype={}, fec={}, db_map={:.6}",
+        tp.diseqc.unwrap_or(0),
+        tp.fe.unwrap_or(0),
+        sys,
+        mtype,
+        fec,
+        db_map
+    );
+    db_map
 }
 
 /// Absolute source mapping (`--virtual-diseqc`, adapter.cpp:681-705 and 1798-1816).

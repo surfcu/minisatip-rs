@@ -76,12 +76,25 @@ impl NetcvShared {
             return data.len();
         }
         if data.first() != Some(&0x47) || !data.len().is_multiple_of(TS_PACKET_SIZE) {
+            ms_log::log!(
+                "netceiver: TS data malformed: buf[0]=0x{:02x} len={}",
+                data.first().copied().unwrap_or(0),
+                data.len()
+            );
             return data.len();
         }
         let free = NETCV_PIPE_SIZE - inner.pipe.len();
         let take = data.len().min(free / TS_PACKET_SIZE * TS_PACKET_SIZE);
         inner.pipe.extend(&data[..take]);
         inner.dropped += (data.len() - take) as u64;
+        if take != data.len() {
+            // The in-memory queue stands in for the non-blocking DVR pipe;
+            // a short queue is the equivalent of a short write(EAGAIN).
+            ms_log::log!(
+                "netceiver: not all data forwarded ({})",
+                ms_log::strerror(&std::io::Error::from_raw_os_error(libc::EAGAIN))
+            );
+        }
         data.len()
     }
 

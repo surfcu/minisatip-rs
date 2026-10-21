@@ -10,6 +10,7 @@ members = [
     "crates/ms-ca-drivers",
     "crates/ms-srt",
     "crates/ms-net",
+    "crates/ms-log",
     "crates/ms-config",
     "crates/ms-harness",
     "crates/ms-fakecam",

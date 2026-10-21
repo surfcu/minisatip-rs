@@ -56,10 +56,11 @@ pub enum ResetResult {
 pub fn reset_and_wait_ready(
     link: &mut dyn CaLink,
     info: &mut SlotInfo,
+    id: usize,
     attempts: u32,
     polls: u32,
 ) -> ResetResult {
-    for _ in 0..attempts {
+    for attempt in 0..attempts {
         if link.reset().is_err() {
             return ResetResult::IoError;
         }
@@ -83,7 +84,16 @@ pub fn reset_and_wait_ready(
             return ResetResult::Ready;
         }
         if info.flags & CA_CI_MODULE_PRESENT == 0 && !seen_present {
+            ms_log::log!("CA {}: no module present, not retrying reset", id);
             return ResetResult::Timeout;
+        }
+        if attempt + 1 < attempts {
+            ms_log::log!(
+                "CA {}: module not ready after reset {}/{}, retrying",
+                id,
+                attempt + 1,
+                attempts
+            );
         }
     }
     ResetResult::Timeout
@@ -196,7 +206,7 @@ mod tests {
     }
 
     fn run(s: &mut FakeSlot) -> ResetResult {
-        reset_and_wait_ready(s, &mut SlotInfo::default(), 3, 10)
+        reset_and_wait_ready(s, &mut SlotInfo::default(), 0, 3, 10)
     }
 
     // Ported from tests/test_ca.cpp:964

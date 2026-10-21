@@ -1366,6 +1366,7 @@ fn setup_switch_master_and_slave_sharing() {
         &mut dev,
         false,
         Some(MasterView {
+            id: 0,
             state: &mut master,
             idle: true,
         }),
@@ -1391,6 +1392,7 @@ fn setup_switch_master_and_slave_sharing() {
             &mut dev,
             false,
             Some(MasterView {
+                id: 0,
                 state: &mut busy,
                 idle: false,
             })
@@ -1547,7 +1549,7 @@ fn probe_device_uses_enum_delsys_and_frontend_name() {
     dev.info = "TurboSight TBS 6903".to_owned();
     dev.delsys = vec![SYS_DVBS2 as u32, SYS_DVBS as u32];
 
-    let probed = probe_device(&mut dev);
+    let probed = probe_device(&mut dev, 0);
     assert_eq!(probed.name, "TurboSight TBS 6903");
     assert_eq!(
         probed.systems,
@@ -1569,7 +1571,7 @@ fn probe_device_falls_back_to_frontend_info() {
     dev.info_fe_type = FE_QPSK;
     dev.info_caps = FE_CAN_2G_MODULATION;
 
-    let probed = probe_device(&mut dev);
+    let probed = probe_device(&mut dev, 0);
     assert_eq!(
         probed.systems,
         vec![DeliverySystem::DvbS2, DeliverySystem::DvbS]

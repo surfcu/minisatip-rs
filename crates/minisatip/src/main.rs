@@ -17,14 +17,32 @@ fn main() {
             })
         })
         .collect();
-    let outcome = ms_config::parse_args(&args);
+    let ms_config::ParseOutcome {
+        options,
+        warnings,
+        error,
+    } = ms_config::parse_args(&args);
     // glibc getopt prints these as it walks argv; the C++ switch has no default
     // case, so they are diagnostics and parsing continues.
-    for warning in &outcome.warnings {
+    for warning in &warnings {
         eprintln!("minisatip: {warning}");
     }
-    if let Some(err) = outcome.error {
-        eprintln!("minisatip: {err}");
+    let mut opts = options;
+    // minisatip.cpp:1907-1910: the main thread is named before set_options.
+    // The logger is installed right after parsing and before daemonising
+    // (minisatip.cpp:1911-1923).
+    ms_log::set_thread_name("main");
+    ms_log::init(ms_log::Config {
+        log: opts.log,
+        debug: opts.debug,
+        slog: opts.slog,
+        file_line: opts.file_line != 0,
+        backend: Box::new(sys::SysLogBackend::new(opts.slog)),
+    });
+    if let Some(err) = error {
+        // C++ FAIL: LOG0, unlink(pid_file), exit(1).
+        ms_log::log0!("{err}");
+        sys::remove_pid_file();
         // usage() is printed only on the paths where the C++ code calls it
         // before exit(1) (invalid --sdt-charset, --help).
         if matches!(
@@ -38,7 +56,6 @@ fn main() {
         }
         std::process::exit(1);
     }
-    let mut opts = outcome.options;
     let program = std::env::args_os().next().unwrap_or_default();
     opts.command_line = command_line(&program.to_string_lossy(), &args);
     if opts.version {
@@ -51,16 +68,34 @@ fn main() {
         print!("{}", ms_config::usage_text());
         std::process::exit(1);
     }
-    // minisatip.cpp:1914-1923: daemonise by default (opts.daemon is 1 unless
-    // -f is given) and open syslog for -g. becomeDaemon's result is ignored.
+    // minisatip.cpp:1914-1932: daemonise by default (opts.daemon is 1 unless
+    // -f is given), then log the startup lines in C++ order. becomeDaemon's
+    // result is ignored.
     if opts.daemon != 0 {
         let _ = sys::become_daemon(&opts.log_file);
     }
-    if opts.slog > 0 {
-        sys::open_syslog("minisatip", opts.slog > 1);
+    ms_log::log!(
+        "Running mode: {}",
+        if opts.daemon != 0 {
+            "background"
+        } else {
+            "foreground"
+        }
+    );
+    // print_version(1, 1): the banner through LOG0, the build lines through LOG.
+    ms_log::log0!("{}", ms_config::VERSION_BANNER);
+    for line in ms_config::BUILT_INFO {
+        ms_log::log!("{line}");
+    }
+    ms_log::log!("Command line: {}", opts.command_line);
+    for (index, module) in ms_log::LOG_LEVELS.iter().enumerate() {
+        let mask = 1u32 << index;
+        ms_log::logl!(mask, " LOG  of the module enabled: {module}");
+        ms_log::debugl!(mask, "DEBUG of the module enabled: {module}");
     }
     if let Err(error) = runtime::run(&opts) {
-        sys::log_error(format_args!("minisatip: {error}"));
+        ms_log::log0!("{error}");
+        sys::remove_pid_file();
         std::process::exit(1);
     }
 }

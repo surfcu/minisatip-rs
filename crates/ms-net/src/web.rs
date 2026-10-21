@@ -806,8 +806,21 @@ impl WebService {
         if relative.contains('/') || relative.contains("..") || relative.is_empty() {
             return HttpRoute::new(404, Vec::new());
         }
-        let Ok(mut data) = fs::read(self.config.document_root.join(relative)) else {
-            return HttpRoute::new(404, Vec::new());
+        // `readfile` joins the document root and the request path
+        // (utils.cpp:432).
+        let path = self.config.document_root.join(relative);
+        let Ok(mut data) = fs::read(&path) else {
+            // utils.cpp:436-446: a failed open and a non-regular file are
+            // distinct diagnostics but both yield a 404 route here.
+            if fs::metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+                ms_log::log!("readfile: {} is not a file", path.display());
+                return HttpRoute::new(404, Vec::new());
+            }
+            ms_log::log_and_return!(
+                HttpRoute::new(404, Vec::new()),
+                "Could not open file {}",
+                path.display()
+            );
         };
         let headers = content_type_headers(relative);
         if is_head {

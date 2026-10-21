@@ -22,9 +22,13 @@ use super::media::{
 use super::sys;
 #[cfg(feature = "srt")]
 use super::util::random_u32;
+use super::util::{delsys_code, delsys_name};
 use crate::tuner::{
     PidSet, Result, SignalStatus, TS_PACKET_SIZE, TsBuf, TuneParams, Tuner, TunerError,
 };
+
+/// `satipc.cpp`'s `#define DEFAULT_LOG LOG_SATIPC`.
+const DEFAULT_LOG: u32 = ms_log::LOG_SATIPC;
 
 /// Reconnect backoff of `satipc_open_device`.
 const OPEN_BACKOFF_MS: i64 = 5_000;
@@ -107,6 +111,19 @@ impl Driver {
         client.no_pids_all = server.no_pids_all;
         client.user_agent = config.user_agent.clone();
         client.ignore_signal = config.ignore_signal;
+        // satipc.cpp:2059-2066; the adapter total is not known here.
+        let systems = server.systems();
+        ms_log::log!(
+            "AD{}: Satip device {} port {} delsys {}: {} {}, fe {}, total number of devices {}",
+            config.adapter_id,
+            server.host,
+            server.port,
+            delsys_code(server.delsys),
+            delsys_name(systems[0]),
+            delsys_name(systems[1]),
+            server.fe,
+            0
+        );
         Self {
             client,
             rtsp: None,
@@ -139,12 +156,33 @@ impl Driver {
         } else {
             Some(self.client.source_ip.as_str())
         };
-        let stream = connect(&self.client.host, self.client.port, source)?;
+        // satipc.cpp:396-397
+        if !self.client.source_ip.is_empty()
+            && let Some(bind) = bind_source.as_deref()
+        {
+            ms_log::log!(
+                "per-server source {} overrides --bind-dev source {}",
+                self.client.source_ip,
+                bind
+            );
+        }
+        let stream = match connect(&self.client.host, self.client.port, source) {
+            Ok(stream) => stream,
+            // satipc.cpp:402-403
+            Err(error) => ms_log::log_and_return!(
+                Err(error),
+                "could not connect to {}:{}, error {}",
+                self.client.host,
+                self.client.port,
+                ms_log::strerror(&error)
+            ),
+        };
         stream.set_nonblocking(true)?;
         let _ = stream.set_nodelay(true);
         if self.client.transport == Transport::Tcp {
             sys::set_receive_buffer(stream.as_raw_fd(), self.receive_buffer);
         }
+        let fd = stream.as_raw_fd();
         self.rtsp = Some(stream);
         self.rbuf.clear();
         self.demux.reset();
@@ -157,6 +195,24 @@ impl Driver {
         if self.client.data_open && !is_init {
             self.client.post_init();
         }
+        // satipc.cpp:427-430
+        ms_log::log!(
+            "satipc: connected to SAT>IP server {} port {} {} handle {} {} {}",
+            self.client.host,
+            self.client.port,
+            self.client.transport.name(),
+            fd,
+            if self.client.source_ip.is_empty() {
+                ""
+            } else {
+                "from source"
+            },
+            if self.client.source_ip.is_empty() {
+                ""
+            } else {
+                self.client.source_ip.as_str()
+            }
+        );
         Ok(())
     }
 
@@ -167,8 +223,28 @@ impl Driver {
         }
         let port = u32::from(self.start_rtp) + 1000 + 2 * self.client.id as u32;
         let port = u16::try_from(port).map_err(|_| io::Error::other("RTP port out of range"))?;
-        let rtp = sys::udp_bind(self.bind_dev_ip, port)?;
-        let rtcp = sys::udp_bind(self.bind_dev_ip, port.wrapping_add(1))?;
+        let rtp = match sys::udp_bind(self.bind_dev_ip, port) {
+            Ok(socket) => socket,
+            // satipc.cpp:818-819
+            Err(error) => ms_log::log_and_return!(
+                Err(error),
+                "Could not listen on port {}: err {}: {}",
+                port,
+                ms_log::errno(&error),
+                ms_log::strerror(&error)
+            ),
+        };
+        let rtcp = match sys::udp_bind(self.bind_dev_ip, port.wrapping_add(1)) {
+            Ok(socket) => socket,
+            // satipc.cpp:826-827
+            Err(error) => ms_log::log_and_return!(
+                Err(error),
+                "Could not listen on port {}: err {}: {}",
+                port.wrapping_add(1),
+                ms_log::errno(&error),
+                ms_log::strerror(&error)
+            ),
+        };
         rtp.set_nonblocking(true)?;
         rtcp.set_nonblocking(true)?;
         sys::set_receive_buffer(rtp.as_raw_fd(), self.receive_buffer);
@@ -199,25 +275,42 @@ impl Driver {
             return 0;
         }
         if self.srt_sock != SRT_INVALID_SOCK && ms_srt::is_connected(self.srt_sock) {
+            // satipc.cpp:715-716
+            ms_log::log!(
+                "Reusing existing SRT socket {} for adapter {}",
+                self.srt_sock,
+                self.client.id
+            );
             self.client.srt_connected = true;
             return 0;
         }
         self.client.srt_connected = false;
         if self.srt_sock != SRT_INVALID_SOCK {
+            // satipc.cpp:723-724
+            ms_log::log!("Closing old SRT socket {} (not connected)", self.srt_sock);
             // Not connected any more; srt_close also closes the acquired UDP fd.
             ms_srt::close(self.srt_sock);
             self.srt_sock = SRT_INVALID_SOCK;
         }
-        // The stale UDP descriptor went with the SRT socket: drop tracking.
+        // satipc.cpp:731-733; the stale UDP descriptor went with the SRT socket.
+        if self.srt_udp >= 0 {
+            ms_log::log!(
+                "Closing stale UDP socket {} for adapter {}",
+                self.srt_udp,
+                self.client.id
+            );
+        }
         self.srt_udp = -1;
 
         srt_startup_once();
         let Ok(udp) = sys::udp_bind(self.bind_dev_ip, 0) else {
-            return 2;
+            // satipc.cpp:746
+            ms_log::log_and_return!(2, "SRT UDP bind failed on ephemeral port");
         };
         let sock = ms_srt::create_socket();
         if sock == SRT_INVALID_SOCK {
-            return 2;
+            // satipc.cpp:751-752
+            ms_log::log_and_return!(2, "srt_create_socket failed: {}", ms_srt::last_error());
         }
         self.srt_sock = sock;
         ms_srt::set_flag(sock, SockOpt::Latency, SRT_LATENCY_MS);
@@ -225,6 +318,8 @@ impl Driver {
         self.client.srt_streamid = random_u32().to_string();
         ms_srt::set_streamid(sock, &self.client.srt_streamid);
         if !ms_srt::bind_acquire(sock, udp.as_raw_fd()) {
+            // satipc.cpp:764
+            ms_log::log!("srt_bind_acquire failed: {}", ms_srt::last_error());
             ms_srt::close(sock);
             self.srt_sock = SRT_INVALID_SOCK;
             self.client.srt_streamid.clear();
@@ -240,6 +335,13 @@ impl Driver {
         // SRT now owns the UDP descriptor.
         self.srt_udp = udp.into_raw_fd();
         if !address.is_some_and(|address| ms_srt::connect(sock, address)) {
+            // satipc.cpp:786-787
+            ms_log::log!(
+                "SRT connect to {}:{} failed: {}",
+                self.client.host,
+                self.client.port,
+                ms_srt::last_error()
+            );
             ms_srt::close(sock);
             self.srt_sock = SRT_INVALID_SOCK;
             self.client.srt_streamid.clear();
@@ -250,6 +352,15 @@ impl Driver {
         // Non-blocking reads after the connect.
         ms_srt::set_flag(sock, SockOpt::RcvSyn, 0);
         self.client.srt_connected = true;
+        // satipc.cpp:804-805
+        ms_log::log!(
+            "SRT connected for adapter {} to {}:{}, streamid={}, srt_sock={}",
+            self.client.id,
+            self.client.host,
+            self.client.port,
+            self.client.srt_streamid,
+            sock
+        );
         0
     }
 
@@ -271,6 +382,11 @@ impl Driver {
     // The SRT branch of `satipc_timeout`, after the claim.
     #[cfg(feature = "srt")]
     fn restart_srt(&mut self) {
+        // satipc.cpp:539
+        ms_log::log!(
+            "SRT connection lost for adapter {}. Restarting SRT.",
+            self.client.id
+        );
         let fresh = if self.open_srt() == 0 && !self.device_open {
             self.srt_sock
         } else {
@@ -406,6 +522,15 @@ impl Driver {
 
     // The RTSP connection ended or failed.
     fn rtsp_eof(&mut self) {
+        // satipc.cpp:366-368; the socketworks id is not tracked.
+        let fd = self.rtsp.as_ref().map_or(-1, |stream| stream.as_raw_fd());
+        ms_log::log!(
+            "satip_close called for adapter {}, socket_id {}, handle {} timeout {}",
+            self.client.id,
+            0,
+            fd,
+            self.client.fe_timeout_ms
+        );
         self.rtsp = None;
         self.client.rtsp_connected = false;
         match self.client.transport {
@@ -425,6 +550,14 @@ impl Driver {
     fn handle_rtsp_bytes(&mut self, bytes: &[u8]) {
         match self.client.transport {
             Transport::Tcp => {
+                // satipc.cpp:1201-1203
+                ms_log::debugm!(
+                    "start satipc_tcp_read tcp_pos {} tcp_len {} tcp_size {}, buffer len {}",
+                    self.demux.position(),
+                    self.demux.position() + self.demux.buffered(),
+                    self.demux.capacity(),
+                    bytes.len()
+                );
                 self.demux.push(bytes);
                 self.drain_demux();
             }
@@ -438,12 +571,20 @@ impl Driver {
     }
 
     fn drain_demux(&mut self) {
+        let before = self.tcp_ts.len();
         while self.tcp_ts.len() + 65_536 <= TCP_TS_MAX {
             let Some(frame) = self.demux.next_frame() else {
                 break;
             };
             match frame {
                 Frame::Rtsp(message) => {
+                    // satipc.cpp:1299
+                    ms_log::debugm!(
+                        "ad {} processed {}, socket {}",
+                        self.client.id,
+                        message.len(),
+                        0
+                    );
                     let _ = self.client.reply(&message);
                 }
                 Frame::Rtcp(_) | Frame::Rtp(_) if self.client.ignore_packets => {}
@@ -454,6 +595,11 @@ impl Driver {
                 }
             }
         }
+        // satipc.cpp:1370
+        ms_log::debugm!(
+            "satipc_tcp_read: returning {} bytes",
+            self.tcp_ts.len() - before
+        );
     }
 
     /// One I/O pass: sockets, timers and queued ops; `true` when data arrived.
@@ -466,18 +612,67 @@ impl Driver {
         let mut buf = [0u8; 16 * 1024];
         let room =
             self.client.transport != Transport::Tcp || self.tcp_ts.len() + 65_536 <= TCP_TS_MAX;
+        if !room {
+            // satipc.cpp:1249-1252; the interleaved buffer is `tcp_ts` here.
+            ms_log::logm!(
+                "buffer is full, skipping read, {}, pos {} [{:02X} {:02X}, {:02X} {:02X}]",
+                self.tcp_ts.len(),
+                0,
+                self.tcp_ts.first().copied().unwrap_or(0),
+                self.tcp_ts.get(1).copied().unwrap_or(0),
+                self.tcp_ts.get(2).copied().unwrap_or(0),
+                self.tcp_ts.get(3).copied().unwrap_or(0)
+            );
+        }
         if room && let Some(stream) = self.rtsp.as_mut() {
+            let fd = stream.as_raw_fd();
             match stream.read(&mut buf) {
-                Ok(0) => self.rtsp_eof(),
+                Ok(0) => {
+                    if self.client.transport == Transport::Tcp {
+                        // satipc.cpp:1238-1239
+                        ms_log::log!(
+                            "read 0 from RTSP sock {}, handle {}, errno 0, {}",
+                            0,
+                            fd,
+                            io::Error::from_raw_os_error(0)
+                        );
+                    }
+                    self.rtsp_eof();
+                }
                 Ok(read) => {
                     work = true;
                     if self.client.transport != Transport::Tcp {
                         self.fe_rtime = self.client.tick();
+                    } else {
+                        // satipc.cpp:1232-1236; the socketworks id is not tracked.
+                        ms_log::debugm!(
+                            "read {} (from {}) from rtsp socket {} (id {}) [{:02X} {:02X}, {:02X} {:02X}]",
+                            read,
+                            buf.len(),
+                            fd,
+                            0,
+                            buf.first().copied().unwrap_or(0),
+                            buf.get(1).copied().unwrap_or(0),
+                            buf.get(2).copied().unwrap_or(0),
+                            buf.get(3).copied().unwrap_or(0)
+                        );
                     }
                     self.handle_rtsp_bytes(&buf[..read]);
                 }
                 Err(error) if is_transient(&error) => {}
-                Err(_) => self.rtsp_eof(),
+                Err(error) => {
+                    if self.client.transport == Transport::Tcp {
+                        // satipc.cpp:1238-1239
+                        ms_log::log!(
+                            "read -1 from RTSP sock {}, handle {}, errno {}, {}",
+                            0,
+                            fd,
+                            ms_log::errno(&error),
+                            ms_log::strerror(&error)
+                        );
+                    }
+                    self.rtsp_eof();
+                }
             }
         }
         if self.client.transport == Transport::Tcp {
@@ -513,14 +708,28 @@ impl Driver {
                 };
                 let mut datagram = [0u8; DATAGRAM_MAX];
                 let mut total = 0;
+                let mut messages = 0;
                 for _ in 0..MAX_RTP_MSG {
                     if buf.remaining_bytes() < MAX_UDP_PACKET_SIZE {
                         break;
                     }
-                    let Ok(read) = rtp.recv(&mut datagram) else {
-                        break;
+                    let read = match rtp.recv(&mut datagram) {
+                        Ok(read) => read,
+                        Err(error) => {
+                            // satipc.cpp:1054-1055; a transient error is the
+                            // normal "no datagram ready" case in Rust.
+                            if !is_transient(&error) {
+                                ms_log::debugm!("satipc_read: read error or zero datagrams");
+                            }
+                            break;
+                        }
                     };
+                    messages += 1;
                     total += process_rtp_datagram(&mut self.client, &datagram[..read], buf);
+                }
+                // satipc.cpp:1067-1068
+                if messages == MAX_RTP_MSG {
+                    ms_log::debugm!("satipc_read: read full, so flushing output");
                 }
                 total
             }
@@ -550,6 +759,15 @@ impl Driver {
             // SRT_EASYNCRCV (nothing ready) and errors both end the pass.
             let read = ms_srt::recv(self.srt_sock, &mut message);
             let Ok(read) = usize::try_from(read) else {
+                if ms_srt::last_error_code() != ms_srt::SRT_EASYNCRCV {
+                    // satipc.cpp:697-699
+                    ms_log::log!(
+                        "SRT recv failed for adapter {}, socket {}: {}",
+                        self.client.id,
+                        self.srt_sock,
+                        ms_srt::last_error()
+                    );
+                }
                 break;
             };
             if read == 0 {

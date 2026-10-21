@@ -3,11 +3,16 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use super::client::Transport;
-use super::util::{delsys_code, delsys_from_code, delsys_lookup, parse_int, split};
+use super::util::{delsys_code, delsys_from_code, delsys_lookup, delsys_name, parse_int, split};
 use crate::tuner::DeliverySystem;
+
+/// `satipc.cpp`'s `#define DEFAULT_LOG LOG_SATIPC`; the `httpc.cpp` lines in
+/// this module use an explicit `LOG_HTTP` mask instead.
+const DEFAULT_LOG: u32 = ms_log::LOG_SATIPC;
 
 /// `MAX_DVBAPI_SYSTEMS`: size of the per-delivery-system tuner table.
 pub const MAX_DVBAPI_SYSTEMS: usize = 22;
@@ -63,6 +68,8 @@ pub fn parse_satip_servers(spec: &str, rtsp_over_tcp: bool) -> Result<Vec<SatipS
             #[cfg(not(feature = "srt"))]
             {
                 let _ = rest;
+                // satipc.cpp:2094 `FAIL`: log then give up (Rust returns Err).
+                ms_log::log0!("SRT support is disabled, install libsrt-openssl-dev");
                 return Err("SRT support is disabled, install libsrt-openssl-dev".to_owned());
             }
             #[cfg(feature = "srt")]
@@ -90,7 +97,8 @@ pub fn parse_satip_servers(spec: &str, rtsp_over_tcp: bool) -> Result<Vec<SatipS
         let first_segment = sep1.map_or(token, |i| &token[..i]);
         let (system_part, host_part, port_part) = if delsys_lookup(first_segment).is_some() {
             let Some(first) = sep1 else {
-                // only the system was given
+                // satipc.cpp:2126-2127; only the system was given.
+                ms_log::log!("Found only the system for satip adapter {}", first_segment);
                 continue;
             };
             match sep2 {
@@ -204,8 +212,14 @@ pub fn parse_satip_xml(xml: &str, host: &str) -> Option<SatipXml> {
     if let Some(pos) = xml.find("X-SATIP-RTSP-Port:") {
         result.port = u16::try_from(parse_int(&xml[pos + 18..], 554)).unwrap_or(0);
     }
-    let cap = xml.find("<satip:X_SATIPCAP")?;
-    let start = cap + xml[cap..].find('>')? + 1;
+    let start = xml
+        .find("<satip:X_SATIPCAP")
+        .and_then(|cap| xml[cap..].find('>').map(|gt| cap + gt + 1));
+    let Some(start) = start else {
+        // satipc.cpp:2223; the XML URL is not available here.
+        ms_log::log!("No satipcap found for {}, XML:\n{}", host, xml);
+        return None;
+    };
     let caps = &xml[start..];
     let caps = caps.find('<').map_or(caps, |end| &caps[..end]);
     for item in split(caps, ',') {
@@ -214,6 +228,8 @@ pub fn parse_satip_xml(xml: &str, host: &str) -> Option<SatipXml> {
             None => (item, ""),
         };
         let Some(sys) = delsys_lookup(name) else {
+            // satipc.cpp:2239-2240
+            ms_log::log!("Could not determine the delivery system for {}", item);
             continue;
         };
         let code = delsys_code(sys);
@@ -223,10 +239,20 @@ pub fn parse_satip_xml(xml: &str, host: &str) -> Option<SatipXml> {
             || tuners < 0
             || result.order.len() >= MAX_DVBAPI_SYSTEMS
         {
+            // satipc.cpp:2250-2254
+            ms_log::log!(
+                "Could not determine the delivery system for {} ({}) tuners {}, order {}",
+                item,
+                code,
+                tuners,
+                result.order.len()
+            );
             continue;
         }
         result.tuners[code as usize] = tuners;
         result.order.push(delsys_from_code(code));
+        // satipc.cpp:2258; the XML URL is not available here.
+        ms_log::logm!("{}: {} tuners for {}", delsys_name(sys), tuners, host);
     }
     Some(result)
 }
@@ -234,10 +260,15 @@ pub fn parse_satip_xml(xml: &str, host: &str) -> Option<SatipXml> {
 /// `http_client`: `GET` over HTTP/1.0; returns the URL host and the raw response.
 pub fn fetch_satip_xml(url: &str) -> io::Result<(String, String)> {
     if !url.starts_with("http") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Only http support for {url}"),
-        ));
+        // httpc.cpp:107
+        ms_log::log_and_return!(
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Only http support for {url}")
+            )),
+            "Only http support for {}",
+            url
+        );
     }
     let rest = url.get(7..).unwrap_or("");
     let host_end = rest.find([':', '/']).unwrap_or(rest.len());
@@ -252,9 +283,34 @@ pub fn fetch_satip_xml(url: &str) -> io::Result<(String, String)> {
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("cannot resolve {host}")))?;
-    let mut stream = TcpStream::connect_timeout(&address, HTTP_TIMEOUT)?;
+    let mut stream = match TcpStream::connect_timeout(&address, HTTP_TIMEOUT) {
+        Ok(stream) => stream,
+        // httpc.cpp:131-132
+        Err(error) => ms_log::log_and_return!(
+            Err(error),
+            "http_client: connect to {}:{} failed",
+            host,
+            port
+        ),
+    };
     stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
     stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+    // httpc.cpp:144-145; the socketworks s_id is not tracked.
+    let fd = stream.as_raw_fd();
+    ms_log::logl!(
+        ms_log::LOG_HTTP,
+        "http_client url {} using handle {} s_id {}",
+        url,
+        fd,
+        0
+    );
+    // httpc.cpp:88
+    ms_log::logl!(
+        ms_log::LOG_HTTP,
+        "http_client_read: sending to {}: {}",
+        fd,
+        request
+    );
     stream.write_all(format!("GET {request} HTTP/1.0\r\n\r\n").as_bytes())?;
     let deadline = Instant::now() + HTTP_TIMEOUT;
     let mut data = Vec::new();
@@ -263,8 +319,17 @@ pub fn fetch_satip_xml(url: &str) -> io::Result<(String, String)> {
         match stream.read(&mut chunk) {
             Ok(0) => break,
             // A chunk that would overflow `xml[4000]` is dropped, like C++.
-            Ok(read) if data.len() + read >= XML_SIZE => {}
-            Ok(read) => data.extend_from_slice(&chunk[..read]),
+            Ok(read) if data.len() + read >= XML_SIZE => {
+                // satipc.cpp:2284: drop the chunk and stop, like the returning
+                // C++ callback (otherwise every later chunk logs again).
+                ms_log::log!("too much data from the satip server for URL {}", url);
+                break;
+            }
+            Ok(read) => {
+                data.extend_from_slice(&chunk[..read]);
+                // satipc.cpp:2289
+                ms_log::debugm!("satip_getxml_data: {}", String::from_utf8_lossy(&data));
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error)
                 if matches!(

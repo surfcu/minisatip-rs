@@ -14,6 +14,9 @@ use std::sync::Arc;
 /// `EIO`: a failed write with it means the CAM was removed.
 const EIO: i32 = 5;
 
+/// `#define DEFAULT_LOG LOG_DVBCA` (ca.cpp:52).
+const DEFAULT_LOG: u32 = ms_log::LOG_DVBCA;
+
 /// `CA_STATE_*`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CaState {
@@ -246,6 +249,7 @@ impl CaDevice {
 
     /// `ca_request_close`.
     pub fn request_close(&mut self) {
+        ms_log::log!("Requesting CA {} close", self.id);
         self.close_requested = true;
         self.push_event(HostEvent::CloseRequested);
     }
@@ -283,6 +287,7 @@ impl CaDevice {
         if self.sock != Some(sock) {
             return false;
         }
+        ms_log::log!("closing CA device {} fd {}", self.id, -1);
         self.teardown();
         true
     }
@@ -297,16 +302,31 @@ impl CaDevice {
 
     /// `ca_init_en50221`: reset, wait for READY, then T_CREATE_TC.
     pub(super) fn init_en50221(&mut self) -> bool {
+        let start = self.now();
+        let id = self.id;
         let Some(link) = self.link.as_deref_mut() else {
             return false;
         };
         let mut info = SlotInfo::default();
-        if reset_and_wait_ready(link, &mut info, CA_RESET_ATTEMPTS, CA_READY_POLLS)
-            == ResetResult::IoError
-        {
+        let reset = reset_and_wait_ready(link, &mut info, id, CA_RESET_ATTEMPTS, CA_READY_POLLS);
+        if reset == ResetResult::IoError {
+            ms_log::log!("ca_init_en50221: io error on ca {}", id);
             return false;
         }
-        if info.kind != CA_CI_LINK || info.flags & CA_CI_MODULE_READY == 0 {
+        ms_log::log!(
+            "initializing CA {} fd {} type {} flags 0x{:x}, after {} ms",
+            id,
+            -1,
+            info.kind,
+            info.flags,
+            self.now() - start
+        );
+        if info.kind != CA_CI_LINK {
+            ms_log::log!("incompatible CA interface");
+            return false;
+        }
+        if info.flags & CA_CI_MODULE_READY == 0 {
+            ms_log::log!("CA module not present or not ready");
             return false;
         }
         self.write_tpdu(T_CREATE_TC, &[]);
@@ -317,8 +337,9 @@ impl CaDevice {
 
     /// `ca_init_enigma`.
     pub(super) fn init_enigma(&mut self) -> bool {
-        self.new_sock();
+        let sock = self.new_sock();
         self.pending_since = self.now();
+        ms_log::log!("initializing CA {} fd {} sock {}", self.id, -1, sock);
         true
     }
 
@@ -336,8 +357,30 @@ impl CaDevice {
             None => Err(io::Error::from(io::ErrorKind::NotConnected)),
         };
         match rc {
-            Ok(n) => n == buf.len(),
+            Ok(n) if n == buf.len() => true,
+            Ok(n) => {
+                // C++ would print the stale errno; a short write has none.
+                ms_log::log!(
+                    "incomplete write to CA {} fd {} expected {} got {}, errno {} {}",
+                    self.id,
+                    -1,
+                    buf.len(),
+                    n,
+                    0,
+                    "Success"
+                );
+                false
+            }
             Err(e) => {
+                ms_log::log!(
+                    "incomplete write to CA {} fd {} expected {} got {}, errno {} {}",
+                    self.id,
+                    -1,
+                    buf.len(),
+                    -1,
+                    ms_log::errno(&e),
+                    ms_log::strerror(&e)
+                );
                 if eio_closes && e.raw_os_error() == Some(EIO) {
                     self.request_close();
                 }
@@ -366,6 +409,9 @@ impl CaDevice {
             }
             _ => p.clear(),
         }
+        if tag != T_DATA_LAST || !data.is_empty() {
+            ms_log::hexdump!("WRITE TPDU: ", &p);
+        }
         self.write_raw(&p, true)
     }
 
@@ -376,17 +422,45 @@ impl CaDevice {
         pkt.extend_from_slice(data);
         pkt.extend_from_slice(&(session_number as u16).to_be_bytes());
         pkt.extend_from_slice(apdu);
+        let name = if session_number > 0 {
+            self.sessions
+                .get(session_number as usize - 1)
+                .and_then(|s| *s)
+                .map_or("(null)", |s| s.handler.name)
+        } else {
+            "none"
+        };
+        ms_log::debugm!(
+            "ca_write_spdu: CA {}, session {}, name {}, write tag {:02X}, data length {}",
+            self.id,
+            session_number,
+            name,
+            tag,
+            pkt.len()
+        );
+        if !pkt.is_empty() {
+            ms_log::hexdump!("WRITE SPDU: ", &pkt);
+        }
         self.write_tpdu(T_DATA_LAST, &pkt)
     }
 
     /// `ca_write_apdu` on the session at `idx`; a successful tracked command arms the watchdog.
     pub fn write_apdu(&mut self, idx: usize, tag: u32, body: &[u8]) -> bool {
-        let Some(number) = self.sessions.get(idx).copied().flatten().map(|s| s.number) else {
+        let Some(session) = self.sessions.get(idx).copied().flatten() else {
             return false;
         };
+        let number = session.number;
         let mut pkt = tag.to_be_bytes()[1..].to_vec();
         encode_len(body.len(), &mut pkt);
         pkt.extend_from_slice(body);
+        ms_log::log!(
+            "ca_write_apdu: CA {}, session {}, name {}, write tag {:06X}, data length {}",
+            self.id,
+            number,
+            session.handler.name,
+            tag,
+            body.len()
+        );
         self.log_apdu(ApduDir::HostToCam, number, tag, body);
         let ok = self.write_spdu(i32::from(number), ST_SESSION_NUMBER, &[], &pkt);
         if ok {
@@ -438,29 +512,63 @@ impl CaDevice {
             Err(_) => return ReadOutcome::Eof,
         };
         self.poll_fails = 0;
+        if !(len == 6 && data[5] == 0) {
+            ms_log::hexdump!("READ TPDU: ", &data[..len]);
+        }
         let mut out = Vec::new();
         let mut d = &data[len.min(2)..len];
         while let Some(&tag) = d.first() {
             let Some((asn_len, lfl)) = decode_len(&d[1..]) else {
+                ms_log::log!(
+                    "Received data with invalid asn from module on device {}",
+                    self.id
+                );
+                ms_log::hexdump(Some("INVALID LENGTH: "), &data[..len]);
                 break;
             };
-            if asn_len < 1 || asn_len > d.len() - (1 + lfl) || out.len() + asn_len > MAX_TPDU {
+            if asn_len < 1 || asn_len > d.len() - (1 + lfl) {
+                ms_log::log!(
+                    "Received data with invalid length from module on device {}",
+                    self.id
+                );
+                ms_log::hexdump(Some("INVALID LENGTH: "), &data[..len]);
+                break;
+            }
+            if out.len() + asn_len > MAX_TPDU {
+                // C++ prints the socket buffer bound (`*rb + buf_len`).
+                ms_log::log!(
+                    "Received data for CA {} larger than socket buffer (len {})",
+                    self.id,
+                    MAX_TPDU
+                );
                 break;
             }
             let body = &d[2 + lfl..1 + lfl + asn_len];
             match tag {
                 T_CTC_REPLY => {
+                    ms_log::debugm!("Got CTC Replay (CA {})", self.id);
                     if self.state == CaState::Inactive {
                         self.state = CaState::Active;
                     }
                     self.write_tpdu(T_DATA_LAST, &[]);
                 }
-                T_DELETE_TC => return ReadOutcome::Eof,
+                T_DELETE_TC => {
+                    ms_log::log!("Got \"Delete Transport Connection\" from module ");
+                    return ReadOutcome::Eof;
+                }
+                T_DTC_REPLY => {
+                    ms_log::log!("Got \"Delete Transport Connection Replay\" from module!\n");
+                }
+                T_REQUEST_TC => {
+                    ms_log::log!(
+                        "Got \"Request Transport Connection\" from Module ->currently not handled!"
+                    );
+                }
                 T_DATA_MORE | T_DATA_LAST => out.extend_from_slice(body),
                 T_SB if body.first().is_some_and(|b| b & 0x80 != 0) => {
                     self.write_tpdu(T_RCV, &[]);
                 }
-                _ => {}
+                _ => ms_log::log!("unhandled tpdu_tag 0x{:x}\n", tag),
             }
             d = &d[1 + lfl + asn_len..];
         }
@@ -502,8 +610,14 @@ impl CaDevice {
 
     /// `new_session`: refuses resources without a handler and a full table.
     fn new_session(&mut self, resource: u32) -> Option<usize> {
-        let handler = find_handler(resource)?;
-        let idx = self.sessions.iter().position(Option::is_none)?;
+        let Some(handler) = find_handler(resource) else {
+            ms_log::log!("CA {}: resource {:06X} is not supported", self.id, resource);
+            return None;
+        };
+        let Some(idx) = self.sessions.iter().position(Option::is_none) else {
+            ms_log::log!("Could not allocate a new session id for CA {}", self.id);
+            return None;
+        };
         self.sessions[idx] = Some(Session {
             number: idx as u16 + 1,
             resource,
@@ -520,6 +634,7 @@ impl CaDevice {
 
     /// `ca_read`: one SPDU from the CAM.
     pub fn handle_spdu(&mut self, data: &[u8]) {
+        ms_log::hexdump!("CAREAD", data);
         let Some(&tag) = data.first() else {
             return;
         };
@@ -528,6 +643,12 @@ impl CaDevice {
         }
         self.poll_fails = 0;
         let Some((len, llen)) = decode_len(&data[1..]) else {
+            ms_log::log!(
+                "Invalid SPDU length {:02X} {:02X} {:02X}",
+                data.get(1).copied().unwrap_or(0),
+                data.get(2).copied().unwrap_or(0),
+                data.get(3).copied().unwrap_or(0)
+            );
             return;
         };
         let start = 1 + llen + len;
@@ -539,9 +660,19 @@ impl CaDevice {
                 let resource = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
                 let idx = self.new_session(resource);
                 let status = if idx.is_some() { 0 } else { SS_NOT_FOUND };
+                let number = idx.map_or(-1, |i| i as i32 + 1);
+                let name = idx
+                    .and_then(|i| self.sessions[i])
+                    .map_or("none", |s| s.handler.name);
+                ms_log::log!(
+                    "Found session_number {} for resource {:06X}, name {}, status {:02X}",
+                    number,
+                    resource,
+                    name,
+                    status
+                );
                 let mut pkt = vec![status];
                 pkt.extend_from_slice(&resource.to_be_bytes());
-                let number = idx.map_or(-1, |i| i as i32 + 1);
                 self.write_spdu(number, ST_OPEN_SESSION_RESPONSE, &pkt, &[]);
                 if let Some(idx) = idx {
                     self.app_create(idx, resource);
@@ -553,9 +684,13 @@ impl CaDevice {
                 };
                 let number = u16::from_be_bytes([b[0], b[1]]);
                 if number < 1 || usize::from(number) > MAX_SESSIONS {
+                    ms_log::log!("CA {}: bad session {}, dropping", self.id, number);
                     return;
                 }
                 let idx = usize::from(number) - 1;
+                // C++ prints a zeroed `handler.name` as glibc's "(null)".
+                let name = self.sessions[idx].map_or("(null)", |s| s.handler.name);
+                ms_log::log!("Received close session {}", name);
                 if self.sessions[idx].is_some() {
                     self.app_close(idx);
                 }
@@ -575,12 +710,16 @@ impl CaDevice {
                     return;
                 };
                 let number = u16::from_be_bytes([b[0], b[1]]);
+                ms_log::debugm!("got ST_SESSION_NUMBER for session_number {}", number);
                 if number < 1 || usize::from(number) > MAX_SESSIONS {
+                    ms_log::log!("CA {}: bad session {}, dropping", self.id, number);
                     return;
                 }
                 let idx = usize::from(number) - 1;
                 if self.sessions[idx].is_some() {
                     self.read_apdu(idx, data.get(start..).unwrap_or(&[]));
+                } else {
+                    ms_log::log!("CA {}: session {} is not registered", self.id, number);
                 }
             }
             _ => {}
@@ -589,17 +728,36 @@ impl CaDevice {
 
     /// `ca_read_apdu`: every APDU of the SPDU goes to the session's handler.
     pub fn read_apdu(&mut self, idx: usize, mut data: &[u8]) {
+        ms_log::hexdump!("APDU", data);
         while data.len() >= 4 {
             let Some((len, llen)) = decode_len(&data[3..]) else {
+                ms_log::log!(
+                    "Invalid APDU length {:02X} {:02X} {:02X}",
+                    data.get(3).copied().unwrap_or(0),
+                    data.get(4).copied().unwrap_or(0),
+                    data.get(5).copied().unwrap_or(0)
+                );
                 return;
             };
             let tag = u32::from_be_bytes([0, data[0], data[1], data[2]]);
             let Some(body) = data.get(3 + llen..3 + llen + len) else {
                 return;
             };
-            let Some(number) = self.sessions[idx].map(|s| s.number) else {
+            let Some(session) = self.sessions[idx] else {
                 return;
             };
+            let number = session.number;
+            ms_log::log!(
+                "ca_read_apdu: CA {}, session {}, name {}, read tag {:06X}, data length {}",
+                self.id,
+                number,
+                session.handler.name,
+                tag,
+                len
+            );
+            if len > 0 {
+                ms_log::hexdump!("data: ", body);
+            }
             self.log_apdu(ApduDir::CamToHost, number, tag, body);
             self.match_reply(number, tag);
             self.app_apdu(idx, tag, body);
@@ -639,7 +797,20 @@ impl CaDevice {
         if self.pending_since < 0 || now - self.pending_since < CA_CMD_TIMEOUT_MS {
             return;
         }
-        if self.pending_tag == 0 && self.state == CaState::Initialized {
+        if self.pending_tag != 0 {
+            ms_log::log!(
+                "CA {}: command {:06X} unanswered after {} ms, resetting",
+                self.id,
+                self.pending_tag,
+                now - self.pending_since
+            );
+        } else if self.state != CaState::Initialized {
+            ms_log::log!(
+                "CA {}: initialization stalled after {} ms, resetting",
+                self.id,
+                now - self.pending_since
+            );
+        } else {
             return;
         }
         self.clear_pending();

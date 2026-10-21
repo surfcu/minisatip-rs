@@ -49,6 +49,7 @@ dependencies = [
  "ms-ca-drivers",
  "ms-config",
  "ms-fakecam",
+ "ms-log",
  "ms-net",
  "ms-psi",
  "ms-sched",
@@ -60,6 +61,7 @@ dependencies = [
 name = "ms-ca"
 version = "0.1.0"
 dependencies = [
+ "ms-log",
  "ms-psi",
  "ms-ts",
 ]
@@ -72,6 +74,7 @@ dependencies = [
  "ms-ca",
  "ms-config",
  "ms-fakecam",
+ "ms-log",
  "ms-psi",
  "ms-ts",
  "ms-tuner",
@@ -80,6 +83,9 @@ dependencies = [
 [[package]]
 name = "ms-config"
 version = "0.1.0"
+dependencies = [
+ "ms-log",
+]
 
 [[package]]
 name = "ms-fakecam"
@@ -97,10 +103,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-log"
+version = "0.1.0"
+
+[[package]]
 name = "ms-net"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ms-log",
  "ms-sched",
  "ms-srt",
  "ms-ts",
@@ -111,6 +122,7 @@ dependencies = [
 name = "ms-psi"
 version = "0.1.0"
 dependencies = [
+ "ms-log",
  "ms-ts",
 ]
 
@@ -119,6 +131,7 @@ name = "ms-sched"
 version = "0.1.0"
 dependencies = [
  "ms-ca",
+ "ms-log",
  "ms-psi",
  "ms-tuner",
 ]
@@ -128,17 +141,22 @@ name = "ms-srt"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ms-log",
 ]
 
 [[package]]
 name = "ms-ts"
 version = "0.1.0"
+dependencies = [
+ "ms-log",
+]
 
 [[package]]
 name = "ms-tuner"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ms-log",
  "ms-srt",
 ]
 

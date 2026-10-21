@@ -12,10 +12,15 @@ use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner, TunerError};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
+
+/// Rust-side thread ids for the C++ `tid` in `select_and_execute` messages.
+/// `AtomicUsize` rather than `AtomicU64`, which 32-bit MIPS lacks.
+static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Adapter buffer size (`ADAPTER_BUFFER`, `-B` default).
 pub const ADAPTER_BUFFER: usize = 2000 * DVB_FRAME;
@@ -95,6 +100,16 @@ impl Default for DataPlaneConfig {
 /// `wait_transponder_id`, updating the remembered id (`check_new_transponder`,
 /// stream.cpp:864-889). Returns the offset of that PAT in `data`, if any.
 pub fn check_new_transponder(data: &[u8], wait_transponder_id: &mut i32) -> Option<usize> {
+    check_new_transponder_elapsed(data, wait_transponder_id, 0)
+}
+
+/// [`check_new_transponder`] with the time since the tune for the C++ logs
+/// (stream.cpp:877,883).
+fn check_new_transponder_elapsed(
+    data: &[u8],
+    wait_transponder_id: &mut i32,
+    elapsed_ms: i64,
+) -> Option<usize> {
     for offset in (0..data.len()).step_by(DVB_FRAME) {
         let packet = &data[offset..];
         if packet.len() < 10 {
@@ -105,7 +120,25 @@ pub fn check_new_transponder(data: &[u8], wait_transponder_id: &mut i32) -> Opti
             let tid = i32::from(packet[8]) * 256 + i32::from(packet[9]);
             if tid != *wait_transponder_id {
                 *wait_transponder_id = tid;
+                // stream.cpp:877 (`LOG`, general module).
+                ms_log::log!(
+                    "Got the new transponder {:04X} {}, position {}, {} ms after tune",
+                    tid,
+                    tid,
+                    offset,
+                    elapsed_ms
+                );
                 return Some(offset);
+            // stream.cpp:883.
+            } else {
+                ms_log::logl!(
+                    ms_log::LOG_DMX,
+                    "Got old transponder id {:04X} {}, position {}, {} ms after tune",
+                    tid,
+                    tid,
+                    offset,
+                    elapsed_ms
+                );
             }
         }
     }
@@ -127,7 +160,7 @@ pub fn post_tune_filter(
     if elapsed_ms >= NEW_TRANSPONDER_WINDOW_MS {
         return Some(0);
     }
-    check_new_transponder(data, wait_transponder_id)
+    check_new_transponder_elapsed(data, wait_transponder_id, elapsed_ms)
 }
 
 /// Per-PID continuity counters (`check_cc`, stream.cpp:891-974).
@@ -141,12 +174,20 @@ pub struct ContinuityCounter {
     last: BTreeMap<u16, i16>,
     packets: u64,
     errors: u64,
+    /// Adapter index printed by the continuity-error log (`ad->id`).
+    adapter_id: i32,
 }
 
 impl ContinuityCounter {
     /// Creates an empty tracker.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records the adapter index used in log lines (stream.cpp:937).
+    pub fn with_adapter(mut self, adapter_id: i32) -> Self {
+        self.adapter_id = adapter_id;
+        self
     }
 
     /// Total packets checked for an active PID (`p->packets`).
@@ -161,6 +202,11 @@ impl ContinuityCounter {
 
     /// Checks one 188-byte packet; `true` when its counter was out of sequence.
     pub fn check_packet(&mut self, packet: &[u8]) -> bool {
+        self.check_packet_at(packet, 0)
+    }
+
+    /// [`Self::check_packet`] with the packet position for the C++ log.
+    fn check_packet_at(&mut self, packet: &[u8], position: i64) -> bool {
         if packet.len() < DVB_FRAME || packet[1] & 0x80 != 0 {
             return false;
         }
@@ -173,17 +219,32 @@ impl ContinuityCounter {
             return false;
         }
         let cc = i16::from(packet[3] & 0x0f);
-        let last = self.last.entry(pid).or_insert(-1);
-        let expected = if *last < 0 || *last > 15 {
+        let cc_before = self.last.get(&pid).copied().unwrap_or(-1);
+        let expected = if !(0..=15).contains(&cc_before) {
             cc
         } else {
-            (*last + 1) % 16
+            (cc_before + 1) % 16
         };
         let error = expected != cc;
         if error {
             self.errors += 1;
+            // stream.cpp:937 (`LOG`, general module).
+            ms_log::log!(
+                "PID Continuity error (adapter {}, pos {}): pid: {:03}, Expected CC: {:X}, Actual CC: {:X}, CC Before {:X} {}",
+                self.adapter_id,
+                position,
+                pid,
+                expected,
+                cc,
+                cc_before,
+                if packet[3] & 0x80 != 0 {
+                    "encrypted"
+                } else {
+                    ""
+                }
+            );
         }
-        *last = cc;
+        self.last.insert(pid, cc);
         error
     }
 
@@ -191,13 +252,29 @@ impl ContinuityCounter {
     ///
     /// Like C++, checking is skipped entirely while `PID_ALL` is active.
     pub fn check_buffer(&mut self, data: &[u8], pids: &PidSet) {
+        self.check_buffer_from(data, pids, 0);
+    }
+
+    /// [`Self::check_buffer`] for a slice that starts `offset` bytes into the
+    /// adapter buffer, so `pos` and `_dump_packets` keep the C++ offsets.
+    fn check_buffer_from(&mut self, data: &[u8], pids: &PidSet, offset: usize) {
         if pids.contains(PID_ALL) {
             return;
         }
-        for packet in data.as_chunks::<DVB_FRAME>().0 {
+        for (index, packet) in data.as_chunks::<DVB_FRAME>().0.iter().enumerate() {
+            // stream.cpp:912: `_dump_packets("check_cc -> ", b, 188, i)`.
+            if packet[1] & 0x80 != 0 {
+                continue;
+            }
             let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+            if pid == PID_NULL {
+                continue;
+            }
+            if ms_log::debug_enabled(ms_log::LOG_DMX) {
+                ms_log::dump_packets("check_cc -> ", packet, (offset + index * DVB_FRAME) as i64);
+            }
             if pids.contains(pid) {
-                self.check_packet(packet);
+                self.check_packet_at(packet, ((offset + index * DVB_FRAME) / DVB_FRAME) as i64);
             }
         }
     }
@@ -348,8 +425,17 @@ impl AdapterHandle {
         let tune_generation = Arc::new(Mutex::new(0));
         let generation = Arc::clone(&tune_generation);
         let thread = thread::Builder::new()
-            .name(format!("adapter{}", config.adapter_id))
+            // adapter.cpp:341: the data-plane thread is `AD%d`.
+            .name(format!("AD{}", config.adapter_id))
             .spawn(move || {
+                let thread_name = format!("AD{}", config.adapter_id);
+                ms_log::set_thread_name(&thread_name);
+                let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+                // socketworks.cpp:769-770.
+                ms_log::log!(
+                    "Starting select_and_execute on thread ID {thread_id:x}, \
+                     thread_name {thread_name}"
+                );
                 let mut plane = DataPlane::new(tuner, config, command_rx, event_tx, bandwidth);
                 plane.stages = stages;
                 plane.tune_generation = generation;
@@ -566,6 +652,8 @@ struct DataPlane {
     wait_transponder_id: i32,
     threshold_ms: i64,
     last_send_ms: i64,
+    /// Consecutive full-buffer reads (`read_dmx`'s static `cnt`).
+    full_reads: i32,
     origin: Instant,
     running: bool,
     bandwidth: Option<Arc<Bandwidth>>,
@@ -596,7 +684,7 @@ impl DataPlane {
             buf: TsBuf::new(config.adapter_buffer),
             cc_checked: 0,
             active_pids: PidSet::new(),
-            continuity: ContinuityCounter::new(),
+            continuity: ContinuityCounter::new().with_adapter(config.adapter_id),
             reported_cc_errors: 0,
             last_cc_report_ms: 0,
             wait_new_stream: false,
@@ -604,6 +692,7 @@ impl DataPlane {
             wait_transponder_id: 0,
             threshold_ms: config.threshold_ms,
             last_send_ms: 0,
+            full_reads: 0,
             origin: Instant::now(),
             running: true,
             bandwidth,
@@ -683,6 +772,8 @@ impl DataPlane {
                 // streams_add set `wtime`/`rtcp_wtime` at SETUP
                 // (stream.cpp:630-636); the output starts at PLAY.
                 output.set_clocks(now.saturating_sub(setup_age_ms));
+                // Log lines use `sid->sid` (stream.cpp:785,838,845,...).
+                output.set_stream_id(stream_id);
                 self.outputs.insert(
                     stream_id,
                     Subscriber {
@@ -712,6 +803,9 @@ impl DataPlane {
             Command::StopOutput(stream_id) => {
                 if let Some(subscriber) = self.outputs.remove(&stream_id) {
                     let mut output = subscriber.output;
+                    // stream.cpp:376,385: the UDP sockets close_stream forces
+                    // shut. (StopOutput also runs for a transport change.)
+                    output.log_closing_sockets();
                     // close_stream drops queued bytes up to the next RTSP
                     // header before the pending reply (stream.cpp:374).
                     output.set_flush_enqueued_data();
@@ -834,6 +928,12 @@ impl DataPlane {
             }
             return false;
         }
+        // stream.cpp:1216-1219: `cnt` counts consecutive full-buffer reads.
+        if read == self.buf.capacity_packets() * DVB_FRAME {
+            self.full_reads += 1;
+        } else {
+            self.full_reads = 0;
+        }
         // read_dmx's new-stream flush (src_stream.cpp:1241-1259).
         if !self.after_read(now) {
             return true;
@@ -843,6 +943,20 @@ impl DataPlane {
         let force = since > FORCE_SEND_MS
             || since > 4 * self.threshold_ms
             || self.buf.remaining_bytes() <= 7 * DVB_FRAME;
+        // stream.cpp:1269 (`LOGM` under `#define DEFAULT_LOG LOG_DMX`).
+        ms_log::logl!(
+            ms_log::LOG_DMX,
+            "read_dmx send={}, force_send={}, cnt {} called for adapter {} -> {} out of {} bytes read, {} ms ago ({} {})",
+            u8::from(send),
+            u8::from(force),
+            self.full_reads,
+            self.config.adapter_id,
+            read,
+            self.buf.capacity_packets() * DVB_FRAME,
+            since,
+            now,
+            self.last_send_ms
+        );
         if send || force {
             self.process(now);
         }
@@ -864,6 +978,14 @@ impl DataPlane {
                     self.cc_checked = self.cc_checked.saturating_sub(offset);
                 }
                 None => {
+                    // stream.cpp:1249 (`LOGM` under `#define DEFAULT_LOG LOG_DMX`).
+                    ms_log::logl!(
+                        ms_log::LOG_DMX,
+                        "Flushing adapter {} buffer of {} bytes after the tune {} ms ago",
+                        self.config.adapter_id,
+                        self.buf.len(),
+                        elapsed
+                    );
                     self.buf.clear();
                     self.cc_checked = 0;
                     return false;
@@ -880,6 +1002,17 @@ impl DataPlane {
     }
 
     fn process(&mut self, now_ms: i64) {
+        // stream.cpp:1167-1177: `ms_ago` is relative to the previous
+        // process_dmx, which `last_send_ms` tracks.
+        let ms_ago = now_ms - self.last_send_ms;
+        ms_log::logl!(
+            ms_log::LOG_DMX,
+            "process_dmx start called for adapter {} -> {} out of {} bytes read, {} ms ago",
+            self.config.adapter_id,
+            self.buf.len(),
+            self.buf.capacity_packets() * DVB_FRAME,
+            ms_ago
+        );
         self.last_send_ms = now_ms;
         self.tap_sections();
         for stage in &mut self.stages {
@@ -941,6 +1074,23 @@ impl DataPlane {
             }
             subscriber.last_timer_ms = now;
             if subscriber.output.poll_rtcp() {
+                // stream.cpp:1455,1459: `rtcp_confirm` logs once per callback.
+                match subscriber.output.remote_addr() {
+                    Some(addr) => ms_log::log!(
+                        "rtcp_confirm: called for stream sid {} from {}:{}",
+                        stream_id,
+                        addr.ip(),
+                        u32::from(addr.port()) + 1
+                    ),
+                    None => {
+                        ms_log::log!("rtcp_confirm: called for stream sid {} from :1", stream_id)
+                    }
+                }
+                ms_log::logl!(
+                    ms_log::LOG_STREAM,
+                    "Acknowledging stream sid {} via rtcp packet",
+                    stream_id
+                );
                 let _ = self.events.send(Event::RtcpReceived(*stream_id));
             }
             let input = DescribeInput {
@@ -950,9 +1100,17 @@ impl DataPlane {
                 use_adapter: true,
                 pids: &subscriber.pids,
             };
-            let result = subscriber
-                .output
-                .on_timer(now, mono, wall, || describe_adapter(&input));
+            let result = subscriber.output.on_timer(now, mono, wall, || {
+                let description = describe_adapter(&input);
+                ms_log::logl!(
+                    ms_log::LOG_ADAPTER,
+                    "describe_adapter: sid {} aid {} => {}",
+                    *stream_id,
+                    input.adapter_id,
+                    description
+                );
+                description
+            });
             if result.is_err() {
                 closed.push(*stream_id);
             }
@@ -991,6 +1149,9 @@ impl DataPlane {
 
     fn close(&mut self, stream_id: StreamId) {
         if let Some(subscriber) = self.outputs.remove(&stream_id) {
+            // The output-initiated closures below all lead to `close_stream`
+            // (stream.cpp:376,385).
+            subscriber.output.log_closing_sockets();
             let _ = self
                 .events
                 .send(Event::OutputClosed(stream_id, subscriber.epoch));

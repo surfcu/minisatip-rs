@@ -5,6 +5,9 @@ use super::client::Client;
 use super::util::{find_bytes, find_ci, parse_int};
 use crate::tuner::{TS_PACKET_SIZE, TsBuf};
 
+/// `satipc.cpp`'s `#define DEFAULT_LOG LOG_SATIPC`.
+const DEFAULT_LOG: u32 = ms_log::LOG_SATIPC;
+
 /// `MAX_UDP_PACKET_SIZE`: the TS payload read from one datagram.
 pub const MAX_UDP_PACKET_SIZE: usize = 7 * TS_PACKET_SIZE;
 /// RTP header length assumed by satipc (no CSRC or extension).
@@ -36,6 +39,13 @@ pub fn process_rtp_datagram(client: &mut Client, datagram: &[u8], out: &mut TsBu
     let payload = &datagram[RTP_HEADER..datagram.len().min(RTP_HEADER + MAX_UDP_PACKET_SIZE)];
     // Some servers (e.g. XORO) send keep-alive RTP packets without TS payload.
     if payload.len() < MAX_UDP_PACKET_SIZE && payload[0] != 0x47 {
+        // satipc.cpp:1103-1107; socket id/handle are not modelled here.
+        ms_log::logm!(
+            "discarding RTP packet without valid TS payload (sock {}, socket_id {}) [len={}]",
+            0,
+            0,
+            payload.len()
+        );
         return 0;
     }
     if client.ignore_packets {
@@ -67,6 +77,15 @@ pub enum Frame {
     Rtsp(Vec<u8>),
 }
 
+/// Emits `satipc_tcp_read`'s skipped-bytes LOG for the amount not yet logged.
+fn log_skipped(skipped: usize, logged: &mut usize) {
+    if skipped > *logged {
+        let delta = skipped - *logged;
+        *logged = skipped;
+        ms_log::log!("satipc_tcp_read: skipped {} bytes", delta);
+    }
+}
+
 /// Splits the TCP byte stream like `satipc_tcp_read`, skipping unknown bytes.
 #[derive(Debug, Default, Clone)]
 pub struct TcpDemux {
@@ -74,6 +93,12 @@ pub struct TcpDemux {
     pos: usize,
     /// Bytes skipped while resynchronising.
     pub skipped: usize,
+    /// How much of [`Self::skipped`] has already been logged.
+    ///
+    /// The C++ counter is a local of `satipc_tcp_read`; here frames are pulled
+    /// one at a time, so the logged amount is tracked separately to keep the
+    /// public total intact.
+    logged_skipped: usize,
 }
 
 impl TcpDemux {
@@ -85,8 +110,15 @@ impl TcpDemux {
     /// Appends received bytes.
     pub fn push(&mut self, bytes: &[u8]) {
         if self.pos > 0 {
-            self.data.drain(..self.pos);
+            let pos = self.pos;
+            self.data.drain(..pos);
             self.pos = 0;
+            // satipc.cpp:1221
+            ms_log::debugm!(
+                "Moved from the position {}, length {}",
+                pos,
+                self.data.len()
+            );
         }
         self.data.extend_from_slice(bytes);
     }
@@ -94,6 +126,16 @@ impl TcpDemux {
     /// Bytes not consumed yet.
     pub fn buffered(&self) -> usize {
         self.data.len() - self.pos
+    }
+
+    /// Capacity of the buffered byte vector (`tcp_size`).
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Index of the next unconsumed byte (`tcp_pos`).
+    pub fn position(&self) -> usize {
+        self.pos
     }
 
     /// Drops buffered bytes (`tcp_len = tcp_pos = 0`).
@@ -108,7 +150,27 @@ impl TcpDemux {
             let b = &self.data[self.pos..];
             if b[0] == 0x24 && b[1] < 2 && b[4] == 0x80 && (b[5] == 0x21 || b[5] == 0xC8) {
                 let len = usize::from(u16::from_be_bytes([b[2], b[3]]));
+                // satipc.cpp:1261-1262
+                ms_log::debugm!(
+                    "found at pos {}, rtsp_len {}, len {}",
+                    self.pos,
+                    len,
+                    self.data.len()
+                );
+                // satipc.cpp:1270-1273
+                log_skipped(self.skipped, &mut self.logged_skipped);
                 if 4 + len > b.len() {
+                    // satipc.cpp:1278-1284; destination position is not modelled.
+                    ms_log::debugm!(
+                        "The curent chunk is not completely read @ pos {}, tcp_pos {}, required {} len {} tcp_len {}, tcp_size {}, left to read {}",
+                        0,
+                        self.pos,
+                        len.saturating_sub(RTP_HEADER),
+                        b.len(),
+                        self.data.len(),
+                        self.data.capacity(),
+                        4 + len - b.len()
+                    );
                     return None;
                 }
                 let body = &b[4..4 + len];
@@ -121,11 +183,25 @@ impl TcpDemux {
                 return Some(frame);
             }
             if b.starts_with(b"RTSP") {
-                let nlnl = find_bytes(b, b"\r\n\r\n")?;
+                // satipc.cpp:1308-1311
+                log_skipped(self.skipped, &mut self.logged_skipped);
+                let Some(nlnl) = find_bytes(b, b"\r\n\r\n") else {
+                    // satipc.cpp:1334-1337
+                    ms_log::logm!(
+                        "End of rtsp rtsp message not found in this block, pos {}, tcp_pos {}, len {}, size {}",
+                        0,
+                        self.pos,
+                        b.len(),
+                        self.data.len()
+                    );
+                    return None;
+                };
                 let mut end = nlnl as i64;
+                let mut icl = 0i32;
                 if let Some(cl) = find_ci(&b[..nlnl], b"content-length:") {
                     let value = String::from_utf8_lossy(&b[cl + 15..nlnl]);
-                    end += i64::from(parse_int(&value, 0));
+                    icl = parse_int(&value, 0);
+                    end += i64::from(icl);
                 }
                 let total = usize::try_from(end + 4).unwrap_or(0).max(nlnl + 4);
                 if total > b.len() {
@@ -133,8 +209,19 @@ impl TcpDemux {
                 }
                 let message = b[..total].to_vec();
                 self.pos += total;
+                // satipc.cpp:1354-1358; destination position is not modelled.
+                ms_log::logm!(
+                    "sending {} bytes to satipc_reply, cl {}, pos {}, tcp_len {}, left {}",
+                    total,
+                    icl,
+                    self.pos - total,
+                    self.data.len(),
+                    0
+                );
                 return Some(Frame::Rtsp(message));
             }
+            // satipc.cpp:1362-1364
+            ms_log::debugm!("ignoring byte {:02X}", b[0]);
             self.skipped += 1;
             self.pos += 1;
         }
