@@ -102,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "ms-sched",
+ "ms-srt",
  "ms-ts",
  "ms-tuner",
 ]
@@ -123,6 +124,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-srt"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ms-ts"
 version = "0.1.0"
 
@@ -131,6 +139,7 @@ name = "ms-tuner"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ms-srt",
 ]
 
 [[package]]

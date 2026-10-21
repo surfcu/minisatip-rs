@@ -8,7 +8,7 @@ repository.workspace = true
 [features]
 default = ["linux-dvb"]
 # Builds with SRT support.
-srt = ["ms-config/srt", "ms-net/srt"]
+srt = ["ms-config/srt", "ms-net/srt", "ms-tuner/srt"]
 # Enables the Linux DVB tuner backend and /dev/dvb enumeration.
 linux-dvb = ["ms-tuner/linux-dvb"]
 # DVB-CSA software descrambling through libdvbcsa.

@@ -1,8 +1,8 @@
 //! SRT listener and output, mirroring `srt.cpp` and the SRT branch of
 //! `flush_stream` (stream.cpp:795).
 //!
-//! The safe logic talks to the library through [`SrtOps`]; the only FFI module
-//! is `srt_ffi`, enabled by the `srt` feature.
+//! The safe logic talks to the library through [`SrtOps`]; `srt_ffi`, enabled by
+//! the `srt` feature, implements it over the shared `ms-srt` bindings.
 
 use std::collections::HashMap;
 use std::fmt;
