@@ -916,8 +916,9 @@ impl DataPlane {
             }
         }
         if !tapped.is_empty() {
+            let generation = *lock_counter(&self.tune_generation);
             let _ = self.events.send(Event::TablePackets {
-                generation: *lock_counter(&self.tune_generation),
+                generation,
                 packets: tapped,
             });
         }
