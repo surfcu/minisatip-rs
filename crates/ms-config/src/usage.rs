@@ -285,7 +285,12 @@ By default every CAM supports 1 channels
 "#
 );
 
-/// Returns the help text printed for `--help`.
-pub fn usage_text() -> &'static str {
-    USAGE
+/// Returns the help text printed for `--help`, including the C++
+/// `DISABLE_SRT` build line when the feature is off.
+pub fn usage_text() -> String {
+    if cfg!(feature = "srt") {
+        USAGE.to_owned()
+    } else {
+        USAGE.replace("Built with srt\n", "Built without srt\n")
+    }
 }

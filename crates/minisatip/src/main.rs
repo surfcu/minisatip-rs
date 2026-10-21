@@ -1,5 +1,8 @@
 //! Binary entry point: wiring, logging and signal handling.
 
+mod runtime;
+mod sys;
+
 fn main() {
     let args: Vec<String> = std::env::args_os()
         .skip(1)
@@ -27,7 +30,7 @@ fn main() {
                 ..
             }
         ) {
-            print!("{}", ms_config::USAGE);
+            print!("{}", ms_config::usage_text());
         }
         std::process::exit(1);
     }
@@ -39,10 +42,13 @@ fn main() {
     }
     if opts.help {
         // usage() prints the banner and help text, then exits with status 1.
-        print!("{}", ms_config::USAGE);
+        print!("{}", ms_config::usage_text());
         std::process::exit(1);
     }
-    // Server startup lands with the rest of M3.
+    if let Err(error) = runtime::run(&opts) {
+        eprintln!("minisatip: {error}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]

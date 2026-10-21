@@ -50,13 +50,15 @@ pub enum Polarization {
 /// Tuning parameters passed from the RTSP layer; backend-specific fields are optional.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TuneParams {
-    /// Frequency in kHz.
-    pub freq: u32,
+    /// Frequency in kHz, like the C++ `transponder::freq`.
+    ///
+    /// SAT>IP sends MHz, so `freq=11361.75` parses to `11_361_750`.
+    pub freq: i32,
     /// Polarisation.
     pub pol: Polarization,
     /// Delivery system (`msys`).
     pub msys: DeliverySystem,
-    /// Symbol rate in kSym/s.
+    /// Symbol rate in sym/s, like the C++ `transponder::sr` (`sr * 1000`).
     pub sr: u32,
     /// Source or diSEqC input.
     pub src: u8,
@@ -265,6 +267,15 @@ impl TsBuf {
     /// Drops buffered packets.
     pub fn clear(&mut self) {
         self.data.clear();
+    }
+
+    /// Drops the first `bytes` bytes, rounded down to whole packets.
+    ///
+    /// This mirrors the `memmove` C++ performs when a new PAT is found after a
+    /// tune (`check_new_transponder`, stream.cpp:880).
+    pub fn discard_front(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.data.len()) / TS_PACKET_SIZE * TS_PACKET_SIZE;
+        self.data.drain(..bytes);
     }
 
     /// Bytes currently buffered.
