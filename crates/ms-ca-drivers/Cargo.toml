@@ -1,0 +1,30 @@
+[package]
+name = "ms-ca-drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# DVB-CSA via libdvbcsa (C++ CMake option DVBCSA); links -ldvbcsa.
+dvbcsa = []
+# iCAM CSA: needs a libdvbcsa that exports dvbcsa_bs_key_set_ecm.
+dvbcsa-icam = ["dvbcsa"]
+
+[dependencies]
+ms-ca = { path = "../ms-ca" }
+ms-config = { path = "../ms-config" }
+ms-tuner = { path = "../ms-tuner" }
+ms-ts = { path = "../ms-ts" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+ms-fakecam = { path = "../ms-fakecam" }
+ms-psi = { path = "../ms-psi" }
+ms-ts = { path = "../ms-ts" }
+
+[lints]
+workspace = true

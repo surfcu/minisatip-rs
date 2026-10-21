@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ms-ts",
+    "crates/ms-psi",
+    "crates/ms-psi/gen-charset",
+    "crates/ms-tuner",
+    "crates/ms-sched",
+    "crates/ms-ca",
+    "crates/ms-ca-drivers",
+    "crates/ms-srt",
+    "crates/ms-net",
+    "crates/ms-config",
+    "crates/ms-harness",
+    "crates/ms-fakecam",
+    "crates/minisatip",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/surfcu/minisatip-rs"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,18 @@
+name: pmt-version
+description: PMT version change and a stream added mid-cycle in the replay capture
+capture: pmtver
+fast: true
+steps:
+  - udp: u1
+  - rtsp:
+      conn: c
+      method: DESCRIBE
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=all"
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=all"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - capture: { from: u1, settle_ms: 50, timeout_ms: 8000 }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }

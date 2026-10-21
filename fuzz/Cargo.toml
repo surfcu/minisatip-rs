@@ -1,0 +1,58 @@
+[package]
+name = "ms-fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ms-psi = { path = "../crates/ms-psi" }
+ms-ts = { path = "../crates/ms-ts" }
+
+[[bin]]
+name = "fuzz_section_assembler"
+path = "fuzz_targets/fuzz_section_assembler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pat"
+path = "fuzz_targets/fuzz_pat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pmt"
+path = "fuzz_targets/fuzz_pmt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sdt"
+path = "fuzz_targets/fuzz_sdt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cat"
+path = "fuzz_targets/fuzz_cat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_charset"
+path = "fuzz_targets/fuzz_charset.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

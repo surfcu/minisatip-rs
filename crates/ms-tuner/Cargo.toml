@@ -1,0 +1,26 @@
+[package]
+name = "ms-tuner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["linux-dvb"]
+# Real /dev/dvb backend (/dev/dvb enumeration and ioctls).
+linux-dvb = []
+# Netceiver FFI to libnetceiver (libmcli); off by default like the C++ NETCVCLIENT probe.
+netceiver = []
+# SRT transport for satipc servers marked `^`; links libsrt through ms-srt.
+srt = ["dep:ms-srt", "ms-srt/srt"]
+
+# satipc uses libc unconditionally, so it stays a plain dependency.
+[dependencies]
+libc = "0.2"
+ms-srt = { path = "../ms-srt", optional = true }
+
+[dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

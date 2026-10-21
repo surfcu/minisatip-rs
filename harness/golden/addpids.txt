@@ -1,0 +1,59 @@
+# scenario addpids
+== 2 rtsp c > SETUP rtsp://127.0.0.1:<RTSP>/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,17,256,257 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 1
+Server: minisatip/<VER>
+Transport: RTP/AVP;unicast;destination=127.0.0.1;source=127.0.0.1;client_port=<u1.rtp>-<u1.rtcp>;server_port=<SRTP+0>-<SRTP+1>
+Session: <SESSION1>;timeout=30
+com.ses.streamID: 1
+== 3 rtsp c > PLAY rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION1>
+CSeq: 2
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=1;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 4 capture u1
+rtp: version=2 pt=33 ssrc=constant seq_gaps=0 bad_payload=0
+ts: period=complete packets=208 sync_errors=0 cc_errors=0 order=d540cc50c2679ce5
+pid 0x0000 packets=32 scrambled=0
+pid 0x0011 packets=16 scrambled=0
+pid 0x0100 packets=32 scrambled=0
+pid 0x0101 packets=128 scrambled=0
+section pid=0x0000 table=0x00 ext=0x0457 v=0 len=16 crc=e38505be count=32
+section pid=0x0011 table=0x42 ext=0x0457 v=0 len=43 crc=76c3bb2f count=16
+section pid=0x0100 table=0x02 ext=0x0001 v=0 len=26 crc=47267c13 count=32
+== 5 rtsp c > SETUP rtsp://127.0.0.1:<RTSP>/?addpids=258&delpids=257 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 3
+Server: minisatip/<VER>
+Transport: RTP/AVP;unicast;destination=127.0.0.1;source=127.0.0.1;client_port=<u1.rtp>-<u1.rtcp>;server_port=<SRTP+0>-<SRTP+1>
+Session: <SESSION1>;timeout=30
+com.ses.streamID: 1
+== 6 rtsp c > PLAY rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION1>
+CSeq: 4
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=1;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 7 capture u1
+rtp: version=2 pt=33 ssrc=constant seq_gaps=0 bad_payload=0
+ts: period=complete packets=112 sync_errors=0 cc_errors=0 order=360441c6be6d2765
+pid 0x0000 packets=32 scrambled=0
+pid 0x0011 packets=16 scrambled=0
+pid 0x0100 packets=32 scrambled=0
+pid 0x0102 packets=32 scrambled=0
+section pid=0x0000 table=0x00 ext=0x0457 v=0 len=16 crc=e38505be count=32
+section pid=0x0011 table=0x42 ext=0x0457 v=0 len=43 crc=76c3bb2f count=16
+section pid=0x0100 table=0x02 ext=0x0001 v=0 len=26 crc=47267c13 count=32
+== 8 rtsp c > TEARDOWN rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 5
+Server: minisatip/<VER>
+Session: <SESSION1>

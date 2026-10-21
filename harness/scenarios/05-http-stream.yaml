@@ -1,0 +1,10 @@
+name: http-stream
+description: HTTP MPEG-TS stream started with a GET carrying SAT>IP parameters
+capture: fta
+fast: true
+steps:
+  - http_stream:
+      name: h
+      path: "/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,17,256,257"
+  - capture: { from: h }
+  - close: h

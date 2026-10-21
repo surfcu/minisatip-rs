@@ -1,0 +1,21 @@
+[package]
+name = "ms-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# SRT output support; links libsrt (through ms-srt) only when enabled.
+srt = ["dep:ms-srt", "ms-srt/srt"]
+
+[dependencies]
+libc = "0.2"
+ms-sched = { path = "../ms-sched" }
+ms-srt = { path = "../ms-srt", optional = true }
+ms-tuner = { path = "../ms-tuner" }
+ms-ts = { path = "../ms-ts" }
+
+[lints]
+workspace = true

@@ -1,0 +1,279 @@
+From ca4d806a9e32de3a2ba067692ba5768972dbb915 Mon Sep 17 00:00:00 2001
+From: surfcu <59124393+surfcu@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 16:31:33 +0300
+Subject: [PATCH] Add file-replay tuner for the differential harness
+
+---
+ CMakeLists.txt  |   6 +-
+ src/adapter.cpp |   3 +
+ src/adapter.h   |   3 +
+ src/replay.cpp  | 198 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 209 insertions(+), 1 deletion(-)
+ create mode 100644 src/replay.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8cb377f..0aec875 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -96,6 +96,7 @@ option(DDCI "Enable DDCI support" ${DDCI_DEFAULT})
+ option(CXX23 "Enable C++23 features (stacktrace)" ${CXX23_DEFAULT})
+ option(DEBUG "Enable debug/sanitizer build" OFF)
+ option(SRT "Enable SRT support" ${SRT_DEFAULT})
++option(REPLAY "Enable the file-replay tuner used by the differential harness" OFF)
+ option(BUILD_TESTING "Build tests" OFF)
+ option(TEST_SANITIZERS "Build tests with AddressSanitizer/LeakSanitizer" ON)
+ 
+@@ -124,7 +125,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ # Generate config.h
+-set(OPTIONS DVBCSA DVBCA NETCVCLIENT LINUXDVB DDCI CXX23 SRT)
++set(OPTIONS DVBCSA DVBCA NETCVCLIENT LINUXDVB DDCI CXX23 SRT REPLAY)
+ set(CONFIG_CONTENT "// Auto-generated configuration header\n#ifndef CONFIG_H\n#define CONFIG_H\n\n")
+ 
+ foreach(OPT ${OPTIONS})
+@@ -227,6 +228,9 @@ endif()
+ if(DDCI)
+     list(APPEND MINISATIP_SOURCES src/ddci.cpp)
+ endif()
++if(REPLAY)
++    list(APPEND MINISATIP_SOURCES src/replay.cpp)
++endif()
+ if(SRT)
+     list(APPEND MINISATIP_SOURCES src/srt.cpp)
+     list(APPEND MINISATIP_LIBS ${SRT_LIBRARY})
+diff --git a/src/adapter.cpp b/src/adapter.cpp
+index 403442a..b357036 100644
+--- a/src/adapter.cpp
++++ b/src/adapter.cpp
+@@ -153,6 +153,9 @@ void find_adapters() {
+         return;
+     init_find_adapter = 1;
+     a_count = 0;
++#ifndef DISABLE_REPLAY
++    find_replay_adapter(a);
++#endif
+ #ifndef DISABLE_LINUXDVB
+     find_dvb_adapter(a);
+ #endif
+diff --git a/src/adapter.h b/src/adapter.h
+index 54c10eb..5b879ca 100644
+--- a/src/adapter.h
++++ b/src/adapter.h
+@@ -193,6 +193,9 @@ int init_hw(int i);
+ int init_all_hw();
+ int getAdaptersCount();
+ adapter *adapter_alloc();
++#ifndef DISABLE_REPLAY
++void find_replay_adapter(adapter **a);
++#endif
+ void adapter_resize_buffers();
+ int close_adapter(int na);
+ int get_free_adapter(transponder *tp);
+diff --git a/src/replay.cpp b/src/replay.cpp
+new file mode 100644
+index 0000000..6aa3ca8
+--- /dev/null
++++ b/src/replay.cpp
+@@ -0,0 +1,198 @@
++/*
++ * File-replay tuner for differential testing (minisatip-rs ms-harness).
++ * MINISATIP_REPLAY=<file.ts> adds MINISATIP_REPLAY_ADAPTERS (default 1)
++ * adapters that loop over the file; MINISATIP_REPLAY_BITRATE paces it.
++ */
++#include "adapter.h"
++#include "dvb.h"
++#include "minisatip.h"
++#include "utils.h"
++#include "utils/logging/logging.h"
++
++#include <atomic>
++#include <chrono>
++#include <errno.h>
++#include <fcntl.h>
++#include <mutex>
++#include <poll.h>
++#include <set>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <string>
++#include <thread>
++#include <unistd.h>
++
++#define DEFAULT_LOG LOG_ADAPTER
++
++namespace {
++
++struct ReplayState {
++    std::string path;
++    uint64_t bitrate = 0;
++    int wfd = -1;
++    std::thread thread;
++    std::atomic<bool> stop{false};
++    std::mutex mutex;
++    std::set<int> pids; // 8192 means all PIDs
++};
++
++ReplayState *replay[MAX_ADAPTERS];
++
++// Paces on the whole mux (like a real tuner) and blocks on the pipe, so no
++// packet is dropped; an idle gap restarts the pacing budget.
++void replay_loop(ReplayState *st) {
++    using clock = std::chrono::steady_clock;
++    FILE *f = fopen(st->path.c_str(), "rb");
++    if (!f) {
++        LOG("replay: cannot open %s: %s", st->path.c_str(), strerror(errno));
++        return;
++    }
++    unsigned char packet[188];
++    auto start = clock::now();
++    uint64_t bytes = 0;
++    while (!st->stop) {
++        if (fread(packet, 1, sizeof(packet), f) != sizeof(packet)) {
++            if (ftell(f) < (long)sizeof(packet)) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            }
++            rewind(f);
++            continue;
++        }
++        if (st->bitrate) {
++            bytes += sizeof(packet);
++            auto due = start + std::chrono::microseconds(bytes * 8 * 1000000 /
++                                                         st->bitrate);
++            auto now = clock::now();
++            if (now > due + std::chrono::milliseconds(200)) {
++                start = now;
++                bytes = 0;
++            } else if (due > now) {
++                std::this_thread::sleep_until(due);
++            }
++        }
++        int pid = ((packet[1] & 0x1f) << 8) | packet[2];
++        {
++            std::lock_guard<std::mutex> lock(st->mutex);
++            if (!st->pids.count(8192) && !st->pids.count(pid))
++                continue;
++        }
++        size_t written = 0;
++        while (written < sizeof(packet) && !st->stop) {
++            struct pollfd pfd = {st->wfd, POLLOUT, 0};
++            if (poll(&pfd, 1, 100) <= 0)
++                continue;
++            ssize_t rv = write(st->wfd, packet + written, sizeof(packet) - written);
++            if (rv > 0)
++                written += rv;
++            else if (rv < 0 && errno != EAGAIN && errno != EINTR)
++                break;
++        }
++    }
++    fclose(f);
++}
++
++int replay_open(adapter *ad) {
++    ReplayState *st = replay[ad->id];
++    int fds[2];
++    if (pipe2(fds, O_NONBLOCK)) {
++        LOG("replay: pipe failed: %s", strerror(errno));
++        return 1;
++    }
++    fcntl(fds[0], F_SETPIPE_SZ, 1024 * 1024);
++    ad->dvr = fds[0];
++    st->wfd = fds[1];
++    st->stop = false;
++    {
++        std::lock_guard<std::mutex> lock(st->mutex);
++        st->pids.clear();
++    }
++    ad->fe = 0;
++    ad->strength = 255;
++    ad->snr = 15;
++    ad->status = FE_HAS_LOCK;
++    st->thread = std::thread(replay_loop, st);
++    LOG("replay: adapter %d replays %s at %ju bit/s", ad->id,
++        st->path.c_str(), (uintmax_t)st->bitrate);
++    return 0;
++}
++
++int replay_close(adapter *ad) {
++    ReplayState *st = replay[ad->id];
++    st->stop = true;
++    if (st->thread.joinable())
++        st->thread.join();
++    if (st->wfd >= 0)
++        close(st->wfd);
++    st->wfd = -1;
++    return 0;
++}
++
++int replay_set_pid(adapter *ad, int pid) {
++    ReplayState *st = replay[ad->id];
++    std::lock_guard<std::mutex> lock(st->mutex);
++    st->pids.insert(pid);
++    return 1000 + pid;
++}
++
++int replay_del_filters(adapter *ad, int fd, int pid) {
++    ReplayState *st = replay[ad->id];
++    std::lock_guard<std::mutex> lock(st->mutex);
++    st->pids.erase(pid);
++    return 0;
++}
++
++int replay_tune(int aid, transponder *tp) { return 0; }
++
++fe_delivery_system_t replay_delsys(int aid, int fd, fe_delivery_system_t *sys) {
++    return SYS_UNDEFINED;
++}
++
++// minisatip-rs replay adapters carry no frontend name.
++std::string replay_name(int aid, int fd) { return ""; }
++
++} // namespace
++
++void find_replay_adapter(adapter **a) {
++    const char *path = getenv("MINISATIP_REPLAY");
++    if (!path || !path[0])
++        return;
++    const char *count_env = getenv("MINISATIP_REPLAY_ADAPTERS");
++    const char *rate_env = getenv("MINISATIP_REPLAY_BITRATE");
++    int count = count_env ? atoi(count_env) : 1;
++    if (count < 1)
++        count = 1;
++    // As in minisatip-rs, a replay replaces the DVB adapters; the DVB scan
++    // would also reset pa/fn to -1, so init_all_hw would skip the replay.
++    opts.disable_dvb = 1;
++    for (int i = 0; i < count && a_count < MAX_ADAPTERS; i++) {
++        int na = a_count;
++        if (!a[na])
++            a[na] = adapter_alloc();
++        if (!replay[na])
++            replay[na] = new ReplayState();
++        replay[na]->path = path;
++        replay[na]->bitrate = rate_env ? strtoull(rate_env, NULL, 10) : 0;
++        adapter *ad = a[na];
++        ad->pa = na;
++        ad->fn = 0;
++        ad->open = replay_open;
++        ad->set_pid = replay_set_pid;
++        ad->del_filters = replay_del_filters;
++        ad->commit = NULL;
++        ad->tune = replay_tune;
++        ad->delsys = replay_delsys;
++        ad->name = replay_name;
++        ad->post_init = NULL;
++        ad->close = replay_close;
++        ad->get_signal = NULL;
++        ad->type = ADAPTER_DVB;
++        for (int k = 0; k < MAX_DELSYS; k++)
++            ad->sys[k] = SYS_UNDEFINED;
++        // Same delivery systems as the minisatip-rs replay adapters.
++        ad->sys[0] = (fe_delivery_system_t)SYS_DVBS2;
++        ad->sys[1] = (fe_delivery_system_t)SYS_DVBS;
++        a_count = na + 1;
++    }
++    LOG("replay: %d adapter(s) for %s", a_count, path);
++}
+-- 
+2.53.0
+
