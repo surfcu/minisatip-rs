@@ -31,6 +31,7 @@ use ms_net::web::{ApiFeatures, RuntimeState, WebConfig, WebService, format_ascti
 use ms_sched::{
     AdapterConfig, AdapterTuner, MAX_ADAPTERS, MAX_DELSYS, Scheduler, SwitchType, TuneError,
 };
+use ms_ts::TsStage;
 use ms_tuner::satipc::{
     MAX_DVBAPI_SYSTEMS, SatipServer, SatipcConfig, SatipcTuner, delsys_code, fetch_satip_xml,
     parse_satip_servers, parse_satip_xml,
@@ -46,6 +47,7 @@ use ms_tuner::linux_dvb::{
     TUNER_FORCE_SNR_PERCENT, TUNER_FORCE_STRENGTH_DECIBEL, TUNER_FORCE_STRENGTH_PERCENT,
 };
 
+use crate::ca::CaRuntime;
 use crate::sys;
 
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
@@ -205,6 +207,7 @@ struct Runtime {
     satip: SatipSettings,
     satip_adapters: Vec<SatipAdapter>,
     xml_poll: Option<SatipXmlPoll>,
+    ca: CaRuntime,
 }
 
 impl Runtime {
@@ -224,6 +227,7 @@ impl Runtime {
         let adapter_ids = adapter_ids(opts);
         let mut handles: Vec<Option<AdapterHandle>> = (0..MAX_ADAPTERS).map(|_| None).collect();
         let bandwidth = Arc::new(Bandwidth::new());
+        let mut ca = CaRuntime::new(opts);
 
         if let Some(path) = replay {
             for aid in adapter_ids {
@@ -235,8 +239,13 @@ impl Runtime {
                     },
                 )
                 .map_err(|error| format!("cannot replay {}: {error}", path.display()))?;
-                let handle =
-                    spawn_adapter(opts, aid, Box::new(tuner), Some(Arc::clone(&bandwidth)))?;
+                let handle = spawn_adapter(
+                    opts,
+                    aid,
+                    Box::new(tuner),
+                    Some(Arc::clone(&bandwidth)),
+                    ca.stages(aid),
+                )?;
                 let bridge = DataPlaneTuner::new(handle.command_sender());
                 scheduler.add_adapter(aid, adapter_config(), Box::new(bridge));
                 // 1-based `fe=` -> adapter number, as for DVB adapters below.
@@ -245,13 +254,49 @@ impl Runtime {
             }
         }
         #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
+        if !replay_enabled && !opts.disable_dvb {
+            let dvbca = crate::dvbca::Dvbca::spawn(
+                crate::dvbca::DvbcaSettings::from_options(opts),
+                Box::new(ms_ca_drivers::en50221::sys::DvbCaOpener),
+                Arc::new(ms_ca_drivers::en50221::SystemClock::default()),
+            )
+            .map_err(|error| format!("cannot start the CA thread: {error}"))?;
+            ca.attach_dvbca(&mut scheduler, dvbca);
+            if opts.hw_descrambler {
+                let hw = crate::hw::Hw::new(ms_ca_drivers::hw_descrambler::LinuxCaDevice);
+                ca.attach_hw(&mut scheduler, hw);
+            }
+        }
+        #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
         if !replay_enabled {
+            // find_ddci_adapter: DDCI registers before the tuners get their stages.
+            let nodes = if opts.disable_dvb {
+                Vec::new()
+            } else {
+                crate::ddci::linux::find()
+            };
+            let hub = (!nodes.is_empty()).then(crate::ddci::DdciHub::new);
+            if let Some(hub) = hub.as_ref() {
+                ca.attach_ddci(&mut scheduler, hub.clone());
+            }
             spawn_dvb_adapters(
                 opts,
                 &mut scheduler,
                 &mut handles,
                 Some(Arc::clone(&bandwidth)),
+                &mut ca,
             )?;
+            if let Some(hub) = hub {
+                spawn_ddci_adapters(
+                    opts,
+                    &nodes,
+                    &hub,
+                    &mut scheduler,
+                    &mut handles,
+                    Some(Arc::clone(&bandwidth)),
+                    &mut ca,
+                )?;
+            }
         }
 
         // find_satip_adapter runs after the local adapters (find_adapters).
@@ -264,7 +309,13 @@ impl Runtime {
                 eprintln!("minisatip: MAX_ADAPTERS reached");
                 break;
             };
-            let handle = spawn_satip(&satip, &server, aid, Some(Arc::clone(&bandwidth)))?;
+            let handle = spawn_satip(
+                &satip,
+                &server,
+                aid,
+                Some(Arc::clone(&bandwidth)),
+                ca.stages(aid),
+            )?;
             let bridge = DataPlaneTuner::new(handle.command_sender());
             scheduler.add_adapter(aid, satipc_adapter_config(&server), Box::new(bridge));
             handles[aid] = Some(handle);
@@ -293,6 +344,12 @@ impl Runtime {
             })
         });
 
+        // pmt_init_device: CAs registered at start-up may handle every adapter.
+        for aid in 0..MAX_ADAPTERS {
+            if scheduler.adapter(aid).is_some() {
+                ca.adapter_added(&mut scheduler, aid);
+            }
+        }
         let mut session = SessionManager::with_scheduler(scheduler);
         session.set_bandwidth(Arc::clone(&bandwidth));
         session.set_start_rtp(config.start_rtp);
@@ -355,6 +412,7 @@ impl Runtime {
             satip,
             satip_adapters,
             xml_poll,
+            ca,
         })
     }
 
@@ -374,6 +432,7 @@ impl Runtime {
             self.expire_streams();
             self.drain_events();
             self.poll_satip_xml();
+            self.ca.tick(self.session.scheduler_mut(), &self.handles);
         }
     }
 
@@ -385,13 +444,21 @@ impl Runtime {
             eprintln!("minisatip: MAX_ADAPTERS reached");
             return Ok(());
         };
-        let handle = spawn_satip(&self.satip, &server, aid, Some(Arc::clone(&self.bandwidth)))?;
+        let stages = self.ca.stages(aid);
+        let handle = spawn_satip(
+            &self.satip,
+            &server,
+            aid,
+            Some(Arc::clone(&self.bandwidth)),
+            stages,
+        )?;
         let bridge = DataPlaneTuner::new(handle.command_sender());
         self.session.scheduler_mut().add_adapter(
             aid,
             satipc_adapter_config(&server),
             Box::new(bridge),
         );
+        self.ca.adapter_added(self.session.scheduler_mut(), aid);
         self.handles[aid] = Some(handle);
         self.satip_adapters.push(SatipAdapter {
             aid,
@@ -437,6 +504,7 @@ impl Runtime {
                 handle.stop();
             }
             self.session.scheduler_mut().remove_adapter(aid);
+            self.ca.adapter_removed(aid);
         }
         self.satip_adapters
             .retain(|entry| entry.host != host || entry.port != port);
@@ -615,6 +683,9 @@ impl Runtime {
         }
         self.sync_output(id, conn_id, peer, writer);
         self.update_thresholds();
+        // PID changes move PMT claims (pmt_pid_updated_pids); push them to the data planes.
+        self.ca
+            .after_scheduler(self.session.scheduler_mut(), &self.handles);
     }
 
     /// Copies the live RTP sequence into the session for `RTP-Info`
@@ -890,6 +961,7 @@ impl Runtime {
     }
 
     fn drain_events(&mut self) {
+        let mut tables = Vec::new();
         for (aid, handle) in self.handles.iter().enumerate() {
             let Some(handle) = handle else {
                 continue;
@@ -917,8 +989,21 @@ impl Runtime {
                     ms_net::dataplane::Event::ContinuityErrors(errors) => {
                         self.session.set_adapter_ccerr(aid, errors);
                     }
+                    ms_net::dataplane::Event::TablePackets {
+                        generation,
+                        packets,
+                    } => tables.push((aid, generation, packets)),
                 }
             }
+        }
+        for (aid, generation, packets) in tables {
+            self.ca.on_table_packets(
+                self.session.scheduler_mut(),
+                &self.handles,
+                aid,
+                generation,
+                &packets,
+            );
         }
     }
 
@@ -950,6 +1035,7 @@ impl Runtime {
     }
 
     fn shutdown(&mut self) {
+        self.ca.shutdown();
         let ids: Vec<i32> = self.outputs.keys().copied().collect();
         for id in ids {
             self.stop_output(id);
@@ -1265,6 +1351,7 @@ fn spawn_adapter(
     aid: usize,
     tuner: Box<dyn Tuner + Send>,
     bandwidth: Option<Arc<Bandwidth>>,
+    stages: Vec<Box<dyn TsStage>>,
 ) -> Result<AdapterHandle, String> {
     let buffer = usize::try_from(opts.adapter_buffer)
         .ok()
@@ -1276,6 +1363,7 @@ fn spawn_adapter(
         buffer,
         ms_net::dataplane::clamp_threshold(opts.udp_threshold),
         bandwidth,
+        stages,
     )
 }
 
@@ -1285,9 +1373,10 @@ fn spawn_adapter_with(
     buffer: usize,
     threshold_ms: i64,
     bandwidth: Option<Arc<Bandwidth>>,
+    stages: Vec<Box<dyn TsStage>>,
 ) -> Result<AdapterHandle, String> {
     let adapter_id = i32::try_from(aid).map_err(|_| format!("adapter index {aid} out of range"))?;
-    AdapterHandle::spawn_with_bandwidth(
+    AdapterHandle::spawn_with_stages(
         tuner,
         DataPlaneConfig {
             adapter_id,
@@ -1295,6 +1384,7 @@ fn spawn_adapter_with(
             threshold_ms,
         },
         bandwidth,
+        stages,
     )
     .map_err(|error| format!("cannot start adapter {aid}: {error}"))
 }
@@ -1305,6 +1395,7 @@ fn spawn_satip(
     server: &SatipServer,
     aid: usize,
     bandwidth: Option<Arc<Bandwidth>>,
+    stages: Vec<Box<dyn TsStage>>,
 ) -> Result<AdapterHandle, String> {
     let (strength, snr) = settings.signal_multipliers(aid);
     let config = SatipcConfig {
@@ -1336,6 +1427,7 @@ fn spawn_satip(
         buffer,
         settings.threshold_ms,
         bandwidth,
+        stages,
     )
 }
 
@@ -1399,6 +1491,7 @@ fn spawn_dvb_adapters(
     scheduler: &mut Scheduler,
     handles: &mut [Option<AdapterHandle>],
     bandwidth: Option<Arc<Bandwidth>>,
+    ca: &mut CaRuntime,
 ) -> Result<(), String> {
     if opts.disable_dvb {
         return Ok(());
@@ -1431,15 +1524,27 @@ fn spawn_dvb_adapters(
             ) {
                 Ok(mut tuner) => {
                     apply_tuner_options(opts, aid, &diseqc, &mut tuner);
+                    ca.set_hw_node(
+                        aid,
+                        frontend.path_adapter as i32,
+                        frontend.path_frontend as i32,
+                    );
                     let handle = spawn_adapter_with(
                         aid,
                         Box::new(tuner),
                         buffer,
                         ms_net::dataplane::clamp_threshold(opts.udp_threshold),
                         bandwidth.clone(),
+                        ca.stages(aid),
                     )?;
                     let bridge = DataPlaneTuner::new(handle.command_sender());
                     handles[aid] = Some(handle);
+                    // init_hw -> pmt_init_device -> dvbca_init_dev (ca.cpp:3891).
+                    ca.dvbca_init_dev(ms_ca_drivers::en50221::AdapterInfo::dvb(
+                        aid as i32,
+                        frontend.path_adapter,
+                        frontend.path_frontend,
+                    ));
                     Box::new(bridge)
                 }
                 Err(error) => {
@@ -1459,6 +1564,65 @@ fn spawn_dvb_adapters(
         // `get_adapter_nw` reads `fe_map[fe - 1]`, so `?fe=N` selects
         // adapter N-1 unless `-s` installs another map.
         scheduler.set_fe_map_entry(aid, aid as i16);
+    }
+    Ok(())
+}
+
+/// Opens each DDCI device as a CI adapter after the tuners (`find_ddci_adapter`,
+/// `ddci_open_device`, `ddci_post_init`).
+#[cfg(all(feature = "linux-dvb", target_os = "linux"))]
+fn spawn_ddci_adapters(
+    opts: &Options,
+    nodes: &[crate::ddci::linux::DdciNode],
+    hub: &crate::ddci::DdciHub,
+    scheduler: &mut Scheduler,
+    handles: &mut [Option<AdapterHandle>],
+    bandwidth: Option<Arc<Bandwidth>>,
+    ca: &mut CaRuntime,
+) -> Result<(), String> {
+    for node in nodes {
+        let Some(aid) = (0..MAX_ADAPTERS).find(|aid| handles[*aid].is_none()) else {
+            break;
+        };
+        let (reader, writer) = match crate::ddci::linux::open(node) {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("minisatip: DDCI adapter{}/sec{}: {error}", node.pa, node.fe);
+                continue;
+            }
+        };
+        hub.open_device(aid, Box::new(writer));
+        let buffer = usize::try_from(opts.adapter_buffer)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
+        let handle = spawn_adapter_with(
+            aid,
+            Box::new(reader),
+            buffer,
+            ms_net::dataplane::clamp_threshold(opts.udp_threshold),
+            bandwidth.clone(),
+            ca.ci_stages(aid),
+        )?;
+        // The CAM output is read without client streams (ddci_read_sec_data).
+        handle.send(Command::KeepReading(true));
+        let bridge = DataPlaneTuner::new(handle.command_sender());
+        let config = AdapterConfig {
+            enabled: true,
+            adapter_type: ms_sched::AdapterType::Ci,
+            ..AdapterConfig::default()
+        };
+        scheduler.add_adapter(aid, config, Box::new(bridge));
+        handles[aid] = Some(handle);
+        scheduler.post_tune_adapter(aid);
+        ca.adapter_added(scheduler, aid);
+        ca.dvbca_init_dev(ms_ca_drivers::en50221::AdapterInfo {
+            id: aid as i32,
+            enabled: true,
+            kind: ms_ca_drivers::en50221::AdapterKind::Ci,
+            pa: node.pa,
+            fe: node.fe,
+        });
     }
     Ok(())
 }

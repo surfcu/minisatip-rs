@@ -2465,3 +2465,81 @@ fn version_update_keeps_claims() {
     sched.del_filter(fid);
     sched.free_all_pmts();
 }
+
+// Wiring additions (not ports): pmt_tune, CA masks and filter queries.
+
+#[test]
+fn post_tune_arms_pat_and_sdt_filters_once() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    sched.post_tune_adapter(0);
+    assert_eq!(sched.section_pids(0), vec![0, 17]);
+    let pat = sched.filters_for_pid(0, 0);
+    assert_eq!(pat.len(), 1);
+    assert_eq!(sched.filter_slot(pat[0]).unwrap().target, FilterTarget::Pat);
+    assert_eq!(
+        sched.filter_slot(pat[0]).unwrap().flags,
+        FILTER_PERMANENT | FILTER_CRC
+    );
+    // A retune reuses the permanent filters (pmt_tune checks pat_filter == -1).
+    sched.post_tune_adapter(0);
+    assert_eq!(sched.filters_for_pid(0, 0), pat);
+    assert_eq!(sched.filters_for_pid(0, 17).len(), 1);
+}
+
+#[test]
+fn ci_adapters_only_get_pid_zero_on_post_tune() {
+    let mut sched = test_sched(AdapterType::Ci);
+    sched.post_tune_adapter(0);
+    assert_eq!(sched.adapter(0).unwrap().active_pids(), vec![0]);
+    let mut dvb = test_sched(AdapterType::Dvb);
+    dvb.post_tune_adapter(0);
+    assert_eq!(dvb.adapter(0).unwrap().active_pids(), vec![0, 1, 16, 18]);
+}
+
+#[test]
+fn ca_masks_follow_registration_and_restart() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let log = Rc::new(RefCell::new(CaLog::default()));
+    let ca = sched.add_ca(Box::new(FakeCa(log.clone())));
+    // An unregistered CA id never reaches the adapter mask.
+    sched.init_ca_for_adapter(0, ca + 1);
+    assert_eq!(sched.adapter_ca_mask(0), 0);
+    sched.init_ca_for_adapter(0, ca);
+    assert_eq!(sched.adapter_ca_mask(0), 1 << ca);
+
+    let pmt = sched.pmt_add(0, SID_KEPT, PID_KEPT);
+    sched.pmt_add_caid(pmt, 0x0B00, 0x500, &[]);
+    sched.send_pmt_to_cas(0, pmt);
+    assert_eq!(pmt_ca_mask(&sched, pmt), 1 << ca);
+    sched.restart_pmt_for_ca(ca, pmt);
+    assert_eq!(pmt_ca_mask(&sched, pmt), 0, "restart must allow a resend");
+    assert_eq!(log.borrow().del_calls, 1);
+
+    sched.send_pmt_to_cas(0, pmt);
+    sched.pmt_slot_mut(pmt).unwrap().disabled_ca_mask = 1 << ca;
+    sched.clear_pmt_ca_masks(pmt, ca, true);
+    let slot = sched.pmt_slot(pmt).unwrap();
+    assert_eq!(
+        (slot.ca_mask, slot.ca_registered_mask, slot.disabled_ca_mask),
+        (0, 0, 0)
+    );
+
+    sched.close_ca_for_adapter(0);
+    assert_eq!(sched.adapter_ca_mask(0), 0);
+}
+
+#[test]
+fn ca_service_carries_pcr_and_av_pids() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let log = Rc::new(RefCell::new(CaLog::default()));
+    let ca = sched.add_ca(Box::new(FakeCa(log.clone())));
+    sched.init_ca_for_adapter(0, ca);
+    let pmt = sched.pmt_add(0, SID_KEPT, PID_KEPT);
+    sched.pmt_add_caid(pmt, 0x0B00, 0x500, &[]);
+    sched.pmt_add_stream_pid(pmt, 1001, 2, false, true);
+    sched.pmt_add_stream_pid(pmt, 1002, 6, false, false);
+    sched.pmt_slot_mut(pmt).unwrap().pcr_pid = 1003;
+    let service = sched.ca_service(pmt).unwrap();
+    assert_eq!(service.pcr_pid, 1003);
+    assert_eq!(service.av_pids, vec![1001]);
+}

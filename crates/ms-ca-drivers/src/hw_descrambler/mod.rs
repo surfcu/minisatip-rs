@@ -15,12 +15,14 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::sync::{Arc, Mutex};
 
 pub use device::*;
 #[cfg(target_os = "linux")]
 pub use sys::LinuxCaDevice;
 
 use crate::algo::{Algo, AlgoOp, AlgoRegistry, Backend};
+use crate::descramble::{Cipher, KeyMaterial};
 
 /// Slots assumed when `CA_GET_DESCR_INFO` is unavailable.
 pub const DEFAULT_MAX_DESCRAMBLERS: i32 = 16;
@@ -443,4 +445,66 @@ impl<D: CaDevice> HwDescrambler<D> {
         }
         0
     }
+}
+
+/// A hardware cipher: programming the CA device is the whole job, the demux
+/// clears the packets (`hw_decrypt_stream` is a pass-through).
+pub struct HwCipher<D: CaDevice + Send> {
+    hw: Arc<Mutex<HwDescrambler<D>>>,
+    adapter: HwAdapter,
+    algo: Algo,
+    pmt_id: usize,
+    parity: u8,
+    pids: Vec<u16>,
+}
+
+impl<D: CaDevice + Send> HwCipher<D> {
+    /// A cipher for one algorithm on one adapter.
+    pub fn new(hw: Arc<Mutex<HwDescrambler<D>>>, adapter: HwAdapter, algo: Algo) -> Self {
+        Self {
+            hw,
+            adapter,
+            algo,
+            pmt_id: 0,
+            parity: 0,
+            pids: Vec::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HwDescrambler<D>> {
+        self.hw.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl<D: CaDevice + Send> Cipher for HwCipher<D> {
+    fn set_context(&mut self, pmt_id: usize, parity: u8, pids: &[u16]) {
+        self.pmt_id = pmt_id;
+        self.parity = parity;
+        self.pids = pids.to_vec();
+    }
+
+    fn set_cw(&mut self, key: &KeyMaterial) {
+        let mut cw = HwCw {
+            algo: self.algo,
+            parity: self.parity,
+            ..HwCw::default()
+        };
+        cw.cw[..8].copy_from_slice(&key.cw[..8]);
+        if key.cw_len > 8 {
+            cw.cw.copy_from_slice(&key.cw[..16]);
+        }
+        cw.iv.copy_from_slice(&key.iv[..16]);
+        HwDescrambler::<D>::create_key(&mut cw);
+        let pmt = HwPmt {
+            id: self.pmt_id,
+            adapter: Some(self.adapter.id),
+            enabled: true,
+            stream_pids: self.pids.clone(),
+        };
+        let mut reg = HwRegistry::default();
+        reg.adapters.insert(self.adapter.id, self.adapter);
+        self.lock().set_cw(&mut cw, &pmt, &reg);
+    }
+
+    fn decrypt(&mut self, _key: &KeyMaterial, _payloads: &mut [&mut [u8]]) {}
 }

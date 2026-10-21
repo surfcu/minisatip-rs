@@ -47,7 +47,7 @@ impl Cipher for NullCipher {
 
 fn null_csa_registry() -> CipherRegistry {
     let mut registry = CipherRegistry::empty();
-    registry.register(CwAlgo::Csa, || Box::new(NullCipher));
+    registry.register(CwAlgo::Csa, std::sync::Arc::new(|| Box::new(NullCipher)));
     registry
 }
 
@@ -268,7 +268,10 @@ fn cw_slots_fill_up_and_expired_slots_are_reused() {
 #[test]
 fn slots_of_another_algorithm_are_not_reused() {
     let mut registry = null_csa_registry();
-    registry.register(CwAlgo::Aes128Ecb, || Box::new(AesEcb::default()));
+    registry.register(
+        CwAlgo::Aes128Ecb,
+        std::sync::Arc::new(|| Box::new(AesEcb::default())),
+    );
     let mut d = Descrambler::new(registry);
     d.add_service(1, &[]);
     assert_eq!(send(&mut d, 1, CwAlgo::Csa, 0, &CW0, NOW), 0);
@@ -749,4 +752,22 @@ fn csa_test_vector_decrypts_with_cw0_only() {
     d.decrypt_stream(&mut buf, NOW);
     assert_eq!(&buf[4..7], &[0, 0, 1]);
     assert_eq!(buf[3], 0x19);
+}
+
+#[test]
+fn updating_service_pids_keeps_the_control_words() {
+    let mut d = Descrambler::new(null_csa_registry());
+    d.add_service(1, &[0x100]);
+    assert_eq!(send(&mut d, 1, CwAlgo::Csa, 0, &CW0, NOW), 0);
+    d.set_service_pids(1, &[0x100, 0x101]);
+    assert!(
+        d.slot(0)
+            .is_some_and(|(pmt, _, _, enabled)| pmt == 1 && enabled)
+    );
+    // add_service is the reset path: it drops the CWs.
+    d.add_service(1, &[0x100]);
+    assert!(d.slot(0).is_some_and(|(_, _, _, enabled)| !enabled));
+    // An unknown service is added.
+    d.set_service_pids(2, &[0x200]);
+    assert!(d.has_service(2));
 }

@@ -267,6 +267,19 @@ impl DvbapiClient {
         self.now = now;
     }
 
+    /// Time last given to [`Self::set_time`] or [`Self::poll`] (ms).
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+
+    /// PMT of the live key owning a section filter.
+    pub fn pmt_for_filter(&self, id: FilterId) -> Option<usize> {
+        self.keys
+            .iter()
+            .find(|k| k.enabled && k.filters.iter().any(|f| f.id == Some(id)))
+            .map(|k| k.pmt_id)
+    }
+
     /// Settings in use.
     pub fn config(&self) -> &DvbapiConfig {
         &self.cfg

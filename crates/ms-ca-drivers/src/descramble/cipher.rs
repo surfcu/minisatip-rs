@@ -1,5 +1,7 @@
 //! Cipher backends behind one trait (the C++ `SCW_op` table).
 
+use std::sync::Arc;
+
 use ms_ca::CwAlgo;
 
 use super::aes::{Aes128, BLOCK};
@@ -32,6 +34,8 @@ impl KeyMaterial {
 
 /// One key instance of an algorithm (`create_cw`/`set_cw`/`stop_cw`/`decrypt_stream`).
 pub trait Cipher: Send {
+    /// The PMT, parity and live PIDs the next key belongs to (`SCW` callers).
+    fn set_context(&mut self, _pmt_id: usize, _parity: u8, _pids: &[u16]) {}
     /// Loads a new key (`set_cw`).
     fn set_cw(&mut self, key: &KeyMaterial);
     /// The key is being replaced or dropped (`stop_cw`).
@@ -40,8 +44,9 @@ pub trait Cipher: Send {
     fn decrypt(&mut self, key: &KeyMaterial, payloads: &mut [&mut [u8]]);
 }
 
-/// Creates a key instance (`create_cw`).
-pub type CipherFactory = fn() -> Box<dyn Cipher>;
+/// Creates a key instance (`create_cw`); shared so hardware ciphers can
+/// capture their device.
+pub type CipherFactory = Arc<dyn Fn() -> Box<dyn Cipher> + Send + Sync>;
 
 /// Registered algorithms in priority order (`register_algo`/`get_op_for_algo`).
 #[derive(Clone, Default)]
@@ -60,9 +65,18 @@ impl CipherRegistry {
         let mut registry = Self::empty();
         #[cfg(feature = "dvbcsa")]
         super::csa::register(&mut registry);
-        registry.register(CwAlgo::Aes128Ecb, || Box::new(AesEcb::default()));
-        registry.register(CwAlgo::Aes128Cbc, || Box::new(AesCbc));
+        registry.register(CwAlgo::Aes128Ecb, Arc::new(|| Box::new(AesEcb::default())));
+        registry.register(CwAlgo::Aes128Cbc, Arc::new(|| Box::new(AesCbc)));
         registry
+    }
+
+    /// Appends every algorithm of `other` not registered here yet, as fallbacks.
+    pub fn extend_missing(&mut self, other: &CipherRegistry) {
+        for (algo, factory) in &other.ops {
+            if self.get(*algo).is_none() {
+                self.register(*algo, Arc::clone(factory));
+            }
+        }
     }
 
     /// Appends an algorithm; `false` when `MAX_OPS` are registered.
@@ -76,7 +90,10 @@ impl CipherRegistry {
 
     /// The first factory registered for `algo`.
     pub fn get(&self, algo: CwAlgo) -> Option<CipherFactory> {
-        self.ops.iter().find(|(a, _)| *a == algo).map(|(_, f)| *f)
+        self.ops
+            .iter()
+            .find(|(a, _)| *a == algo)
+            .map(|(_, f)| Arc::clone(f))
     }
 }
 

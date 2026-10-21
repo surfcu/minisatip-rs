@@ -41,6 +41,18 @@ impl Algo {
     }
 }
 
+impl From<ms_ca::CwAlgo> for Algo {
+    fn from(algo: ms_ca::CwAlgo) -> Self {
+        match algo {
+            ms_ca::CwAlgo::Csa => Self::Csa,
+            ms_ca::CwAlgo::Des => Self::Des,
+            ms_ca::CwAlgo::Aes128Ecb => Self::Aes128Ecb,
+            ms_ca::CwAlgo::Aes128Cbc => Self::Aes128Cbc,
+            ms_ca::CwAlgo::CsaIcam => Self::CsaIcam,
+        }
+    }
+}
+
 /// Which implementation registered an algorithm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {

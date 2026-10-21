@@ -209,6 +209,29 @@ impl Descrambler {
         );
     }
 
+    /// Remaps a tracked service's PIDs, keeping its CWs (`p->pmt` claim moves).
+    pub fn set_service_pids(&mut self, pmt_id: usize, pids: &[u16]) {
+        let Some(service) = self.services.get_mut(&pmt_id) else {
+            self.add_service(pmt_id, pids);
+            return;
+        };
+        for &pid in &service.pids {
+            if self.pid_pmt[pid as usize] == pmt_id as u32 {
+                self.pid_pmt[pid as usize] = NO_PMT;
+            }
+        }
+        service.pids = pids.iter().copied().filter(|&p| p < 8192).collect();
+        for &pid in &service.pids {
+            self.pid_pmt[pid as usize] = pmt_id as u32;
+        }
+        let pids = service.pids.clone();
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.pmt == pmt_id {
+                slot.cipher.set_context(pmt_id, slot.parity, &pids);
+            }
+        }
+    }
+
     /// Drops a service and disables its CWs (`pmt_del` + `clear_cw_for_pmt`).
     pub fn remove_service(&mut self, pmt_id: usize) {
         let Some(service) = self.services.remove(&pmt_id) else {
@@ -384,6 +407,7 @@ impl Descrambler {
             key.iv[..n].copy_from_slice(&iv[..n]);
         }
 
+        let pids = self.services[&pmt_id].pids.clone();
         let slot = self.slots[id].get_or_insert_with(|| CwSlot {
             enabled: false,
             key,
@@ -410,6 +434,7 @@ impl Descrambler {
         slot.algo = algo;
         slot.pmt = pmt_id;
         slot.parity = parity;
+        slot.cipher.set_context(pmt_id, parity, &pids);
         slot.cipher.set_cw(&slot.key);
         slot.enabled = true;
 

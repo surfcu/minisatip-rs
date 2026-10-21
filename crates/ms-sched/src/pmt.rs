@@ -29,6 +29,8 @@ pub const FILTER_PERMANENT: i32 = 4;
 pub const FILTER_REVERSE: i32 = 8;
 /// Filter flag: verify the section CRC (`FILTER_CRC`).
 pub const FILTER_CRC: i32 = 16;
+/// Filter flag: EMM sections, matched one by one after assembly (`FILTER_EMM`).
+pub const FILTER_EMM: i32 = 32;
 /// Subscription marker DDCI uses on CI adapters (`DDCI_SID`).
 pub const DDCI_SID: StreamId = 257; // MAX_STREAMS + 1 (stream.h:13)
 
@@ -1069,6 +1071,105 @@ impl Scheduler {
         }
     }
 
+    /// Lets CA `ca` handle the adapter once its `ca_init_dev` accepted it
+    /// (`tables_init_ca_for_device`).
+    pub fn init_ca_for_adapter(&mut self, aid: usize, ca: i32) {
+        let registered = usize::try_from(ca)
+            .ok()
+            .and_then(|slot| self.pmt.ca.get(slot))
+            .is_some_and(Option::is_some);
+        if let Some(adapter) = self.adapter_mut(aid)
+            && registered
+        {
+            adapter.ca_mask |= 1u64 << ca;
+        }
+    }
+
+    /// Clears every CA of the adapter (`tables_close_device`).
+    pub fn close_ca_for_adapter(&mut self, aid: usize) {
+        if let Some(adapter) = self.adapter_mut(aid) {
+            adapter.ca_mask = 0;
+        }
+    }
+
+    /// CAs handling the adapter (`ad->ca_mask`).
+    pub fn adapter_ca_mask(&self, aid: usize) -> u64 {
+        self.adapter(aid).map_or(0, |adapter| adapter.ca_mask)
+    }
+
+    /// Clears one CA's bits of a PMT so it is offered again
+    /// (`tables_clear_pmt_ca_masks`, used by `ca_release_pmts`).
+    pub fn clear_pmt_ca_masks(&mut self, pmt_id: i32, ca: i32, clear_disabled: bool) {
+        let Ok(slot) = u32::try_from(ca) else {
+            return;
+        };
+        let mask = 1u64.checked_shl(slot).unwrap_or(0);
+        if let Some(pmt) = self.pmt_slot_mut(pmt_id)
+            && pmt.enabled
+        {
+            pmt.ca_mask &= !mask;
+            pmt.ca_registered_mask &= !mask;
+            if clear_disabled {
+                pmt.disabled_ca_mask &= !mask;
+            }
+        }
+    }
+
+    /// Drops the PMT's registration with one CA so the next
+    /// `start_active_pmts` offers it again (`close_pmt_for_ca`).
+    pub fn restart_pmt_for_ca(&mut self, ca: i32, pmt_id: i32) {
+        let Some(aid) = self.pmt(pmt_id).map(|pmt| pmt.adapter) else {
+            return;
+        };
+        self.close_pmt_for_ca(ca, aid, pmt_id);
+    }
+
+    /// Arms the PAT/SDT filters and drops the previous mux's PMTs (`pmt_tune`).
+    pub fn pmt_tune(&mut self, aid: i32) {
+        let Some(index) = self.adapter_index(aid) else {
+            return;
+        };
+        let (pat, sdt) = match self.adapters[index].as_ref() {
+            Some(adapter) => (adapter.pat_filter, adapter.sdt_filter),
+            None => return,
+        };
+        if pat == -1 {
+            let id = self.add_filter(aid, 0, FilterTarget::Pat, FILTER_PERMANENT | FILTER_CRC);
+            if let Some(adapter) = self.adapters[index].as_mut() {
+                adapter.pat_filter = id;
+            }
+        }
+        if sdt == -1 {
+            let id = self.add_filter(aid, 17, FilterTarget::Sdt, FILTER_PERMANENT | FILTER_CRC);
+            if let Some(adapter) = self.adapters[index].as_mut() {
+                adapter.sdt_filter = id;
+            }
+        }
+        self.clear_pmt_for_adapter(aid);
+    }
+
+    /// PIDs of the adapter's enabled filters, ascending.
+    pub fn section_pids(&self, aid: i32) -> Vec<u16> {
+        let pids: BTreeSet<u16> = self
+            .pmt
+            .filters
+            .iter()
+            .filter(|filter| filter.enabled && filter.adapter == aid)
+            .filter_map(|filter| u16::try_from(filter.pid).ok())
+            .collect();
+        pids.into_iter().collect()
+    }
+
+    /// Enabled filters of one adapter PID in slot order (the `next_filter` chain).
+    pub fn filters_for_pid(&self, aid: i32, pid: i32) -> Vec<i32> {
+        self.pmt
+            .filters
+            .iter()
+            .filter(|filter| filter.enabled && filter.adapter == aid && filter.pid == pid)
+            .map(|filter| filter.id as i32)
+            .collect()
+    }
+
     /// Offers the PMT to every enabled CA (`send_pmt_to_cas`).
     pub fn send_pmt_to_cas(&mut self, aid: i32, pmt_id: i32) {
         let Some(pmt) = self.pmt(pmt_id) else {
@@ -1222,6 +1323,7 @@ impl Scheduler {
             tsid,
             sid: pmt.sid as u16,
             pmt_pid: pmt.pid as u16,
+            pcr_pid: pmt.pcr_pid as u16,
             ca: pmt.ca[..pmt.caids]
                 .iter()
                 .map(|ca| CaServiceDescriptor {
@@ -1237,6 +1339,12 @@ impl Scheduler {
                     stream_type: stream.stream_type as u8,
                     pid: stream.pid as u16,
                 })
+                .collect(),
+            av_pids: pmt
+                .stream_pids
+                .iter()
+                .filter(|stream| stream.is_audio || stream.is_video)
+                .map(|stream| stream.pid as u16)
                 .collect(),
         })
     }
