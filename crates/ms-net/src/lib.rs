@@ -6,6 +6,7 @@ pub mod bind;
 pub mod describe;
 pub mod fifo;
 pub mod handler;
+pub mod output;
 pub mod response;
 pub mod rtcp;
 pub mod rtp;
