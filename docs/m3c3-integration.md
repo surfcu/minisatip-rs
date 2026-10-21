@@ -60,17 +60,23 @@ adapter.stop();                                     // adapter close
 - `OutputClosed(sid)` → a write failed (client gone): close the stream like C++.
 - `OutputStopped(sid, stats)` → reply to `stop_output`.
 - `TunerError(text)` → log; C++ handles tune errors in `tune()`.
+- `ContinuityErrors(total)` → `SessionManager::set_adapter_ccerr`, exposed as `ad_ccerr`.
 
 ## Left for the integration step
 
-- Session timeout (`sid->timeout`, `stream_timeout`'s close path) stays in the session
-  layer; the data plane only does keepalive RTP (1 s idle) and RTCP (≥ 200 ms).
+- Session timeout (`sid->timeout`, `stream_timeout`'s close path) lives in the session
+  layer (`expired_streams` on an injectable `Clock`); the data plane only does
+  keepalive RTP (1 s idle) and RTCP (≥ 200 ms). The runtime calls `expired_streams`
+  each control-loop tick and closes the returned streams, releasing adapters.
 - `adapter_update_threshold` needs global stream knowledge: call `adapter_threshold`
   from the scheduler whenever streams are added/removed and send `SetThreshold`.
 - The tuner PID filter is the union of the outputs' sets; once `ms-sched` owns
   `update_pids`, decide whether the scheduler or the data plane calls `set_pids`.
-- Not ported yet: `check_new_transponder`/`wait_new_stream` (drop data for 200 ms
-  after a tune), `wait_pusi`, `check_cc`, PMT processing, SRT output (M3 SRT part).
+- Implemented in M3: `check_new_transponder`/`wait_new_stream` (200 ms PAT search
+  after a tune, buffer truncated at the new PAT), `check_cc` (aggregate continuity
+  errors; see DEV-111/112) and SRT output (chunked `srt_send` on an accepted socket,
+  behind the `srt` feature).
+- Still for later milestones: `wait_pusi`, PMT processing and CA decoding (DEV-113).
 - `start_play` sets `flush_enqued_data` on the RTSP socket; for TCP streams that
   socket's queue now lives in the data plane, so forward it as a command if needed.
 - `describe_adapter` is shared with DESCRIBE SDP; `TuneParams.mtype`/`fec` should
