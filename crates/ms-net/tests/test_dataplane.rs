@@ -6,9 +6,10 @@ use ms_net::dataplane::{
 };
 use ms_net::output::{OutputConfig, StreamOutput, UdpTarget};
 use ms_tuner::{
-    DeliverySystem, FileReplayConfig, FileReplayTuner, PidSet, Polarization, TuneParams,
+    DeliverySystem, FileReplayConfig, FileReplayTuner, PidSet, Polarization, Result, SignalStatus,
+    TsBuf, TuneParams, Tuner,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -214,6 +215,148 @@ fn file_replay_to_udp_routes_only_subscribed_pids() {
 
     adapter.stop();
     let _ = std::fs::remove_file(path);
+}
+
+/// A tuner that emits scripted chunks once, optionally sleeping first.
+struct ScriptedTuner {
+    chunks: VecDeque<(Duration, Vec<u8>)>,
+    wait: bool,
+}
+
+impl ScriptedTuner {
+    fn new(wait: bool, chunks: Vec<(Duration, Vec<u8>)>) -> Self {
+        Self {
+            chunks: chunks.into(),
+            wait,
+        }
+    }
+}
+
+impl Tuner for ScriptedTuner {
+    fn tune(&mut self, _params: &TuneParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_pids(&mut self, _pids: &PidSet) -> Result<()> {
+        Ok(())
+    }
+
+    fn status(&self) -> SignalStatus {
+        SignalStatus {
+            locked: true,
+            strength: 255,
+            snr: 15,
+        }
+    }
+
+    fn read(&mut self, buf: &mut TsBuf) -> Result<usize> {
+        let Some((delay, data)) = self.chunks.pop_front() else {
+            return Ok(0);
+        };
+        std::thread::sleep(delay);
+        Ok(buf.push_data(&data))
+    }
+
+    fn take_wait_new_stream(&mut self) -> bool {
+        std::mem::take(&mut self.wait)
+    }
+}
+
+fn pat_packet(tsid: u16) -> [u8; 188] {
+    let mut packet = [0xFFu8; 188];
+    packet[0] = 0x47;
+    packet[1] = 0x40;
+    packet[2] = 0;
+    packet[8] = (tsid >> 8) as u8;
+    packet[9] = tsid as u8;
+    packet
+}
+
+fn chunk(pid: u16, count: u32) -> Vec<u8> {
+    (0..count).flat_map(|index| ts_packet(pid, index)).collect()
+}
+
+fn scripted_adapter(
+    tuner: ScriptedTuner,
+    rx: &UdpSocket,
+    pids: impl IntoIterator<Item = u16>,
+) -> AdapterHandle {
+    let config = DataPlaneConfig {
+        adapter_buffer: 100 * 188,
+        ..DataPlaneConfig::default()
+    };
+    let adapter = AdapterHandle::spawn(Box::new(tuner), config).unwrap();
+    adapter.start_output(
+        1,
+        output_to(rx.local_addr().unwrap(), 1),
+        PidSet::from_pids(pids),
+    );
+    adapter
+}
+
+// src_satipc.cpp:211-216 + src_stream.cpp:1241-1259: after PLAY the data plane
+// drops the old transponder until the new PAT transport_stream_id arrives.
+#[test]
+fn satipc_wait_new_stream_flushes_old_transponder() {
+    let (rx, _rtcp) = udp_pair();
+    let mut new = pat_packet(0x2222).to_vec();
+    new.extend_from_slice(&chunk(0x100, 10));
+    let tuner = ScriptedTuner::new(
+        true,
+        vec![(Duration::ZERO, chunk(0x101, 10)), (Duration::ZERO, new)],
+    );
+    let adapter = scripted_adapter(tuner, &rx, [0, 0x100, 0x101]);
+
+    let (received, _) = collect(&rx, 11);
+    assert!(
+        !received.contains_key(&0x101),
+        "old-transponder packets must be flushed"
+    );
+    assert_eq!(received.get(&0).map(Vec::len), Some(1), "new PAT must flow");
+    assert_eq!(
+        received.get(&0x100).map(Vec::len),
+        Some(10),
+        "packets after the new PAT must flow"
+    );
+    adapter.stop();
+}
+
+// src_stream.cpp:1244: the flush window is only 200 ms.
+#[test]
+fn satipc_wait_new_stream_gives_up_after_200ms() {
+    let (rx, _rtcp) = udp_pair();
+    let tuner = ScriptedTuner::new(
+        true,
+        vec![
+            (Duration::ZERO, chunk(0x101, 10)),
+            (Duration::from_millis(250), chunk(0x102, 10)),
+        ],
+    );
+    let adapter = scripted_adapter(tuner, &rx, [0x101, 0x102]);
+
+    let (received, _) = collect(&rx, 10);
+    assert_eq!(
+        received.keys().copied().collect::<Vec<_>>(),
+        vec![0x102],
+        "data after the 200 ms window must flow even without a new PAT"
+    );
+    adapter.stop();
+}
+
+// Only satipc sets `wait_new_stream`; other tuners must not flush.
+#[test]
+fn tuners_without_wait_new_stream_forward_immediately() {
+    let (rx, _rtcp) = udp_pair();
+    let tuner = ScriptedTuner::new(false, vec![(Duration::ZERO, chunk(0x103, 10))]);
+    let adapter = scripted_adapter(tuner, &rx, [0x103]);
+
+    let (received, _) = collect(&rx, 10);
+    assert_eq!(
+        received.keys().copied().collect::<Vec<_>>(),
+        vec![0x103],
+        "the default must forward data"
+    );
+    adapter.stop();
 }
 
 #[test]

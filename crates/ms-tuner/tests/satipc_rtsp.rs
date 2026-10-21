@@ -4,12 +4,16 @@
 mod common;
 
 use std::io::Read;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use common::fake_satip_server::FakeSatipServer;
-use ms_tuner::satipc::{Driver, PidSlot, PidState, SatipServer, SatipcConfig, State, Transport};
+use ms_tuner::satipc::{
+    Driver, MAX_QUALITY, MAX_STRENGTH, PidSlot, PidState, SatipServer, SatipcConfig, State,
+    Transport,
+};
 use ms_tuner::{DeliverySystem, Polarization, TuneParams};
 
 const SETUP_OK: &str = "RTSP/1.0 200 OK\r\nCSeq: 1\r\n\
@@ -64,6 +68,8 @@ fn config(aid: usize, host: &str, port: u16, start_rtp: u16) -> SatipcConfig {
         user_agent: "minisatip test".to_owned(),
         adapter_timeout_ms: 0,
         ignore_signal: false,
+        bind_dev_ip: None,
+        receive_buffer: 0,
     }
 }
 
@@ -508,6 +514,184 @@ fn assert_nothing_tracked(d: &Driver) {
     );
 }
 
+#[allow(unsafe_code)]
+fn receive_buffer(fd: std::os::fd::RawFd) -> i32 {
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: value and length describe the SO_RCVBUF output buffer.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw mut value).cast(),
+            &mut length,
+        )
+    };
+    assert_eq!(result, 0, "getsockopt(SO_RCVBUF)");
+    value
+}
+
+// src_satipc.cpp:605: with both multipliers zero the server signal is ignored;
+// otherwise the reported strength/quality are used.
+#[test]
+fn test_satipc_per_adapter_multipliers_select_signal() {
+    let _serial = serial();
+    let mut ignoring = config(0, "127.0.0.1", 554, 5500);
+    ignoring.ignore_signal = true;
+    let mut d = Driver::new(&ignoring);
+    d.client
+        .set_adapter_signal("tuner=1,106,1,0,538.00,8,dvbc,256qam,6900");
+    assert_eq!(d.client.strength, MAX_STRENGTH, "signal must be forced");
+    assert_eq!(d.client.snr, MAX_QUALITY, "quality must be forced");
+
+    let mut honouring = config(0, "127.0.0.1", 554, 5500);
+    honouring.ignore_signal = false;
+    let mut d = Driver::new(&honouring);
+    d.client
+        .set_adapter_signal("tuner=1,106,1,0,538.00,8,dvbc,256qam,6900");
+    assert_eq!(d.client.strength, 106, "server strength must be kept");
+    assert_eq!(d.client.snr, 7, "AVM quality workaround must apply");
+    assert!(d.client.status, "lock must be reported");
+}
+
+// src_satipc.cpp:395-400: the per-server source is passed to tcp_connect_src.
+#[test]
+fn test_satipc_source_ip_binds_rtsp_socket() {
+    let _serial = serial();
+    let (listener, port) = listen_on_loopback();
+    let mut cfg = config(0, "127.0.0.1", port, 5500);
+    cfg.server.source_ip = "127.0.0.2".to_owned();
+    let mut d = Driver::new(&cfg);
+    d.open_rtsp_socket(true).expect("connect");
+    let (peer, _) = listener.accept().expect("accept");
+    assert_eq!(
+        peer.peer_addr().expect("peer").ip(),
+        Ipv4Addr::new(127, 0, 0, 2),
+        "RTSP connection must use the per-server source"
+    );
+}
+
+// src_satipc.cpp:400: without a per-server source, bind_dev_ip() is used.
+#[test]
+fn test_satipc_bind_dev_ip_binds_rtsp_socket() {
+    let _serial = serial();
+    let (listener, port) = listen_on_loopback();
+    let mut cfg = config(0, "127.0.0.1", port, 5500);
+    cfg.bind_dev_ip = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+    let mut d = Driver::new(&cfg);
+    d.open_rtsp_socket(true).expect("connect");
+    let (peer, _) = listener.accept().expect("accept");
+    assert_eq!(
+        peer.peer_addr().expect("peer").ip(),
+        Ipv4Addr::new(127, 0, 0, 2),
+        "RTSP connection must use bind_dev_ip()"
+    );
+}
+
+// socketworks.cpp:427-445: a wrong-family source is ignored, not fatal.
+#[test]
+fn test_satipc_wrong_family_source_is_ignored() {
+    let _serial = serial();
+    let (listener, port) = listen_on_loopback();
+    let mut cfg = config(0, "127.0.0.1", port, 5500);
+    cfg.server.source_ip = "::1".to_owned();
+    let mut d = Driver::new(&cfg);
+    d.open_rtsp_socket(true)
+        .expect("connect without the source");
+    let (peer, _) = listener.accept().expect("accept");
+    assert_eq!(
+        peer.peer_addr().expect("peer").ip(),
+        Ipv4Addr::LOCALHOST,
+        "wrong-family source must be skipped"
+    );
+}
+
+// src_satipc.cpp:816-822: udp_bind(bind_dev_ip(), listen_udp).
+#[test]
+fn test_satipc_bind_dev_ip_binds_rtp_sockets() {
+    let _serial = serial();
+    let aid = 0;
+    for _ in 0..50 {
+        let probe = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).expect("probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let Some(start_rtp) = port.checked_sub(1000) else {
+            continue;
+        };
+        let mut cfg = config(aid, "127.0.0.1", 554, start_rtp);
+        cfg.bind_dev_ip = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+        let mut d = Driver::new(&cfg);
+        if d.setup_rtp_udp_sockets().is_err() {
+            continue;
+        }
+        let rtp = d.rtp.as_ref().expect("rtp");
+        let rtcp = d.rtcp.as_ref().expect("rtcp");
+        assert_eq!(
+            rtp.local_addr().expect("rtp addr").ip(),
+            Ipv4Addr::new(127, 0, 0, 2)
+        );
+        assert_eq!(rtp.local_addr().expect("rtp addr").port(), port);
+        assert_eq!(
+            rtcp.local_addr().expect("rtcp addr").ip(),
+            Ipv4Addr::new(127, 0, 0, 2)
+        );
+        assert_eq!(rtcp.local_addr().expect("rtcp addr").port(), port + 1);
+        return;
+    }
+    panic!("could not bind RTP sockets on the loopback alias");
+}
+
+// src_satipc.cpp:410-411, 842-843: opts.satipc_buffer becomes SO_RCVBUF on the
+// TCP media socket and the RTP socket only.
+#[test]
+fn test_satipc_receive_buffer_applied() {
+    let _serial = serial();
+    let aid = 0;
+    let requested = 1024;
+    for _ in 0..50 {
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let Some(start_rtp) = port.checked_sub(1000) else {
+            continue;
+        };
+        let mut cfg = config(aid, "127.0.0.1", 554, start_rtp);
+        cfg.receive_buffer = requested;
+        let mut d = Driver::new(&cfg);
+        if d.setup_rtp_udp_sockets().is_err() {
+            continue;
+        }
+        let rtp = receive_buffer(d.rtp.as_ref().expect("rtp").as_raw_fd());
+        let rtcp = receive_buffer(d.rtcp.as_ref().expect("rtcp").as_raw_fd());
+        assert!(
+            (requested..=8192).contains(&rtp),
+            "RTP SO_RCVBUF {rtp} must reflect {requested}"
+        );
+        assert!(rtcp > rtp, "RTCP must keep the default buffer ({rtcp})");
+        return;
+    }
+    panic!("could not bind RTP sockets");
+}
+
+// src_satipc.cpp:410-411: the TCP media socket is the RTSP socket.
+#[test]
+fn test_satipc_receive_buffer_applied_to_tcp_media() {
+    let _serial = serial();
+    let (listener, port) = listen_on_loopback();
+    let mut cfg = config(0, "127.0.0.1", port, 5500);
+    cfg.server.transport = Transport::Tcp;
+    cfg.receive_buffer = 1024;
+    let mut d = Driver::new(&cfg);
+    d.open_rtsp_socket(true).expect("connect");
+    let _peer = listener.accept().expect("accept");
+    let value = receive_buffer(d.rtsp.as_ref().expect("rtsp").as_raw_fd());
+    assert!(
+        (1024..=8192).contains(&value),
+        "TCP SO_RCVBUF {value} must reflect --satip-receive-buffer"
+    );
+}
+
 // Ported from tests/test_satipc_rtsp.cpp:579
 // A failed RTP setup must release the RTSP socket opened just before.
 #[test]
@@ -520,11 +704,17 @@ fn test_satipc_open_device_cleans_rtsp_on_rtp_failure() {
     let _block = block_udp(listen_udp);
     let mut d = Driver::new(&config(aid, "127.0.0.1", port, start_rtp));
 
+    let before = count_open_fds();
     let rv = d.open_device();
+    let after = count_open_fds();
     assert_ne!(rv, 0, "RTP setup must fail on the occupied port");
     assert!(
         d.rtsp.is_none() && !d.client.rtsp_connected,
         "failed open must drop the RTSP socket"
+    );
+    assert!(
+        before >= 0 && after == before,
+        "failed open must not leak fds"
     );
     assert_nothing_tracked(&d);
 }
@@ -540,12 +730,15 @@ fn test_satipc_drop_raced_socket() {
     d.open_rtsp_socket(true).expect("connect");
     let (mut peer, _) = srv.accept().expect("accept");
     d.client.rtsp_socket_closed = false;
+    // tests/test_satipc_rtsp.cpp:710: the expected fd must be closed.
+    let before = count_open_fds();
     d.drop_rtsp_socket();
     assert!(
         d.rtsp.is_none() && !d.client.rtsp_connected,
         "fields must reset"
     );
     assert!(d.client.rtsp_socket_closed, "flag must return");
+    assert_eq!(count_open_fds(), before - 1, "exactly the RTSP fd closes");
     peer.set_read_timeout(Some(Duration::from_secs(2)))
         .expect("timeout");
     let mut byte = [0u8; 1];
@@ -557,8 +750,15 @@ fn test_satipc_drop_raced_socket() {
     d.open_rtsp_socket(true).expect("connect");
     let (mut peer, _) = srv.accept().expect("accept");
     assert!(d.client.data_open);
+    // tests/test_satipc_rtsp.cpp:748: the TCP dvr fd must close.
+    let before = count_open_fds();
     d.drop_rtsp_socket();
     assert!(!d.client.data_open, "TCP dvr must reset");
+    assert_eq!(
+        count_open_fds(),
+        before - 1,
+        "the TCP media fd must be released"
+    );
     peer.set_read_timeout(Some(Duration::from_secs(2)))
         .expect("timeout");
     assert_eq!(

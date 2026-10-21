@@ -238,6 +238,9 @@ struct DataPlane {
     last_send_ms: i64,
     origin: Instant,
     running: bool,
+    wait_new_stream: bool,
+    tune_time_ms: Option<i64>,
+    wait_transponder_id: u16,
 }
 
 impl DataPlane {
@@ -259,6 +262,9 @@ impl DataPlane {
             last_send_ms: 0,
             origin: Instant::now(),
             running: true,
+            wait_new_stream: false,
+            tune_time_ms: None,
+            wait_transponder_id: 0,
         }
     }
 
@@ -371,6 +377,9 @@ impl DataPlane {
     }
 
     fn read_once(&mut self) -> bool {
+        if self.tuner.take_wait_new_stream() {
+            self.wait_new_stream = true;
+        }
         let read = match self.tuner.read(&mut self.buf) {
             Ok(read) => read,
             Err(error) => {
@@ -385,6 +394,21 @@ impl DataPlane {
                 self.process(now);
             }
             return false;
+        }
+        // read_dmx's new-stream flush (src_stream.cpp:1241-1259).
+        if self.wait_new_stream {
+            let tune_time = *self.tune_time_ms.get_or_insert(now);
+            if now - tune_time < 200 {
+                match check_new_transponder(&mut self.wait_transponder_id, self.buf.as_bytes()) {
+                    Some(position) => self.buf.drain_prefix(position),
+                    None => {
+                        self.buf.clear();
+                        return false;
+                    }
+                }
+            }
+            self.tune_time_ms = None;
+            self.wait_new_stream = false;
         }
         let since = now - self.last_send_ms;
         let send = since > self.threshold_ms;
@@ -473,5 +497,58 @@ impl DataPlane {
         if self.outputs.is_empty() {
             self.tuner.standby();
         }
+    }
+}
+
+/// `check_new_transponder` (src_stream.cpp:864-886): returns the offset of the
+/// first PID-0 packet (PUSI, no adaptation) whose transport_stream_id differs
+/// from `wait_transponder_id`, and records it.
+fn check_new_transponder(wait_transponder_id: &mut u16, data: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while offset + 10 <= data.len() {
+        let packet = &data[offset..];
+        if packet[0] == 0x47 && packet[1] == 0x40 && packet[2] == 0 {
+            let tid = u16::from(packet[8]) * 256 + u16::from(packet[9]);
+            if tid != *wait_transponder_id {
+                *wait_transponder_id = tid;
+                return Some(offset);
+            }
+        }
+        offset += DVB_FRAME;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pat(tsid: u16) -> [u8; DVB_FRAME] {
+        let mut packet = [0xff; DVB_FRAME];
+        packet[0] = 0x47;
+        packet[1] = 0x40;
+        packet[2] = 0x00;
+        packet[8] = (tsid >> 8) as u8;
+        packet[9] = tsid as u8;
+        packet
+    }
+
+    #[test]
+    fn new_transponder_keeps_its_suffix() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&pat(1));
+        data.extend_from_slice(&pat(1));
+        data.extend_from_slice(&pat(2));
+        data.extend_from_slice(&pat(2));
+        let mut id = 1;
+        let position = check_new_transponder(&mut id, &data).expect("new transponder");
+        assert_eq!(position, 2 * DVB_FRAME);
+        assert_eq!(id, 2);
+        // The caller drops the prefix and keeps the matching PAT and its suffix.
+        let suffix = &data[position..];
+        assert_eq!(suffix.len(), 2 * DVB_FRAME);
+        assert_eq!(u16::from(suffix[8]) * 256 + u16::from(suffix[9]), 2);
+        // An already-recorded transponder is not new.
+        assert_eq!(check_new_transponder(&mut id, suffix), None);
     }
 }

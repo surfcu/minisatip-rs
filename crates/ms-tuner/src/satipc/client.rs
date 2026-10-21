@@ -178,6 +178,8 @@ pub struct Client {
     pub cseq: u32,
     /// `sip->ignore_packets`.
     pub ignore_packets: bool,
+    /// `ad->wait_new_stream`: discard data until the new transponder appears.
+    pub wait_new_stream: bool,
     /// `sip->last_cmd`.
     pub last_cmd: LastCmd,
     /// `sip->state`.
@@ -267,6 +269,7 @@ impl Client {
             listen_udp: 0,
             cseq: 1,
             ignore_packets: false,
+            wait_new_stream: false,
             last_cmd: LastCmd::None,
             state: State::Inactive,
             last_setup: 0,
@@ -368,6 +371,8 @@ impl Client {
     fn handle_play(&mut self) {
         if self.ignore_packets {
             self.ignore_packets = false;
+            // src_satipc.cpp:211-216: flush until the new transponder shows up.
+            self.wait_new_stream = true;
         }
         if !self.want_tune && self.last_cmd == LastCmd::Play {
             self.can_keep_adapter_open = true;

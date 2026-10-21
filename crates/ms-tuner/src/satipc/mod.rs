@@ -5,6 +5,7 @@ mod client;
 mod config;
 mod driver;
 mod media;
+mod sys;
 mod util;
 
 pub use client::{

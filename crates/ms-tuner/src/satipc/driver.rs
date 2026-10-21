@@ -4,7 +4,8 @@
 //! runs the timers; the data-plane thread reads RTP or drains interleaved TS.
 
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -15,6 +16,7 @@ use super::config::SatipServer;
 use super::media::{
     Frame, MAX_RTP_MSG, MAX_UDP_PACKET_SIZE, TcpDemux, process_rtp_datagram, push_packets,
 };
+use super::sys;
 use crate::tuner::{
     PidSet, Result, SignalStatus, TS_PACKET_SIZE, TsBuf, TuneParams, Tuner, TunerError,
 };
@@ -45,6 +47,11 @@ pub struct SatipcConfig {
     pub adapter_timeout_ms: i64,
     /// Both signal multipliers are 0.
     pub ignore_signal: bool,
+    /// `bind_dev_ip()`: source of the RTSP connection and address of the
+    /// RTP/RTCP sockets (`src_satipc.cpp:395-400`, `816-822`).
+    pub bind_dev_ip: Option<IpAddr>,
+    /// `opts.satipc_buffer` in bytes; 0 keeps the kernel default.
+    pub receive_buffer: i32,
 }
 
 /// [`Client`] plus the sockets it drives.
@@ -68,6 +75,8 @@ pub struct Driver {
     fe_rtime: i64,
     standby_since: Option<i64>,
     adapter_timeout_ms: i64,
+    bind_dev_ip: Option<IpAddr>,
+    receive_buffer: i32,
 }
 
 impl Driver {
@@ -96,15 +105,27 @@ impl Driver {
             fe_rtime: 0,
             standby_since: None,
             adapter_timeout_ms: config.adapter_timeout_ms,
+            bind_dev_ip: config.bind_dev_ip,
+            receive_buffer: config.receive_buffer,
         }
     }
 
     /// `satipc_open_rtsp_socket`: connects and installs the RTSP socket.
     pub fn open_rtsp_socket(&mut self, is_init: bool) -> io::Result<()> {
         self.client.last_connect = self.client.tick();
-        let stream = connect(&self.client.host, self.client.port)?;
+        // satipc_open_rtsp_socket: the per-server source overrides bind_dev_ip().
+        let bind_source = self.bind_dev_ip.map(|ip| ip.to_string());
+        let source = if self.client.source_ip.is_empty() {
+            bind_source.as_deref()
+        } else {
+            Some(self.client.source_ip.as_str())
+        };
+        let stream = connect(&self.client.host, self.client.port, source)?;
         stream.set_nonblocking(true)?;
         let _ = stream.set_nodelay(true);
+        if self.client.transport == Transport::Tcp {
+            sys::set_receive_buffer(stream.as_raw_fd(), self.receive_buffer);
+        }
         self.rtsp = Some(stream);
         self.rbuf.clear();
         self.demux.reset();
@@ -126,13 +147,11 @@ impl Driver {
         }
         let port = u32::from(self.start_rtp) + 1000 + 2 * self.client.id as u32;
         let port = u16::try_from(port).map_err(|_| io::Error::other("RTP port out of range"))?;
-        let rtp = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))?;
-        let rtcp = UdpSocket::bind(SocketAddr::from((
-            Ipv4Addr::UNSPECIFIED,
-            port.wrapping_add(1),
-        )))?;
+        let rtp = sys::udp_bind(self.bind_dev_ip, port)?;
+        let rtcp = sys::udp_bind(self.bind_dev_ip, port.wrapping_add(1))?;
         rtp.set_nonblocking(true)?;
         rtcp.set_nonblocking(true)?;
+        sys::set_receive_buffer(rtp.as_raw_fd(), self.receive_buffer);
         self.client.listen_udp = port;
         self.rtp = Some(rtp);
         self.rtcp = Some(rtcp);
@@ -383,6 +402,11 @@ impl Driver {
         Ok(())
     }
 
+    /// Takes `ad->wait_new_stream` for the data plane.
+    pub fn take_wait_new_stream(&mut self) -> bool {
+        std::mem::take(&mut self.client.wait_new_stream)
+    }
+
     /// Applies the adapter PID set and commits.
     pub fn set_pids(&mut self, pids: &PidSet) {
         if !self.device_open {
@@ -409,10 +433,10 @@ impl Driver {
     }
 }
 
-fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
+fn connect(host: &str, port: u16, source: Option<&str>) -> io::Result<TcpStream> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, format!("cannot resolve {host}"));
     for address in (host, port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+        match sys::tcp_connect_src(address, source, CONNECT_TIMEOUT) {
             Ok(stream) => return Ok(stream),
             Err(error) => last = error,
         }
@@ -516,6 +540,10 @@ impl Tuner for SatipcTuner {
 
     fn standby(&mut self) {
         lock(&self.driver).standby();
+    }
+
+    fn take_wait_new_stream(&mut self) -> bool {
+        lock(&self.driver).take_wait_new_stream()
     }
 }
 
