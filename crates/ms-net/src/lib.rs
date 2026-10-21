@@ -3,9 +3,12 @@
 //! The socket core is owned by [`socket::SocketTable`]; there is no global table.
 
 pub mod bind;
+pub mod describe;
 pub mod fifo;
 pub mod handler;
 pub mod response;
+pub mod rtcp;
+pub mod rtp;
 pub mod rtsp;
 pub mod satip;
 pub mod socket;
