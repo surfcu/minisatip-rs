@@ -93,6 +93,8 @@ pub struct OutputStats {
     pub packets: u32,
     /// Bytes written (`sid->sb`).
     pub octets: u32,
+    /// Failed flushes (`failed_writes`).
+    pub failed_writes: u32,
     /// Bytes dropped by the queue or a full UDP socket.
     pub overflow: u64,
     /// Bytes waiting in the write queue.
@@ -115,6 +117,7 @@ pub struct StreamOutput {
     rtcp_wtime_ms: i64,
     sp: u32,
     sb: u32,
+    failed_writes: u32,
     started: bool,
     forced_close: bool,
 }
@@ -208,6 +211,7 @@ impl StreamOutput {
             rtcp_wtime_ms: now_ms,
             sp: 0,
             sb: 0,
+            failed_writes: 0,
             started: false,
             forced_close: false,
         }
@@ -232,6 +236,7 @@ impl StreamOutput {
             ssrc: self.rtp.ssrc,
             packets: self.sp,
             octets: self.sb,
+            failed_writes: self.failed_writes,
             overflow: self.queue.overflow() + self.udp_dropped,
             buffered: self.queue.fifo().used(),
             remote,
@@ -312,6 +317,7 @@ impl StreamOutput {
                     sent += count;
                     if failed {
                         self.forced_close = true;
+                        self.failed_writes = self.failed_writes.wrapping_add(1);
                         break;
                     }
                 }
