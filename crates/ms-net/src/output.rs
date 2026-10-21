@@ -5,10 +5,14 @@ use crate::handler::StreamType;
 use crate::rtcp::{RtcpInfo, build_rtcp};
 use crate::rtp::{Batch, Framing, RtpState, packetize};
 use crate::socket::DEFAULT_FIFO_SIZE;
+#[cfg(feature = "srt")]
+use crate::srt::{SrtOps, send_ts_partial};
 use crate::writeq::WriteQueue;
 use ms_tuner::PidSet;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+#[cfg(feature = "srt")]
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Period of the per-stream timer (`sockets_timeout(st_sock, 200)`).
@@ -68,6 +72,12 @@ enum Transport {
         sink: Sink,
         remote: Option<SocketAddr>,
     },
+    #[cfg(feature = "srt")]
+    Srt {
+        sock: i32,
+        ops: Arc<dyn SrtOps>,
+        remote: Option<SocketAddr>,
+    },
 }
 
 /// Counters and addresses exposed to the session layer.
@@ -106,6 +116,7 @@ pub struct StreamOutput {
     sp: u32,
     sb: u32,
     started: bool,
+    forced_close: bool,
 }
 
 impl StreamOutput {
@@ -161,6 +172,24 @@ impl StreamOutput {
         )
     }
 
+    /// Raw TS over an accepted SRT connection (`STREAM_RTSP_SRT`).
+    #[cfg(feature = "srt")]
+    pub fn srt(
+        sock: i32,
+        ops: Arc<dyn SrtOps>,
+        remote: Option<SocketAddr>,
+        config: OutputConfig,
+        now_ms: i64,
+    ) -> Self {
+        Self::new(
+            Transport::Srt { sock, ops, remote },
+            StreamType::RtspSrt,
+            Framing::Raw,
+            config,
+            now_ms,
+        )
+    }
+
     fn new(
         transport: Transport,
         stream_type: StreamType,
@@ -180,6 +209,7 @@ impl StreamOutput {
             sp: 0,
             sb: 0,
             started: false,
+            forced_close: false,
         }
     }
 
@@ -193,6 +223,8 @@ impl StreamOutput {
         let remote = match &self.transport {
             Transport::Udp { rtp, .. } => rtp.peer_addr().ok(),
             Transport::Tcp { remote, .. } => *remote,
+            #[cfg(feature = "srt")]
+            Transport::Srt { remote, .. } => *remote,
         };
         OutputStats {
             stream_type: self.stream_type,
@@ -215,7 +247,14 @@ impl StreamOutput {
                 rtcp.connect(with_port(dest, dest.port().wrapping_add(1)))
             }
             Transport::Tcp { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            #[cfg(feature = "srt")]
+            Transport::Srt { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
         }
+    }
+
+    /// Whether a failed SRT send requested a forced close (`sid->timeout = 1`).
+    pub fn forced_close(&self) -> bool {
+        self.forced_close
     }
 
     /// Sends the stream's packets from one adapter buffer (`process_packets_for_stream`).
@@ -262,6 +301,21 @@ impl StreamOutput {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
                 rv
+            }
+            #[cfg(feature = "srt")]
+            Transport::Srt { sock, ops, .. } => {
+                // stream.cpp:800-823: each iovec is sent in chunks of at most
+                // MAX_UDP_PACKET_SIZE bytes; a failure forces the stream closed.
+                let mut sent = 0usize;
+                for chunk in batch.chunks(buf) {
+                    let (count, failed) = send_ts_partial(ops.as_ref(), *sock, chunk);
+                    sent += count;
+                    if failed {
+                        self.forced_close = true;
+                        break;
+                    }
+                }
+                sent as i32
             }
         };
         if rv > 0 {
@@ -331,6 +385,8 @@ impl StreamOutput {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
             }
+            #[cfg(feature = "srt")]
+            Transport::Srt { .. } => {}
         }
         self.rtcp_wtime_ms = ctime_ms;
         Ok(())
@@ -347,6 +403,8 @@ impl StreamOutput {
                 Ok(rv)
             }
             Transport::Udp { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            #[cfg(feature = "srt")]
+            Transport::Srt { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
         }
     }
 
@@ -361,6 +419,8 @@ impl StreamOutput {
                 Ok(rv)
             }
             Transport::Udp { .. } => Ok(0),
+            #[cfg(feature = "srt")]
+            Transport::Srt { .. } => Ok(0),
         }
     }
 

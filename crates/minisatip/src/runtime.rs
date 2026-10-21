@@ -16,13 +16,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ms_config::Options;
 use ms_net::dataplane::{AdapterHandle, Command, DataPlaneConfig};
-use ms_net::handler::{HandlerContext, StreamType, handle_http, handle_rtsp};
+use ms_net::handler::{HandlerContext, StreamBackend, StreamType, handle_http, handle_rtsp};
 use ms_net::output::{OutputConfig, StreamOutput, UdpTarget};
 use ms_net::response::format_http_date;
 use ms_net::rtsp::{ParseOutcome, Protocol, Request, parse_request};
 use ms_net::session::{DescribeOptions, SessionManager};
 use ms_net::socket::DEFAULT_FIFO_SIZE;
-use ms_net::ssdp::{ANNOUNCE_INTERVAL_MS, SsdpConfig, SsdpServer, UdpSsdpIo, read_boot_id, uuid4};
+use ms_net::ssdp::{
+    ANNOUNCE_INTERVAL_MS, SharedIdentity, SsdpConfig, SsdpServer, UdpSsdpIo, read_boot_id, uuid4,
+};
 use ms_net::web::{RuntimeState, WebConfig, WebService};
 use ms_sched::{AdapterConfig, AdapterTuner, MAX_ADAPTERS, Scheduler, TuneError};
 use ms_tuner::{DeliverySystem, FileReplayConfig, FileReplayTuner, Pacing, PidSet, TuneParams};
@@ -100,6 +102,7 @@ impl Runtime {
         uuid: String,
         bootid: i32,
         device_id: i32,
+        identity: SharedIdentity,
     ) -> Result<Self, String> {
         let mut scheduler = Scheduler::new();
         let replay = std::env::var_os("MINISATIP_REPLAY").map(PathBuf::from);
@@ -139,6 +142,7 @@ impl Runtime {
 
         let mut session = SessionManager::with_scheduler(scheduler);
         session.set_start_rtp(config.start_rtp);
+        session.set_server_timeout_ms(config.timeout_ms);
         session.set_describe_options(DescribeOptions {
             local_host: config.advertised_host.clone(),
             session_id: None,
@@ -165,7 +169,8 @@ impl Runtime {
             playlist: opts.playlist.clone(),
             bootid,
             device_id,
-        });
+        })
+        .with_identity(identity);
         session.set_web(web);
         session.set_web_runtime(RuntimeState {
             datetime_compile: String::new(),
@@ -200,8 +205,23 @@ impl Runtime {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+            self.expire_streams();
             self.drain_events();
         }
+    }
+
+    /// Closes streams whose idle timeout expired (`stream_timeout`).
+    fn expire_streams(&mut self) {
+        let expired = self.session.expired_streams();
+        if expired.is_empty() {
+            return;
+        }
+        for id in expired {
+            self.stop_output(id);
+            self.session.close_stream(id);
+            self.conn_streams.retain(|_, sid| *sid != id);
+        }
+        self.update_thresholds();
     }
 
     fn handle_request(&mut self, message: ConnectionRequest) {
@@ -299,7 +319,7 @@ impl Runtime {
         let Some(stream) = self.session.stream(id) else {
             return;
         };
-        let (stream_type, adapter, ssrc, seq, server_port, remote_host, remote_port) = (
+        let (stream_type, adapter, ssrc, seq, server_port, remote_host, remote_port, srt_sock) = (
             stream.stream_type,
             stream.adapter,
             stream.session_id as u32,
@@ -307,6 +327,7 @@ impl Runtime {
             stream.server_port,
             stream.remote_host.clone(),
             stream.remote_port,
+            stream.srt_sock,
         );
         if adapter < 0 {
             return;
@@ -314,6 +335,8 @@ impl Runtime {
         let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref) else {
             return;
         };
+        #[cfg(not(feature = "srt"))]
+        let _ = srt_sock;
         let config = OutputConfig {
             ssrc,
             seq,
@@ -345,7 +368,25 @@ impl Runtime {
                 config,
                 now_ms,
             )),
-            StreamType::RtspSrt | StreamType::None => return,
+            #[cfg(feature = "srt")]
+            StreamType::RtspSrt => {
+                if srt_sock == ms_net::srt::SRT_INVALID_SOCK {
+                    return;
+                }
+                let Some(listener) = self.session.srt_listener() else {
+                    return;
+                };
+                // flush_stream sends through the same library handle as the listener.
+                let ops: Arc<dyn ms_net::srt::SrtOps> = listener.ops().clone();
+                let remote = remote_host
+                    .parse::<IpAddr>()
+                    .ok()
+                    .map(|ip| SocketAddr::new(ip, remote_port));
+                Ok(StreamOutput::srt(srt_sock, ops, remote, config, now_ms))
+            }
+            #[cfg(not(feature = "srt"))]
+            StreamType::RtspSrt => return,
+            StreamType::None => return,
         };
         match output {
             Ok(output) => {
@@ -408,14 +449,22 @@ impl Runtime {
             .map(|(id, _)| *id)
             .collect();
         for id in streams {
-            self.stop_output(id);
-            self.session.close_stream(id);
+            self.close_control_stream(id);
         }
         if let Some(id) = self.conn_streams.remove(&conn_id) {
-            self.stop_output(id);
-            self.session.close_stream(id);
+            self.close_control_stream(id);
         }
         self.update_thresholds();
+    }
+
+    /// Applies `close_http` (minisatip.cpp:1678): RTSP/UDP and undecoded
+    /// streams with a timeout survive their control connection.
+    fn close_control_stream(&mut self, id: i32) {
+        if !self.session.closes_on_control_close(id) {
+            return;
+        }
+        self.stop_output(id);
+        self.session.close_stream(id);
     }
 
     fn drain_events(&mut self) {
@@ -433,7 +482,13 @@ impl Runtime {
                     ms_net::dataplane::Event::TunerError(error) => {
                         eprintln!("minisatip: adapter {aid}: {error}");
                     }
-                    ms_net::dataplane::Event::RtcpReceived(_) => {}
+                    ms_net::dataplane::Event::RtcpReceived(id) => {
+                        // rtcp_confirm refreshes the idle timer (stream.cpp:1448).
+                        self.session.touch_stream(id);
+                    }
+                    ms_net::dataplane::Event::ContinuityErrors(errors) => {
+                        self.session.set_adapter_ccerr(aid, errors);
+                    }
                 }
             }
         }
@@ -562,7 +617,17 @@ pub fn run(opts: &Options) -> Result<(), String> {
         fifo_size: fifo_size(opts.max_sbuf),
         rrtp: opts.rrtp.clone(),
     };
-    let mut runtime = Runtime::new(opts, config, uuid.clone(), bootid, device_id)?;
+    // C++ keeps these in `opts`: the SSDP thread and HTTP endpoints see the
+    // same values, including a DEVICEID changed by conflict handling.
+    let identity = SharedIdentity::new(uuid.clone(), device_id, bootid);
+    let mut runtime = Runtime::new(
+        opts,
+        config,
+        uuid.clone(),
+        bootid,
+        device_id,
+        identity.clone(),
+    )?;
 
     let (requests, receiver) = mpsc::channel();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -604,6 +669,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
         };
         Some(spawn_ssdp(
             ssdp_config,
+            identity,
             opts.bind.clone(),
             opts.disc_host.clone(),
             Arc::clone(&shutdown),
@@ -776,18 +842,20 @@ fn serve_connection(
 
 fn spawn_ssdp(
     config: SsdpConfig,
+    identity: SharedIdentity,
     bind: Option<String>,
     disc_host: String,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("ssdp".to_owned())
-        .spawn(move || ssdp_loop(config, bind, disc_host, shutdown))
+        .spawn(move || ssdp_loop(config, identity, bind, disc_host, shutdown))
         .expect("spawn SSDP thread")
 }
 
 fn ssdp_loop(
     config: SsdpConfig,
+    identity: SharedIdentity,
     bind: Option<String>,
     disc_host: String,
     shutdown: Arc<AtomicBool>,
@@ -800,7 +868,7 @@ fn ssdp_loop(
         }
     };
     let _ = io.set_read_timeout(Some(SSDP_READ_TIMEOUT));
-    let mut server = SsdpServer::new(io, config);
+    let mut server = SsdpServer::new(io, config).with_identity(identity);
     let origin = Instant::now();
     let mut next_announce = 0i64;
     let mut buffer = [0u8; 4096];

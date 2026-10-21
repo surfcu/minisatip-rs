@@ -3,8 +3,11 @@
 //! The manager owns all mutable state; adapter decisions are delegated to
 //! [`ms_sched::Scheduler`].
 
-use ms_sched::{Scheduler, SetParamsError, StreamId, TuneError};
+use ms_sched::{MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
 use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Instant;
 
 use crate::handler::{
     HttpResource, HttpRoute, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType,
@@ -17,6 +20,77 @@ use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener};
 use crate::web::{AdapterState, RuntimeState, StreamState, WebService, WebSnapshot};
 
 const STREAM_SLOTS: usize = MAX_STREAMS as usize;
+/// Extra time a client has to respond before the stream is closed
+/// (`stream_timeout`, stream.cpp:1366).
+pub const TIMEOUT_GRACE_MS: i64 = 10_000;
+/// Timeout value meaning "close now" (`sid->timeout == 1`).
+pub const TIMEOUT_FORCED: u32 = 1;
+/// Default session timeout (`opts.timeout_sec`).
+pub const DEFAULT_TIMEOUT_MS: u32 = 30_000;
+
+/// Time source for session timeouts; tests install [`ManualClock`].
+pub trait Clock: Send + Sync {
+    /// Milliseconds since an arbitrary origin.
+    fn now_ms(&self) -> i64;
+}
+
+/// Wall-independent clock used by the server.
+#[derive(Debug)]
+pub struct MonotonicClock {
+    origin: Instant,
+}
+
+impl MonotonicClock {
+    /// Starts the clock now.
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now_ms(&self) -> i64 {
+        self.origin.elapsed().as_millis() as i64
+    }
+}
+
+/// Clock advanced explicitly by tests.
+#[derive(Debug, Default)]
+pub struct ManualClock {
+    now_ms: AtomicI64,
+}
+
+impl ManualClock {
+    /// Creates a clock at `now_ms`.
+    pub fn new(now_ms: i64) -> Self {
+        Self {
+            now_ms: AtomicI64::new(now_ms),
+        }
+    }
+
+    /// Sets the current time.
+    pub fn set(&self, now_ms: i64) {
+        self.now_ms.store(now_ms, Ordering::SeqCst);
+    }
+
+    /// Moves the clock forward by `delta_ms`.
+    pub fn advance(&self, delta_ms: i64) {
+        self.now_ms.fetch_add(delta_ms, Ordering::SeqCst);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_ms(&self) -> i64 {
+        self.now_ms.load(Ordering::SeqCst)
+    }
+}
 
 /// One stream slot, mirroring the C++ `streams` structure.
 #[derive(Debug, Clone)]
@@ -49,8 +123,10 @@ pub struct Stream {
     pub rtcp_server_port: u16,
     /// RTP sequence number.
     pub rtp_seq: u16,
-    /// Idle timeout in milliseconds; zero disables it.
+    /// Idle timeout in milliseconds; zero disables it, one forces a close.
     pub timeout_ms: u32,
+    /// Last request or RTCP time (`sid->rtime`).
+    pub rtime_ms: i64,
     /// Client user agent.
     pub user_agent: String,
     /// Accepted SRT socket, or `-1`.
@@ -62,7 +138,14 @@ pub struct Stream {
 }
 
 impl Stream {
-    fn new(id: StreamId, sock: i32, session_id: i64, start_rtp: u16) -> Self {
+    fn new(
+        id: StreamId,
+        sock: i32,
+        session_id: i64,
+        start_rtp: u16,
+        timeout_ms: u32,
+        now_ms: i64,
+    ) -> Self {
         let server_port = start_rtp.wrapping_add((2 * id) as u16);
         Self {
             id,
@@ -79,7 +162,8 @@ impl Stream {
             server_port,
             rtcp_server_port: server_port.wrapping_add(1),
             rtp_seq: 0,
-            timeout_ms: 30_000,
+            timeout_ms,
+            rtime_ms: now_ms,
             user_agent: String::new(),
             srt_sock: -1,
             srt_streamid: String::new(),
@@ -120,6 +204,9 @@ pub struct SessionManager {
     next_session_id: i64,
     start_rtp: u16,
     describe: DescribeOptions,
+    clock: Arc<dyn Clock>,
+    server_timeout_ms: u32,
+    adapter_ccerr: Vec<u64>,
     web: Option<WebService>,
     web_runtime: RuntimeState,
     #[cfg(feature = "srt")]
@@ -140,6 +227,11 @@ impl SessionManager {
 
     /// Creates an empty manager around an existing scheduler.
     pub fn with_scheduler(sched: Scheduler) -> Self {
+        Self::with_clock(sched, Arc::new(MonotonicClock::new()))
+    }
+
+    /// Creates an empty manager around an existing scheduler and clock.
+    pub fn with_clock(sched: Scheduler, clock: Arc<dyn Clock>) -> Self {
         let mut streams = Vec::with_capacity(STREAM_SLOTS);
         streams.resize_with(STREAM_SLOTS, || None);
         Self {
@@ -149,6 +241,9 @@ impl SessionManager {
             next_session_id: 1000,
             start_rtp: 5500,
             describe: DescribeOptions::default(),
+            clock,
+            server_timeout_ms: DEFAULT_TIMEOUT_MS,
+            adapter_ccerr: vec![0; MAX_ADAPTERS],
             web: None,
             web_runtime: RuntimeState::default(),
             #[cfg(feature = "srt")]
@@ -222,6 +317,69 @@ impl SessionManager {
         self.start_rtp = start_rtp;
     }
 
+    /// Installs a clock, rebasing the idle time of every live stream.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+        let now = self.clock.now_ms();
+        for stream in self.streams.iter_mut().flatten() {
+            stream.rtime_ms = now;
+        }
+    }
+
+    /// Time source used for idle timeouts.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
+    /// Sets the default session timeout (`opts.timeout_sec`).
+    pub fn set_server_timeout_ms(&mut self, timeout_ms: u32) {
+        self.server_timeout_ms = timeout_ms;
+    }
+
+    /// Records the continuity error count of one adapter for the web UI.
+    pub fn set_adapter_ccerr(&mut self, adapter: usize, errors: u64) {
+        if let Some(slot) = self.adapter_ccerr.get_mut(adapter) {
+            *slot = errors;
+        }
+    }
+
+    /// Streams whose idle timeout expired, in slot order (`stream_timeout`,
+    /// stream.cpp:1332-1378). HTTP and SRT streams have no idle timeout.
+    pub fn expired_streams(&self) -> Vec<StreamId> {
+        let now = self.clock.now_ms();
+        let mut expired = Vec::new();
+        for slot in self
+            .streams
+            .iter()
+            .flatten()
+            .filter(|stream| stream.enabled)
+        {
+            if slot.timeout_ms == TIMEOUT_FORCED {
+                expired.push(slot.id);
+                continue;
+            }
+            if matches!(slot.stream_type, StreamType::Http | StreamType::RtspSrt) {
+                continue;
+            }
+            if slot.timeout_ms != 0
+                && now - slot.rtime_ms > i64::from(slot.timeout_ms) + TIMEOUT_GRACE_MS
+            {
+                expired.push(slot.id);
+            }
+        }
+        expired
+    }
+
+    /// Whether closing the control connection closes this stream
+    /// (`close_http`, minisatip.cpp:1678-1692). RTSP/UDP and not-yet-decoded
+    /// streams with an active timeout are kept.
+    pub fn closes_on_control_close(&self, id: StreamId) -> bool {
+        self.stream(id).is_none_or(|stream| {
+            !(matches!(stream.stream_type, StreamType::RtspUdp | StreamType::None)
+                && stream.timeout_ms != 0)
+        })
+    }
+
     /// Replaces the SDP header inputs.
     pub fn set_describe_options(&mut self, options: DescribeOptions) {
         self.describe = options;
@@ -259,7 +417,16 @@ impl SessionManager {
         let id = index as StreamId;
         let session_id = self.next_session_id;
         self.next_session_id += 1;
-        self.streams[index] = Some(Stream::new(id, self.sock, session_id, self.start_rtp));
+        let timeout_ms = self.server_timeout_ms;
+        let now_ms = self.clock.now_ms();
+        self.streams[index] = Some(Stream::new(
+            id,
+            self.sock,
+            session_id,
+            self.start_rtp,
+            timeout_ms,
+            now_ms,
+        ));
         Some(id)
     }
 
@@ -784,6 +951,12 @@ impl SessionManager {
                 sm: params.sm.unwrap_or(0),
                 gi: params.gi.unwrap_or(-1),
                 pids: adapter.active_pids(),
+                ccerr: self
+                    .adapter_ccerr
+                    .get(aid)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(i32::MAX as u64) as i32,
                 ..AdapterState::default()
             };
         }
@@ -817,12 +990,17 @@ impl SessionManager {
 
 impl StreamBackend for SessionManager {
     fn find_session(&mut self, session_id: i64) -> Option<StreamId> {
-        (0..STREAM_SLOTS).find_map(|index| {
+        let found = (0..STREAM_SLOTS).find_map(|index| {
             self.streams[index]
                 .as_ref()
                 .filter(|stream| stream.enabled && stream.session_id == session_id)
                 .map(|stream| stream.id)
-        })
+        });
+        // C++ `find_session_id` refreshes `sid->rtime` (stream.cpp:1438).
+        if let Some(id) = found {
+            self.touch_stream(id);
+        }
+        found
     }
 
     fn get_stream(&self, id: StreamId) -> Option<StreamInfo> {
@@ -855,10 +1033,12 @@ impl StreamBackend for SessionManager {
     }
 
     fn touch_stream(&mut self, id: StreamId) {
+        let now = self.clock.now_ms();
         if let Some(index) = self.slot_index(id)
             && let Some(stream) = self.streams[index].as_mut()
         {
             stream.touched = true;
+            stream.rtime_ms = now;
         }
     }
 
@@ -1093,4 +1273,46 @@ fn positive_or_empty(value: Option<i32>) -> String {
     value
         .filter(|value| *value >= 0)
         .map_or_else(String::new, |value| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manual_manager(clock: &Arc<ManualClock>) -> SessionManager {
+        let mut manager = SessionManager::new();
+        let manual: Arc<ManualClock> = Arc::clone(clock);
+        let clock: Arc<dyn Clock> = manual;
+        manager.set_clock(clock);
+        manager
+    }
+
+    #[test]
+    fn srt_streams_never_expire() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut manager = manual_manager(&clock);
+        let id = manager.add_stream().expect("slot");
+        manager.streams[id as usize]
+            .as_mut()
+            .expect("stream")
+            .stream_type = StreamType::RtspSrt;
+
+        // stream.cpp:1353: the timeout block skips HTTP and SRT streams.
+        clock.advance(10_000_000);
+        assert!(manager.expired_streams().is_empty());
+    }
+
+    #[test]
+    fn forced_timeout_closes_immediately() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut manager = manual_manager(&clock);
+        let id = manager.add_stream().expect("slot");
+        manager.streams[id as usize]
+            .as_mut()
+            .expect("stream")
+            .timeout_ms = TIMEOUT_FORCED;
+
+        // stream.cpp:1346: `sid->timeout == 1` closes without waiting.
+        assert_eq!(manager.expired_streams(), vec![id]);
+    }
 }

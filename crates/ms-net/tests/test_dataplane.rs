@@ -2,11 +2,12 @@
 
 use ms_net::StreamType;
 use ms_net::dataplane::{
-    AdapterHandle, DataPlaneConfig, Event, adapter_threshold, clamp_threshold,
+    AdapterHandle, ContinuityCounter, DataPlaneConfig, Event, NEW_TRANSPONDER_WINDOW_MS,
+    adapter_threshold, check_new_transponder, clamp_threshold, post_tune_filter,
 };
 use ms_net::output::{OutputConfig, StreamOutput, UdpTarget};
 use ms_tuner::{
-    DeliverySystem, FileReplayConfig, FileReplayTuner, PidSet, Polarization, TuneParams,
+    DeliverySystem, FileReplayConfig, FileReplayTuner, PID_ALL, PidSet, Polarization, TuneParams,
 };
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -253,4 +254,106 @@ fn set_pids_changes_routing() {
     assert!(switched, "set_pids did not switch to 0x200");
     adapter.stop();
     let _ = std::fs::remove_file(path);
+}
+
+fn pat_packet(transponder_id: u16) -> [u8; 188] {
+    let mut packet = ts_packet(0, 0);
+    packet[1] = 0x40; // payload unit start, PID 0
+    packet[2] = 0;
+    packet[8] = (transponder_id >> 8) as u8;
+    packet[9] = transponder_id as u8;
+    packet
+}
+
+#[test]
+fn new_transponder_is_found_at_packet_offset() {
+    let mut wait = 0x1111;
+    let mut data = Vec::new();
+    data.extend_from_slice(&ts_packet(0x100, 0));
+    data.extend_from_slice(&ts_packet(0x100, 1));
+    data.extend_from_slice(&pat_packet(0x1234));
+    data.extend_from_slice(&pat_packet(0x5678));
+
+    // stream.cpp:864-889: the buffer is kept from the first PAT with a new id.
+    assert_eq!(check_new_transponder(&data, &mut wait), Some(2 * 188));
+    assert_eq!(wait, 0x1234);
+    // Old PATs are skipped, the next new one is found.
+    assert_eq!(check_new_transponder(&data, &mut wait), Some(3 * 188));
+    assert_eq!(wait, 0x5678);
+    let only_latest = pat_packet(0x5678);
+    assert_eq!(check_new_transponder(&only_latest, &mut wait), None);
+}
+
+#[test]
+fn post_tune_filter_drops_only_inside_the_window() {
+    let mut data = Vec::new();
+    data.extend_from_slice(&ts_packet(0x100, 0));
+    data.extend_from_slice(&pat_packet(0x2222));
+
+    let mut wait = 0x1111;
+    assert_eq!(
+        post_tune_filter(&data, &mut wait, NEW_TRANSPONDER_WINDOW_MS - 1),
+        Some(188)
+    );
+    assert_eq!(wait, 0x2222);
+
+    let mut wait = 0x1111;
+    assert_eq!(
+        post_tune_filter(&data, &mut wait, NEW_TRANSPONDER_WINDOW_MS),
+        Some(0),
+        "the window expired: keep the whole buffer"
+    );
+    assert_eq!(wait, 0x1111, "outside the window the id is not updated");
+
+    let mut wait = 0x1111;
+    let no_pat = ts_packet(0x100, 0);
+    assert_eq!(post_tune_filter(&no_pat, &mut wait, 0), None);
+
+    let mut wait = 0x2222;
+    let old_pat = pat_packet(0x2222);
+    assert_eq!(post_tune_filter(&old_pat, &mut wait, 0), None);
+}
+
+#[test]
+fn continuity_counter_flags_gaps_and_skips_tei_and_null_packets() {
+    let mut cc = ContinuityCounter::new();
+    for counter in [0u32, 1, 2] {
+        assert!(!cc.check_packet(&ts_packet(0x100, counter)));
+    }
+    assert!(cc.check_packet(&ts_packet(0x100, 4)), "CC 4 after 2");
+    assert_eq!(cc.errors(), 1);
+    assert!(!cc.check_packet(&ts_packet(0x100, 5)));
+    assert_eq!(cc.packets(), 5);
+
+    let mut tei = ts_packet(0x100, 9);
+    tei[1] |= 0x80;
+    assert!(!cc.check_packet(&tei));
+    assert_eq!(cc.packets(), 5, "TEI packets are skipped");
+
+    assert!(!cc.check_packet(&ts_packet(8191, 9)));
+    assert_eq!(cc.packets(), 5, "null packets are skipped");
+    assert_eq!(cc.errors(), 1);
+}
+
+#[test]
+fn continuity_counter_skips_all_pid_mode_and_forgets_removed_pids() {
+    let all = PidSet::from_pids([PID_ALL]);
+    let mut cc = ContinuityCounter::new();
+    let mut data = Vec::new();
+    data.extend_from_slice(&ts_packet(0x100, 0));
+    data.extend_from_slice(&ts_packet(0x100, 5));
+    cc.check_buffer(&data, &all);
+    assert_eq!(cc.packets(), 0, "PID 8192 disables checking");
+    assert_eq!(cc.errors(), 0);
+
+    let only_100 = PidSet::from_pids([0x100]);
+    cc.check_buffer(&data, &only_100);
+    assert_eq!(cc.packets(), 2);
+    assert_eq!(cc.errors(), 1);
+
+    cc.retain_pids(&PidSet::from_pids([0x200]));
+    assert!(
+        !cc.check_packet(&ts_packet(0x100, 9)),
+        "re-added PID starts over"
+    );
 }

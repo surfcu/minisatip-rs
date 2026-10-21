@@ -269,6 +269,15 @@ impl TsBuf {
         self.data.clear();
     }
 
+    /// Drops the first `bytes` bytes, rounded down to whole packets.
+    ///
+    /// This mirrors the `memmove` C++ performs when a new PAT is found after a
+    /// tune (`check_new_transponder`, stream.cpp:880).
+    pub fn discard_front(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.data.len()) / TS_PACKET_SIZE * TS_PACKET_SIZE;
+        self.data.drain(..bytes);
+    }
+
     /// Bytes currently buffered.
     pub fn len(&self) -> usize {
         self.data.len()
