@@ -115,7 +115,7 @@ impl Runtime {
                     &path,
                     FileReplayConfig {
                         looping: true,
-                        pacing: Pacing::None,
+                        pacing: replay_pacing(),
                     },
                 )
                 .map_err(|error| format!("cannot replay {}: {error}", path.display()))?;
@@ -696,6 +696,15 @@ fn fifo_size(max_sbuf: i32) -> usize {
         .filter(|megabytes| *megabytes > 0)
         .map(|megabytes| megabytes.saturating_mul(1024 * 1024))
         .unwrap_or(DEFAULT_FIFO_SIZE)
+}
+
+/// `MINISATIP_REPLAY_BITRATE=<bit/s>` paces the replay (DEV-120); unset or 0 is unpaced.
+fn replay_pacing() -> Pacing {
+    std::env::var("MINISATIP_REPLAY_BITRATE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bits| *bits > 0)
+        .map_or(Pacing::None, Pacing::FixedBitrate)
 }
 
 fn adapter_ids(opts: &Options) -> Vec<usize> {

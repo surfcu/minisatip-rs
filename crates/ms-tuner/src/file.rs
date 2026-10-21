@@ -9,6 +9,9 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Largest delay behind the fixed-bitrate schedule that is still caught up.
+const MAX_PACING_LAG: Duration = Duration::from_millis(200);
+
 /// Pacing applied while replaying a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Pacing {
@@ -109,7 +112,14 @@ impl FileReplayTuner {
         if bytes == 0 || bits_per_second == 0 {
             return;
         }
-        let start = *self.pacing_start.get_or_insert_with(Instant::now);
+        let mut start = *self.pacing_start.get_or_insert_with(Instant::now);
+        let sent = Duration::from_secs_f64(self.pacing_bytes as f64 * 8.0 / bits_per_second as f64);
+        // After an idle gap, restart the budget instead of bursting to catch up.
+        if start.elapsed() > sent + MAX_PACING_LAG {
+            start = Instant::now();
+            self.pacing_start = Some(start);
+            self.pacing_bytes = 0;
+        }
         self.pacing_bytes = self.pacing_bytes.saturating_add(bytes as u64);
         let expected =
             Duration::from_secs_f64(self.pacing_bytes as f64 * 8.0 / bits_per_second as f64);
