@@ -1240,6 +1240,14 @@ impl Scheduler {
             .find(|entry| entry.state != PidState::Inactive && entry.pid == pid)
     }
 
+    /// Non-inactive PID entries of an enabled adapter, in table order.
+    pub fn active_pids(&self, aid: i32) -> impl Iterator<Item = &PidEntry> {
+        self.enabled_adapter(aid)
+            .into_iter()
+            .flat_map(|adapter| adapter.pids.iter())
+            .filter(|entry| entry.state != PidState::Inactive)
+    }
+
     /// Mutable PID entry lookup, same scan as [`Self::find_pid`].
     pub fn find_pid_mut(&mut self, aid: i32, pid: i32) -> Option<&mut PidEntry> {
         let adapter = self.enabled_adapter_mut(aid)?;
@@ -2219,6 +2227,28 @@ mod tests {
             !scheduler.compare_slave_parameters(0, &tp),
             "Matching polarization on slave adapter should return 0"
         );
+    }
+
+    // DDCI's multiple-PMT filter mirrors this view of the pid table.
+    #[test]
+    fn active_pids_lists_owned_and_released_pids() {
+        let mut scheduler = scheduler();
+        assert_eq!(scheduler.mark_pid_add(0, 3, 100), 0);
+        assert_eq!(scheduler.mark_pid_add(0, 3, 8192), 0);
+        let owned = |s: &Scheduler, pid| {
+            s.active_pids(0)
+                .find(|p| p.pid == pid)
+                .map(|p| p.sids.contains(&3))
+        };
+        assert_eq!(owned(&scheduler, 100), Some(true));
+        assert_eq!(owned(&scheduler, 8192), Some(true));
+        scheduler.unmark_pid(0, 3, 100);
+        assert_ne!(
+            owned(&scheduler, 100),
+            Some(true),
+            "released pid has no owner"
+        );
+        assert_eq!(scheduler.active_pids(99).count(), 0, "unknown adapter");
     }
 
     // Ported from tests/test_adapter.cpp:515

@@ -204,6 +204,14 @@ impl CaRuntime {
             sched.unmark_pid(aid, DDCI_SID, i32::from(pid));
             touched.insert(aid);
         }
+        // The multiple-PMT filter of `ddci_create_pmt` reads the real pid table,
+        // including the pids DDCI itself owns (marked just above).
+        for (aid, adapter) in link.hub.lock().ddci.adapters.iter_mut() {
+            adapter.client_pids = sched
+                .active_pids(i32::from(*aid))
+                .filter_map(|p| Some((u16::try_from(p.pid).ok()?, !p.sids.is_empty())))
+                .collect();
+        }
         link.mirrored = wanted;
         let filters: BTreeMap<usize, u16> = link
             .hub
