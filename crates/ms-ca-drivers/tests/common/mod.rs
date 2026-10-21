@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use ms_ca::{CaCaps, Program, ProgramTable};
-use ms_ca_drivers::en50221::{En50221Driver, TAG_CA_PMT, TpduLink};
+use ms_ca_drivers::en50221::consts::TAG_CA_PMT;
+use ms_ca_drivers::en50221::{En50221Driver, TpduLink};
 use ms_fakecam::host::HostSim;
 use ms_fakecam::record::Event;
 use ms_fakecam::tags::CA_SUPPORT;
