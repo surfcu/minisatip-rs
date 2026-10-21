@@ -111,6 +111,8 @@ dependencies = [
 name = "ms-sched"
 version = "0.1.0"
 dependencies = [
+ "ms-ca",
+ "ms-psi",
  "ms-tuner",
 ]
 

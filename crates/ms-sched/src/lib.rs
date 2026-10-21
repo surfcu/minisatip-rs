@@ -9,6 +9,26 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use ms_tuner::{DeliverySystem, PidSet, Polarization, TuneParams};
 
+pub mod pmt;
+
+/// Maximum PMTs tracked per adapter (`MAX_PMT_FOR_ADAPTER`).
+pub const MAX_PMT_FOR_ADAPTER: usize = 255;
+/// Adapter kind (`ADAPTER_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdapterType {
+    /// Type not set (C++ zero-initialized test adapters).
+    #[default]
+    Unknown,
+    /// Local DVB device (`ADAPTER_DVB`).
+    Dvb,
+    /// SAT>IP client (`ADAPTER_SATIP`).
+    Satip,
+    /// Network/CI backend (`ADAPTER_NETCV`).
+    NetCv,
+    /// Common-interface adapter (`ADAPTER_CI`).
+    Ci,
+}
+
 /// Maximum adapter count (`MAX_ADAPTERS`).
 pub const MAX_ADAPTERS: usize = 100;
 /// Delivery systems stored per adapter (`MAX_DELSYS`).
@@ -164,6 +184,8 @@ pub struct AdapterConfig {
     pub lnb_circular: u32,
     /// Initial hardware PID limit (`opts.max_pids`, 0 means unlimited).
     pub max_pids: i32,
+    /// Adapter kind; CI adapters accept DDCI's PID subscriptions.
+    pub adapter_type: AdapterType,
 }
 
 impl Default for AdapterConfig {
@@ -177,6 +199,7 @@ impl Default for AdapterConfig {
             lnb_switch: 11_700_000,
             lnb_circular: 10_750_000,
             max_pids: 0,
+            adapter_type: AdapterType::Unknown,
         }
     }
 }
@@ -220,6 +243,14 @@ pub struct Adapter {
     max_pids: i32,
     dvr: i32,
     pid_order: PidOrder,
+    pub(crate) ca_mask: u64,
+    pub(crate) active_pmt: [i32; MAX_PMT_FOR_ADAPTER],
+    pub(crate) active_pmts: usize,
+    pub(crate) pat_processed: bool,
+    pub(crate) transponder_id: u16,
+    pub(crate) pat_ver: i32,
+    pub(crate) pat_filter: i32,
+    pub(crate) sdt_filter: i32,
 }
 
 impl Adapter {
@@ -243,6 +274,14 @@ impl Adapter {
             max_pids,
             dvr: -1,
             pid_order: PidOrder::default(),
+            ca_mask: 0,
+            active_pmt: [-1; MAX_PMT_FOR_ADAPTER],
+            active_pmts: 0,
+            pat_processed: false,
+            transponder_id: 0,
+            pat_ver: 0,
+            pat_filter: -1,
+            sdt_filter: -1,
         }
     }
 
@@ -289,10 +328,14 @@ pub enum PidState {
 }
 
 /// One PID slot of an adapter (`SPid`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PidEntry {
     /// PID number.
     pub pid: i32,
+    /// Owning PMT id, `-1` when unclaimed (`SPid.pmt`).
+    pub pmt: i32,
+    /// Section filter attached to this PID, `-1` when none (`SPid.filter`).
+    pub filter: i32,
     /// Slot state.
     pub state: PidState,
     /// Descriptor of the PID filter, 0 when not open.
@@ -301,7 +344,26 @@ pub struct PidEntry {
     pub order: u32,
     /// Packets received since the last update; `sort_pids` orders by this.
     pub packets: u32,
-    sids: BTreeSet<StreamId>,
+    /// Set once the first decrypted packet is seen (claim reset on steal).
+    pub is_decrypted: bool,
+    /// Streams currently owning this PID.
+    pub sids: BTreeSet<StreamId>,
+}
+
+impl Default for PidEntry {
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            pmt: -1,
+            filter: -1,
+            state: PidState::default(),
+            fd: 0,
+            order: 0,
+            packets: 0,
+            is_decrypted: false,
+            sids: BTreeSet::new(),
+        }
+    }
 }
 
 impl PidEntry {
@@ -322,6 +384,7 @@ pub struct Scheduler {
     fe_map: [i16; FE_MAP_LEN],
     disabled: [bool; MAX_ADAPTERS],
     absolute_switch: bool,
+    pub(crate) pmt: pmt::PmtTables,
 }
 
 impl Default for Scheduler {
@@ -340,6 +403,7 @@ impl Scheduler {
             fe_map: [-1; FE_MAP_LEN],
             disabled: [false; MAX_ADAPTERS],
             absolute_switch: false,
+            pmt: pmt::PmtTables::new(),
         }
     }
 
@@ -925,10 +989,13 @@ impl Scheduler {
             return -1;
         };
         entry.pid = pid;
+        entry.pmt = -1;
+        entry.filter = -1;
         entry.state = PidState::New;
         entry.fd = 0;
         entry.order = 0;
         entry.packets = 0;
+        entry.is_decrypted = false;
         entry.sids.clear();
         if sid != PID_STREAM_ID_UNDEFINED {
             entry.sids.insert(sid);
@@ -949,28 +1016,49 @@ impl Scheduler {
             .find(|entry| entry.state != PidState::Inactive && entry.pid == pid)
     }
 
+    /// Mutable PID entry lookup, same scan as [`Self::find_pid`].
+    pub fn find_pid_mut(&mut self, aid: i32, pid: i32) -> Option<&mut PidEntry> {
+        let adapter = self.enabled_adapter_mut(aid)?;
+        adapter
+            .pids
+            .iter_mut()
+            .find(|entry| entry.state != PidState::Inactive && entry.pid == pid)
+    }
+
     fn mark_pid_deleted(&mut self, index: usize, sid: StreamId, pid: Option<i32>) {
-        let Some(adapter) = self.adapters[index].as_mut() else {
-            return;
-        };
-        for entry in &mut adapter.pids {
-            if entry.state == PidState::Inactive {
-                continue;
-            }
-            if pid.is_some_and(|pid| entry.pid != pid) {
-                continue;
-            }
-            if sid == PID_STREAM_ID_UNDEFINED {
-                entry.state = PidState::Deleted;
-                entry.sids.clear();
-                entry.order = 0;
-            } else {
-                entry.sids.remove(&sid);
-                if entry.sids.is_empty() {
+        let mut deleted = Vec::new();
+        {
+            let Some(adapter) = self.adapters[index].as_mut() else {
+                return;
+            };
+            for entry in &mut adapter.pids {
+                if entry.state == PidState::Inactive {
+                    continue;
+                }
+                if pid.is_some_and(|pid| entry.pid != pid) {
+                    continue;
+                }
+                let was_live = entry.state != PidState::Deleted;
+                if sid == PID_STREAM_ID_UNDEFINED {
                     entry.state = PidState::Deleted;
+                    entry.sids.clear();
                     entry.order = 0;
+                } else {
+                    entry.sids.remove(&sid);
+                    if entry.sids.is_empty() {
+                        entry.state = PidState::Deleted;
+                        entry.order = 0;
+                    }
+                }
+                if was_live && entry.state == PidState::Deleted {
+                    deleted.push(entry.pid);
                 }
             }
+        }
+        // C++ mark_pid_deleted() closes CA PIDs and stops PMTs that lost
+        // their last live stream before update_pids() runs.
+        for pid in deleted {
+            self.pmt_pid_del(index, pid);
         }
     }
 
@@ -1040,6 +1128,9 @@ impl Scheduler {
     /// (`update_pids`, adapter.cpp:928-1047). Returns 0 on success, 1 on error.
     fn update_pids(&mut self, index: usize) -> i32 {
         let mut rv = 0;
+        // pids=all expansion must precede the NEW->ACTIVE pass below, so the
+        // PMT/stream pids it adds can start the PMT in this same update.
+        self.emulate_add_all_pids(index);
         {
             let Some(adapter) = self.adapters[index].as_mut() else {
                 return 1;
@@ -1110,6 +1201,9 @@ impl Scheduler {
             }
         }
         self.sort_pids(index);
+        // C++ update_pids() tail: settle claims and PMT states even when no
+        // demux pass follows. CAPMTs are sent by start_active_pmts instead.
+        self.pmt_pid_updated_pids(index);
         rv
     }
 
