@@ -185,6 +185,9 @@ pub struct PidEntry {
 pub struct AdapterState {
     pub transponder_id: u16,
     pub pids: BTreeMap<u16, PidEntry>,
+    /// The adapter's real pid table (`find_pid` in C++), mirrored by the
+    /// runtime: pid -> owned by at least one stream (`!p->sid.empty()`).
+    pub client_pids: BTreeMap<u16, bool>,
 }
 
 /// TS buffer of an adapter (`ad->buf`, `ad->rlen`, `ad->lbuf = buf.len()`).
@@ -839,10 +842,9 @@ impl Ddci {
         for s in &pmt.streams {
             if multiple {
                 // Do not map pids the client did not request.
-                let p = self
-                    .find_pid(pmt.adapter, s.pid)
-                    .or_else(|| self.find_pid(pmt.adapter, 8192));
-                if p.is_none_or(|p| p.sids.is_empty()) {
+                let pids = self.adapters.get(&pmt.adapter).map(|a| &a.client_pids);
+                let owned = pids.and_then(|p| p.get(&s.pid).or_else(|| p.get(&8192)));
+                if owned != Some(&true) {
                     continue;
                 }
             }

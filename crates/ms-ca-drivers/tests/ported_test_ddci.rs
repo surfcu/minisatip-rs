@@ -1368,3 +1368,48 @@ fn test_ddci_least_used_device() {
         "it runs on DDCI 1"
     );
 }
+
+/// Stream pids of a generated PMT section (after the pointer field).
+fn section_stream_pids(psi: &[u8]) -> Vec<u16> {
+    let end = 4 + ((usize::from(psi[2] & 0x0F) << 8) | usize::from(psi[3])) - 4;
+    let mut pos = 13 + ((usize::from(psi[11] & 0x0F) << 8) | usize::from(psi[12]));
+    let mut pids = Vec::new();
+    while pos + 5 <= end {
+        pids.push((u16::from(psi[pos + 1] & 0x1F) << 8) | u16::from(psi[pos + 2]));
+        pos += 5 + ((usize::from(psi[pos + 3] & 0x0F) << 8) | usize::from(psi[pos + 4]));
+    }
+    pids
+}
+
+// With `-c N:**M` (multiple PMT), ddci_create_pmt keeps only the stream pids the
+// adapter's real pid table has with an owner, or all when pid 8192 is owned.
+#[test]
+fn test_multiple_pmt_maps_only_requested_pids() {
+    let (mut x, mut t) = one_ddci(6);
+    x.cams.get_mut(&0).unwrap().multiple_pmt = 2;
+    x.cams.get_mut(&0).unwrap().max_ca_pmt = 2;
+    let pmt0 = create_pmt(&mut t, 8, 600, 601, 602, 0x100, 0x100);
+    assert_eq!(x.process_pmt(8, &prog(&t, pmt0), false), TablesResult::Ok);
+    let video = ddci_pid(&x, 8, 601) as u16;
+    let audio = ddci_pid(&x, 8, 602) as u16;
+    let pids =
+        |x: &mut Ddci| section_stream_pids(&x.create_pmt_for_slot(0, 0, &prog(&t, pmt0), 1500));
+
+    assert!(
+        pids(&mut x).is_empty(),
+        "no client pid known: no stream mapped"
+    );
+
+    x.adapters.get_mut(&8).unwrap().client_pids = [(601, true), (602, false)].into();
+    assert_eq!(pids(&mut x), [video], "only the owned stream pid is mapped");
+
+    x.adapters.get_mut(&8).unwrap().client_pids = [(8192, true)].into();
+    assert_eq!(pids(&mut x), [video, audio], "pids=all maps every stream");
+
+    x.adapters.get_mut(&8).unwrap().client_pids = [(601, false), (8192, true)].into();
+    assert_eq!(
+        pids(&mut x),
+        [audio],
+        "an unowned entry does not fall back to 8192"
+    );
+}
