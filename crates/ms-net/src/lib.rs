@@ -3,6 +3,7 @@
 //! The socket core is owned by [`socket::SocketTable`]; there is no global table.
 
 pub mod bind;
+pub mod dataplane;
 pub mod describe;
 pub mod fifo;
 pub mod handler;
