@@ -12,9 +12,8 @@ use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner, TunerError};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -37,6 +36,11 @@ const PID_NULL: u16 = 8191;
 /// before the frontend ioctls finish. The bound only guards against a wedged
 /// adapter thread: expiry is reported as a hardware failure (`-500`).
 pub const TUNE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Locks a shared counter; a `Mutex` because 32-bit MIPS lacks `AtomicU64`.
+fn lock_counter(counter: &Mutex<u64>) -> MutexGuard<'_, u64> {
+    counter.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Clamps a threshold to `1..200` ms, with 200 for out-of-range values.
 pub fn clamp_threshold(threshold: i32) -> i64 {
@@ -312,7 +316,7 @@ pub struct AdapterHandle {
     events: Receiver<Event>,
     // A mutex rather than `AtomicU64`, which 32-bit MIPS does not provide.
     epoch: Mutex<u64>,
-    tune_generation: Arc<AtomicU64>,
+    tune_generation: Arc<Mutex<u64>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -341,7 +345,7 @@ impl AdapterHandle {
     ) -> io::Result<Self> {
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
-        let tune_generation = Arc::new(AtomicU64::new(0));
+        let tune_generation = Arc::new(Mutex::new(0));
         let generation = Arc::clone(&tune_generation);
         let thread = thread::Builder::new()
             .name(format!("adapter{}", config.adapter_id))
@@ -414,7 +418,7 @@ impl AdapterHandle {
         setup_age_ms: i64,
     ) -> Option<u64> {
         let epoch = {
-            let mut epoch = self.epoch.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut epoch = lock_counter(&self.epoch);
             *epoch = epoch.wrapping_add(1);
             *epoch
         };
@@ -454,7 +458,7 @@ impl AdapterHandle {
 
     /// Tunes the thread has handled; it is raised before the tune is answered.
     pub fn tune_generation(&self) -> u64 {
-        self.tune_generation.load(Ordering::SeqCst)
+        *lock_counter(&self.tune_generation)
     }
 
     /// Event receiver.
@@ -569,7 +573,7 @@ struct DataPlane {
     bandwidth_marks: BTreeMap<StreamId, (u64, u32, u32, u64, u64)>,
     stages: Vec<Box<dyn TsStage>>,
     section_pids: PidSet,
-    tune_generation: Arc<AtomicU64>,
+    tune_generation: Arc<Mutex<u64>>,
     keep_reading: bool,
 }
 
@@ -606,7 +610,7 @@ impl DataPlane {
             bandwidth_marks: BTreeMap::new(),
             stages: Vec::new(),
             section_pids: PidSet::new(),
-            tune_generation: Arc::new(AtomicU64::new(0)),
+            tune_generation: Arc::new(Mutex::new(0)),
             keep_reading: false,
         }
     }
@@ -645,7 +649,10 @@ impl DataPlane {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Tune { params, reply } => {
-                self.tune_generation.fetch_add(1, Ordering::SeqCst);
+                {
+                    let mut generation = lock_counter(&self.tune_generation);
+                    *generation = generation.wrapping_add(1);
+                }
                 let result = self.tuner.tune(&params);
                 match reply {
                     Some(reply) => {
@@ -910,7 +917,7 @@ impl DataPlane {
         }
         if !tapped.is_empty() {
             let _ = self.events.send(Event::TablePackets {
-                generation: self.tune_generation.load(Ordering::SeqCst),
+                generation: *lock_counter(&self.tune_generation),
                 packets: tapped,
             });
         }
