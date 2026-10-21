@@ -12,8 +12,24 @@ pub struct Normalizer {
 
 impl Normalizer {
     /// Replaces every occurrence of `port` as a whole number by `<name>`.
-    pub fn add_port(&mut self, port: u16, name: &str) {
-        self.ports.insert(port.to_string(), format!("<{name}>"));
+    /// Fails when `port` already has another name, which would be ambiguous.
+    pub fn add_port(&mut self, port: u16, name: &str) -> Result<(), String> {
+        let name = format!("<{name}>");
+        match self.ports.get(&port.to_string()) {
+            Some(known) if *known != name => Err(format!("port {port} is both {known} and {name}")),
+            _ => {
+                self.ports.insert(port.to_string(), name);
+                Ok(())
+            }
+        }
+    }
+
+    /// Ports that already have a placeholder.
+    pub fn ports(&self) -> Vec<u16> {
+        self.ports
+            .keys()
+            .filter_map(|port| port.parse().ok())
+            .collect()
     }
 
     /// Replaces every occurrence of `from` by `to` (per-binary paths).
@@ -194,8 +210,8 @@ mod tests {
     #[test]
     fn normalises_rtsp_reply() {
         let mut norm = Normalizer::default();
-        norm.add_port(40001, "RTSP");
-        norm.add_port(41000, "u1.rtp");
+        norm.add_port(40001, "RTSP").unwrap();
+        norm.add_port(41000, "u1.rtp").unwrap();
         let text = "RTSP/1.0 200 OK\r\nDate: Wed, 21 Oct 2026 10:00:00 GMT\r\nCSeq: 3\r\n\
                     Session: 0123456789;timeout=30\r\n\
                     Transport: RTP/AVP;unicast;client_port=41000-41001;ssrc=1a2b3c\r\n\
@@ -240,11 +256,25 @@ mod tests {
     #[test]
     fn numbers_inside_words_are_kept() {
         let mut norm = Normalizer::default();
-        norm.add_port(554, "P");
+        norm.add_port(554, "P").unwrap();
         assert_eq!(
             norm.text("a554 554 5540 1.554 :554"),
             "a554 <P> 5540 1.554 :<P>"
         );
         assert_eq!(all_numbers("a=12,b=3"), "a=<N>,b=<N>");
+    }
+
+    #[test]
+    fn a_port_cannot_have_two_names() {
+        let mut norm = Normalizer::default();
+        norm.add_port(40001, "RTSP").unwrap();
+        norm.add_port(40001, "RTSP").unwrap();
+        let error = norm.add_port(40001, "SRTP+31").unwrap_err();
+        assert!(
+            error.contains("<RTSP>") && error.contains("<SRTP+31>"),
+            "{error}"
+        );
+        assert_eq!(norm.text("127.0.0.1:40001"), "127.0.0.1:<RTSP>");
+        assert_eq!(norm.ports(), vec![40001]);
     }
 }
