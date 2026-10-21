@@ -56,6 +56,12 @@ pub struct TuneParams {
     pub freq: i32,
     /// Polarisation.
     pub pol: Polarization,
+    /// Whether `pol` was present, like the C++ optional `tp->pol`.
+    ///
+    /// An explicitly specified `pol=0` maps to `Polarization::None` but is
+    /// distinct from an absent value in `compare_slave_parameters`, where C++
+    /// uses `value_or(-1)`.
+    pub pol_specified: bool,
     /// Delivery system (`msys`).
     pub msys: DeliverySystem,
     /// Symbol rate in sym/s, like the C++ `transponder::sr` (`sr * 1000`).
@@ -157,6 +163,11 @@ impl PidSet {
         self.pids.contains(&pid) || self.pids.contains(&PID_ALL)
     }
 
+    /// Exact membership, without the `PID_ALL` sentinel widening the answer.
+    pub fn contains_exact(&self, pid: u16) -> bool {
+        self.pids.contains(&pid)
+    }
+
     /// Whether the set contains the `PID_ALL` sentinel.
     pub fn is_all(&self) -> bool {
         self.pids.contains(&PID_ALL)
@@ -215,12 +226,15 @@ impl SignalStatus {
 pub enum TunerError {
     /// The backing file or device failed.
     Io(io::Error),
+    /// The backend rejected the request with a C++-style negative code.
+    Backend(i32),
 }
 
 impl fmt::Display for TunerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "tuner I/O error: {error}"),
+            Self::Backend(code) => write!(f, "tuner backend error: {code}"),
         }
     }
 }
@@ -229,6 +243,7 @@ impl std::error::Error for TunerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Backend(_) => None,
         }
     }
 }

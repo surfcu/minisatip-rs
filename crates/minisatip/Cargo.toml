@@ -6,9 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["linux-dvb"]
 # Builds with SRT support.
 srt = ["ms-config/srt", "ms-net/srt"]
+# Enables the Linux DVB tuner backend and /dev/dvb enumeration.
+linux-dvb = ["ms-tuner/linux-dvb"]
 
 [dependencies]
 libc = "0.2"

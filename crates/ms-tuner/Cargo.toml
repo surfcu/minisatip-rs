@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["linux-dvb"]
+# Real /dev/dvb backend (/dev/dvb enumeration and ioctls).
+linux-dvb = []
+
+# satipc uses libc unconditionally, so it stays a plain dependency.
 [dependencies]
 libc = "0.2"
 

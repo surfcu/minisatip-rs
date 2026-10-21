@@ -518,6 +518,7 @@ fn test_start_play_pid_exhaustion_returns_503() {
         && manager
             .scheduler_mut()
             .mark_pid_add(0, PID_STREAM_ID_UNDEFINED, pid)
+            == 0
     {
         pid += 1;
     }

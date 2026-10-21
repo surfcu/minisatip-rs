@@ -4,8 +4,10 @@
 //! behind [`AdapterTuner`].
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use ms_tuner::{DeliverySystem, Polarization, TuneParams};
+use ms_tuner::{DeliverySystem, PidSet, Polarization, TuneParams};
 
 /// Maximum adapter count (`MAX_ADAPTERS`).
 pub const MAX_ADAPTERS: usize = 100;
@@ -19,6 +21,8 @@ pub const MAX_PIDS: usize = 128;
 pub const FE_MAP_LEN: usize = 2 * MAX_ADAPTERS;
 /// PID sentinel meaning "all PIDs".
 pub const PID_ALL: i32 = 8192;
+/// Minimum usable PID count per adapter (`MIN_ADAPTER_PIDS`).
+pub const MIN_ADAPTER_PIDS: i32 = 16;
 /// Stream id used when a PID has no owning stream.
 pub const PID_STREAM_ID_UNDEFINED: i32 = -1;
 /// DVB stream identifier.
@@ -80,6 +84,65 @@ pub struct TuneOutcome {
 pub trait AdapterTuner {
     /// Applies tuning parameters.
     fn tune(&mut self, params: &TuneParams) -> Result<(), TuneError>;
+
+    /// Applies the adapter's active PID set after `update_pids`.
+    ///
+    /// The scheduler owns the table (defaults included, `dvb_set_pid` order);
+    /// backends that do not filter in software can ignore it.
+    fn set_pids(&mut self, _pids: &PidSet) -> Result<(), TuneError> {
+        Ok(())
+    }
+
+    /// Opens one PID filter, returning its descriptor (C++ `set_pid`).
+    ///
+    /// The scheduler increments `active_pids` only after this succeeds; a
+    /// negative or error result triggers the `max_pids` fallback.
+    fn set_pid(&mut self, _pid: i32) -> Result<i32, TuneError> {
+        Ok(1)
+    }
+
+    /// Closes one PID filter (C++ `del_filters`).
+    ///
+    /// Any error is reported from `update_pids` after the entry is cleaned up.
+    fn del_filters(&mut self, _fd: i32, _pid: i32) -> Result<(), TuneError> {
+        Ok(())
+    }
+}
+
+/// Monotonic source for [`PidEntry`] subscription order (`adapter::pid_order_seq`).
+#[derive(Debug, Clone, Default)]
+pub struct PidOrder(Arc<AtomicU32>);
+
+impl PidOrder {
+    /// Next nonzero order, identical to the C++ `next_pid_order`.
+    pub fn next_pid_order(&self) -> u32 {
+        let mut sequence = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence == 0 {
+            sequence = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+        }
+        sequence
+    }
+}
+
+/// Single-cable switch type (`diseqc::switch_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SwitchType {
+    /// A conventional DiSEqC switch.
+    #[default]
+    None,
+    /// EN 50494 unicable.
+    Unicable,
+    /// EN 50607 JESS.
+    Jess,
+    /// The adapter drives the switch through its master (`SWITCH_SLAVE`).
+    Slave,
+}
+
+impl SwitchType {
+    /// Whether band/polarisation conflicts are irrelevant for this switch.
+    pub fn is_single_cable(self) -> bool {
+        matches!(self, Self::Unicable | Self::Jess)
+    }
 }
 
 /// Static and tunable properties of one adapter.
@@ -93,10 +156,14 @@ pub struct AdapterConfig {
     pub absolute_table: [u8; MAX_SOURCES],
     /// Master adapter index when this is a slave tuner.
     pub master_source: Option<usize>,
+    /// DiSEqC/single-cable switch type.
+    pub switch_type: SwitchType,
     /// LNB band-switch frequency in kHz.
     pub lnb_switch: u32,
     /// Circular LNB local-oscillator frequency in kHz.
     pub lnb_circular: u32,
+    /// Initial hardware PID limit (`opts.max_pids`, 0 means unlimited).
+    pub max_pids: i32,
 }
 
 impl Default for AdapterConfig {
@@ -106,8 +173,10 @@ impl Default for AdapterConfig {
             sys: [DeliverySystem::Undefined; MAX_DELSYS],
             absolute_table: [0; MAX_SOURCES],
             master_source: None,
+            switch_type: SwitchType::None,
             lnb_switch: 11_700_000,
             lnb_circular: 10_750_000,
+            max_pids: 0,
         }
     }
 }
@@ -147,11 +216,15 @@ pub struct Adapter {
     attached: BTreeSet<StreamId>,
     do_tune: bool,
     active_pids: i32,
+    max_active_pids: i32,
     max_pids: i32,
+    dvr: i32,
+    pid_order: PidOrder,
 }
 
 impl Adapter {
     fn new(config: AdapterConfig, tuner: Box<dyn AdapterTuner>) -> Self {
+        let max_pids = config.max_pids;
         Self {
             config,
             master_sid: -1,
@@ -166,7 +239,10 @@ impl Adapter {
             attached: BTreeSet::new(),
             do_tune: false,
             active_pids: 0,
-            max_pids: 0,
+            max_active_pids: 0,
+            max_pids,
+            dvr: -1,
+            pid_order: PidOrder::default(),
         }
     }
 
@@ -183,22 +259,61 @@ impl Adapter {
             .map(|entry| entry.pid)
             .collect()
     }
+
+    /// Active PIDs sharing the demux descriptor with the DVR (`dvb_demux_shared_pid_count`).
+    pub fn demux_shared_pid_count(&self) -> i32 {
+        self.pids
+            .iter()
+            .filter(|entry| entry.state == PidState::Active && entry.fd == self.dvr)
+            .count() as i32
+    }
+
+    /// Sequence source used for PID subscription order.
+    pub fn pid_order(&self) -> PidOrder {
+        self.pid_order.clone()
+    }
 }
 
+/// PID entry state (`PID_STATE_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum PidState {
+pub enum PidState {
+    /// `PID_STATE_INACTIVE`.
     #[default]
     Inactive,
+    /// `PID_STATE_ACTIVE`.
     Active,
+    /// `PID_STATE_NEW`.
     New,
+    /// `PID_STATE_DELETED`.
     Deleted,
 }
 
+/// One PID slot of an adapter (`SPid`).
 #[derive(Debug, Clone, Default)]
-struct PidEntry {
-    pid: i32,
-    state: PidState,
+pub struct PidEntry {
+    /// PID number.
+    pub pid: i32,
+    /// Slot state.
+    pub state: PidState,
+    /// Descriptor of the PID filter, 0 when not open.
+    pub fd: i32,
+    /// Subscription order; 0 when no client stream owns the PID.
+    pub order: u32,
+    /// Packets received since the last update; `sort_pids` orders by this.
+    pub packets: u32,
     sids: BTreeSet<StreamId>,
+}
+
+impl PidEntry {
+    /// Streams currently owning this PID.
+    pub fn sids(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.sids.iter().copied()
+    }
+
+    /// Whether `sid` owns this PID.
+    pub fn has_stream(&self, sid: StreamId) -> bool {
+        self.sids.contains(&sid)
+    }
 }
 
 /// Adapter table and allocation policy.
@@ -345,6 +460,7 @@ impl Scheduler {
             return (usable && self.init_hw(index)).then_some(index);
         }
 
+        // Reuse an adapter already tuned to the same mux (C++ adapter.cpp:754-759).
         for index in 0..MAX_ADAPTERS {
             let Some(adapter) = self.adapters[index].as_ref() else {
                 continue;
@@ -359,19 +475,29 @@ impl Scheduler {
                 return Some(index);
             }
         }
+        // A free adapter, or an adapter slot that was never opened (adapter.cpp:761-774).
         for index in 0..MAX_ADAPTERS {
-            let Some(adapter) = self.adapters[index].as_ref() else {
+            let Some((enabled, sid_cnt, sys_match)) =
+                self.adapters[index].as_ref().map(|adapter| {
+                    (
+                        adapter.config.enabled,
+                        adapter.sid_cnt,
+                        delsys_match(adapter, tp.msys),
+                    )
+                })
+            else {
                 continue;
             };
-            if adapter.config.enabled
-                && adapter.sid_cnt == 0
-                && delsys_match(adapter, tp.msys)
-                && self.source_enabled(index, tp)
-                && !self.compare_slave_parameters(index as i32, tp)
-            {
+            let slave_ok = !self.compare_slave_parameters(index as i32, tp);
+            let src_ok = self.source_enabled(index, tp);
+            if enabled && sid_cnt == 0 && sys_match && src_ok && slave_ok {
+                return Some(index);
+            }
+            if !enabled && sys_match && slave_ok && src_ok && self.init_hw(index) {
                 return Some(index);
             }
         }
+        // No regular tuner is free: a slave may still be usable (adapter.cpp:776-785).
         for index in 0..MAX_ADAPTERS {
             let Some(adapter) = self.adapters[index].as_ref() else {
                 continue;
@@ -474,6 +600,10 @@ impl Scheduler {
     }
 
     /// Whether a slave tuner cannot follow `tp` because of LNB/DiSEqC state.
+    ///
+    /// Mirrors `compare_slave_parameters` (adapter.cpp:617): unicable/JESS
+    /// adapters ignore band and polarisation, and the band threshold comes from
+    /// the master LNB when this adapter has one.
     pub fn compare_slave_parameters(&self, aid: i32, tp: &TuneParams) -> bool {
         let Some(adapter) = self.enabled_adapter(aid) else {
             return false;
@@ -481,21 +611,33 @@ impl Scheduler {
         if adapter.config.master_source.is_none() && !adapter.used.iter().any(|used| *used) {
             return false;
         }
-        let pol = (polarization_code(tp.pol) - 1) & 1;
-        let diseqc = if tp.src > 0 { i32::from(tp.src) - 1 } else { 0 };
-        let hiband = (tp.freq > 0).then(|| lnb_hiband(adapter, tp));
+        if adapter.config.switch_type.is_single_cable() {
+            return false;
+        }
+        let pol = (polarization_code(tp) - 1) & 1;
+        let diseqc = if tp.src_specified && tp.src > 0 {
+            i32::from(tp.src) - 1
+        } else {
+            0
+        };
+        let lnb = adapter
+            .config
+            .master_source
+            .and_then(|master| self.adapters.get(master).and_then(Option::as_ref))
+            .map_or(&adapter.config, |master| &master.config);
+        let hiband = (tp.freq > 0).then(|| lnb_hiband(lnb, tp.pol, tp.freq));
         for (index, used) in adapter.used.iter().enumerate() {
             if !used {
                 continue;
             }
-            if let Some(other) = self.adapters[index].as_ref()
+            if let Some(other) = self.enabled_adapter(index as i32)
                 && incompatible(other, pol, hiband, diseqc)
             {
                 return true;
             }
         }
         if let Some(master) = adapter.config.master_source
-            && let Some(other) = self.adapters.get(master).and_then(Option::as_ref)
+            && let Some(other) = self.enabled_adapter(master as i32)
             && incompatible(other, pol, hiband, diseqc)
         {
             return true;
@@ -632,7 +774,7 @@ impl Scheduler {
                 adapter.do_tune = true;
             }
             self.mark_pid_deleted(index, PID_STREAM_ID_UNDEFINED, None);
-            if self.update_pids(index) {
+            if self.update_pids(index) != 0 {
                 return Err(SetParamsError::PidFailure);
             }
         }
@@ -677,6 +819,7 @@ impl Scheduler {
         let mut result = Ok(());
         if adapter.master_sid == sid && adapter.do_tune {
             let params = adapter.params.clone();
+            let config = adapter.config.clone();
             let slaves: Vec<StreamId> = if adapter.sid_cnt > 1 {
                 adapter
                     .attached
@@ -687,6 +830,29 @@ impl Scheduler {
             } else {
                 Vec::new()
             };
+            // setup_switch records the switch position before tuning
+            // (dvb.cpp:1224-1232); a slave also updates its master's cache.
+            if matches!(params.msys, DeliverySystem::DvbS | DeliverySystem::DvbS2) {
+                let pol = (polarization_code(&params) - 1) & 1;
+                let diseqc = if params.src_specified && params.src > 0 {
+                    i32::from(params.src) - 1
+                } else {
+                    0
+                };
+                let hiband = lnb_hiband(&config, params.pol, params.freq);
+                if let Some(adapter) = self.adapters[index].as_mut() {
+                    adapter.old_pol = pol;
+                    adapter.old_hiband = hiband;
+                    adapter.old_diseqc = diseqc;
+                }
+                if let Some(master) = config.master_source
+                    && let Some(master) = self.adapters.get_mut(master).and_then(Option::as_mut)
+                {
+                    master.old_pol = pol;
+                    master.old_hiband = hiband;
+                    master.old_diseqc = diseqc;
+                }
+            }
             if let Some(adapter) = self.adapters[index].as_mut() {
                 result = adapter.tuner.tune(&params);
             }
@@ -700,7 +866,7 @@ impl Scheduler {
         if result.is_err() {
             self.mark_pid_deleted(index, PID_STREAM_ID_UNDEFINED, None);
         }
-        if self.update_pids(index) && result.is_ok() {
+        if self.update_pids(index) != 0 && result.is_ok() {
             result = Err(TuneError::Pids);
         }
         if let Some(adapter) = self.adapters[index].as_mut() {
@@ -725,41 +891,62 @@ impl Scheduler {
             .collect()
     }
 
-    /// Adds `pid` to `aid`'s table for `sid`; `false` when the table is full.
-    pub fn mark_pid_add(&mut self, aid: i32, sid: StreamId, pid: i32) -> bool {
+    /// Adds `pid` to `aid`'s table for `sid`; `-1` on rejection, `0` on success.
+    pub fn mark_pid_add(&mut self, aid: i32, sid: StreamId, pid: i32) -> i32 {
         if !(0..=PID_ALL).contains(&pid) {
-            return false;
+            return -1;
         }
         let Some(adapter) = self.enabled_adapter_mut(aid) else {
-            return false;
+            return -1;
         };
+        let pid_order = adapter.pid_order.clone();
         if let Some(entry) = adapter
             .pids
             .iter_mut()
             .find(|entry| entry.state != PidState::Inactive && entry.pid == pid)
         {
             if sid != PID_STREAM_ID_UNDEFINED {
+                let had_client = !entry.sids.is_empty();
                 entry.sids.insert(sid);
+                if !had_client && !entry.sids.is_empty() {
+                    entry.order = pid_order.next_pid_order();
+                }
             }
             if entry.state == PidState::Deleted {
                 entry.state = PidState::New;
             }
-            return true;
+            return 0;
         }
         let Some(entry) = adapter
             .pids
             .iter_mut()
             .find(|entry| entry.state == PidState::Inactive)
         else {
-            return false;
+            return -1;
         };
         entry.pid = pid;
         entry.state = PidState::New;
+        entry.fd = 0;
+        entry.order = 0;
+        entry.packets = 0;
         entry.sids.clear();
         if sid != PID_STREAM_ID_UNDEFINED {
             entry.sids.insert(sid);
         }
-        true
+        if !entry.sids.is_empty() {
+            entry.order = pid_order.next_pid_order();
+        }
+        0
+    }
+
+    /// Finds a non-inactive PID entry, scanning the whole table
+    /// (`find_pid`, adapter.cpp:1137).
+    pub fn find_pid(&self, aid: i32, pid: i32) -> Option<&PidEntry> {
+        let adapter = self.enabled_adapter(aid)?;
+        adapter
+            .pids
+            .iter()
+            .find(|entry| entry.state != PidState::Inactive && entry.pid == pid)
     }
 
     fn mark_pid_deleted(&mut self, index: usize, sid: StreamId, pid: Option<i32>) {
@@ -776,10 +963,12 @@ impl Scheduler {
             if sid == PID_STREAM_ID_UNDEFINED {
                 entry.state = PidState::Deleted;
                 entry.sids.clear();
+                entry.order = 0;
             } else {
                 entry.sids.remove(&sid);
                 if entry.sids.is_empty() {
                     entry.state = PidState::Deleted;
+                    entry.order = 0;
                 }
             }
         }
@@ -814,7 +1003,7 @@ impl Scheduler {
                         && entry.sids.contains(&sid)
                 })
             });
-            if !present && !self.mark_pid_add(aid, sid, pid) {
+            if !present && self.mark_pid_add(aid, sid, pid) < 0 {
                 return false;
             }
         }
@@ -842,36 +1031,112 @@ impl Scheduler {
             .collect();
         for pid in [0, 1, 16, 18] {
             if !existing.contains(&pid) {
-                self.mark_pid_add(index as i32, PID_STREAM_ID_UNDEFINED, pid);
+                let _ = self.mark_pid_add(index as i32, PID_STREAM_ID_UNDEFINED, pid);
             }
         }
     }
 
-    fn update_pids(&mut self, index: usize) -> bool {
-        let Some(adapter) = self.adapters[index].as_mut() else {
-            return true;
-        };
-        for entry in &mut adapter.pids {
-            if entry.state == PidState::Deleted {
-                *entry = PidEntry::default();
+    /// Applies pending DELETED/NEW entries and sorts the table
+    /// (`update_pids`, adapter.cpp:928-1047). Returns 0 on success, 1 on error.
+    fn update_pids(&mut self, index: usize) -> i32 {
+        let mut rv = 0;
+        {
+            let Some(adapter) = self.adapters[index].as_mut() else {
+                return 1;
+            };
+            for slot in (0..MAX_PIDS).rev() {
+                if adapter.pids[slot].state != PidState::Deleted {
+                    continue;
+                }
+                if adapter.pids[slot].fd > 0 {
+                    if adapter.active_pids > 0 {
+                        adapter.active_pids -= 1;
+                    }
+                    let (fd, pid) = (adapter.pids[slot].fd, adapter.pids[slot].pid);
+                    if adapter.tuner.del_filters(fd, pid).is_err() {
+                        rv = 1;
+                    }
+                }
+                // Soft cleanup: C++ keeps `pid` and clears the rest.
+                let entry = &mut adapter.pids[slot];
+                entry.fd = 0;
+                entry.order = 0;
+                entry.state = PidState::Inactive;
+                entry.packets = 0;
+            }
+
+            for slot in 0..MAX_PIDS {
+                if adapter.pids[slot].state != PidState::New {
+                    continue;
+                }
+                if adapter.max_pids != 0 && adapter.max_pids < adapter.active_pids {
+                    break;
+                }
+                if adapter.pids[slot].fd <= 0 {
+                    let pid = adapter.pids[slot].pid;
+                    match adapter.tuner.set_pid(pid) {
+                        Ok(fd) => adapter.pids[slot].fd = fd,
+                        Err(_) => {
+                            adapter.max_pids = adapter.max_active_pids - 1;
+                            if adapter.max_pids < MIN_ADAPTER_PIDS {
+                                adapter.max_pids = MIN_ADAPTER_PIDS;
+                            }
+                            if adapter.active_pids < MIN_ADAPTER_PIDS {
+                                rv = 1;
+                            }
+                            break;
+                        }
+                    }
+                    adapter.active_pids += 1;
+                    if adapter.max_active_pids < adapter.active_pids {
+                        adapter.max_active_pids = adapter.active_pids;
+                    }
+                }
+                adapter.pids[slot].state = PidState::Active;
+                adapter.pids[slot].packets = 0;
+            }
+
+            // The C++ drives each PID through set_pid/del_filters above; also
+            // hand the resulting active set to backends that filter in bulk.
+            let pids = PidSet::from_pids(
+                adapter
+                    .pids
+                    .iter()
+                    .filter(|entry| entry.state == PidState::Active && entry.fd > 0)
+                    .filter_map(|entry| u16::try_from(entry.pid).ok()),
+            );
+            if adapter.tuner.set_pids(&pids).is_err() {
+                rv = 1;
             }
         }
-        adapter.active_pids = adapter
-            .pids
-            .iter()
-            .filter(|entry| entry.state == PidState::Active)
-            .count() as i32;
-        for slot in 0..MAX_PIDS {
-            if adapter.pids[slot].state != PidState::New {
-                continue;
+        self.sort_pids(index);
+        rv
+    }
+
+    /// Bubble-sorts active entries to the front, highest packet count first
+    /// (`sort_pids`, adapter.cpp:1565).
+    fn sort_pids(&mut self, index: usize) {
+        let Some(adapter) = self.adapters[index].as_mut() else {
+            return;
+        };
+        let pids = &mut adapter.pids;
+        loop {
+            let mut swapped = false;
+            for slot in 0..MAX_PIDS - 1 {
+                if pids[slot + 1].state == PidState::Inactive {
+                    continue;
+                }
+                if pids[slot].state == PidState::Inactive
+                    || pids[slot].packets < pids[slot + 1].packets
+                {
+                    pids.swap(slot, slot + 1);
+                    swapped = true;
+                }
             }
-            if adapter.max_pids > 0 && adapter.max_pids < adapter.active_pids {
+            if !swapped {
                 break;
             }
-            adapter.active_pids += 1;
-            adapter.pids[slot].state = PidState::Active;
         }
-        false
     }
 }
 
@@ -892,7 +1157,20 @@ fn mtype_is_auto(tp: &TuneParams) -> bool {
     !tp.mtype_specified || tp.mtype == 6
 }
 
-fn polarization_code(pol: Polarization) -> i32 {
+/// `tp.pol.value_or(-1)`: an explicit `pol=0` is distinct from an absent one.
+fn polarization_code(tp: &TuneParams) -> i32 {
+    match tp.pol {
+        Polarization::Vertical => 1,
+        Polarization::Horizontal => 2,
+        Polarization::Right => 3,
+        Polarization::Left => 4,
+        Polarization::None if tp.pol_specified => 0,
+        Polarization::None => -1,
+    }
+}
+
+/// `tp.pol.value_or(0)`, used by the LNB band computation.
+fn lnb_polarization_code(pol: Polarization) -> i32 {
     match pol {
         Polarization::Vertical => 1,
         Polarization::Horizontal => 2,
@@ -902,13 +1180,11 @@ fn polarization_code(pol: Polarization) -> i32 {
     }
 }
 
-fn lnb_hiband(adapter: &Adapter, tp: &TuneParams) -> i32 {
-    if polarization_code(tp.pol) > 2 && adapter.config.lnb_circular > 0 {
+fn lnb_hiband(config: &AdapterConfig, pol: Polarization, freq: i32) -> i32 {
+    if lnb_polarization_code(pol) > 2 && config.lnb_circular > 0 {
         return 0;
     }
-    i32::from(
-        adapter.config.lnb_switch > 0 && i64::from(tp.freq) > i64::from(adapter.config.lnb_switch),
-    )
+    i32::from(config.lnb_switch > 0 && i64::from(freq) > i64::from(config.lnb_switch))
 }
 
 fn incompatible(adapter: &Adapter, pol: i32, hiband: Option<i32>, diseqc: i32) -> bool {
@@ -919,8 +1195,11 @@ fn incompatible(adapter: &Adapter, pol: i32, hiband: Option<i32>, diseqc: i32) -
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
+
     use super::*;
-    use ms_tuner::PidSet;
 
     struct OkTuner;
 
@@ -951,6 +1230,73 @@ mod tests {
             Box::new(OkTuner),
         );
         scheduler
+    }
+
+    fn add_ok(scheduler: &mut Scheduler, aid: usize, config: AdapterConfig) {
+        scheduler.add_adapter(aid, config, Box::new(OkTuner));
+    }
+
+    fn add_sat(scheduler: &mut Scheduler, aid: usize) {
+        add_ok(scheduler, aid, AdapterConfig::new(DeliverySystem::DvbS2));
+    }
+
+    fn sat_params(freq: i32, pol: Polarization) -> TuneParams {
+        TuneParams {
+            freq,
+            pol,
+            src: 1,
+            src_specified: true,
+            msys: DeliverySystem::DvbS2,
+            sr: 27_500_000,
+            ..TuneParams::default()
+        }
+    }
+
+    type RecordedTunes = Rc<RefCell<Vec<TuneParams>>>;
+    type RecordedPidSets = Rc<RefCell<Vec<BTreeSet<i32>>>>;
+
+    /// Records `tune` and `set_pids` calls; `result` overrides the tune result.
+    struct RecordingTuner {
+        tunes: RecordedTunes,
+        pid_sets: RecordedPidSets,
+        result: Option<TuneError>,
+    }
+
+    impl AdapterTuner for RecordingTuner {
+        fn tune(&mut self, params: &TuneParams) -> Result<(), TuneError> {
+            self.tunes.borrow_mut().push(params.clone());
+            self.result.map_or(Ok(()), Err)
+        }
+
+        fn set_pids(&mut self, pids: &PidSet) -> Result<(), TuneError> {
+            self.pid_sets
+                .borrow_mut()
+                .push(pids.iter().map(i32::from).collect());
+            Ok(())
+        }
+    }
+
+    fn recording_scheduler() -> (Scheduler, RecordedTunes, RecordedPidSets) {
+        let tunes = Rc::new(RefCell::new(Vec::new()));
+        let pid_sets = Rc::new(RefCell::new(Vec::new()));
+        let mut scheduler = Scheduler::new();
+        add_ok(&mut scheduler, 0, AdapterConfig::new(DeliverySystem::DvbS2));
+        scheduler
+            .adapter_mut(0)
+            .unwrap()
+            .set_tuner(Box::new(RecordingTuner {
+                tunes: Rc::clone(&tunes),
+                pid_sets: Rc::clone(&pid_sets),
+                result: None,
+            }));
+        (scheduler, tunes, pid_sets)
+    }
+
+    fn active_pids(scheduler: &Scheduler) -> BTreeSet<i32> {
+        scheduler
+            .adapter(0)
+            .map(|adapter| adapter.active_pids().into_iter().collect())
+            .unwrap_or_default()
     }
 
     #[test]
@@ -1040,16 +1386,989 @@ mod tests {
 
         let mut added = 0;
         let mut pid = 100;
-        while pid < 8000 && scheduler.mark_pid_add(0, PID_STREAM_ID_UNDEFINED, pid) {
+        while pid < 8000 && scheduler.mark_pid_add(0, PID_STREAM_ID_UNDEFINED, pid) == 0 {
             added += 1;
             pid += 1;
         }
         assert_eq!(added, MAX_PIDS - 4, "four default pids are already active");
 
         scheduler.close_adapter_for_stream(0, 0);
-        assert!(
+        assert_eq!(
             scheduler.mark_pid_add(0, PID_STREAM_ID_UNDEFINED, 5000),
+            0,
             "releasing the adapter must free the PID table"
         );
+    }
+
+    /// PID hooks that can be made to fail, like the C++ `set_pid`/`del_filters`
+    /// test callbacks in test_adapter.cpp.
+    struct FailingTuner {
+        set_pid_fails: bool,
+        del_filters_fails: bool,
+    }
+
+    impl AdapterTuner for FailingTuner {
+        fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+            Ok(())
+        }
+
+        fn set_pid(&mut self, _pid: i32) -> Result<i32, TuneError> {
+            if self.set_pid_fails {
+                Err(TuneError::Hardware)
+            } else {
+                Ok(1)
+            }
+        }
+
+        fn del_filters(&mut self, _fd: i32, _pid: i32) -> Result<(), TuneError> {
+            if self.del_filters_fails {
+                Err(TuneError::Hardware)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    // Ported from tests/test_adapter.cpp:125
+    #[test]
+    fn test_update_pids() {
+        let mut scheduler = scheduler();
+        {
+            let adapter = scheduler.adapter_mut(0).unwrap();
+            for i in 0..8 {
+                adapter.pids[i].state = match i % 4 {
+                    0 => PidState::Inactive,
+                    1 => PidState::Active,
+                    2 => PidState::New,
+                    _ => PidState::Deleted,
+                };
+                adapter.pids[i].pid = i as i32;
+                adapter.pids[i].packets = i as u32;
+            }
+        }
+        scheduler.update_pids(0);
+        let adapter = scheduler.adapter(0).unwrap();
+        assert_eq!(
+            adapter.pids[0].pid, 5,
+            "Expected pid with flags = 1 and largest number of packets"
+        );
+        assert_eq!(
+            adapter.pids[1].pid, 1,
+            "Expected pid with flags = 1 and second largest number of packets"
+        );
+        assert!(
+            adapter.pids[2].pid == 2 && adapter.pids[2].packets == 0,
+            "Expected pid with flags = 1 and 0 packets"
+        );
+        assert!(
+            adapter.pids[3].pid == 6 && adapter.pids[2].packets == 0,
+            "Expected pid with flags = 1 and 0 packets"
+        );
+        assert!(
+            adapter.pids[4].pid == 0 && adapter.pids[4].state == PidState::Inactive,
+            "Expected pid with flags = 0"
+        );
+    }
+
+    // Ported from tests/test_adapter.cpp:169
+    #[test]
+    fn test_find_pid_unsorted() {
+        let mut scheduler = scheduler();
+        {
+            let adapter = scheduler.adapter_mut(0).unwrap();
+            adapter.pids[0].state = PidState::Inactive;
+            adapter.pids[1].state = PidState::New;
+            adapter.pids[1].pid = 18;
+            adapter.pids[2].state = PidState::Active;
+            adapter.pids[2].pid = 1151;
+        }
+
+        let found = scheduler.find_pid(0, 18);
+        assert!(
+            found.is_some_and(|entry| entry.pid == 18),
+            "find_pid must find a NEW entry behind an INACTIVE slot"
+        );
+        let found = scheduler.find_pid(0, 1151);
+        assert!(
+            found.is_some_and(|entry| entry.pid == 1151),
+            "find_pid must find an ACTIVE entry behind an INACTIVE slot"
+        );
+        assert!(
+            scheduler.find_pid(0, 9999).is_none(),
+            "find_pid must return NULL for a missing pid"
+        );
+    }
+
+    // Ported from tests/test_adapter.cpp:213
+    #[test]
+    fn test_update_pids_del_filters_error() {
+        let mut first = scheduler();
+        first
+            .adapter_mut(0)
+            .unwrap()
+            .set_tuner(Box::new(FailingTuner {
+                set_pid_fails: false,
+                del_filters_fails: true,
+            }));
+        {
+            let adapter = first.adapter_mut(0).unwrap();
+            adapter.active_pids = 5;
+            adapter.pids[0].state = PidState::Deleted;
+            adapter.pids[0].pid = 0;
+            adapter.pids[0].fd = 42;
+        }
+        assert_ne!(
+            first.update_pids(0),
+            0,
+            "update_pids should fail when a pid cannot be removed"
+        );
+        {
+            let adapter = first.adapter(0).unwrap();
+            assert!(
+                adapter.pids[0].state == PidState::Inactive && adapter.pids[0].fd == 0,
+                "removed pid entry must be cleaned up even on failure"
+            );
+        }
+
+        let mut second = scheduler();
+        second
+            .adapter_mut(0)
+            .unwrap()
+            .set_tuner(Box::new(FailingTuner {
+                set_pid_fails: false,
+                del_filters_fails: true,
+            }));
+        {
+            let adapter = second.adapter_mut(0).unwrap();
+            adapter.active_pids = 20;
+            adapter.pids[0].state = PidState::Deleted;
+            adapter.pids[0].pid = 0;
+            adapter.pids[0].fd = 42;
+        }
+        assert_ne!(
+            second.update_pids(0),
+            0,
+            "update_pids should fail on removal failure regardless of pid count"
+        );
+    }
+
+    // Ported from tests/test_adapter.cpp:254
+    #[test]
+    fn test_update_pids_max_pids_floor() {
+        let mut first = scheduler();
+        first
+            .adapter_mut(0)
+            .unwrap()
+            .set_tuner(Box::new(FailingTuner {
+                set_pid_fails: true,
+                del_filters_fails: false,
+            }));
+        {
+            let adapter = first.adapter_mut(0).unwrap();
+            adapter.active_pids = 5;
+            adapter.max_active_pids = 5;
+            adapter.pids[0].state = PidState::New;
+            adapter.pids[0].pid = 1151;
+        }
+        assert_ne!(
+            first.update_pids(0),
+            0,
+            "update_pids should fail when a pid cannot be added below the minimum pid count"
+        );
+        {
+            let adapter = first.adapter(0).unwrap();
+            assert_eq!(
+                adapter.max_pids, MIN_ADAPTER_PIDS,
+                "max_pids must not go below MIN_ADAPTER_PIDS"
+            );
+            assert_eq!(
+                adapter.pids[0].state,
+                PidState::New,
+                "failing pid must stay NEW so a later update retries it"
+            );
+        }
+
+        assert_ne!(
+            first.update_pids(0),
+            0,
+            "repeated failure should still report error"
+        );
+        assert_eq!(
+            first.adapter(0).unwrap().max_pids,
+            MIN_ADAPTER_PIDS,
+            "max_pids must stay at MIN_ADAPTER_PIDS on repeated failures"
+        );
+
+        let mut second = scheduler();
+        second
+            .adapter_mut(0)
+            .unwrap()
+            .set_tuner(Box::new(FailingTuner {
+                set_pid_fails: true,
+                del_filters_fails: false,
+            }));
+        {
+            let adapter = second.adapter_mut(0).unwrap();
+            adapter.active_pids = 20;
+            adapter.max_active_pids = 20;
+            adapter.pids[0].state = PidState::New;
+            adapter.pids[0].pid = 1151;
+        }
+        assert_eq!(
+            second.update_pids(0),
+            0,
+            "update_pids should succeed when the cap is reached at/above the minimum pid count"
+        );
+        assert_eq!(
+            second.adapter(0).unwrap().max_pids,
+            19,
+            "max_pids should lower to max_active_pids - 1"
+        );
+    }
+
+    // Ported from tests/test_adapter.cpp:308
+    #[test]
+    fn test_dvb_demux_shared_pid_count() {
+        let mut scheduler = scheduler();
+        let adapter = scheduler.adapter_mut(0).unwrap();
+        adapter.dvr = 12;
+        adapter.pids[0].state = PidState::Active;
+        adapter.pids[0].pid = 0;
+        adapter.pids[0].fd = 18; // PSI pid on its own fd
+        adapter.pids[1].state = PidState::Active;
+        adapter.pids[1].pid = 1151;
+        adapter.pids[1].fd = 12; // media pid on the shared demux fd
+        adapter.pids[2].state = PidState::New;
+        adapter.pids[2].pid = 2221;
+        adapter.pids[2].fd = 0; // not active yet: must not be counted
+        adapter.pids[3].state = PidState::Deleted;
+        adapter.pids[3].pid = 20;
+        adapter.pids[3].fd = 12; // deleted: must not be counted
+        assert_eq!(
+            adapter.demux_shared_pid_count(),
+            1,
+            "only active pids on the shared demux fd must be counted"
+        );
+    }
+
+    // Ported from tests/test_adapter.cpp:329
+    #[test]
+    fn test_compare_slave_parameters() {
+        let mut scheduler = Scheduler::new();
+        let empty = TuneParams::default();
+
+        // 1. ad is NULL
+        assert!(
+            !scheduler.compare_slave_parameters(0, &empty),
+            "compare_slave_parameters with NULL adapter should return 0"
+        );
+
+        add_sat(&mut scheduler, 0);
+        let mut slave_config = AdapterConfig::new(DeliverySystem::DvbS2);
+        slave_config.master_source = Some(0);
+        add_ok(&mut scheduler, 1, slave_config);
+
+        // 2. master is not a slave and is not marked as used by any slave adapter
+        assert!(
+            !scheduler.compare_slave_parameters(0, &empty),
+            "Adapter with empty used array and master_source < 0 should return 0"
+        );
+
+        // 3. JESS/UNICABLE switch types should always return 0
+        scheduler.adapter_mut(1).unwrap().config.switch_type = SwitchType::Jess;
+        let mut tp = TuneParams {
+            pol: Polarization::Horizontal,
+            ..TuneParams::default()
+        };
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "UNICABLE/JESS adapter should return 0"
+        );
+        scheduler.adapter_mut(1).unwrap().config.switch_type = SwitchType::Unicable;
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "UNICABLE/JESS adapter should return 0"
+        );
+
+        // Reset switch type
+        scheduler.adapter_mut(1).unwrap().config.switch_type = SwitchType::Slave;
+
+        // Configure LNB parameters (Universal LNB) and master old values.
+        {
+            let master = scheduler.adapter_mut(0).unwrap();
+            master.config.lnb_switch = 11_700_000;
+            master.old_pol = 0;
+            master.old_hiband = 0;
+            master.old_diseqc = 0;
+        }
+
+        // 4. master check with optional parameters
+        tp = TuneParams::default();
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "No parameters set in transponder should not conflict"
+        );
+
+        tp = TuneParams {
+            pol: Polarization::Vertical,
+            ..TuneParams::default()
+        };
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "Matching polarization should return 0"
+        );
+
+        tp = TuneParams {
+            pol: Polarization::None,
+            pol_specified: true,
+            ..TuneParams::default()
+        };
+        assert!(
+            scheduler.compare_slave_parameters(1, &tp),
+            "Polarization=0 (unspecified) maps to pol=1 and should conflict with old_pol=0"
+        );
+
+        scheduler.adapter_mut(0).unwrap().old_pol = 1;
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "Polarization=0 (unspecified) maps to pol=1 and should match old_pol=1"
+        );
+        scheduler.adapter_mut(0).unwrap().old_pol = 0;
+
+        tp = TuneParams {
+            pol: Polarization::Horizontal,
+            ..TuneParams::default()
+        };
+        assert!(
+            scheduler.compare_slave_parameters(1, &tp),
+            "Conflicting polarization should return 1"
+        );
+
+        tp = TuneParams {
+            src: 1,
+            src_specified: true,
+            ..TuneParams::default()
+        };
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "Matching diseqc should return 0"
+        );
+
+        tp = TuneParams {
+            src: 0,
+            src_specified: true,
+            ..TuneParams::default()
+        };
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "Diseqc=0 (unspecified) maps to diseqc=0 and should match old_diseqc=0"
+        );
+
+        scheduler.adapter_mut(0).unwrap().old_diseqc = 1;
+        assert!(
+            scheduler.compare_slave_parameters(1, &tp),
+            "Diseqc=0 (unspecified) maps to diseqc=0 and should conflict with old_diseqc=1"
+        );
+        scheduler.adapter_mut(0).unwrap().old_diseqc = 0;
+
+        tp = TuneParams {
+            src: 2,
+            src_specified: true,
+            ..TuneParams::default()
+        };
+        assert!(
+            scheduler.compare_slave_parameters(1, &tp),
+            "Conflicting diseqc should return 1"
+        );
+
+        tp = TuneParams {
+            freq: 10_778_000,
+            ..TuneParams::default()
+        };
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "Matching band (lowband) should return 0"
+        );
+
+        tp = TuneParams::default();
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "Frequency=0 (unspecified) should return 0"
+        );
+
+        tp = TuneParams {
+            freq: 12_322_000,
+            ..TuneParams::default()
+        };
+        assert!(
+            scheduler.compare_slave_parameters(1, &tp),
+            "Conflicting band (hiband) should return 1"
+        );
+
+        // 4b. Empty tp.diseqc_param: the adapter's settings apply.
+        scheduler.adapter_mut(0).unwrap().old_hiband = 1;
+        assert!(
+            !scheduler.compare_slave_parameters(1, &tp),
+            "Highband tp with empty diseqc_param should match master old_hiband=1"
+        );
+        scheduler.adapter_mut(0).unwrap().old_hiband = 0;
+        assert!(
+            scheduler.compare_slave_parameters(1, &tp),
+            "Highband tp with empty diseqc_param should conflict with master old_hiband=0"
+        );
+
+        // 5. master used by slave_ad
+        {
+            let master = scheduler.adapter_mut(0).unwrap();
+            master.used[1] = true;
+        }
+        {
+            let slave = scheduler.adapter_mut(1).unwrap();
+            slave.old_pol = 0;
+            slave.old_hiband = 0;
+            slave.old_diseqc = 0;
+        }
+
+        tp = TuneParams {
+            pol: Polarization::Horizontal,
+            ..TuneParams::default()
+        };
+        assert!(
+            scheduler.compare_slave_parameters(0, &tp),
+            "Conflicting polarization on slave adapter should return 1"
+        );
+
+        tp = TuneParams {
+            pol: Polarization::Vertical,
+            ..TuneParams::default()
+        };
+        assert!(
+            !scheduler.compare_slave_parameters(0, &tp),
+            "Matching polarization on slave adapter should return 0"
+        );
+    }
+
+    // Ported from tests/test_adapter.cpp:515
+    #[test]
+    fn test_mark_pid_add_bounds() {
+        let mut scheduler = scheduler();
+        assert_eq!(
+            scheduler.mark_pid_add(0, 0, 8193),
+            -1,
+            "pid 8193 must be rejected"
+        );
+        assert_eq!(
+            scheduler.mark_pid_add(0, 0, 99999),
+            -1,
+            "pid 99999 must be rejected"
+        );
+        assert_eq!(
+            scheduler.mark_pid_add(0, 0, -5),
+            -1,
+            "negative pid must be rejected"
+        );
+        assert!(
+            scheduler.find_pid(0, 8193).is_none(),
+            "rejected pid must leave no entry"
+        );
+        assert_eq!(
+            scheduler.mark_pid_add(0, 0, 8192),
+            0,
+            "pids=all marker must be added"
+        );
+        assert!(
+            scheduler.find_pid(0, 8192).is_some(),
+            "pids=all marker must be found"
+        );
+    }
+
+    // Ported from tests/test_adapter.cpp:534
+    #[test]
+    fn test_next_pid_order_concurrent() {
+        let scheduler = scheduler();
+        let pid_order = scheduler.adapter(0).unwrap().pid_order();
+        const NTHREADS: usize = 8;
+        const PER: usize = 2000;
+
+        let got: Vec<Vec<u32>> = std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..NTHREADS {
+                let pid_order = pid_order.clone();
+                threads.push(
+                    scope.spawn(move || (0..PER).map(|_| pid_order.next_pid_order()).collect()),
+                );
+            }
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect()
+        });
+
+        let mut seen = std::collections::HashSet::new();
+        for value in got.into_iter().flatten() {
+            assert_ne!(value, 0, "order must never be 0");
+            assert!(seen.insert(value), "duplicate pid order across threads");
+        }
+        assert_eq!(seen.len(), NTHREADS * PER, "lost sequence updates");
+    }
+
+    // C++: get_free_adapter checks an already tuned adapter first
+    // (adapter.cpp:754-759), before looking at idle ones (#1509).
+    #[test]
+    fn same_mux_reuses_busy_adapter_before_free_adapter() {
+        let mut scheduler = Scheduler::new();
+        add_sat(&mut scheduler, 0);
+        add_sat(&mut scheduler, 1);
+
+        let tp = sat_params(11_362_000, Polarization::Horizontal);
+        assert_eq!(scheduler.get_free_adapter(&tp), Some(0));
+        assert!(scheduler.set_adapter_for_stream(10, 0));
+        assert!(scheduler.set_adapter_parameters(0, 10, &tp).is_ok());
+
+        assert_eq!(
+            scheduler.get_free_adapter(&tp),
+            Some(0),
+            "the tuned adapter is chosen even though adapter 1 is idle"
+        );
+        let other = sat_params(11_363_001, Polarization::Horizontal);
+        assert_eq!(
+            scheduler.get_free_adapter(&other),
+            Some(1),
+            "1001 kHz away is a different mux"
+        );
+    }
+
+    // C++: adapter.cpp:761-774 opens an allocated but uninitialized slot.
+    #[test]
+    fn uninitialized_adapter_is_initialized_by_allocation() {
+        let mut scheduler = Scheduler::new();
+        let mut config = AdapterConfig::new(DeliverySystem::DvbS2);
+        config.enabled = false;
+        add_ok(&mut scheduler, 0, config);
+        assert!(!scheduler.adapter(0).unwrap().config.enabled);
+
+        let tp = sat_params(11_362_000, Polarization::Horizontal);
+        assert_eq!(scheduler.get_free_adapter(&tp), Some(0));
+        assert!(scheduler.adapter(0).unwrap().config.enabled);
+    }
+
+    // C++: `-e` marks adapters disabled; init_hw refuses them
+    // (adapter.cpp:269-272) and get_free_adapter skips them.
+    #[test]
+    fn disabled_adapter_is_skipped_and_blames_the_frontend() {
+        let mut scheduler = Scheduler::new();
+        let mut config = AdapterConfig::new(DeliverySystem::DvbS2);
+        config.enabled = false;
+        add_ok(&mut scheduler, 0, config);
+        scheduler.set_disabled(0, true);
+
+        let tp = sat_params(11_362_000, Polarization::Horizontal);
+        assert_eq!(scheduler.get_free_adapter(&tp), None);
+        assert_eq!(scheduler.out_of_range_attrs(&tp), Some("msys"));
+
+        scheduler.set_fe_map_entry(0, 0);
+        let mut pinned = tp.clone();
+        pinned.fe = Some(1);
+        assert_eq!(scheduler.get_free_adapter(&pinned), None);
+        assert_eq!(scheduler.out_of_range_attrs(&pinned), Some("fe"));
+    }
+
+    // C++: a mapped `fe=` pins get_free_adapter to that adapter and `goto
+    // noadapter` forbids falling back to an idle one (adapter.cpp:720-752).
+    #[test]
+    fn pinned_frontend_overrides_same_mux_and_free_adapters() {
+        let mut scheduler = Scheduler::new();
+        add_sat(&mut scheduler, 0);
+        add_sat(&mut scheduler, 1);
+        scheduler.set_fe_map_entry(0, 1);
+
+        let mut tp = sat_params(11_362_000, Polarization::Horizontal);
+        tp.fe = Some(1);
+        assert_eq!(scheduler.get_free_adapter(&tp), Some(1));
+        assert!(scheduler.set_adapter_for_stream(10, 1));
+        assert!(scheduler.set_adapter_parameters(1, 10, &tp).is_ok());
+        assert_eq!(scheduler.tune(1, 10).result, Ok(()));
+
+        assert_eq!(scheduler.get_free_adapter(&tp), Some(1));
+        let mut other = sat_params(12_543_000, Polarization::Vertical);
+        other.fe = Some(1);
+        assert_eq!(
+            scheduler.get_free_adapter(&other),
+            None,
+            "a busy pinned frontend must not fall back to the free adapter"
+        );
+    }
+
+    // C++: absolute sources map `diseqc` per adapter when `-A` is enabled
+    // (adapter.cpp:681-705) and are applied when the client omits FE=
+    // (adapter.cpp:1411-1415).
+    #[test]
+    fn absolute_source_table_filters_and_maps() {
+        let mut scheduler = Scheduler::new();
+        add_sat(&mut scheduler, 0);
+        scheduler.set_absolute_switch(true);
+        let mut table = [0u8; MAX_SOURCES];
+        table[0] = 3;
+        scheduler.set_absolute_table(0, table);
+
+        let tp = sat_params(11_362_000, Polarization::Horizontal);
+        assert_eq!(scheduler.get_free_adapter(&tp), Some(0));
+        assert!(scheduler.set_adapter_for_stream(10, 0));
+        assert!(scheduler.set_adapter_parameters(0, 10, &tp).is_ok());
+        let stored = scheduler.adapter(0).unwrap();
+        assert_eq!(stored.params.src, 3);
+        assert!(stored.params.src_specified);
+        assert!(
+            !scheduler.compare_tuning_parameters(0, &tp),
+            "src 1 maps to the stored src 3"
+        );
+
+        let unmapped = sat_params(12_000_000, Polarization::Vertical);
+        let unmapped = TuneParams { src: 2, ..unmapped };
+        assert_eq!(scheduler.get_free_adapter(&unmapped), None);
+        assert_eq!(scheduler.out_of_range_attrs(&unmapped), Some("src"));
+    }
+
+    // C++: absolute sources only apply to DVB-S/S2 (adapter.cpp:684-686).
+    #[test]
+    fn absolute_source_table_ignores_terrestrial() {
+        let mut scheduler = Scheduler::new();
+        add_ok(&mut scheduler, 0, AdapterConfig::new(DeliverySystem::DvbT2));
+        scheduler.set_absolute_switch(true);
+        let tp = TuneParams {
+            freq: 474_000_000,
+            msys: DeliverySystem::DvbT2,
+            src: 9,
+            src_specified: true,
+            ..TuneParams::default()
+        };
+        assert_eq!(scheduler.get_free_adapter(&tp), Some(0));
+    }
+
+    // C++: compare_tunning_parameters (adapter.cpp:1322-1348).
+    #[test]
+    fn tuning_comparison_covers_every_cpp_field() {
+        let mut scheduler = scheduler();
+        let mut tp = params(11_362_000, 1);
+        tp.plp = Some(0);
+        tp.mtype = 2;
+        tp.mtype_specified = true;
+        assert!(scheduler.set_adapter_for_stream(10, 0));
+        assert!(scheduler.set_adapter_parameters(0, 10, &tp).is_ok());
+        assert!(!scheduler.compare_tuning_parameters(0, &tp));
+
+        let mut changed = tp.clone();
+        changed.plp = Some(1);
+        assert!(scheduler.compare_tuning_parameters(0, &changed));
+
+        let mut changed = tp.clone();
+        changed.src_specified = false;
+        changed.src = 0;
+        assert!(
+            scheduler.compare_tuning_parameters(0, &changed),
+            "a missing source stores the C++ nullopt, which differs from 1"
+        );
+
+        let mut changed = tp.clone();
+        changed.pol = Polarization::None;
+        assert!(
+            !scheduler.compare_tuning_parameters(0, &changed),
+            "polarisation is only compared when the new value is > 0"
+        );
+
+        let mut changed = tp.clone();
+        changed.pol = Polarization::Vertical;
+        assert!(scheduler.compare_tuning_parameters(0, &changed));
+
+        let mut changed = tp.clone();
+        changed.sr = 1_000;
+        assert!(
+            !scheduler.compare_tuning_parameters(0, &changed),
+            "symbol rates <= 1000 are ignored"
+        );
+
+        let mut changed = tp.clone();
+        changed.sr = 22_000_000;
+        assert!(scheduler.compare_tuning_parameters(0, &changed));
+
+        let mut changed = tp.clone();
+        changed.mtype_specified = false;
+        assert!(
+            !scheduler.compare_tuning_parameters(0, &changed),
+            "an unspecified modulation is QAM_AUTO"
+        );
+
+        let mut changed = tp.clone();
+        changed.mtype = 6;
+        assert!(
+            !scheduler.compare_tuning_parameters(0, &changed),
+            "QAM_AUTO(6) is never compared"
+        );
+
+        let mut changed = tp.clone();
+        changed.mtype = 3;
+        assert!(scheduler.compare_tuning_parameters(0, &changed));
+    }
+
+    // C++: compare_slave_parameters returns 0 for an adapter that is neither a
+    // slave nor has slaves attached (adapter.cpp:621-624).
+    #[test]
+    fn standalone_adapter_ignores_slave_lnb_state() {
+        let mut scheduler = scheduler();
+        scheduler.adapter_mut(0).unwrap().old_pol = 1;
+        assert!(
+            !scheduler.compare_slave_parameters(0, &sat_params(11_000_000, Polarization::Vertical))
+        );
+    }
+
+    // C++: a slave must match its master's polarisation, band and diseqc
+    // (adapter.cpp:637-672), with hiband from get_lnb_hiband.
+    #[test]
+    fn master_lnb_state_rejects_incompatible_slaves() {
+        let mut scheduler = Scheduler::new();
+        add_sat(&mut scheduler, 0);
+        let mut slave = AdapterConfig::new(DeliverySystem::DvbS2);
+        slave.master_source = Some(0);
+        add_ok(&mut scheduler, 1, slave);
+        {
+            let master = scheduler.adapter_mut(0).unwrap();
+            master.old_pol = 1;
+            master.old_hiband = 0;
+            master.old_diseqc = 0;
+        }
+
+        let h_low = sat_params(11_000_000, Polarization::Horizontal);
+        let v_low = sat_params(11_000_000, Polarization::Vertical);
+        let h_high = sat_params(12_000_000, Polarization::Horizontal);
+        let mut h_other_src = h_low.clone();
+        h_other_src.src = 2;
+
+        assert!(!scheduler.compare_slave_parameters(1, &h_low));
+        assert!(scheduler.compare_slave_parameters(1, &v_low));
+        assert!(scheduler.compare_slave_parameters(1, &h_high));
+        assert!(scheduler.compare_slave_parameters(1, &h_other_src));
+
+        let left_high = sat_params(12_000_000, Polarization::Left);
+        assert!(
+            !scheduler.compare_slave_parameters(1, &left_high),
+            "a circular LNB always uses the low band (adapter.cpp:1294-1300)"
+        );
+    }
+
+    // C++: a master also checks the adapters that use it (adapter.cpp:649-666).
+    #[test]
+    fn master_checks_used_slaves_lnb_state() {
+        let mut scheduler = Scheduler::new();
+        add_sat(&mut scheduler, 0);
+        let mut slave = AdapterConfig::new(DeliverySystem::DvbS2);
+        slave.master_source = Some(0);
+        add_ok(&mut scheduler, 1, slave);
+        assert!(scheduler.set_adapter_for_stream(5, 1));
+        assert!(scheduler.adapter(0).unwrap().used[1]);
+        {
+            let used = scheduler.adapter_mut(1).unwrap();
+            used.old_pol = 1;
+            used.old_hiband = 0;
+            used.old_diseqc = 0;
+        }
+
+        assert!(
+            scheduler.compare_slave_parameters(0, &sat_params(11_000_000, Polarization::Vertical))
+        );
+        assert!(
+            !scheduler
+                .compare_slave_parameters(0, &sat_params(11_000_000, Polarization::Horizontal))
+        );
+    }
+
+    // C++: unicable/JESS slaves ignore polarisation and band
+    // (adapter.cpp:626-630), so they are allocated as regular tuners.
+    #[test]
+    fn unicable_and_jess_slaves_skip_lnb_conflicts() {
+        for switch in [SwitchType::Unicable, SwitchType::Jess] {
+            let mut scheduler = Scheduler::new();
+            add_sat(&mut scheduler, 0);
+            let mut slave = AdapterConfig::new(DeliverySystem::DvbS2);
+            slave.master_source = Some(0);
+            slave.switch_type = switch;
+            add_ok(&mut scheduler, 1, slave);
+
+            let busy = sat_params(11_362_000, Polarization::Horizontal);
+            assert!(scheduler.set_adapter_for_stream(10, 0));
+            assert!(scheduler.set_adapter_parameters(0, 10, &busy).is_ok());
+            assert_eq!(scheduler.tune(0, 10).result, Ok(()));
+
+            let conflicting = sat_params(12_000_000, Polarization::Vertical);
+            assert!(!scheduler.compare_slave_parameters(1, &conflicting));
+            assert_eq!(scheduler.get_free_adapter(&conflicting), Some(1));
+        }
+    }
+
+    // C++: when no regular tuner is free, a conflicting slave is still
+    // returned by the final loop (adapter.cpp:776-785).
+    #[test]
+    fn conflicting_slave_is_the_last_resort() {
+        let mut scheduler = Scheduler::new();
+        add_sat(&mut scheduler, 0);
+        let mut slave = AdapterConfig::new(DeliverySystem::DvbS2);
+        slave.master_source = Some(0);
+        add_ok(&mut scheduler, 1, slave);
+
+        let busy = sat_params(11_362_000, Polarization::Horizontal);
+        assert!(scheduler.set_adapter_for_stream(10, 0));
+        assert!(scheduler.set_adapter_parameters(0, 10, &busy).is_ok());
+        assert_eq!(scheduler.tune(0, 10).result, Ok(()));
+
+        let conflicting = sat_params(11_000_000, Polarization::Vertical);
+        assert!(scheduler.compare_slave_parameters(1, &conflicting));
+        assert_eq!(scheduler.get_free_adapter(&conflicting), Some(1));
+    }
+
+    // C++: a slave stream cannot retune a busy adapter (-2,
+    // adapter.cpp:1389-1401); the same mux is still accepted.
+    #[test]
+    fn slave_stream_cannot_retune_the_master() {
+        let mut scheduler = scheduler();
+        let tp = params(11_362_000, 1);
+        assert!(scheduler.set_adapter_for_stream(10, 0));
+        assert!(scheduler.set_adapter_parameters(0, 10, &tp).is_ok());
+        assert!(scheduler.set_adapter_for_stream(11, 0));
+
+        let other = params(12_543_000, 1);
+        let error = scheduler
+            .set_adapter_parameters(0, 11, &other)
+            .expect_err("a slave must not retune");
+        assert_eq!(error, SetParamsError::SlaveConflict);
+        assert_eq!(error.code(), -2);
+        assert!(scheduler.set_adapter_parameters(0, 11, &tp).is_ok());
+    }
+
+    // C++: tune calls the backend, closes the other streams and then runs
+    // post_tune's default PIDs (adapter.cpp:1086-1114, 526-554).
+    #[test]
+    fn tune_forwards_params_closes_slaves_and_syncs_default_pids() {
+        let (mut scheduler, tunes, pid_sets) = recording_scheduler();
+        let mut tp = sat_params(11_362_000, Polarization::Horizontal);
+        tp.pids = PidSet::from_pids([100u16, 200]);
+        assert!(scheduler.set_adapter_for_stream(1, 0));
+        assert!(scheduler.set_adapter_parameters(0, 1, &tp).is_ok());
+        assert!(scheduler.set_adapter_for_stream(2, 0));
+
+        let outcome = scheduler.tune(0, 1);
+        assert_eq!(outcome.result, Ok(()));
+        assert_eq!(outcome.close_streams, vec![2]);
+        assert_eq!(tunes.borrow().len(), 1);
+        assert_eq!(tunes.borrow()[0], tp);
+        assert_eq!(scheduler.adapter(0).unwrap().sid_cnt, 1);
+
+        let expected = BTreeSet::from([0, 1, 16, 18, 100, 200]);
+        assert_eq!(active_pids(&scheduler), expected);
+        assert_eq!(
+            pid_sets.borrow().last().cloned().unwrap_or_default(),
+            expected,
+            "the backend receives the table, defaults included"
+        );
+
+        // A second tune on the same master has nothing pending.
+        assert_eq!(scheduler.tune(0, 1).result, Ok(()));
+        assert_eq!(tunes.borrow().len(), 1);
+    }
+
+    // C++: post_tune does not add defaults when PID_ALL is already active
+    // (adapter.cpp:1010-1018 and post_tune's early return).
+    #[test]
+    fn pid_all_suppresses_default_pids() {
+        let (mut scheduler, _tunes, pid_sets) = recording_scheduler();
+        let mut tp = sat_params(11_362_000, Polarization::Horizontal);
+        tp.pids = PidSet::all();
+        assert!(scheduler.set_adapter_for_stream(1, 0));
+        assert!(scheduler.set_adapter_parameters(0, 1, &tp).is_ok());
+
+        assert_eq!(scheduler.tune(0, 1).result, Ok(()));
+        assert_eq!(active_pids(&scheduler), BTreeSet::from([PID_ALL]));
+        assert_eq!(
+            pid_sets.borrow().last().cloned().unwrap_or_default(),
+            BTreeSet::from([PID_ALL])
+        );
+    }
+
+    // C++: a failed tune still deletes the adapter's PIDs and returns the
+    // hardware error (adapter.cpp:1118-1127).
+    #[test]
+    fn failed_tune_returns_the_hardware_error_and_clears_pids() {
+        let tunes = Rc::new(RefCell::new(Vec::new()));
+        let pid_sets = Rc::new(RefCell::new(Vec::new()));
+        let mut scheduler = Scheduler::new();
+        add_sat(&mut scheduler, 0);
+        scheduler
+            .adapter_mut(0)
+            .unwrap()
+            .set_tuner(Box::new(RecordingTuner {
+                tunes,
+                pid_sets,
+                result: Some(TuneError::OutOfRange),
+            }));
+
+        let tp = params(11_362_000, 1);
+        assert!(scheduler.set_adapter_for_stream(1, 0));
+        assert!(scheduler.set_adapter_parameters(0, 1, &tp).is_ok());
+        let outcome = scheduler.tune(0, 1);
+        assert_eq!(outcome.result, Err(TuneError::OutOfRange));
+        assert_eq!(outcome.result.unwrap_err().code(), -403);
+        assert!(active_pids(&scheduler).is_empty());
+    }
+
+    // C++: tune returns -500 when get_adapter() is NULL (adapter.cpp:1081-1082).
+    #[test]
+    fn tune_without_an_enabled_adapter_returns_500() {
+        let mut scheduler = Scheduler::new();
+        let error = scheduler.tune(3, 0).result.expect_err("no adapter");
+        assert_eq!(error, TuneError::Hardware);
+        assert_eq!(error.code(), -500);
+
+        let mut config = AdapterConfig::new(DeliverySystem::DvbS2);
+        config.enabled = false;
+        add_ok(&mut scheduler, 0, config);
+        scheduler.set_disabled(0, true);
+        let error = scheduler.tune(0, 0).result.expect_err("disabled adapter");
+        assert_eq!(error, TuneError::Hardware);
+    }
+
+    // C++: mark_pid_add accepts 0..=8192 and shares one entry between streams
+    // (adapter.cpp:1227-1259); the last close drops it.
+    #[test]
+    fn pid_add_range_and_shared_entries() {
+        let mut scheduler = scheduler();
+        assert_eq!(scheduler.mark_pid_add(0, PID_STREAM_ID_UNDEFINED, -1), -1);
+        assert_eq!(
+            scheduler.mark_pid_add(0, PID_STREAM_ID_UNDEFINED, PID_ALL + 1),
+            -1
+        );
+        assert_eq!(
+            scheduler.mark_pid_add(0, PID_STREAM_ID_UNDEFINED, PID_ALL),
+            0
+        );
+
+        let mut tp = params(11_362_000, 1);
+        tp.pids = PidSet::from_pids([100u16]);
+        assert!(scheduler.set_adapter_for_stream(1, 0));
+        assert!(scheduler.set_adapter_parameters(0, 1, &tp).is_ok());
+        assert_eq!(scheduler.tune(0, 1).result, Ok(()));
+        assert_eq!(scheduler.stream_pids(0, 1), vec![100]);
+
+        assert!(scheduler.set_adapter_for_stream(2, 0));
+        assert!(scheduler.set_adapter_parameters(0, 2, &tp).is_ok());
+        assert_eq!(scheduler.stream_pids(0, 2), vec![100]);
+
+        scheduler.close_adapter_for_stream(2, 0);
+        assert_eq!(
+            scheduler.stream_pids(0, 1),
+            vec![100],
+            "the PID is still owned by stream 1"
+        );
+        assert!(scheduler.adapter(0).unwrap().active_pids().contains(&100));
+
+        scheduler.close_adapter_for_stream(1, 0);
+        assert!(scheduler.adapter(0).unwrap().active_pids().is_empty());
     }
 }

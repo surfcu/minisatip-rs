@@ -59,8 +59,14 @@ default 8080) and, unless `--disable-ssdp` is given, the SSDP discovery socket.
 Each scheduler adapter has one data-plane thread. `SIGINT`/`SIGTERM` send the
 SSDP byebye set and close the listeners.
 
-This milestone has no DVB hardware backend yet. To exercise the data path, point
-the hidden `MINISATIP_REPLAY` variable at a TS capture:
+The default build includes the DVB hardware backend (`linux-dvb` feature). On
+Linux it enumerates `/dev/dvb` frontends at startup; every frontend becomes a
+scheduler adapter whose data-plane thread opens the frontend and DVR device and
+tunes it. A frontend that cannot be opened is listed but disabled, like the C++
+startup path, and `-N`/`--disable-dvb` skips detection entirely.
+
+To exercise the data path without hardware, point the hidden `MINISATIP_REPLAY`
+variable at a TS capture:
 
 ```sh
 MINISATIP_REPLAY=/path/to/capture.ts \
@@ -69,8 +75,8 @@ MINISATIP_REPLAY=/path/to/capture.ts \
 
 The variable is a PLAN §3 harness aid, not a user-facing option: when it is set,
 every adapter listed by `-e` (one adapter by default) is backed by
-`FileReplayTuner`, looping over the file. When it is unset, no adapters are
-created. See `docs/deviations.md` (DEV-056).
+`FileReplayTuner`, looping over the file, and DVB enumeration is skipped. See
+`docs/deviations.md` (DEV-056).
 
 The end-to-end test starts the binary on OS-assigned ports with a generated
 capture and covers OPTIONS, DESCRIBE, SETUP, PLAY (RTP/UDP), TEARDOWN and the
