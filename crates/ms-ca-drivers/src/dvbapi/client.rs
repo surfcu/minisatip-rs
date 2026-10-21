@@ -408,10 +408,8 @@ impl DvbapiClient {
             ServerMsg::CaSetPid { .. } | ServerMsg::Unknown(_) => {}
             ServerMsg::CaSetDescr {
                 key, parity, cw, ..
-            } => self.set_descr(key, parity, &cw),
-            ServerMsg::CaSetDescrAes {
-                key, parity, cw, ..
-            } => self.set_descr(key, parity, &cw),
+            } => self.set_descr(key, parity, cw),
+            ServerMsg::CaSetDescrAes => log_unknown_aes(),
             ServerMsg::CaSetDescrMode {
                 key, algo, mode, ..
             } => {
@@ -508,7 +506,7 @@ impl DvbapiClient {
         k.last_dmx_stop = now;
     }
 
-    fn set_descr(&mut self, raw_key: u8, parity: i32, cw: &[u8]) {
+    fn set_descr(&mut self, raw_key: u8, parity: i32, cw: [u8; 8]) {
         let Some(i) = self.wire_key(raw_key) else {
             return;
         };
@@ -516,8 +514,9 @@ impl DvbapiClient {
             return;
         }
         let k = &mut self.keys[i];
-        k.key_len = cw.len();
-        k.cw[parity as usize][..cw.len()].copy_from_slice(cw);
+        // C++ stores 8 bytes for every CA_SET_DESCR, even in AES mode.
+        k.key_len = 8;
+        k.cw[parity as usize][..8].copy_from_slice(&cw);
         let algo = if k.is_icam { CwAlgo::CsaIcam } else { k.algo };
         self.events.push_back(CaEvent::ControlWord {
             pmt_id: k.pmt_id,
@@ -884,6 +883,15 @@ fn set_algo(k: &mut Key, algo: i32, mode: i32) {
         CW_ALGO_AES128 => CwAlgo::Aes128Cbc,
         _ => return,
     };
+}
+
+/// `CA_SET_DESCR_AES` has no C++ `case`; C++ logs the unknown operation and
+/// drops the rest of the read (plain `LOG`, level 0 and unconditional).
+fn log_unknown_aes() {
+    eprintln!(
+        "dvbapi: unknown operation: {:08X}",
+        proto::DVBAPI_CA_SET_DESCR_AES
+    );
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

@@ -19,7 +19,7 @@ pub const DVBAPI_DMX_SET_FILTER: u32 = 0x403C_6F2B;
 pub const DVBAPI_CA_SET_PID: u32 = 0x4008_6F87;
 /// CSA control word.
 pub const DVBAPI_CA_SET_DESCR: u32 = 0x4010_6F86;
-/// AES control word (16 bytes).
+/// AES control word; recognised only to skip it (C++ has no `case` for it).
 pub const DVBAPI_CA_SET_DESCR_AES: u32 = 0x4010_6F87;
 /// Descrambling algorithm and cipher mode.
 pub const DVBAPI_CA_SET_DESCR_MODE: u32 = 0x400C_6F88;
@@ -246,17 +246,8 @@ pub enum ServerMsg {
         /// Control word.
         cw: [u8; 8],
     },
-    /// 16-byte AES control word.
-    CaSetDescrAes {
-        /// Raw key byte.
-        key: u8,
-        /// Descrambler index.
-        index: i32,
-        /// Parity.
-        parity: i32,
-        /// Control word.
-        cw: [u8; 16],
-    },
+    /// 16-byte AES control word; carried only so the frame can be skipped.
+    CaSetDescrAes,
     /// Algorithm and cipher mode for the next control words.
     CaSetDescrMode {
         /// Raw key byte.
@@ -402,16 +393,12 @@ pub fn parse_message(b: &[u8]) -> Parsed {
             (msg, 21)
         }
         DVBAPI_CA_SET_DESCR_AES => {
-            if !need(29) {
+            // oscam `ca_descr_aes`: opcode(4) + key(1) + index(4) + parity(4) + cw[16] = 29 bytes.
+            const AES_LEN: usize = 29;
+            if !need(AES_LEN) {
                 return Parsed::Incomplete;
             }
-            let msg = ServerMsg::CaSetDescrAes {
-                key: key(b),
-                index: r.i32(5),
-                parity: r.i32(9),
-                cw: array(b, 13),
-            };
-            (msg, 29)
+            (ServerMsg::CaSetDescrAes, AES_LEN)
         }
         DVBAPI_CA_SET_DESCR_MODE => {
             if !need(17) {
@@ -505,6 +492,33 @@ mod tests {
         };
         assert_eq!(parse_message(&b), Parsed::Message(msg, 21));
         assert_eq!(parse_message(&b[..20]), Parsed::Incomplete);
+    }
+
+    #[test]
+    fn aes_descr_frame_is_skipped_in_both_byte_orders() {
+        // oscam `ca_descr_aes`: 4 + 1 + 4 + 4 + 16 = 29 bytes.
+        let mut be = DVBAPI_CA_SET_DESCR_AES.to_be_bytes().to_vec();
+        be.push(2);
+        be.extend_from_slice(&0i32.to_be_bytes());
+        be.extend_from_slice(&1i32.to_be_bytes());
+        be.extend_from_slice(&[0xAA; 16]);
+        assert_eq!(
+            parse_message(&be),
+            Parsed::Message(ServerMsg::CaSetDescrAes, 29)
+        );
+        assert_eq!(parse_message(&be[..28]), Parsed::Incomplete);
+
+        // Host order: key first, then the opcode in little-endian.
+        let mut host = vec![2, 0x87, 0x6F, 0x10, 0x40];
+        host.extend_from_slice(&0i32.to_le_bytes());
+        host.extend_from_slice(&1i32.to_le_bytes());
+        host.extend_from_slice(&[0xAA; 16]);
+        assert_eq!(host.len(), 29);
+        assert_eq!(
+            parse_message(&host),
+            Parsed::Message(ServerMsg::CaSetDescrAes, 29)
+        );
+        assert_eq!(parse_message(&host[..28]), Parsed::Incomplete);
     }
 
     #[test]

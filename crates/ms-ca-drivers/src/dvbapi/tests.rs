@@ -164,6 +164,22 @@ fn ca_set_descr_aes(key: u8, parity: i32, cw: [u8; 16]) -> Vec<u8> {
     b
 }
 
+fn ca_set_descr_aes_host_order(key: u8, parity: i32, cw: [u8; 16]) -> Vec<u8> {
+    let mut b = vec![key, 0x87, 0x6F, 0x10, 0x40];
+    b.extend_from_slice(&0i32.to_le_bytes());
+    b.extend_from_slice(&parity.to_le_bytes());
+    b.extend_from_slice(&cw);
+    b
+}
+
+fn ca_set_descr_host_order(key: u8, parity: i32, cw: [u8; 8]) -> Vec<u8> {
+    let mut b = vec![key, 0x86, 0x6F, 0x10, 0x40];
+    b.extend_from_slice(&0i32.to_le_bytes());
+    b.extend_from_slice(&parity.to_le_bytes());
+    b.extend_from_slice(&cw);
+    b
+}
+
 fn ecm_info_bytes(key: u8) -> Vec<u8> {
     let mut b = proto::DVBAPI_ECM_INFO.to_be_bytes().to_vec();
     b.push(key);
@@ -742,7 +758,7 @@ fn filter_events_stop_and_emm_flag() {
 }
 
 #[test]
-fn cw_events_csa_aes_and_modes() {
+fn cw_events_csa() {
     let (mut client, mut oscam) = setup(0);
     client
         .add_service(&service(0, 0, 100, 48), false, NOW)
@@ -762,31 +778,165 @@ fn cw_events_csa_aes_and_modes() {
         })
     );
 
-    oscam.feed(&mut client, &ca_set_descr_mode(0, proto::CW_ALGO_AES128, 0));
-    let aes = [7u8; 16];
-    oscam.feed(&mut client, &ca_set_descr_aes(0, 0, aes));
+    // Invalid parity and unknown keys are ignored.
+    oscam.feed(&mut client, &ca_set_descr(0, 2, cw));
+    oscam.feed(&mut client, &ca_set_descr(1, 0, cw));
+    assert_eq!(client.next_event(), None);
+    oscam.drain(&mut client);
+}
+
+#[test]
+fn aes_descr_is_skipped_and_the_next_cw_still_arrives() {
+    let (mut client, mut oscam) = setup(0);
+    client
+        .add_service(&service(0, 0, 100, 48), false, NOW)
+        .unwrap();
+    oscam.drain(&mut client);
+
+    let cw = [1, 2, 3, 6, 4, 5, 6, 15];
+    let mut read = ca_set_descr_aes(0, 0, [0xAA; 16]);
+    read.extend_from_slice(&ca_set_descr(0, 0, cw));
+    oscam.feed(&mut client, &read);
+
+    assert_eq!(
+        client.next_event(),
+        Some(CaEvent::ControlWord {
+            pmt_id: 0,
+            algo: CwAlgo::Csa,
+            parity: 0,
+            cw: cw.to_vec(),
+            icam_ecm: 0,
+        }),
+        "the CSA control word after the AES frame must be delivered"
+    );
+    assert_eq!(client.next_event(), None, "the AES frame emits no event");
+    let k = client.key_for_pmt(0).unwrap();
+    assert_eq!(k.key_len, 8);
+    assert_eq!(k.cw[0][..8], cw);
+    oscam.drain(&mut client);
+}
+
+#[test]
+fn host_order_aes_descr_is_skipped() {
+    let (mut client, mut oscam) = setup(0);
+    client
+        .add_service(&service(0, 0, 100, 48), false, NOW)
+        .unwrap();
+    oscam.drain(&mut client);
+
+    let cw = [8, 7, 6, 5, 4, 3, 2, 1];
+    let mut read = ca_set_descr_aes_host_order(0, 1, [0xBB; 16]);
+    read.extend_from_slice(&ca_set_descr_host_order(0, 1, cw));
+    oscam.feed(&mut client, &read);
+
+    assert_eq!(
+        client.next_event(),
+        Some(CaEvent::ControlWord {
+            pmt_id: 0,
+            algo: CwAlgo::Csa,
+            parity: 1,
+            cw: cw.to_vec(),
+            icam_ecm: 0,
+        }),
+        "the host-order CSA control word after the AES frame must be delivered"
+    );
+    assert_eq!(client.next_event(), None, "the AES frame emits no event");
+    let k = client.key_for_pmt(0).unwrap();
+    assert_eq!(k.key_len, 8);
+    assert_eq!(k.cw[1][..8], cw);
+    oscam.drain(&mut client);
+}
+
+#[test]
+fn partial_aes_descr_is_buffered_then_skipped() {
+    let (mut client, mut oscam) = setup(0);
+    client
+        .add_service(&service(0, 0, 100, 48), false, NOW)
+        .unwrap();
+    oscam.drain(&mut client);
+
+    let aes = ca_set_descr_aes(0, 0, [0xCC; 16]);
+    oscam.feed(&mut client, &aes[..10]);
+    assert_eq!(client.next_event(), None);
+    assert_eq!(
+        client.rx.len(),
+        10,
+        "the partial AES frame must be buffered"
+    );
+
+    oscam.feed(&mut client, &aes[10..]);
+    assert_eq!(client.next_event(), None);
+    assert!(client.rx.is_empty(), "the completed AES frame is consumed");
+    let k = client.key_for_pmt(0).unwrap();
+    assert_eq!(k.key_len, 0, "the skipped AES frame must not store a key");
+    assert_eq!(
+        k.cw, [[0u8; 16]; 2],
+        "the skipped frame must not store a CW"
+    );
+
+    let cw = [2, 4, 6, 8, 1, 3, 5, 7];
+    oscam.feed(&mut client, &ca_set_descr(0, 0, cw));
+    assert_eq!(
+        client.next_event(),
+        Some(CaEvent::ControlWord {
+            pmt_id: 0,
+            algo: CwAlgo::Csa,
+            parity: 0,
+            cw: cw.to_vec(),
+            icam_ecm: 0,
+        }),
+        "a CW after the skipped AES frame is still delivered"
+    );
+    assert_eq!(client.next_event(), None);
+    oscam.drain(&mut client);
+}
+
+#[test]
+fn csa_descr_stores_eight_bytes_under_aes_mode() {
+    let (mut client, mut oscam) = setup(0);
+    client
+        .add_service(&service(0, 0, 100, 48), false, NOW)
+        .unwrap();
+    oscam.drain(&mut client);
+
+    let cw = [9, 8, 7, 6, 5, 4, 3, 2];
+    oscam.feed(
+        &mut client,
+        &ca_set_descr_mode(0, proto::CW_ALGO_AES128, proto::CW_ALGO_MODE_ECB),
+    );
+    oscam.feed(&mut client, &ca_set_descr(0, 0, cw));
     assert_eq!(
         client.next_event(),
         Some(CaEvent::ControlWord {
             pmt_id: 0,
             algo: CwAlgo::Aes128Ecb,
             parity: 0,
-            cw: aes.to_vec(),
+            cw: cw.to_vec(),
             icam_ecm: 0,
         })
     );
+    let k = client.key_for_pmt(0).unwrap();
+    assert_eq!(k.algo, CwAlgo::Aes128Ecb);
+    assert_eq!(k.key_len, 8);
+    assert_eq!(k.cw[0], [9, 8, 7, 6, 5, 4, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-    oscam.feed(&mut client, &ca_set_descr_mode(0, proto::CW_ALGO_AES128, 1));
-    oscam.feed(&mut client, &ca_set_descr_aes(0, 1, aes));
-    let Some(CaEvent::ControlWord { algo, .. }) = client.next_event() else {
-        panic!("no AES CBC event");
+    let cw = [10, 20, 30, 40, 50, 60, 70, 80];
+    oscam.feed(
+        &mut client,
+        &ca_set_descr_mode(0, proto::CW_ALGO_AES128, proto::CW_ALGO_MODE_CBC),
+    );
+    oscam.feed(&mut client, &ca_set_descr(0, 1, cw));
+    let Some(CaEvent::ControlWord {
+        algo,
+        cw: delivered,
+        ..
+    }) = client.next_event()
+    else {
+        panic!("no AES CBC control word");
     };
     assert_eq!(algo, CwAlgo::Aes128Cbc);
-
-    // Invalid parity and unknown keys are ignored.
-    oscam.feed(&mut client, &ca_set_descr(0, 2, cw));
-    oscam.feed(&mut client, &ca_set_descr(1, 0, cw));
-    assert_eq!(client.next_event(), None);
+    assert_eq!(delivered, cw.to_vec());
+    assert_eq!(client.key_for_pmt(0).unwrap().key_len, 8);
     oscam.drain(&mut client);
 }
 
@@ -843,14 +993,19 @@ fn partial_reads_are_buffered() {
         Some(CaEvent::ControlWord { .. })
     ));
 
+    // A split AES frame is buffered and then skipped; a following CSA frame
+    // in the same read still parses.
     let aes = ca_set_descr_aes(0, 1, [2; 16]);
     oscam.feed(&mut client, &aes[..10]);
     assert_eq!(client.next_event(), None);
-    oscam.feed(&mut client, &aes[10..]);
+    let mut rest = aes[10..].to_vec();
+    rest.extend_from_slice(&ca_set_descr(0, 1, [3; 8]));
+    oscam.feed(&mut client, &rest);
     assert!(matches!(
         client.next_event(),
         Some(CaEvent::ControlWord { .. })
     ));
+    assert_eq!(client.next_event(), None);
     oscam.drain(&mut client);
 }
 
