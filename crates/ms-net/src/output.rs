@@ -11,6 +11,7 @@ use crate::writeq::WriteQueue;
 use ms_tuner::PidSet;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::os::fd::AsRawFd;
 #[cfg(feature = "srt")]
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -99,6 +100,13 @@ pub struct OutputStats {
     pub overflow: u64,
     /// Bytes waiting in the write queue.
     pub buffered: u64,
+    /// Lifetime bytes copied into the FIFO (`s->buffered_bytes`;
+    /// socketworks.cpp:1505-1506). `calculate_bw` folds its per-window delta
+    /// into `c_buffered` (stream.cpp:1308).
+    pub fifo_written: u64,
+    /// Lifetime bytes dropped by the FIFO (`dropped_bytes`;
+    /// socketworks.cpp:1496).
+    pub fifo_dropped: u64,
     /// Remote address (`get_stream_rhost`/`get_stream_rport`).
     pub remote: Option<SocketAddr>,
     /// Set after the first successful flush (`start_streaming`).
@@ -125,11 +133,50 @@ pub struct StreamOutput {
 impl StreamOutput {
     /// Binds RTP/RTCP sockets and connects them to the client (UDP `decode_transport`).
     pub fn udp(target: UdpTarget, config: OutputConfig, now_ms: i64) -> io::Result<Self> {
-        let rtp = bind_connect(target.local, target.dest, target.ttl)?;
+        Self::udp_with_options(target, config, now_ms, None, 0)
+    }
+
+    /// UDP `decode_transport` with `--bind-dev` and `--output-buffer`.
+    ///
+    /// `SO_BINDTODEVICE` is applied before bind by `udp_bind`, then RTP/RTCP
+    /// get the send buffer and DSCP markings (stream.cpp:556-584).
+    pub fn udp_with_options(
+        target: UdpTarget,
+        config: OutputConfig,
+        now_ms: i64,
+        bind_dev: Option<&str>,
+        send_buffer: i32,
+    ) -> io::Result<Self> {
+        let rtp = bind_connect(target.local, target.dest, target.ttl, bind_dev)?;
         let rtcp_local = with_port(target.local, target.local.port().wrapping_add(1));
         let rtcp_dest = with_port(target.dest, target.dest.port().wrapping_add(1));
-        let rtcp = bind_connect(rtcp_local, rtcp_dest, target.ttl)?;
-        Ok(Self::udp_from_sockets(rtp, rtcp, config, now_ms))
+        let rtcp = bind_connect(rtcp_local, rtcp_dest, target.ttl, bind_dev)?;
+        let mut output = Self::udp_from_sockets(rtp, rtcp, config, now_ms);
+        output.apply_udp_socket_options(send_buffer);
+        Ok(output)
+    }
+
+    /// Applies `--output-buffer` and the DSCP markings to the RTP and RTCP
+    /// sockets (`decode_transport`, stream.cpp:570-584).
+    ///
+    /// C++ marks RTP with priority 7 and RTCP with 6, and only sets the send
+    /// buffer when `opts.output_buffer > 0`. Failures are log-only upstream.
+    pub fn apply_udp_socket_options(&mut self, send_buffer: i32) {
+        let Transport::Udp { rtp, rtcp } = &self.transport else {
+            return;
+        };
+        for (socket, priority) in [(rtp, 7), (rtcp, 6)] {
+            crate::sys::set_socket_send_buffer(socket.as_raw_fd(), send_buffer);
+            crate::sys::set_socket_dscp(socket.as_raw_fd(), crate::sys::IPTOS_DSCP_EF, priority);
+        }
+    }
+
+    /// RTP and RTCP descriptors, for socket-option diagnostics and tests.
+    pub fn udp_sockets(&self) -> Option<(&UdpSocket, &UdpSocket)> {
+        match &self.transport {
+            Transport::Udp { rtp, rtcp } => Some((rtp, rtcp)),
+            _ => None,
+        }
     }
 
     /// Wraps already connected, non-blocking RTP and RTCP sockets.
@@ -222,6 +269,20 @@ impl StreamOutput {
         self.stream_type
     }
 
+    /// Follows the RTP session id (`set_session_id` assigns `sid->ssrc`;
+    /// stream.cpp:1409-1416).
+    pub fn set_ssrc(&mut self, ssrc: u32) {
+        self.rtp.ssrc = ssrc;
+    }
+
+    /// Sets `wtime`/`rtcp_wtime`. C++ initialises both in `streams_add`
+    /// (stream.cpp:630-636), before PLAY creates the output; the data plane
+    /// passes the SETUP instant in its own clock.
+    pub fn set_clocks(&mut self, now_ms: i64) {
+        self.wtime_ms = now_ms;
+        self.rtcp_wtime_ms = now_ms;
+    }
+
     /// Current counters.
     pub fn stats(&self) -> OutputStats {
         let remote = match &self.transport {
@@ -239,6 +300,8 @@ impl StreamOutput {
             failed_writes: self.failed_writes,
             overflow: self.queue.overflow() + self.udp_dropped,
             buffered: self.queue.fifo().used(),
+            fifo_written: self.queue.buffered_bytes(),
+            fifo_dropped: self.queue.overflow(),
             remote,
             started: self.started,
         }
@@ -473,8 +536,15 @@ fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
     SocketAddr::new(addr.ip(), port)
 }
 
-fn bind_connect(local: SocketAddr, dest: SocketAddr, ttl: Option<u32>) -> io::Result<UdpSocket> {
-    let socket = UdpSocket::bind(local)?;
+fn bind_connect(
+    local: SocketAddr,
+    dest: SocketAddr,
+    ttl: Option<u32>,
+    bind_dev: Option<&str>,
+) -> io::Result<UdpSocket> {
+    // udp_bind sets SO_REUSEADDR/SO_REUSEPORT and SO_BINDTODEVICE before bind
+    // (socketworks.cpp:250-322).
+    let socket = crate::sys::udp_bind_reuse(local, bind_dev)?;
     socket.connect(dest)?;
     socket.set_nonblocking(true)?;
     if let Some(ttl) = ttl {

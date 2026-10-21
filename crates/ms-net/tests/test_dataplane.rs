@@ -1,6 +1,7 @@
 //! End-to-end data plane: file-replay tuner -> adapter thread -> RTP/UDP on localhost.
 
 use ms_net::StreamType;
+use ms_net::bandwidth::Bandwidth;
 use ms_net::dataplane::{
     AdapterHandle, ContinuityCounter, DataPlaneConfig, Event, NEW_TRANSPONDER_WINDOW_MS,
     adapter_threshold, check_new_transponder, clamp_threshold, post_tune_filter,
@@ -10,8 +11,11 @@ use ms_tuner::{
     DeliverySystem, FileReplayConfig, FileReplayTuner, PID_ALL, PidSet, Polarization, TuneParams,
 };
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PACKETS: usize = 3000;
@@ -98,6 +102,167 @@ fn collect(socket: &UdpSocket, expected: usize) -> (BTreeMap<u16, Vec<u32>>, Vec
         }
     }
     (by_pid, seqs)
+}
+
+#[test]
+fn output_clocks_start_at_setup_not_play() {
+    // streams_add sets wtime/rtcp_wtime at SETUP (stream.cpp:630-636). An
+    // output created five seconds later must still treat SETUP as its clock
+    // origin, so the first 200 ms stream timer sends a keepalive.
+    let path = write_capture("setup-age");
+    let replay = FileReplayConfig {
+        looping: true,
+        pacing: ms_tuner::Pacing::None,
+    };
+    let tuner = FileReplayTuner::open(&path, replay).unwrap();
+    let adapter = AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).unwrap();
+    let (rx, _rtcp) = udp_pair();
+    rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    adapter
+        .start_output_with_age(
+            0,
+            output_to(rx.local_addr().unwrap(), 9),
+            PidSet::new(),
+            5_000,
+        )
+        .unwrap();
+    let mut buf = [0u8; 2048];
+    let len = rx.recv(&mut buf).expect("keepalive datagram");
+    assert_eq!(len, 12, "bare RTP header from the keepalive path");
+}
+
+#[derive(Clone, Default)]
+struct BlockableSink {
+    blocked: Arc<AtomicBool>,
+    data: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for BlockableSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.blocked.load(Ordering::SeqCst) {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        self.data.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn bandwidth_counts_fifo_copies_per_window() {
+    // `buffered_bytes += copied` whenever data enters a socket FIFO, and
+    // `calculate_bw` copies the window accumulator into `c_buffered`
+    // (socketworks.cpp:1505-1506; stream.cpp:1308,1325). A client that blocks
+    // and then drains must still move `c_buffered`, so the counter cannot be
+    // the queue's instantaneous occupancy.
+    let path = write_capture("bandwidth");
+    let replay = FileReplayConfig {
+        looping: true,
+        pacing: ms_tuner::Pacing::None,
+    };
+    let tuner = FileReplayTuner::open(&path, replay).unwrap();
+    let bandwidth = Arc::new(Bandwidth::new());
+    let adapter = AdapterHandle::spawn_with_bandwidth(
+        Box::new(tuner),
+        DataPlaneConfig::default(),
+        Some(bandwidth.clone()),
+    )
+    .unwrap();
+    adapter.tune(TuneParams {
+        freq: 11_362_000,
+        pol: Polarization::Horizontal,
+        msys: DeliverySystem::DvbS2,
+        sr: 22_000_000,
+        src: 1,
+        ..TuneParams::default()
+    });
+
+    let sink = BlockableSink {
+        blocked: Arc::new(AtomicBool::new(true)),
+        data: Arc::new(Mutex::new(Vec::new())),
+    };
+    let blocked = sink.blocked.clone();
+    let output = StreamOutput::rtsp_tcp(
+        Box::new(sink),
+        None,
+        OutputConfig {
+            ssrc: 1,
+            seq: 0,
+            fifo_size: 1 << 20,
+        },
+        0,
+    );
+    adapter
+        .start_output(0, output, PidSet::from_pids([0x100]))
+        .expect("output started");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !adapter.query(0).is_some_and(|stats| stats.fifo_written > 0) {
+        assert!(
+            Instant::now() < deadline,
+            "nothing was copied into the FIFO"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    blocked.store(false, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let stats = adapter.query(0).expect("running output");
+        if stats.buffered == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the FIFO did not drain");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Drop the output and the data source so no further FIFO copies happen;
+    // the queued data was already drained above. The folded snapshot must
+    // still report the copies made in this window, even though the queue is
+    // empty by now.
+    adapter.stop_output(0);
+    adapter.stop();
+
+    // The data-plane thread owns the once-per-second fold; with it stopped,
+    // run `calculate_bw` explicitly after a full window.
+    std::thread::sleep(Duration::from_millis(1100));
+    bandwidth.calculate();
+    assert!(bandwidth.snapshot().buffered > 0);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn ssrc_command_moves_the_live_output() {
+    // stream.cpp:1409-1416: a later `set_session_id` changes the SSRC used by
+    // the running output.
+    let path = write_capture("set-ssrc");
+    let replay = FileReplayConfig {
+        looping: true,
+        pacing: ms_tuner::Pacing::None,
+    };
+    let tuner = FileReplayTuner::open(&path, replay).unwrap();
+    let adapter = AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).unwrap();
+    let (rx, _rtcp) = udp_pair();
+    adapter
+        .start_output(0, output_to(rx.local_addr().unwrap(), 1), PidSet::new())
+        .unwrap();
+    adapter.send(ms_net::dataplane::Command::SetSsrc {
+        stream_id: 0,
+        ssrc: 0x0BAD_F00D,
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(stats) = adapter.query(0)
+            && stats.ssrc == 0x0BAD_F00D
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "SSRC was not updated");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

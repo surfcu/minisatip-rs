@@ -15,12 +15,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use ms_config::Options;
+use ms_net::bandwidth::Bandwidth;
 use ms_net::bind::{BindOptions, resolve_bind_opts};
 use ms_net::dataplane::{AdapterHandle, Command, DataPlaneConfig};
 use ms_net::handler::{HandlerContext, StreamBackend, StreamType, handle_http, handle_rtsp};
 use ms_net::output::{OutputConfig, StreamOutput, UdpTarget};
 use ms_net::response::format_http_date;
-use ms_net::rtsp::{ParseOutcome, Protocol, Request, parse_request};
+use ms_net::rtsp::{ParseOutcome, Protocol, Request, parse_request_with};
 use ms_net::session::{DescribeOptions, SessionManager};
 use ms_net::socket::DEFAULT_FIFO_SIZE;
 use ms_net::ssdp::{
@@ -36,7 +37,8 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOP_TICK: Duration = Duration::from_millis(20);
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
-const SSDP_READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// `set_linux_socket_timeout`: 1 s 100 ms (socketworks.cpp:374-386).
+const SSDP_READ_TIMEOUT: Duration = Duration::from_millis(1100);
 
 /// Fixed runtime values shared by every request.
 struct ServerConfig {
@@ -46,12 +48,15 @@ struct ServerConfig {
     rtsp_host: String,
     start_rtp: u16,
     rtsp_port: u16,
-    http_port: u16,
     timeout_ms: u32,
     udp_threshold: i32,
     tcp_threshold: i32,
     fifo_size: usize,
     rrtp: Option<String>,
+    /// `--bind-dev`: applied as `SO_BINDTODEVICE` to every socket.
+    bind_dev: Option<String>,
+    /// `-H`/`--output-buffer`: RTP/RTCP `SO_SNDBUF` when positive.
+    output_buffer: i32,
 }
 
 /// An RTSP connection request forwarded by a reader thread.
@@ -80,6 +85,8 @@ struct ActiveOutput {
     epoch: u64,
     stream_type: StreamType,
     dest: Option<SocketAddr>,
+    /// SSRC last pushed to the data plane (`sid->ssrc`).
+    ssrc: u32,
 }
 
 /// Adapter tuner that forwards tunes to the data-plane thread.
@@ -118,6 +125,7 @@ impl Runtime {
         let replay = std::env::var_os("MINISATIP_REPLAY").map(PathBuf::from);
         let adapter_ids = adapter_ids(opts);
         let mut handles: Vec<Option<AdapterHandle>> = (0..MAX_ADAPTERS).map(|_| None).collect();
+        let bandwidth = Arc::new(Bandwidth::new());
 
         if let Some(path) = replay {
             for aid in adapter_ids {
@@ -133,13 +141,14 @@ impl Runtime {
                     .ok()
                     .filter(|size| *size > 0)
                     .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
-                let handle = AdapterHandle::spawn(
+                let handle = AdapterHandle::spawn_with_bandwidth(
                     Box::new(tuner),
                     DataPlaneConfig {
                         adapter_id: aid as i32,
                         adapter_buffer: buffer,
                         threshold_ms: ms_net::dataplane::clamp_threshold(opts.udp_threshold),
                     },
+                    Some(Arc::clone(&bandwidth)),
                 )
                 .map_err(|error| format!("cannot start adapter {aid}: {error}"))?;
                 let bridge = DataPlaneTuner {
@@ -151,6 +160,7 @@ impl Runtime {
         }
 
         let mut session = SessionManager::with_scheduler(scheduler);
+        session.set_bandwidth(Arc::clone(&bandwidth));
         session.set_start_rtp(config.start_rtp);
         session.set_transport_defaults(config.rrtp.clone(), &opts.disc_host);
         session.set_server_timeout_ms(config.timeout_ms);
@@ -168,17 +178,20 @@ impl Runtime {
             uuid: uuid.clone(),
             http_host: config.http_host.clone(),
             rtsp_host: config.rtsp_host.clone(),
-            http_port: config.http_port,
-            rtsp_port: config.rtsp_port,
+            http_port: opts.http_port as i32,
+            rtsp_port: opts.rtsp_port,
             xml_path: opts.xml_path.clone(),
             playlist: opts.playlist.clone(),
             bootid,
             device_id,
+            force_sadapter: opts.force_sadapter,
+            force_tadapter: opts.force_tadapter,
+            force_cadapter: opts.force_cadapter,
         })
         .with_identity(identity);
         session.set_web(web);
         session.set_web_runtime(RuntimeState {
-            datetime_compile: String::new(),
+            datetime_compile: env!("MINISATIP_DATETIME_COMPILE").to_owned(),
             datetime_start: sys::asctime_now(),
             datetime_current: sys::asctime_now(),
             time_running: "00:00:00".to_owned(),
@@ -367,19 +380,24 @@ impl Runtime {
         let Some(stream) = self.session.stream(id) else {
             return;
         };
-        let (stream_type, adapter, do_play) = (stream.stream_type, stream.adapter, stream.do_play);
+        let (stream_type, adapter, do_play, ssrc) = (
+            stream.stream_type,
+            stream.adapter,
+            stream.do_play,
+            stream.session_id as u32,
+        );
         let dest = udp_destination(stream);
         let Some(active) = self
             .outputs
             .get(&id)
-            .map(|active| (active.adapter, active.stream_type, active.dest))
+            .map(|active| (active.adapter, active.stream_type, active.dest, active.ssrc))
         else {
             if do_play {
                 self.start_output(id, conn_id, peer, writer);
             }
             return;
         };
-        let (active_adapter, active_type, active_dest) = active;
+        let (active_adapter, active_type, active_dest, active_ssrc) = active;
         if active_adapter != adapter || active_type != stream_type {
             self.stop_output(id);
             if adapter >= 0 {
@@ -387,14 +405,26 @@ impl Runtime {
             }
             return;
         }
-        if let Some(dest) = dest
-            && active_dest != Some(dest)
-            && let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref)
-        {
-            handle.send(Command::SetDestination {
-                stream_id: id,
-                dest,
-            });
+        if let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref) {
+            if let Some(dest) = dest
+                && active_dest != Some(dest)
+            {
+                handle.send(Command::SetDestination {
+                    stream_id: id,
+                    dest,
+                });
+            }
+            // A re-SETUP Session header changes the SSRC of the live output
+            // (stream.cpp:1409-1416).
+            if active_ssrc != ssrc {
+                handle.send(Command::SetSsrc {
+                    stream_id: id,
+                    ssrc,
+                });
+                if let Some(active) = self.outputs.get_mut(&id) {
+                    active.ssrc = ssrc;
+                }
+            }
         }
         self.sync_pids(id);
     }
@@ -431,7 +461,9 @@ impl Runtime {
             StreamType::RtspUdp => match remote_host.parse::<IpAddr>() {
                 Ok(destination) => Some(SocketAddr::new(destination, remote_port)),
                 Err(_) => {
-                    eprintln!("minisatip: invalid RTP destination {remote_host}");
+                    crate::sys::log_error(format_args!(
+                        "minisatip: invalid RTP destination {remote_host}"
+                    ));
                     return;
                 }
             },
@@ -439,12 +471,29 @@ impl Runtime {
         };
         let output = match stream_type {
             StreamType::RtspUdp => {
+                let dest = dest.expect("parsed above");
+                // decode_transport binds `bind_dev_ip()` or the wildcard of
+                // the destination family, not `--bind`
+                // (stream.cpp:556-561, socketworks.cpp:333-341).
+                let local_ip = if self.config.bind_dev.is_some() {
+                    self.config.bind_ip
+                } else if dest.is_ipv4() {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                };
                 let target = UdpTarget {
-                    local: SocketAddr::new(self.config.bind_ip, server_port),
-                    dest: dest.expect("parsed above"),
+                    local: SocketAddr::new(local_ip, server_port),
+                    dest,
                     ttl: None,
                 };
-                StreamOutput::udp(target, config, now_ms)
+                StreamOutput::udp_with_options(
+                    target,
+                    config,
+                    now_ms,
+                    self.config.bind_dev.as_deref(),
+                    self.config.output_buffer,
+                )
             }
             StreamType::RtspTcp => Ok(StreamOutput::rtsp_tcp(
                 Box::new(writer),
@@ -481,7 +530,8 @@ impl Runtime {
         match output {
             Ok(output) => {
                 let pids = self.stream_pids(id, adapter);
-                if let Some(epoch) = handle.start_output(id, output, pids) {
+                let setup_age_ms = self.session.setup_age_ms(id).unwrap_or(0);
+                if let Some(epoch) = handle.start_output_with_age(id, output, pids, setup_age_ms) {
                     self.outputs.insert(
                         id,
                         ActiveOutput {
@@ -490,11 +540,14 @@ impl Runtime {
                             epoch,
                             stream_type,
                             dest,
+                            ssrc,
                         },
                     );
                 }
             }
-            Err(error) => eprintln!("minisatip: cannot start stream {id}: {error}"),
+            Err(error) => {
+                crate::sys::log_error(format_args!("minisatip: cannot start stream {id}: {error}"))
+            }
         }
         self.update_thresholds();
     }
@@ -593,7 +646,7 @@ impl Runtime {
                     // decides whether the stream lives on (stream.cpp:513-556).
                     ms_net::dataplane::Event::OutputStopped(..) => {}
                     ms_net::dataplane::Event::TunerError(error) => {
-                        eprintln!("minisatip: adapter {aid}: {error}");
+                        crate::sys::log_error(format_args!("minisatip: adapter {aid}: {error}"));
                     }
                     ms_net::dataplane::Event::RtcpReceived(id) => {
                         // rtcp_confirm refreshes the idle timer (stream.cpp:1448).
@@ -679,12 +732,13 @@ fn resolve_bind_address(host: Option<&str>) -> Result<Option<IpAddr>, String> {
 pub fn run(opts: &Options) -> Result<(), String> {
     sys::install_shutdown_handlers();
 
-    let rtsp_port = u16::try_from(opts.rtsp_port)
-        .map_err(|_| format!("invalid RTSP port {}", opts.rtsp_port))?;
-    let http_port = u16::try_from(opts.http_port)
-        .map_err(|_| format!("invalid HTTP port {}", opts.http_port))?;
-    let start_rtp = u16::try_from(opts.start_rtp)
-        .map_err(|_| format!("invalid RTP port {}", opts.start_rtp))?;
+    // Ports come from atoi and reach htons()/getaddrinfo as 16-bit values, so
+    // out-of-range numbers wrap instead of being rejected
+    // (minisatip.cpp:965, socketworks.cpp:55-103). Advertising uses the
+    // configured values verbatim, including 0 (minisatip.cpp:1130-1136).
+    let rtsp_port = port16(opts.rtsp_port);
+    let http_port = port16(opts.http_port as i32);
+    let start_rtp = port16(opts.start_rtp as i32);
     // resolve_bind_opts: --bind-dev sets both addresses, and hostnames are
     // resolved through getaddrinfo (socketworks.cpp:138-168).
     let mut binds = BindOptions::new(
@@ -694,8 +748,14 @@ pub fn run(opts: &Options) -> Result<(), String> {
     );
     resolve_bind_opts(&mut binds, &ms_net::sys::SystemDevices)
         .map_err(|error| format!("bind options: {error}"))?;
-    let bind_ip =
-        resolve_bind_address(binds.bind.as_deref())?.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    // fill_sockaddr binds the IPv6 wildcard unless `-4`/--ipv4-only is in
+    // effect (socketworks.cpp:96-102).
+    let wildcard = if opts.use_ipv4_only != 0 {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    };
+    let bind_ip = resolve_bind_address(binds.bind.as_deref())?.unwrap_or(wildcard);
     let http_bind_ip = resolve_bind_address(binds.bind_http.as_deref())?.unwrap_or(bind_ip);
     // set_options: `lip` is the resolved `--bind` or getlocalip()
     // (minisatip.cpp:1125-1128).
@@ -705,18 +765,17 @@ pub fn run(opts: &Options) -> Result<(), String> {
         local_ip(&opts.disc_host, opts.use_ipv4_only != 0)
     };
 
-    let rtsp_listener = TcpListener::bind(SocketAddr::new(bind_ip, rtsp_port))
-        .map_err(|error| format!("cannot bind RTSP port {rtsp_port}: {error}"))?;
-    let http_listener = TcpListener::bind(SocketAddr::new(http_bind_ip, http_port))
-        .map_err(|error| format!("cannot bind HTTP port {http_port}: {error}"))?;
-    let rtsp_port = rtsp_listener
-        .local_addr()
-        .map_err(|error| format!("cannot read RTSP address: {error}"))?
-        .port();
-    let http_port = http_listener
-        .local_addr()
-        .map_err(|error| format!("cannot read HTTP address: {error}"))?
-        .port();
+    // tcp_listen applies SO_BINDTODEVICE before bind and fails hard when the
+    // device cannot be selected (socketworks.cpp:469-505).
+    let bind_dev = opts.bind_dev.clone();
+    let rtsp_listener =
+        ms_net::sys::tcp_listen(SocketAddr::new(bind_ip, rtsp_port), bind_dev.as_deref())
+            .map_err(|error| format!("cannot bind RTSP port {rtsp_port}: {error}"))?;
+    let http_listener = ms_net::sys::tcp_listen(
+        SocketAddr::new(http_bind_ip, http_port),
+        bind_dev.as_deref(),
+    )
+    .map_err(|error| format!("cannot bind HTTP port {http_port}: {error}"))?;
 
     let (mut uuid, mut bootid, mut device_id) =
         (opts.uuid.clone(), opts.bootid.max(0), opts.device_id.max(0));
@@ -738,24 +797,26 @@ pub fn run(opts: &Options) -> Result<(), String> {
         device_id = 1;
     }
 
-    // minisatip.cpp:1130-1136: `-w` overrides http_host; rtsp_host always has the port.
+    // minisatip.cpp:1130-1136: `-w` overrides http_host; rtsp_host always has
+    // the port, printed from the configured (pre-htons) value.
     let http_host = opts
         .http_host
         .clone()
-        .unwrap_or_else(|| format!("{advertised_host}:{http_port}"));
+        .unwrap_or_else(|| format!("{advertised_host}:{}", opts.http_port));
     let config = ServerConfig {
         bind_ip,
         advertised_host: advertised_host.clone(),
         http_host: http_host.clone(),
-        rtsp_host: format!("{advertised_host}:{rtsp_port}"),
+        rtsp_host: format!("{advertised_host}:{}", opts.rtsp_port),
         start_rtp,
         rtsp_port,
-        http_port,
         timeout_ms: u32::try_from(opts.timeout_sec).unwrap_or(30_000),
         udp_threshold: opts.udp_threshold,
         tcp_threshold: opts.tcp_threshold,
         fifo_size: fifo_size(opts.max_sbuf),
         rrtp: opts.rrtp.clone(),
+        bind_dev: opts.bind_dev.clone(),
+        output_buffer: opts.output_buffer,
     };
     // C++ keeps these in `opts`: the SSDP thread and HTTP endpoints see the
     // same values, including a DEVICEID changed by conflict handling.
@@ -807,16 +868,34 @@ pub fn run(opts: &Options) -> Result<(), String> {
             cache_dir: Some(cache_dir.clone()),
             disabled: false,
         };
-        Some(spawn_ssdp(
-            ssdp_config,
-            identity,
-            opts.bind.clone(),
-            opts.disc_host.clone(),
-            Arc::clone(&shutdown),
-        ))
+        // Both SSDP sockets must bind or C++ exits (minisatip.cpp:1943-1947).
+        let bind_dev_ip = if opts.bind_dev.is_some() {
+            match resolve_bind_address(binds.bind.as_deref())? {
+                Some(IpAddr::V4(address)) => Some(address),
+                Some(IpAddr::V6(_)) => {
+                    return Err("SSDP: --bind-dev requires an IPv4 address".to_owned());
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let io = UdpSsdpIo::open(
+            opts.bind.as_deref(),
+            &opts.disc_host,
+            opts.use_ipv4_only != 0,
+            bind_dev.as_deref(),
+            bind_dev_ip,
+        )
+        .map_err(|error| format!("SSDP: {error}"))?;
+        Some(spawn_ssdp(ssdp_config, identity, io, Arc::clone(&shutdown)))
     };
 
+    // minisatip.cpp:2018 writes the pid after initialisation; failures are
+    // ignored (write_pid_file only checks fopen).
+    sys::write_pid_file();
     runtime.run(&receiver, &shutdown);
+    sys::remove_pid_file();
 
     shutdown.store(true, Ordering::SeqCst);
     drop(requests);
@@ -870,16 +949,24 @@ fn fifo_size(max_sbuf: i32) -> usize {
         .unwrap_or(DEFAULT_FIFO_SIZE)
 }
 
+/// Truncates an `atoi` port to 16 bits, as `htons` does
+/// (socketworks.cpp:55-103). The configured value is still what gets
+/// advertised (minisatip.cpp:1130-1136).
+fn port16(value: i32) -> u16 {
+    value as u16
+}
+
 fn adapter_ids(opts: &Options) -> Vec<usize> {
-    let ids: Vec<usize> = opts
-        .enabled_adapters
-        .as_deref()
-        .unwrap_or(&[0])
+    // `enable_adapters` disables every slot before applying the selection, so
+    // `-e ""` leaves no adapters at all (adapter.cpp:1626-1646).
+    let Some(selected) = opts.enabled_adapters.as_deref() else {
+        return vec![0];
+    };
+    selected
         .iter()
         .map(|id| usize::from(*id))
         .filter(|id| *id < MAX_ADAPTERS)
-        .collect();
-    if ids.is_empty() { vec![0] } else { ids }
+        .collect()
 }
 
 fn adapter_config() -> AdapterConfig {
@@ -887,12 +974,11 @@ fn adapter_config() -> AdapterConfig {
         enabled: true,
         ..AdapterConfig::default()
     };
+    // A file replay source stands in for a DVB-S2 frontend, whose Linux
+    // capabilities are SYS_DVBS and SYS_DVBS2 (adapter.cpp:283-371 only
+    // advertises the systems the frontend reports).
     config.sys[0] = DeliverySystem::DvbS2;
     config.sys[1] = DeliverySystem::DvbS;
-    config.sys[2] = DeliverySystem::DvbT;
-    config.sys[3] = DeliverySystem::DvbT2;
-    config.sys[4] = DeliverySystem::DvbC;
-    config.sys[5] = DeliverySystem::DvbC2;
     config
 }
 
@@ -930,7 +1016,9 @@ fn accept_loop(
                     .name(format!("conn{conn_id}"))
                     .spawn(move || serve_connection(stream, protocol, conn_id, requests, shutdown));
                 if spawn.is_err() {
-                    eprintln!("minisatip: cannot start a connection thread");
+                    crate::sys::log_error(format_args!(
+                        "minisatip: cannot start a connection thread"
+                    ));
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
@@ -966,7 +1054,7 @@ fn serve_connection(
                 reads += 1;
                 buffer.extend_from_slice(&chunk[..read]);
                 loop {
-                    match parse_request(&buffer) {
+                    match parse_request_with(&buffer, protocol == Protocol::Http) {
                         ParseOutcome::Complete { request, consumed } => {
                             buffer.drain(..consumed);
                             let Ok(writer) = stream.try_clone() else {
@@ -1019,30 +1107,21 @@ fn serve_connection(
 fn spawn_ssdp(
     config: SsdpConfig,
     identity: SharedIdentity,
-    bind: Option<String>,
-    disc_host: String,
+    io: UdpSsdpIo,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("ssdp".to_owned())
-        .spawn(move || ssdp_loop(config, identity, bind, disc_host, shutdown))
+        .spawn(move || ssdp_loop(config, identity, io, shutdown))
         .expect("spawn SSDP thread")
 }
 
 fn ssdp_loop(
     config: SsdpConfig,
     identity: SharedIdentity,
-    bind: Option<String>,
-    disc_host: String,
+    io: UdpSsdpIo,
     shutdown: Arc<AtomicBool>,
 ) {
-    let io = match UdpSsdpIo::open(bind.as_deref(), &disc_host) {
-        Ok(io) => io,
-        Err(error) => {
-            eprintln!("minisatip: SSDP disabled: {error}");
-            return;
-        }
-    };
     let _ = io.set_read_timeout(Some(SSDP_READ_TIMEOUT));
     let mut server = SsdpServer::new(io, config).with_identity(identity);
     let origin = Instant::now();
@@ -1085,24 +1164,30 @@ fn start_srt_listener(
     use std::os::fd::IntoRawFd;
 
     if !ms_net::srt::LibSrtOps::startup() {
-        eprintln!(
+        crate::sys::log_error(format_args!(
             "minisatip: SRT disabled: {}",
             ms_net::srt::LibSrtOps::last_error()
-        );
+        ));
         return None;
     }
-    let socket = match std::net::UdpSocket::bind(SocketAddr::new(config.bind_ip, config.rtsp_port))
-    {
+    // srt_listener_init uses udp_bind, so the same SO_BINDTODEVICE and reuse
+    // flags apply (srt.cpp:139-145, socketworks.cpp:250-322).
+    let socket = match ms_net::sys::udp_bind_reuse(
+        SocketAddr::new(config.bind_ip, config.rtsp_port),
+        config.bind_dev.as_deref(),
+    ) {
         Ok(socket) => socket,
         Err(error) => {
-            eprintln!("minisatip: SRT disabled: UDP bind failed: {error}");
+            crate::sys::log_error(format_args!(
+                "minisatip: SRT disabled: UDP bind failed: {error}"
+            ));
             ms_net::srt::LibSrtOps::cleanup();
             return None;
         }
     };
     let mut listener = ms_net::srt::SrtListener::new(Arc::new(ms_net::srt::LibSrtOps));
     if let Err(error) = listener.init(socket.into_raw_fd()) {
-        eprintln!("minisatip: SRT disabled: {error}");
+        crate::sys::log_error(format_args!("minisatip: SRT disabled: {error}"));
         ms_net::srt::LibSrtOps::cleanup();
         return None;
     }
@@ -1112,6 +1197,38 @@ fn start_srt_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atoi_ports_are_truncated_like_htons() {
+        // socketworks.cpp:55-103 stores the port in a 16-bit sockaddr field;
+        // minisatip.cpp:965 accepts any atoi result.
+        assert_eq!(port16(554), 554);
+        assert_eq!(port16(0), 0);
+        assert_eq!(port16(70_000), 4_464);
+        assert_eq!(port16(-1), 65_535);
+    }
+
+    #[test]
+    fn datetime_compile_has_the_cpp_date_and_time_format() {
+        // minisatip.cpp:1149-1150: `sprintf("%s | %s", __DATE__, __TIME__)`;
+        // __DATE__ is "Mmm dd yyyy" and __TIME__ is "hh:mm:ss".
+        let stamp = env!("MINISATIP_DATETIME_COMPILE");
+        let (date, time) = stamp.split_once(" | ").expect("date | time");
+        let parts: Vec<&str> = date.split(' ').collect();
+        assert_eq!(parts.len(), 3, "{stamp}");
+        assert!(
+            [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+            ]
+            .contains(&parts[0]),
+            "{stamp}"
+        );
+        assert!((1..=31).contains(&parts[1].trim().parse::<u32>().unwrap()));
+        assert!(parts[2].len() == 4);
+        let clock: Vec<&str> = time.split(':').collect();
+        assert_eq!(clock.len(), 3);
+        assert!(clock.iter().all(|field| field.len() == 2));
+    }
 
     #[test]
     fn local_ip_is_the_route_source_address() {

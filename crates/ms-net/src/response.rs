@@ -25,6 +25,9 @@ pub struct Response {
     pub date: String,
     /// `Server` header value, e.g. `minisatip/1.0.0`.
     pub server: String,
+    /// Stream the body without `Content-Length` (`process_file` after its
+    /// first 8200-byte flush, utils.cpp:399-418).
+    pub streamed: bool,
 }
 
 impl Response {
@@ -39,7 +42,14 @@ impl Response {
             body: Vec::new(),
             date,
             server,
+            streamed: false,
         }
+    }
+
+    /// Marks the body as streamed without `Content-Length`.
+    pub fn streamed(mut self) -> Self {
+        self.streamed = true;
+        self
     }
 
     /// Sets the echoed `CSeq`.
@@ -111,7 +121,16 @@ impl Response {
                 out.push_str("\r\n");
             }
         }
-        if self.body.is_empty() {
+        if self.streamed {
+            // `http_response(so, 200, ctype, "", 0, 0)` writes only the header
+            // block, then the file chunks follow, and process_file ends with
+            // strcpy(outp + io, "\r\n\r\n") (utils.cpp:398-419).
+            out.push_str("\r\n");
+            let mut bytes = out.into_bytes();
+            bytes.extend_from_slice(&self.body);
+            bytes.extend_from_slice(b"\r\n\r\n");
+            bytes
+        } else if self.body.is_empty() {
             out.push_str("\r\n");
             out.into_bytes()
         } else {

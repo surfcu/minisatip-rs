@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use ms_sched::MAX_ADAPTERS;
 use ms_tuner::DeliverySystem;
 
+use crate::bandwidth::BandwidthSnapshot;
 use crate::handler::{HttpRoute, MAX_STREAMS};
 use crate::rtsp::Request;
 use crate::ssdp::{DeviceIdentity, SharedIdentity};
@@ -19,6 +20,8 @@ pub const DESC_XML_PATH: &str = "/desc.xml";
 pub const STATE_JSON_PATH: &str = "/state.json";
 /// Bandwidth counters endpoint.
 pub const BANDWIDTH_JSON_PATH: &str = "/bandwidth.json";
+/// Bytes C++ keeps for `/desc.xml` (`char buf[2000]`, minisatip.cpp:1462).
+const DESC_XML_MAX: usize = 1999;
 
 /// Configuration of the HTTP file server and generated pages.
 #[derive(Debug, Clone)]
@@ -36,9 +39,9 @@ pub struct WebConfig {
     /// RTSP host reported in `state.json`.
     pub rtsp_host: String,
     /// HTTP port reported in `state.json`.
-    pub http_port: u16,
+    pub http_port: i32,
     /// RTSP port advertised by `desc.xml`.
-    pub rtsp_port: u16,
+    pub rtsp_port: i32,
     /// Device description file name.
     pub xml_path: String,
     /// Optional playlist appended to `desc.xml`.
@@ -47,6 +50,13 @@ pub struct WebConfig {
     pub bootid: i32,
     /// SAT>IP device id.
     pub device_id: i32,
+    /// `-a` server count; nonzero pins the DVBS2 tuner count
+    /// (adapter.cpp:478-480).
+    pub force_sadapter: i32,
+    /// `-a` slave count; nonzero pins the DVBT tuner count.
+    pub force_tadapter: i32,
+    /// `-a` ca count; nonzero pins the DVBC tuner count.
+    pub force_cadapter: i32,
 }
 
 impl Default for WebConfig {
@@ -64,6 +74,9 @@ impl Default for WebConfig {
             playlist: None,
             bootid: 0,
             device_id: 0,
+            force_sadapter: 0,
+            force_tadapter: 0,
+            force_cadapter: 0,
         }
     }
 }
@@ -221,6 +234,8 @@ pub struct WebSnapshot {
     pub streams: Vec<StreamState>,
     /// Values from `minisatip_sym`.
     pub runtime: RuntimeState,
+    /// Folded counters printed by `/bandwidth.json` (`c_*`).
+    pub bandwidth: BandwidthSnapshot,
 }
 
 impl WebSnapshot {
@@ -348,7 +363,7 @@ impl WebService {
         let route = match request.uri.as_str() {
             DESC_XML_PATH => self.desc_route(state),
             STATE_JSON_PATH => json_route(self.state_json(state)),
-            BANDWIDTH_JSON_PATH => json_route(self.bandwidth_json()),
+            BANDWIDTH_JSON_PATH => json_route(self.bandwidth_json(&state.bandwidth)),
             uri => self.static_route(uri, request.is_method("HEAD"), state),
         };
         Some(route)
@@ -356,7 +371,7 @@ impl WebService {
 
     /// Builds the UPnP device description (minisatip.cpp:1468-1494, 1575-1609).
     pub fn desc_xml(&self, state: &WebSnapshot) -> String {
-        let adapters = state.tuner_counts().satip_cap();
+        let adapters = self.tuner_counts(state).satip_cap();
         let identity = self.identity();
         let playlist = self.config.playlist.as_deref().unwrap_or("");
         format!(
@@ -478,7 +493,7 @@ impl WebService {
         json.int_array("ad_ccerr", (0..MAX_ADAPTERS).map(|i| adapters(i).ccerr));
         json.int_array("ad_decerr", (0..MAX_ADAPTERS).map(|i| adapters(i).decerr));
 
-        let counts = TunerCounts::from_adapters(&state.adapters);
+        let counts = self.tuner_counts(state);
         json.int("tuner_s2", counts.s2 as i32);
         json.int("tuner_t2", counts.t2 as i32);
         json.int("tuner_c2", counts.c2 as i32);
@@ -536,13 +551,14 @@ impl WebService {
             (0..MAX_STREAMS as usize).map(|i| streams(i).buffered),
         );
 
-        json.int("has_pmt", 0);
+        // minisatip.cpp:2181: a normal (PMT-enabled) build exports has_pmt=1.
+        json.int("has_pmt", 1);
         json.string("name_app", &self.config.name_app);
         json.string("http_host", &self.config.http_host);
         json.string("uuid", &identity.uuid);
         json.int("bootid", identity.bootid);
         json.int("deviceid", identity.device_id);
-        json.int("http_port", i32::from(self.config.http_port));
+        json.int("http_port", self.config.http_port);
         json.string("rtsp_host", &self.config.rtsp_host);
         json.string("datetime_compile", &state.runtime.datetime_compile);
         json.string("datetime_start", &state.runtime.datetime_start);
@@ -555,27 +571,43 @@ impl WebService {
         json.finish()
     }
 
-    /// Builds `/bandwidth.json` with the counters absent in this port.
-    pub fn bandwidth_json(&self) -> String {
-        concat!(
-            "{\n",
-            "\"bw\":0,\n",
-            "\"dmx\":0,\n",
-            "\"tbw\":0,\n",
-            "\"reads\":0,\n",
-            "\"writes\":0,\n",
-            "\"fwrites\":0,\n",
-            "\"ns_read\":0,\n",
-            "\"tt\":0,\n",
-            "\"buffered\":0,\n",
-            "\"dropped\":0\n",
-            "}"
+    /// Builds `/bandwidth.json` from the folded counters
+    /// (`get_json_bandwidth`, api/variables.cpp:305-324).
+    pub fn bandwidth_json(&self, counters: &BandwidthSnapshot) -> String {
+        format!(
+            concat!(
+                "{{\n",
+                "\"bw\":{},\n",
+                "\"dmx\":{},\n",
+                "\"tbw\":{},\n",
+                "\"reads\":{},\n",
+                "\"writes\":{},\n",
+                "\"fwrites\":{},\n",
+                "\"ns_read\":{},\n",
+                "\"tt\":{},\n",
+                "\"buffered\":{},\n",
+                "\"dropped\":{}\n",
+                "}}"
+            ),
+            counters.bw,
+            counters.dmx,
+            counters.tbw,
+            counters.reads,
+            counters.writes,
+            counters.fwrites,
+            counters.ns_read,
+            counters.tt,
+            counters.buffered,
+            counters.dropped
         )
-        .to_owned()
     }
 
     fn desc_route(&self, state: &WebSnapshot) -> HttpRoute {
-        HttpRoute::new(200, self.desc_xml(state).into_bytes())
+        // minisatip.cpp:1462,1601: the description is formatted into
+        // `char buf[2000]` with snprintf, so it is truncated to 1999 bytes.
+        let mut body = self.desc_xml(state).into_bytes();
+        body.truncate(DESC_XML_MAX);
+        HttpRoute::new(200, body)
             .with_headers(vec![
                 "Cache-Control: no-cache".to_owned(),
                 "Content-type: text/xml".to_owned(),
@@ -600,14 +632,38 @@ impl WebService {
             .iter()
             .any(|line| line.contains("html") || line.contains("xml"));
         if templated {
-            let counts = state.tuner_counts();
+            let counts = self.tuner_counts(state);
             data = substitute(&data, |name| self.template_value(name, counts));
         }
         if is_head {
             HttpRoute::new(200, Vec::new()).with_headers(headers)
         } else {
-            HttpRoute::new(200, data).with_headers(headers)
+            let route = HttpRoute::new(200, data).with_headers(headers);
+            // process_file returns the response without Content-Length once
+            // `io > sizeof(outp) - 100` triggers its first flush
+            // (utils.cpp:379-419).
+            if templated && route.body.len() > 8200 {
+                route.streaming()
+            } else {
+                route
+            }
         }
+    }
+
+    /// Effective tuner counts: `-a` nonzero entries pin the DVBS2/DVBT/DVBC
+    /// counts after `getAdaptersCount` counted the adapters
+    /// (adapter.cpp:478-487,523-534).
+    fn tuner_counts(&self, state: &WebSnapshot) -> TunerCounts {
+        let mut counts = state.tuner_counts();
+        let forced = |value: i32, count: &mut usize| {
+            if value != 0 {
+                *count = usize::try_from(value).unwrap_or(0);
+            }
+        };
+        forced(self.config.force_sadapter, &mut counts.s2);
+        forced(self.config.force_tadapter, &mut counts.t);
+        forced(self.config.force_cadapter, &mut counts.c);
+        counts
     }
 
     /// Resolves a template variable by the C++ prefix-match rule

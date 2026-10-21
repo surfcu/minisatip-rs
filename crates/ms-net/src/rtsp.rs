@@ -125,6 +125,14 @@ pub enum ParseOutcome {
 
 /// Parses one request from `buf`, handling leading interleaved RTP frames.
 pub fn parse_request(buf: &[u8]) -> ParseOutcome {
+    parse_request_with(buf, false)
+}
+
+/// Parses one request. `http` allows a request line with no URI, which
+/// `read_http` accepts and answers with 503 (`split(...).size() < 2`;
+/// minisatip.cpp:1561-1564) after `is_http_request` matched the method prefix
+/// (utils.cpp:861-864).
+pub fn parse_request_with(buf: &[u8], http: bool) -> ParseOutcome {
     if buf.is_empty() {
         return ParseOutcome::Incomplete { consumed: 0 };
     }
@@ -160,8 +168,14 @@ pub fn parse_request(buf: &[u8]) -> ParseOutcome {
         return ParseOutcome::Malformed;
     };
     let mut parts = request_line.split_whitespace();
-    let (Some(method), Some(uri)) = (parts.next(), parts.next()) else {
+    let Some(method) = parts.next() else {
         return ParseOutcome::Malformed;
+    };
+    let uri = match parts.next() {
+        Some(uri) => uri,
+        // `GET \r\n\r\n` reaches the inline 503 path (minisatip.cpp:1561-1564).
+        None if http && matches!(method, "GET" | "HEAD" | "POST") => "",
+        None => return ParseOutcome::Malformed,
     };
     let version = parts.next().unwrap_or("");
     if method.is_empty() {

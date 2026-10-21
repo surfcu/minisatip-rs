@@ -1,6 +1,7 @@
 //! Per-adapter data plane: one thread reads a tuner, batches like `read_dmx` and
 //! routes packets by PID to its outputs. It is driven only by messages.
 
+use crate::bandwidth::Bandwidth;
 use crate::describe::{DescribeInput, describe_adapter};
 use crate::handler::{StreamId, StreamType};
 use crate::output::{OutputStats, STREAM_TIMER_MS, StreamOutput};
@@ -9,6 +10,7 @@ use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -216,6 +218,15 @@ pub enum Command {
         output: Box<StreamOutput>,
         /// PIDs routed to it.
         pids: PidSet,
+        /// Milliseconds between SETUP (`streams_add`) and PLAY.
+        setup_age_ms: i64,
+    },
+    /// Updates the RTP SSRC (`sid->ssrc = id`, stream.cpp:1409-1416).
+    SetSsrc {
+        /// Target stream.
+        stream_id: StreamId,
+        /// New SSRC.
+        ssrc: u32,
     },
     /// Replaces an output's PID set.
     SetPids {
@@ -279,11 +290,20 @@ pub struct AdapterHandle {
 impl AdapterHandle {
     /// Spawns the data-plane thread for `tuner`.
     pub fn spawn(tuner: Box<dyn Tuner + Send>, config: DataPlaneConfig) -> io::Result<Self> {
+        Self::spawn_with_bandwidth(tuner, config, None)
+    }
+
+    /// Spawns the data-plane thread, feeding process-wide bandwidth counters.
+    pub fn spawn_with_bandwidth(
+        tuner: Box<dyn Tuner + Send>,
+        config: DataPlaneConfig,
+        bandwidth: Option<Arc<Bandwidth>>,
+    ) -> io::Result<Self> {
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
         let thread = thread::Builder::new()
             .name(format!("adapter{}", config.adapter_id))
-            .spawn(move || DataPlane::new(tuner, config, command_rx, event_tx).run())?;
+            .spawn(move || DataPlane::new(tuner, config, command_rx, event_tx, bandwidth).run())?;
         Ok(Self {
             commands,
             events,
@@ -314,12 +334,24 @@ impl AdapterHandle {
         output: StreamOutput,
         pids: PidSet,
     ) -> Option<u64> {
+        self.start_output_with_age(stream_id, output, pids, 0)
+    }
+
+    /// Starts an output whose SETUP happened `setup_age_ms` ago.
+    pub fn start_output_with_age(
+        &self,
+        stream_id: StreamId,
+        output: StreamOutput,
+        pids: PidSet,
+        setup_age_ms: i64,
+    ) -> Option<u64> {
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         self.send(Command::StartOutput {
             stream_id,
             epoch,
             output: Box::new(output),
             pids,
+            setup_age_ms,
         })
         .then_some(epoch)
     }
@@ -395,6 +427,9 @@ struct DataPlane {
     last_send_ms: i64,
     origin: Instant,
     running: bool,
+    bandwidth: Option<Arc<Bandwidth>>,
+    /// Last octets/packets/failed writes/FIFO-copied/FIFO-dropped per output.
+    bandwidth_marks: BTreeMap<StreamId, (u64, u32, u32, u64, u64)>,
 }
 
 impl DataPlane {
@@ -403,6 +438,7 @@ impl DataPlane {
         config: DataPlaneConfig,
         commands: Receiver<Command>,
         events: Sender<Event>,
+        bandwidth: Option<Arc<Bandwidth>>,
     ) -> Self {
         Self {
             tuner,
@@ -424,6 +460,8 @@ impl DataPlane {
             last_send_ms: 0,
             origin: Instant::now(),
             running: true,
+            bandwidth,
+            bandwidth_marks: BTreeMap::new(),
         }
     }
 
@@ -442,6 +480,7 @@ impl DataPlane {
             let got_data = !self.outputs.is_empty() && self.read_once();
             self.timers();
             self.flush_queues();
+            self.sync_bandwidth();
             if !got_data {
                 let wait = if self.outputs.is_empty() {
                     Duration::from_millis(STREAM_TIMER_MS as u64)
@@ -474,10 +513,14 @@ impl DataPlane {
             Command::StartOutput {
                 stream_id,
                 epoch,
-                output,
+                mut output,
                 pids,
+                setup_age_ms,
             } => {
                 let now = self.mono_us() / 1000;
+                // streams_add set `wtime`/`rtcp_wtime` at SETUP
+                // (stream.cpp:630-636); the output starts at PLAY.
+                output.set_clocks(now.saturating_sub(setup_age_ms));
                 self.outputs.insert(
                     stream_id,
                     Subscriber {
@@ -488,6 +531,11 @@ impl DataPlane {
                     },
                 );
                 self.update_tuner_pids();
+            }
+            Command::SetSsrc { stream_id, ssrc } => {
+                if let Some(subscriber) = self.outputs.get_mut(&stream_id) {
+                    subscriber.output.set_ssrc(ssrc);
+                }
             }
             Command::SetPids { stream_id, pids } => {
                 if let Some(subscriber) = self.outputs.get_mut(&stream_id) {
@@ -535,6 +583,44 @@ impl DataPlane {
         }
     }
 
+    /// Folds output counters into the process-wide bandwidth window and asks it
+    /// to update the snapshot (`calculate_bw`, stream.cpp:1287-1327).
+    fn sync_bandwidth(&mut self) {
+        let Some(bandwidth) = self.bandwidth.clone() else {
+            return;
+        };
+        for (stream_id, subscriber) in &self.outputs {
+            let stats = subscriber.output.stats();
+            let mark = self
+                .bandwidth_marks
+                .entry(*stream_id)
+                .or_insert((0, 0, 0, 0, 0));
+            // `bw`/`writes` advance with `sid->sb`/`sid->sp`
+            // (stream.cpp:825-826, socketworks.cpp:1321).
+            bandwidth.record_writes(
+                u64::from(stats.octets).wrapping_sub(mark.0),
+                stats.packets.wrapping_sub(mark.1),
+            );
+            bandwidth.record_failed_writes(stats.failed_writes.wrapping_sub(mark.2));
+            // `buffered_bytes += copied` when data enters the FIFO and
+            // `dropped_bytes += len - offset` when it does not fit; both are
+            // per-window accumulators reset by `calculate_bw`
+            // (socketworks.cpp:1496,1505-1506; stream.cpp:1308-1309,1325-1326).
+            bandwidth.record_buffered(stats.fifo_written.wrapping_sub(mark.3));
+            bandwidth.record_dropped(stats.fifo_dropped.wrapping_sub(mark.4));
+            *mark = (
+                u64::from(stats.octets),
+                stats.packets,
+                stats.failed_writes,
+                stats.fifo_written,
+                stats.fifo_dropped,
+            );
+        }
+        self.bandwidth_marks
+            .retain(|stream_id, _| self.outputs.contains_key(stream_id));
+        bandwidth.calculate();
+    }
+
     fn update_tuner_pids(&mut self) {
         let mut pids = PidSet::new();
         for subscriber in self.outputs.values() {
@@ -549,6 +635,7 @@ impl DataPlane {
     }
 
     fn read_once(&mut self) -> bool {
+        let started = Instant::now();
         let read = match self.tuner.read(&mut self.buf) {
             Ok(read) => read,
             Err(error) => {
@@ -556,6 +643,10 @@ impl DataPlane {
                 return false;
             }
         };
+        // stream.cpp:1172,1193-1194: `bw_dmx += rlen`, `nsecs += ...`, `reads++`.
+        if let Some(bandwidth) = &self.bandwidth {
+            bandwidth.record_read(read, started.elapsed().as_micros() as i64);
+        }
         let now = self.mono_us() / 1000;
         if read == 0 {
             // A replay at EOF never reads again, so a pending batch leaves after 40 ms.

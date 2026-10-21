@@ -5,7 +5,8 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -264,26 +265,61 @@ pub trait SsdpIo {
     fn send_to(&mut self, data: &[u8], host: &str, port: u16) -> io::Result<usize>;
 }
 
-/// Real UDP socket bound to port 1900 and joined to the SSDP group.
+/// The two SSDP sockets C++ creates in `main` (minisatip.cpp:1943-1947).
+///
+/// `announce`/`reply` is `udp_bind(opts.bind, 1900, ...)`; `discovery` is
+/// `udp_bind(opts.disc_host, 1900, 1)`, joined to the multicast group. Every
+/// outgoing message uses the first socket, like the global `ssdp` descriptor
+/// (minisatip.cpp:1848-1865), while both are polled for datagrams.
 #[derive(Debug)]
 pub struct UdpSsdpIo {
     socket: UdpSocket,
+    discovery: UdpSocket,
 }
 
 impl UdpSsdpIo {
-    /// Opens the discovery socket; `bind` selects the local interface address.
-    pub fn open(bind: Option<&str>, disc_host: &str) -> io::Result<Self> {
-        let interface = bind
-            .and_then(|host| host.parse::<Ipv4Addr>().ok())
-            .unwrap_or(Ipv4Addr::UNSPECIFIED);
-        let socket = UdpSocket::bind((interface, SSDP_PORT))?;
-        if let Ok(group) = disc_host.parse::<Ipv4Addr>() {
-            socket.join_multicast_v4(&group, &interface)?;
+    /// Opens both sockets; a bind failure is fatal, as `FAIL(...)` in C++.
+    pub fn open(
+        bind: Option<&str>,
+        disc_host: &str,
+        ipv4_only: bool,
+        bind_dev: Option<&str>,
+        bind_dev_ip: Option<Ipv4Addr>,
+    ) -> io::Result<Self> {
+        let local = match bind.filter(|host| !host.is_empty()) {
+            Some(host) => resolve_bind(host, ipv4_only)?,
+            None if ipv4_only => SocketAddr::from((Ipv4Addr::UNSPECIFIED, SSDP_PORT)),
+            None => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, SSDP_PORT)),
+        };
+        let socket = crate::sys::udp_bind_reuse(local, bind_dev)?;
+
+        // `fill_sockaddr(disc_host, 1900, 1)` always resolves IPv4.
+        let Ok(group) = disc_host.parse::<Ipv4Addr>() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("SSDP: cannot resolve {disc_host}"),
+            ));
+        };
+        let discovery = crate::sys::udp_bind_reuse(SocketAddr::from((group, SSDP_PORT)), bind_dev)
+            .or_else(|_| {
+                // udp_bind falls back to INADDR_ANY for multicast addresses
+                // (socketworks.cpp:308-322).
+                crate::sys::udp_bind_reuse(
+                    SocketAddr::from((Ipv4Addr::UNSPECIFIED, SSDP_PORT)),
+                    bind_dev,
+                )
+            })?;
+        let interface = bind_dev_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        // The C++ logs membership failures instead of aborting.
+        let _ = crate::sys::join_multicast_v4(discovery.as_raw_fd(), group, interface);
+        if bind_dev_ip.is_some() {
+            let _ = crate::sys::set_multicast_if(discovery.as_raw_fd(), interface);
         }
-        Ok(Self { socket })
+        discovery.set_nonblocking(true)?;
+        Ok(Self { socket, discovery })
     }
 
-    /// Local bound address.
+    /// Local bound address of the announcing socket.
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.socket.local_addr()
     }
@@ -293,8 +329,18 @@ impl UdpSsdpIo {
         self.socket.set_read_timeout(timeout)
     }
 
-    /// Receives one datagram and its source address.
+    /// Receives one datagram from either socket and its source address.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, std::net::SocketAddr)> {
+        match self.discovery.recv_from(buf) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            other => return other,
+        }
         self.socket.recv_from(buf)
     }
 }
@@ -303,6 +349,19 @@ impl SsdpIo for UdpSsdpIo {
     fn send_to(&mut self, data: &[u8], host: &str, port: u16) -> io::Result<usize> {
         self.socket.send_to(data, (host, port))
     }
+}
+
+/// `fill_sockaddr` with `getaddrinfo`: hostnames resolved with the requested
+/// family preference; a literal address keeps its family unless `ipv4_only`.
+fn resolve_bind(host: &str, ipv4_only: bool) -> io::Result<SocketAddr> {
+    let mut addresses = (host, SSDP_PORT).to_socket_addrs()?;
+    let preferred = addresses.find(|addr| !ipv4_only || addr.is_ipv4());
+    preferred.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("SSDP: cannot resolve {host}"),
+        )
+    })
 }
 
 /// Discovery state machine; owns the transport and the identity counters.
@@ -397,10 +456,12 @@ impl<I: SsdpIo> SsdpServer<I> {
         }
 
         if starts_with_ignoring_case(message, "NOTIFY") {
-            let Some(device_id) = header_value(message, "DEVICEID.SES.COM:") else {
+            // C++ uses strcasestr, so the header need not start a line.
+            let Some(start) = find_ignoring_case(message, "DEVICEID.SES.COM:") else {
                 return Ok(action);
             };
-            if parse_int_prefix(&device_id, 0) == self.config.device_id {
+            let device_id = String::from_utf8_lossy(&message[start + 17..]);
+            if parse_int_prefix(device_id.trim_start(), 0) == self.config.device_id {
                 let conflict = device_id_conflict(&self.config);
                 self.io.send_to(&conflict, peer_host, peer_port)?;
                 action.device_id_conflict = true;
@@ -408,16 +469,23 @@ impl<I: SsdpIo> SsdpServer<I> {
             return Ok(action);
         }
 
+        // minisatip.cpp:1827-1835: strcasestr for all three, and the window is
+        // `s->rtime < 15000` where rtime is reset to the *announcement* tick
+        // (`s->rtime = s->wtime`), so it is effectively always true.
         let man = contains_ignoring_case(message, "MAN");
         let discover = contains_ignoring_case(message, "ssdp:discover");
-        let didsescom = header_value(message, "DEVICEID.SES.COM:");
+        let didsescom = find_ignoring_case(message, "DEVICEID.SES.COM:").map(|start| {
+            String::from_utf8_lossy(&message[start + 17..])
+                .trim_start()
+                .to_owned()
+        });
         let mut did = didsescom
             .as_deref()
             .map(|value| parse_int_prefix(value, 0))
             .unwrap_or(0);
         let in_window = self
             .announce_time_ms
-            .is_some_and(|time| now_ms - time < CONFLICT_WINDOW_MS);
+            .is_some_and(|time| time < CONFLICT_WINDOW_MS);
         if man && discover && didsescom.is_some() && in_window && did == self.config.device_id {
             self.config.device_id += 1;
             self.config.bootid += 1;
@@ -445,7 +513,8 @@ impl<I: SsdpIo> SsdpServer<I> {
             did = self.config.device_id;
         }
 
-        if starts_with_ignoring_case(message, "HTTP/1") {
+        // minisatip.cpp:1851: strncmp is case-sensitive here.
+        if message.starts_with(b"HTTP/1") {
             return Ok(action);
         }
 

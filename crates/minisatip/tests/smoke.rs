@@ -61,6 +61,9 @@ impl Server {
         let mut child = command
             .args([
                 "--disable-ssdp",
+                // `-f`: stay in the foreground like C++ with FOREGROUND_OPT
+                // (minisatip.cpp:704); the harness owns the child process.
+                "-f",
                 "-x",
                 &http_port.to_string(),
                 "-y",
@@ -219,6 +222,11 @@ fn replay_serves_rtsp_and_http() -> io::Result<()> {
     let xml = String::from_utf8_lossy(&body);
     assert!(xml.contains("<friendlyName>"), "desc: {xml}");
     assert!(xml.contains("X_SATIPCAP"), "desc: {xml}");
+    // A replay tuner stands in for a DVB-S/S2 frontend, so only those systems
+    // are advertised (adapter.cpp:283-371, getAdaptersCount 478-535).
+    assert!(xml.contains(">DVBS2-1</satip:X_SATIPCAP>"), "desc: {xml}");
+    assert!(!xml.contains("DVBT-"), "desc: {xml}");
+    assert!(!xml.contains("DVBC-"), "desc: {xml}");
 
     let (status, headers, body) = http_get(server.http_port, "/state.json")?;
     assert_eq!(status, 200, "GET /state.json");
@@ -809,6 +817,122 @@ fn terminate(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Finds the daemonised server by its unique `-y` port.
+fn find_daemon_pid(rtsp_port: u16) -> Option<i32> {
+    let port = rtsp_port.to_string();
+    for entry in fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else { continue };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+        let binary = args.first().is_some_and(|arg| arg.ends_with(b"minisatip"));
+        let port_matches = args
+            .windows(2)
+            .any(|pair| pair[0] == b"-y" && pair[1] == port.as_bytes());
+        if binary && port_matches {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+struct DaemonGuard(i32);
+
+#[allow(unsafe_code)]
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if self.0 <= 0 {
+            return;
+        }
+        // SAFETY: the pid was found by scanning /proc for our unique port and
+        // SIGTERM only asks that process to shut down.
+        unsafe {
+            libc::kill(self.0, libc::SIGTERM);
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+#[test]
+fn daemonises_by_default_and_redirects_stdio_to_the_logfile() -> io::Result<()> {
+    // minisatip.cpp:1914-1916 daemonises unless FOREGROUND_OPT (-f) was
+    // given; becomeDaemon double-forks, calls setsid and points stdin at
+    // /dev/null with stdout/stderr on opts.log_file (utils.cpp:302-350).
+    let _start_guard = START_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let capture = generate_ts()?;
+    let dir = unique_dir();
+    fs::create_dir_all(&dir)?;
+    let log_path = dir.join("daemon.log");
+    let (rtsp_port, http_port) = free_tcp_ports()?;
+    let start_rtp = free_udp_pair()?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_minisatip"))
+        .args([
+            "--disable-ssdp",
+            "-F",
+            log_path.to_str().unwrap_or("."),
+            "-x",
+            &http_port.to_string(),
+            "-y",
+            &rtsp_port.to_string(),
+            "-P",
+            &start_rtp.to_string(),
+            "-z",
+            dir.to_str().unwrap_or("."),
+            "-e",
+            "0",
+        ])
+        .env("MINISATIP_REPLAY", &capture.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // The first fork's parent `_exit(0)` (utils.cpp:305-311), so the spawned
+    // process returns immediately while the server keeps running.
+    let status = child.wait()?;
+    assert!(status.success(), "daemon parent status: {status}");
+
+    let deadline = Instant::now() + TIMEOUT;
+    let pid = loop {
+        if let Some(pid) = find_daemon_pid(rtsp_port) {
+            break pid;
+        }
+        if Instant::now() >= deadline {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no daemon process appeared",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let _guard = DaemonGuard(pid);
+
+    // The log file is opened by becomeDaemon before the listener exists.
+    let mut connected = false;
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{rtsp_port}").parse().expect("addr"),
+            Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            connected = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(connected, "daemonised server did not listen");
+    assert!(log_path.exists(), "stdio must go to the -F log file");
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
 }
 
 #[test]

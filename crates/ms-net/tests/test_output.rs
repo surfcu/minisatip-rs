@@ -69,6 +69,33 @@ fn udp_output(dest: SocketAddr, ssrc: u32) -> StreamOutput {
     StreamOutput::udp(target, config(ssrc), 0).unwrap()
 }
 
+#[test]
+fn udp_outputs_set_dscp_ef_and_the_send_buffer() {
+    // stream.cpp:570-584: with `opts.output_buffer > 0`,
+    // set_socket_send_buffer runs on RTP, then set_socket_dscp marks RTP
+    // with IPTOS_DSCP_EF/priority 7 and RTCP with priority 6; the TOS byte
+    // is `dscp & IPTOS_DSCP_MASK_VALUE` (socketworks.cpp:1618-1632).
+    use std::os::fd::AsRawFd;
+
+    let (rx_rtp, rx_rtcp) = udp_pair();
+    let target = UdpTarget {
+        local: free_local_pair(),
+        dest: rx_rtp.local_addr().unwrap(),
+        ttl: None,
+    };
+    let output = StreamOutput::udp_with_options(target, config(7), 0, None, 65_536).unwrap();
+    let (rtp, rtcp) = output.udp_sockets().expect("UDP output");
+    for socket in [rtp, rtcp] {
+        assert_eq!(
+            ms_net::sys::socket_tos(socket.as_raw_fd()).unwrap(),
+            i32::from(0xb8u8)
+        );
+        // The kernel doubles SO_SNDBUF, so the read-back is at least 64 KiB.
+        assert!(ms_net::sys::socket_send_buffer(socket.as_raw_fd()).unwrap() >= 65_536);
+    }
+    drop((rx_rtp, rx_rtcp));
+}
+
 fn recv(socket: &UdpSocket) -> Vec<u8> {
     let mut buf = [0u8; 2048];
     let len = socket.recv(&mut buf).expect("datagram");
@@ -205,6 +232,39 @@ fn udp_client_port_change_updates_rport() {
 }
 
 #[test]
+fn ssrc_follows_set_session_id() {
+    // stream.cpp:1409-1416: `set_session_id` assigns `sid->ssrc`; every
+    // subsequent RTP/RTCP packet carries it.
+    let (rx_rtp, rx_rtcp) = udp_pair();
+    let mut output = udp_output(rx_rtp.local_addr().unwrap(), 1);
+    output.set_ssrc(0xDEAD_BEEF);
+    assert_eq!(output.stats().ssrc, 0xDEAD_BEEF);
+    output.send_rtcp(0, SystemTime::now(), "x").unwrap();
+    let report = recv(&rx_rtcp);
+    assert_eq!(&report[4..8], &0xDEAD_BEEFu32.to_be_bytes());
+}
+
+#[test]
+fn rtcp_clocks_start_at_setup() {
+    // streams_add sets `sid->wtime`/`sid->rtcp_wtime` (stream.cpp:634); the
+    // data plane rewinds the clocks to that instant when PLAY starts.
+    let (rx_rtp, rx_rtcp) = udp_pair();
+    let target = UdpTarget {
+        local: free_local_pair(),
+        dest: rx_rtp.local_addr().unwrap(),
+        ttl: None,
+    };
+    // The output object was built at PLAY (tick 10000) but SETUP was at 5000.
+    let mut output = StreamOutput::udp(target, config(1), 10_000).unwrap();
+    output.set_clocks(5_000);
+    output.send_rtcp(6_000, SystemTime::now(), "x").unwrap();
+    let report = recv(&rx_rtcp);
+    // The sender-report word carries `wtime - rtcp_wtime` semantics from the
+    // SETUP instant, not from PLAY (compare udp_keepalive_and_rtcp_timer).
+    assert_eq!(&report[16..20], &5_000u32.to_be_bytes());
+}
+
+#[test]
 fn udp_rtcp_receiver_report_is_seen() {
     let (rx_rtp, rx_rtcp) = udp_pair();
     let mut output = udp_output(rx_rtp.local_addr().unwrap(), 1);
@@ -310,6 +370,10 @@ fn rtsp_tcp_buffers_and_prioritises_replies() {
         "fully queued writes return 0 like sockets_writev"
     );
     assert_eq!(stats.buffered as usize, 2 * (16 + 2 * 188));
+    // socketworks.cpp:1505-1506: `buffered_bytes` accumulates every byte
+    // copied into the FIFO, not the current queue occupancy.
+    assert_eq!(stats.fifo_written as usize, 2 * (16 + 2 * 188));
+    assert_eq!(stats.fifo_dropped, 0);
     assert!(output.has_pending());
 
     let reply = b"RTSP/1.0 200 OK\r\nCSeq: 3\r\n\r\n";
@@ -325,6 +389,13 @@ fn rtsp_tcp_buffers_and_prioritises_replies() {
     assert_eq!(bytes.len(), reply.len() + 2 * (16 + 2 * 188));
     assert_eq!(&bytes[reply.len()..reply.len() + 2], &[b'$', 0]);
     assert_eq!(&bytes[reply.len() + 16 + 2 * 188..][..2], &[b'$', 0]);
+    let stats = output.stats();
+    assert_eq!(stats.buffered, 0, "queue drained");
+    assert_eq!(
+        stats.fifo_written as usize,
+        2 * (16 + 2 * 188),
+        "the lifetime copy counter is not a queue gauge"
+    );
 }
 
 #[test]

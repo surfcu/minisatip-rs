@@ -7,7 +7,7 @@ use ms_net::handler::{
 use ms_net::response::Response;
 use ms_net::rtsp::{
     MAX_HEADERS, ParseOutcome, Protocol, Request, TransportKind, TransportMode, parse_request,
-    parse_transport,
+    parse_request_with, parse_transport,
 };
 use ms_net::satip::parse_satip_url;
 use ms_tuner::{DeliverySystem, PID_ALL, PidSet, Polarization, TuneParams};
@@ -833,6 +833,34 @@ fn http_head_sends_headers_without_body() {
     assert_eq!(response.status, 200);
     assert!(response.body.is_empty());
     assert!(!text(&response).contains("Content-Length:"));
+}
+
+#[test]
+fn http_get_without_uri_returns_503() {
+    // minisatip.cpp:1561-1564: `split(...).size() < 2` reaches the inline
+    // REPLY_AND_RETURN(503) path for `GET \r\n\r\n`.
+    let req = match parse_request_with(b"GET \r\n\r\n", true) {
+        ParseOutcome::Complete { request, .. } => request,
+        outcome => panic!("expected a complete request, got {outcome:?}"),
+    };
+    assert_eq!(req.method, "GET");
+    assert_eq!(req.uri, "");
+    let mut backend = FakeBackend::default();
+    let mut ctx = context(&mut backend, Protocol::Http);
+    let response = handle_http(&mut ctx, &req).unwrap();
+    assert_eq!(response.status, 503);
+    assert!(text(&response).starts_with("HTTP/1.0 503 Service Unavailable\r\n"));
+    assert!(!text(&response).contains("Content-Length:"));
+}
+
+#[test]
+fn rtsp_request_without_uri_is_still_malformed() {
+    // read_rtsp drops a header with fewer than two arguments
+    // (minisatip.cpp:1240-1248); only the HTTP reader answers 503.
+    assert!(matches!(
+        parse_request(b"OPTIONS\r\n\r\n"),
+        ParseOutcome::Malformed
+    ));
 }
 
 #[test]

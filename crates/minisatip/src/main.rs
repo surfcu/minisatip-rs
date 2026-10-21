@@ -45,8 +45,16 @@ fn main() {
         print!("{}", ms_config::usage_text());
         std::process::exit(1);
     }
+    // minisatip.cpp:1914-1923: daemonise by default (opts.daemon is 1 unless
+    // -f is given) and open syslog for -g. becomeDaemon's result is ignored.
+    if opts.daemon != 0 {
+        let _ = sys::become_daemon(&opts.log_file);
+    }
+    if opts.slog > 0 {
+        sys::open_syslog("minisatip", opts.slog > 1);
+    }
     if let Err(error) = runtime::run(&opts) {
-        eprintln!("minisatip: {error}");
+        sys::log_error(format_args!("minisatip: {error}"));
         std::process::exit(1);
     }
 }

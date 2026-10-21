@@ -5,6 +5,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static SYSLOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_signal: libc::c_int) {
     // Async-signal-safe: only an atomic store.
@@ -57,6 +58,161 @@ pub fn asctime_now() -> String {
 pub fn run_user() -> i32 {
     // SAFETY: getuid(2) has no preconditions.
     unsafe { libc::getuid() as i32 }
+}
+
+/// Path of the pid file, `PID_NAME = "/var/run/%s.pid"` with the C++
+/// `app_name` (minisatip.cpp:76,1889-1895).
+pub fn pid_file_path() -> String {
+    "/var/run/minisatip.pid".to_owned()
+}
+
+/// Writes the current pid, ignoring failures like C++ (`fopen` checked only
+/// for NULL).
+pub fn write_pid_file() {
+    let _ = std::fs::write(pid_file_path(), format!("{}", std::process::id()));
+}
+
+/// Removes the pid file (`unlink(pid_file)`, minisatip.cpp:2021).
+pub fn remove_pid_file() {
+    let _ = std::fs::remove_file(pid_file_path());
+}
+
+/// `becomeDaemon` (utils.cpp:276-350): kill a previous instance recorded in
+/// the pid file, double fork, start a new session, close every descriptor and
+/// reopen stdin on /dev/null with stdout/stderr on `log_file`.
+///
+/// Returns the reason on failure; C++ ignores the return value.
+pub fn become_daemon(log_file: &str) -> Result<(), String> {
+    kill_previous_instance();
+
+    // SAFETY: fork(2) has no preconditions; the parent leaves immediately.
+    match unsafe { libc::fork() } {
+        -1 => return Err("fork failed".to_owned()),
+        0 => {}
+        _ => {
+            // SAFETY: _exit is async-signal-safe and skips destructors, as in C++.
+            unsafe { libc::_exit(0) }
+        }
+    }
+    // SAFETY: setsid(2) fails only when the caller is a process group leader.
+    if unsafe { libc::setsid() } == -1 {
+        return Err("setsid failed".to_owned());
+    }
+    // SAFETY: the second fork detaches from the session leader.
+    match unsafe { libc::fork() } {
+        -1 => return Err("fork failed".to_owned()),
+        0 => {}
+        _ => {
+            // SAFETY: see above.
+            unsafe { libc::_exit(0) }
+        }
+    }
+    // SAFETY: umask(2) has no preconditions.
+    unsafe { libc::umask(0) };
+
+    // SAFETY: sysconf only reads the descriptor limit.
+    let max_fd = match unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } {
+        value if value > 0 => value,
+        _ => 1024,
+    };
+    for fd in 0..max_fd {
+        // SAFETY: closing an unused descriptor is harmless.
+        unsafe { libc::close(fd as libc::c_int) };
+    }
+
+    // SAFETY: the path is a static, NUL-terminated C string.
+    let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+    if null_fd != libc::STDIN_FILENO {
+        if null_fd >= 0 {
+            // SAFETY: null_fd is owned here.
+            unsafe { libc::close(null_fd) };
+        }
+        return Err("cannot open /dev/null as stdin".to_owned());
+    }
+
+    let Ok(path) = std::ffi::CString::new(log_file) else {
+        return Err("invalid log file name".to_owned());
+    };
+    let flags = if std::fs::metadata(log_file).is_ok() {
+        libc::O_RDWR | libc::O_APPEND
+    } else {
+        libc::O_RDWR | libc::O_CREAT
+    };
+    // SAFETY: `path` is NUL-terminated and the mode is only used with O_CREAT.
+    let log_fd = unsafe { libc::open(path.as_ptr(), flags, 0o666 as libc::c_uint) };
+    if log_fd != libc::STDOUT_FILENO {
+        if log_fd >= 0 {
+            // SAFETY: log_fd is owned here.
+            unsafe { libc::close(log_fd) };
+        }
+        return Err(format!("cannot open {log_file} as stdout"));
+    }
+    // SAFETY: dup2 duplicates the now-open stdout onto stderr.
+    if unsafe { libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO) } != libc::STDERR_FILENO {
+        return Err("dup2 failed".to_owned());
+    }
+    Ok(())
+}
+
+/// If the pid file names a live process running this executable, sends it
+/// SIGINT (utils.cpp:283-296).
+fn kill_previous_instance() {
+    let Ok(contents) = std::fs::read_to_string(pid_file_path()) else {
+        return;
+    };
+    let pid: libc::pid_t = contents
+        .trim()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    if pid <= 0 {
+        return;
+    }
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return;
+    };
+    let invoked = std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    if exe == invoked {
+        // SAFETY: kill(2) only signals the pid recorded in our pid file.
+        unsafe { libc::kill(pid, libc::SIGINT) };
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// `openlog(app_name, LOG_NDELAY | LOG_NOWAIT | LOG_PID | (slog > 1 ?
+/// LOG_PERROR : 0), LOG_DAEMON)` (minisatip.cpp:1919-1923).
+pub fn open_syslog(app_name: &str, perror: bool) {
+    let Ok(name) = std::ffi::CString::new(app_name) else {
+        return;
+    };
+    let options = libc::LOG_NDELAY
+        | libc::LOG_NOWAIT
+        | libc::LOG_PID
+        | if perror { libc::LOG_PERROR } else { 0 };
+    // SAFETY: the name is NUL-terminated and outlives the call; openlog copies it.
+    unsafe { libc::openlog(name.as_ptr(), options, libc::LOG_DAEMON) };
+    SYSLOG_ENABLED.store(true, Ordering::SeqCst);
+}
+
+/// Writes an error diagnostic through syslog when `-g` is active, otherwise
+/// to stderr (`LOG` with `opts.slog`, minisatip.cpp:1919-1923).
+pub fn log_error(args: std::fmt::Arguments<'_>) {
+    let message = std::fmt::format(args);
+    if !SYSLOG_ENABLED.load(Ordering::SeqCst) {
+        eprintln!("{message}");
+        return;
+    }
+    let Ok(message) = std::ffi::CString::new(message) else {
+        return;
+    };
+    // SAFETY: "%s" is NUL-terminated and `message` is a NUL-terminated string;
+    // syslog copies both before returning.
+    unsafe { libc::syslog(libc::LOG_ERR, c"%s".as_ptr(), message.as_ptr()) };
 }
 
 /// Formats `time_running` like minisatip.cpp:1549-1552.

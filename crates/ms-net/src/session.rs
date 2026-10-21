@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
+use crate::bandwidth::Bandwidth;
 use crate::handler::{
     HttpResource, HttpRoute, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType,
     TransportError,
@@ -134,6 +135,8 @@ pub struct Stream {
     pub timeout_ms: u32,
     /// Last request or RTCP time (`sid->rtime`).
     pub rtime_ms: i64,
+    /// Creation time (`sid->wtime` assigned by `streams_add`, stream.cpp:634).
+    pub setup_ms: i64,
     /// Client user agent.
     pub user_agent: String,
     /// Accepted SRT socket, or `-1`.
@@ -171,6 +174,7 @@ impl Stream {
             rtp_seq: 0,
             timeout_ms,
             rtime_ms: now_ms,
+            setup_ms: now_ms,
             user_agent: String::new(),
             srt_sock: -1,
             srt_streamid: String::new(),
@@ -218,6 +222,7 @@ pub struct SessionManager {
     adapter_ccerr: Vec<u64>,
     web: Option<WebService>,
     web_runtime: RuntimeState,
+    bandwidth: Arc<Bandwidth>,
     #[cfg(feature = "srt")]
     srt: Option<SrtListener<LibSrtOps>>,
 }
@@ -257,6 +262,7 @@ impl SessionManager {
             adapter_ccerr: vec![0; MAX_ADAPTERS],
             web: None,
             web_runtime: RuntimeState::default(),
+            bandwidth: Arc::new(Bandwidth::new()),
             #[cfg(feature = "srt")]
             srt: None,
         }
@@ -270,6 +276,19 @@ impl SessionManager {
     /// Sets the runtime values reported by `state.json`.
     pub fn set_web_runtime(&mut self, runtime: RuntimeState) {
         self.web_runtime = runtime;
+    }
+
+    /// Installs the process-wide counters reported by `/bandwidth.json`.
+    pub fn set_bandwidth(&mut self, bandwidth: Arc<Bandwidth>) {
+        self.bandwidth = bandwidth;
+    }
+
+    /// Time since the stream was created (`getTick() - sid->wtime`, with
+    /// `wtime` assigned at SETUP; stream.cpp:634,1293).
+    pub fn setup_age_ms(&self, id: StreamId) -> Option<i64> {
+        let index = self.slot_index(id)?;
+        let stream = self.streams[index].as_ref()?;
+        Some(self.clock.now_ms().saturating_sub(stream.setup_ms))
     }
 
     /// Refreshes the clock values recomputed per HTTP request
@@ -1121,6 +1140,8 @@ impl SessionManager {
             };
         }
         snapshot.runtime = self.web_runtime.clone();
+        self.bandwidth.calculate();
+        snapshot.bandwidth = self.bandwidth.snapshot();
         snapshot
     }
 

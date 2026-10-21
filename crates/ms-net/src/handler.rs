@@ -108,6 +108,10 @@ pub struct HttpRoute {
     pub body: Vec<u8>,
     /// Whether a HEAD request still receives `body` (C++ generated pages do).
     pub body_on_head: bool,
+    /// Whether the body is streamed the way `process_file` does after its
+    /// first 8200-byte flush: no `Content-Length`, terminated by CRLFCRLF
+    /// (utils.cpp:379-421).
+    pub streamed: bool,
 }
 
 impl HttpRoute {
@@ -118,12 +122,19 @@ impl HttpRoute {
             headers: Vec::new(),
             body: body.into(),
             body_on_head: false,
+            streamed: false,
         }
     }
 
     /// Adds raw header lines.
     pub fn with_headers(mut self, headers: Vec<String>) -> Self {
         self.headers = headers;
+        self
+    }
+
+    /// Marks the body as coming from the streamed `process_file` path.
+    pub fn streaming(mut self) -> Self {
+        self.streamed = true;
         self
     }
 }
@@ -475,7 +486,11 @@ pub fn handle_http<B: StreamBackend>(
     ctx: &mut HandlerContext<'_, B>,
     request: &Request,
 ) -> Option<Response> {
-    if !(request.is_method("GET") || request.is_method("POST") || request.is_method("HEAD")) {
+    // read_http: `split(buf,' ').size() < 2` replies 503 before any routing
+    // (minisatip.cpp:1561-1564).
+    if request.uri.is_empty()
+        || !(request.is_method("GET") || request.is_method("POST") || request.is_method("HEAD"))
+    {
         return Some(base_response(ctx, 503));
     }
     if request.is_method("HEAD") && request.uri.contains("/?") {
@@ -487,7 +502,9 @@ pub fn handle_http<B: StreamBackend>(
 
     if let Some(route) = ctx.backend.http_route(request) {
         let mut response = base_response(ctx, route.status).with_headers(route.headers);
-        if route.body_on_head || !request.is_method("HEAD") {
+        if route.streamed && !request.is_method("HEAD") {
+            response = response.with_body(route.body).streamed();
+        } else if route.body_on_head || !request.is_method("HEAD") {
             response = response.with_body(route.body);
         }
         return Some(response);

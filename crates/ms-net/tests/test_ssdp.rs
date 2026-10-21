@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ms_net::ssdp::{
-    SharedIdentity, SsdpConfig, SsdpIo, SsdpServer, device_id_conflict, notify_messages,
+    SharedIdentity, SsdpConfig, SsdpIo, SsdpServer, UdpSsdpIo, device_id_conflict, notify_messages,
     read_boot_id, search_reply, st_matches,
 };
 use ms_net::web::{WebConfig, WebService, WebSnapshot};
@@ -310,12 +310,40 @@ fn device_id_clash_in_search_increments_and_replies_with_old_id() {
 }
 
 #[test]
-fn device_id_clash_outside_window_is_ignored() {
+fn device_id_clash_uses_the_announce_tick_not_the_packet_time() {
+    // minisatip.cpp:1700-1745 sets `wtime` when the discovery NOTIFY is sent
+    // and `rtime = getTick()` at its end; ssdp_reply copies
+    // `s->rtime = s->wtime` (minisatip.cpp:1795). Both are absolute process
+    // ticks, so the 15 s test (minisatip.cpp:1830-1833) keeps passing long
+    // after startup once the initial announcement happened early.
     let mut server = SsdpServer::new(FakeIo::default(), config());
     let reply = b"HTTP/1.1 200 OK\r\nST: urn:ses-com:device:SatIPServer:1\r\n\r\n";
     server
         .handle(reply, "10.0.0.8", 1900, DATE, 0)
         .expect("announce");
+    let action = server
+        .handle(
+            &search(2, "urn:ses-com:device:SatIPServer:1"),
+            "10.0.0.8",
+            50000,
+            DATE,
+            20_000,
+        )
+        .expect("handle");
+    assert!(
+        action.device_id_conflict,
+        "rtime stays at the announce tick"
+    );
+    assert!(action.replied);
+    assert_eq!(server.config().device_id, 3);
+}
+
+#[test]
+fn device_id_clash_is_ignored_when_the_first_announce_is_late() {
+    // If the very first datagram (and therefore the one-shot discovery
+    // NOTIFY) arrives after 15 s, `s->rtime` is already >= 15000 and the
+    // clash check in minisatip.cpp:1830 never matches.
+    let mut server = SsdpServer::new(FakeIo::default(), config());
     let action = server
         .handle(
             &search(2, "urn:ses-com:device:SatIPServer:1"),
@@ -439,4 +467,70 @@ fn device_id_conflict_reaches_the_web_endpoints() {
     assert!(web.desc_xml(&WebSnapshot::new()).contains("uuid:old-uuid"));
 
     fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn ssdp_uses_two_reusable_sockets() {
+    // minisatip.cpp:1943-1947: `udp_bind(opts.bind, 1900, ...)` and
+    // `udp_bind(opts.disc_host, 1900, 1)`. udp_bind sets SO_REUSEADDR
+    // (fatal) and SO_REUSEPORT (best effort) before binding
+    // (socketworks.cpp:288-306), so a second instance can bind the same
+    // ports while the first is alive.
+    let first = UdpSsdpIo::open(Some("127.0.0.1"), "239.255.255.250", true, None, None)
+        .expect("first SSDP sockets");
+    assert_eq!(
+        first.local_addr().expect("local").to_string(),
+        "127.0.0.1:1900"
+    );
+    let second = UdpSsdpIo::open(Some("127.0.0.1"), "239.255.255.250", true, None, None)
+        .expect("SO_REUSEADDR/SO_REUSEPORT allow a second bind");
+    drop(second);
+    drop(first);
+}
+
+#[test]
+fn ssdp_bind_failure_is_fatal() {
+    // minisatip.cpp:1943-1947 wraps both binds in FAIL(), so an address that
+    // cannot be bound aborts SSDP setup.
+    let error = UdpSsdpIo::open(Some("192.0.2.1"), "239.255.255.250", true, None, None)
+        .expect_err("unassigned address must not bind");
+    assert!(
+        error.kind() == io::ErrorKind::AddrNotAvailable
+            || error.raw_os_error() == Some(libc::EADDRNOTAVAIL)
+            || error.raw_os_error() == Some(libc::EADDRINUSE),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn ssdp_headers_are_matched_case_insensitively() {
+    // ssdp_reply uses strcasestr for MAN, ssdp:discover and
+    // DEVICEID.SES.COM: (minisatip.cpp:1827-1832).
+    let mut server = SsdpServer::new(FakeIo::default(), config());
+    let message = b"M-SEARCH * HTTP/1.1\r\nhost: 239.255.255.250:1900\r\nman: \"ssdp:discover\"\r\ndeviceid.ses.com: 2\r\n\r\n";
+    let action = server
+        .handle(message, "10.0.0.8", 1900, DATE, 0)
+        .expect("handle");
+    assert!(action.device_id_conflict);
+    assert!(action.replied);
+
+    let mut server = SsdpServer::new(FakeIo::default(), config());
+    let message = b"NOTIFY * HTTP/1.1\r\ndeviceid.ses.com: 2\r\n\r\n";
+    let action = server
+        .handle(message, "10.0.0.8", 1900, DATE, 0)
+        .expect("handle");
+    assert!(action.device_id_conflict);
+}
+
+#[test]
+fn ssdp_reply_detection_is_case_sensitive() {
+    // minisatip.cpp:1848-1850 uses strncmp("HTTP/1", 6), unlike the header
+    // searches above, so a lowercase reply is answered like a request.
+    let mut server = SsdpServer::new(FakeIo::default(), config());
+    let reply = b"http/1.1 200 OK\r\nST: urn:ses-com:device:SatIPServer:1\r\n\r\n";
+    let action = server
+        .handle(reply, "10.0.0.8", 1900, DATE, 0)
+        .expect("handle");
+    assert!(action.replied);
+    assert_eq!(sent(&server).len(), 4);
 }

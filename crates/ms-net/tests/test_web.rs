@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ms_net::bandwidth::BandwidthSnapshot;
 use ms_net::handler::{HandlerContext, handle_http};
 use ms_net::rtsp::{Protocol, Request};
 use ms_net::session::SessionManager;
@@ -71,6 +72,9 @@ fn config(document_root: PathBuf) -> WebConfig {
         playlist: None,
         bootid: 4,
         device_id: 2,
+        force_sadapter: 0,
+        force_tadapter: 0,
+        force_cadapter: 0,
     }
 }
 
@@ -186,6 +190,20 @@ fn desc_xml_matches_cpp_format_string() {
         ]
     );
     assert_eq!(route.body, expected.as_bytes());
+}
+
+#[test]
+fn configured_port_zero_is_advertised_verbatim() {
+    // minisatip.cpp:1130-1136 prints opts.http_port and opts.rtsp_port as
+    // configured; it never substitutes the ephemeral port bind() chose.
+    let mut cfg = config(PathBuf::from("html"));
+    cfg.http_port = 0;
+    cfg.rtsp_port = 0;
+    let service = WebService::new(cfg);
+    let snapshot = WebSnapshot::new();
+    let route = service.route(&get("/desc.xml"), &snapshot).expect("route");
+    assert!(route.headers.contains(&"X-SATIP-RTSP-Port: 0".to_owned()));
+    assert!(service.state_json(&snapshot).contains("\"http_port\":0"));
 }
 
 #[test]
@@ -364,7 +382,8 @@ fn state_json_uses_cpp_symbol_order_and_values() {
     assert!(json.contains("\"st_enabled\":[1,0,0,"));
     assert!(json.contains("\"st_proto\":[\"HTTP\",\"\",\"\","));
     assert!(json.contains("\"st_pids\":[\"0,16\",\"\",\"\","));
-    assert!(json.contains("\"has_pmt\":0,"));
+    // minisatip.cpp:2181: `int has_pmt = 1;` in the normal build.
+    assert!(json.contains("\"has_pmt\":1,"));
     assert!(json.contains("\"name_app\":\"minisatip\","));
     assert!(json.contains("\"deviceid\":2,"));
     assert!(json.ends_with("\"command_line\":\"\"\n}\n"));
@@ -445,4 +464,120 @@ fn html_directory_is_served_byte_for_byte() {
             assert_eq!(route.body, source, "{name}");
         }
     }
+}
+
+#[test]
+fn forced_adapter_counts_override_desc_and_state() {
+    // adapter.cpp:478-487: `if (opts.force_sadapter) tuner_s2 = ...` pins the
+    // server/slave/ca counts even when no adapter supports them.
+    let mut cfg = config(PathBuf::from("html"));
+    cfg.force_sadapter = 3;
+    cfg.force_tadapter = 2;
+    cfg.force_cadapter = 1;
+    let service = WebService::new(cfg);
+    let snapshot = WebSnapshot::new();
+    let xml = service.desc_xml(&snapshot);
+    assert!(xml.contains("DVBS2-3,"), "{xml}");
+    assert!(xml.contains("DVBT-2,"), "{xml}");
+    assert!(xml.contains("DVBC-1"), "{xml}");
+    let json = service.state_json(&snapshot);
+    assert!(json.contains("\"tuner_s2\":3,"), "{json}");
+    assert!(json.contains("\"tuner_t\":2,"), "{json}");
+    assert!(json.contains("\"tuner_c\":1,"), "{json}");
+}
+
+#[test]
+fn no_enabled_adapters_advertise_zero_tuners() {
+    // enable_adapters disables every slot first (adapter.cpp:1626-1636); an
+    // empty `-e` therefore leaves no tuners.
+    let service = WebService::new(config(PathBuf::from("html")));
+    let snapshot = WebSnapshot::new();
+    assert!(
+        service
+            .desc_xml(&snapshot)
+            .contains(">DVBS2-0</satip:X_SATIPCAP>")
+    );
+    assert!(service.state_json(&snapshot).contains("\"tuner_s2\":0,"));
+}
+
+#[test]
+fn desc_xml_is_truncated_to_the_cpp_two_kilobyte_buffer() {
+    // minisatip.cpp:1462,1601: `char buf[2000]` and snprintf, so at most 1999
+    // bytes survive; a long playlist is what reaches the limit.
+    let mut cfg = config(PathBuf::from("html"));
+    cfg.playlist = Some("x".repeat(4000));
+    let service = WebService::new(cfg);
+    let full = service.desc_xml(&WebSnapshot::new()).into_bytes();
+    assert!(full.len() > 1999);
+    let route = service
+        .route(&get("/desc.xml"), &WebSnapshot::new())
+        .expect("route");
+    assert_eq!(route.body.len(), 1999);
+    assert_eq!(route.body, full[..1999]);
+}
+
+#[test]
+fn large_html_files_stream_without_content_length() {
+    // utils.cpp:399-419: after `io > sizeof(outp) - 100` (8200) the response
+    // is sent without Content-Length and the body ends with CRLFCRLF.
+    let root = temp_dir();
+    let mut content = String::from("$version$");
+    content.push_str(&"x".repeat(8200));
+    fs::write(root.join("big.html"), content.as_bytes()).expect("write");
+    let mut manager = SessionManager::new();
+    manager.set_web(WebService::new(config(root.clone())));
+    let request = get("/big.html");
+    let mut ctx = HandlerContext::new(&mut manager, Protocol::Http);
+    let response = handle_http(&mut ctx, &request).expect("response");
+    assert_eq!(response.status, 200);
+    assert!(!response.body.is_empty());
+    let bytes = response.to_bytes();
+    let text = String::from_utf8(bytes).expect("utf-8");
+    assert!(!text.contains("Content-Length:"), "{text}");
+    let (_, body) = text.split_once("\r\n\r\n").expect("header end");
+    assert!(body.ends_with("\r\n\r\n"), "streamed body terminator");
+    assert_eq!(body.len(), response.body.len() + 4);
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn bandwidth_json_prints_the_folded_counters() {
+    // api/variables.cpp:305-324: get_json_bandwidth formats c_bw, c_bw_dmx,
+    // c_tbw, c_reads, c_writes, c_failed_writes, c_ns_read, c_tt, c_buffered
+    // and c_dropped in this order.
+    let service = WebService::new(config(PathBuf::from("html")));
+    let mut snapshot = WebSnapshot::new();
+    snapshot.bandwidth = BandwidthSnapshot {
+        bw: 12,
+        dmx: 340,
+        tbw: 5,
+        reads: 7,
+        writes: 9,
+        fwrites: 2,
+        ns_read: 1100,
+        tt: 8,
+        buffered: 4096,
+        dropped: 512,
+    };
+    let route = service
+        .route(&get("/bandwidth.json"), &snapshot)
+        .expect("route");
+    assert_eq!(route.status, 200);
+    assert_eq!(
+        String::from_utf8(route.body).expect("utf-8"),
+        concat!(
+            "{\n",
+            "\"bw\":12,\n",
+            "\"dmx\":340,\n",
+            "\"tbw\":5,\n",
+            "\"reads\":7,\n",
+            "\"writes\":9,\n",
+            "\"fwrites\":2,\n",
+            "\"ns_read\":1100,\n",
+            "\"tt\":8,\n",
+            "\"buffered\":4096,\n",
+            "\"dropped\":512\n",
+            "}"
+        )
+    );
 }
