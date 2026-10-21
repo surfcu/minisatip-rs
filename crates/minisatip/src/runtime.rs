@@ -176,7 +176,7 @@ impl Runtime {
         // minisatip.cpp:1149-1166; read_http refreshes the current time.
         let start = SystemTime::now();
         session.set_web_runtime(RuntimeState {
-            datetime_compile: String::new(),
+            datetime_compile: env!("MINISATIP_BUILD_STAMP").to_owned(),
             datetime_start: format_asctime(start),
             datetime_current: " ".to_owned(),
             time_running: "0".to_owned(),

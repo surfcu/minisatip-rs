@@ -144,27 +144,45 @@ impl RuntimeState {
     }
 }
 
-/// `asctime()` with the newline replaced by a space, as minisatip stores it
-/// (minisatip.cpp:1156-1158); see DEV-140 for the time zone.
+/// `asctime(localtime())` with the newline replaced by a space, as minisatip
+/// stores it (minisatip.cpp:1155-1158).
 pub fn format_asctime(time: SystemTime) -> String {
-    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
+    #[cfg(target_os = "linux")]
+    if let Some(fields) = crate::sys::local_time_fields(time) {
+        return format_asctime_fields(fields);
+    }
     let seconds = unix_seconds(time);
     let days = seconds.div_euclid(86_400);
     let rest = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
-    format!(
-        "{} {}{:3} {:02}:{:02}:{:02} {} ",
-        WEEKDAYS[(days + 4).rem_euclid(7) as usize],
-        MONTHS[(month - 1) as usize],
-        day,
-        rest / 3600,
-        (rest % 3600) / 60,
-        rest % 60,
-        year
-    )
+    format_asctime_fields((
+        (days + 4).rem_euclid(7) as i32,
+        month as i32 - 1,
+        day as i32,
+        (rest / 3600) as i32,
+        ((rest % 3600) / 60) as i32,
+        (rest % 60) as i32,
+        year,
+    ))
+}
+
+/// `asctime` layout `%s %3d %02d:%02d:%02d %d ` with the trailing newline
+/// replaced by a space.
+fn format_asctime_fields(fields: (i32, i32, i32, i32, i32, i32, i64)) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (wday, month, day, hour, minute, second, year) = fields;
+    let weekday = WEEKDAYS
+        .get(wday.rem_euclid(7) as usize)
+        .copied()
+        .unwrap_or("");
+    let month = MONTHS
+        .get(month.rem_euclid(12) as usize)
+        .copied()
+        .unwrap_or("");
+    format!("{weekday} {month}{day:3} {hour:02}:{minute:02}:{second:02} {year} ")
 }
 
 /// `time_running` (minisatip.cpp:1544-1553): `%.0d` prints nothing for 0 days.
@@ -1249,5 +1267,23 @@ impl SymbolProvider for PmtSymbols<'_> {
                 },
             ),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asctime_layout_matches_cpp() {
+        // asctime's "%.3s %.3s%3d %.2d:%.2d:%.2d %d\n" with a trailing space.
+        assert_eq!(
+            format_asctime_fields((3, 9, 21, 10, 20, 19, 2026)),
+            "Wed Oct 21 10:20:19 2026 "
+        );
+        assert_eq!(
+            format_asctime_fields((0, 0, 1, 0, 0, 5, 1970)),
+            "Sun Jan  1 00:00:05 1970 "
+        );
     }
 }

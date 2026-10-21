@@ -167,6 +167,11 @@ impl<'a> SymbolTable<'a> {
         self.tables.iter().flatten()
     }
 
+    /// Symbol with exactly this table name (no prefix matching).
+    pub fn symbol(&self, name: &str) -> Option<&Symbol<'a>> {
+        self.iter().find(|symbol| symbol.name == name)
+    }
+
     /// `get_var_address` (variables.cpp:113-169): first prefix match wins;
     /// out-of-range array indexes keep searching.
     pub fn get_var_address(&self, var: &[u8]) -> Option<(i32, Raw, f32)> {
@@ -248,7 +253,7 @@ impl<'a> SymbolTable<'a> {
                 let multiplier = function_multiplier(symbol.multiplier);
                 buf.catf(b"[");
                 for off in 0..symbol.len {
-                    let raw = symbol.read(off, slen - 1);
+                    let raw = symbol.read(off, slen.saturating_sub(1));
                     if off > 0 {
                         buf.catf(b",");
                     }
@@ -258,7 +263,7 @@ impl<'a> SymbolTable<'a> {
             } else if symbol.ty == VAR_FUNCTION_STRING {
                 buf.catf(b"[");
                 for off in 0..symbol.len {
-                    let raw = symbol.read(off, slen - 1);
+                    let raw = symbol.read(off, slen.saturating_sub(1));
                     if off > 0 {
                         buf.catf(b",");
                     }
@@ -337,10 +342,11 @@ fn json_value(
     slen: usize,
     multiplier: f32,
 ) {
-    let raw = symbol.read(off, slen - 1);
+    let max_len = slen.saturating_sub(1);
+    let raw = symbol.read(off, max_len);
     let full = snprintf_pointer(symbol.ty, &raw, multiplier);
     if string {
-        buf.escape_json(&clamp_snprintf(full, slen - 1));
+        buf.escape_json(&clamp_snprintf(full, max_len));
     } else {
         buf.put(&full);
     }
@@ -535,8 +541,8 @@ impl CBuf {
     /// `strlcatf(buf, size, ptr, "%s", text)` (utils.h:176-185).
     pub fn catf(&mut self, text: &[u8]) {
         let size = self.buf.len();
-        self.snprintf(self.ptr, size - self.ptr, text);
-        self.ptr += text.len();
+        self.snprintf(self.ptr, size.saturating_sub(self.ptr), text);
+        self.ptr = self.ptr.saturating_add(text.len());
         if self.ptr >= size {
             self.ptr = size.saturating_sub(1);
         }
@@ -544,7 +550,7 @@ impl CBuf {
 
     /// `ptr += snprintf_pointer(buf + ptr, len - ptr, ...)`.
     pub fn put(&mut self, text: &[u8]) {
-        let room = self.buf.len() - self.ptr;
+        let room = self.buf.len().saturating_sub(self.ptr);
         self.snprintf(self.ptr, room, text);
         self.ptr += text.len().min(room);
     }
@@ -591,7 +597,9 @@ impl CBuf {
         self.write_at(base + j as usize, b"\"");
         j += 1;
         self.write_at(base + j as usize, &[0]);
-        self.ptr = base + j as usize;
+        // C++ can move `ptr` past the buffer here; never let a later write
+        // underflow (DEV-140).
+        self.ptr = (base + j as usize).min(self.buf.len());
     }
 
     /// The C string at the start of the buffer.
