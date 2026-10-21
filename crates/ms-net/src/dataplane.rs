@@ -468,7 +468,8 @@ struct DataPlane {
     reported_cc_errors: u64,
     last_cc_report_ms: i64,
     wait_new_stream: bool,
-    tune_time_ms: i64,
+    /// Start of the post-tune window; `None` until the tune or first read sets it.
+    tune_time_ms: Option<i64>,
     wait_transponder_id: i32,
     threshold_ms: i64,
     last_send_ms: i64,
@@ -498,7 +499,7 @@ impl DataPlane {
             reported_cc_errors: 0,
             last_cc_report_ms: 0,
             wait_new_stream: false,
-            tune_time_ms: 0,
+            tune_time_ms: None,
             wait_transponder_id: 0,
             threshold_ms: config.threshold_ms,
             last_send_ms: 0,
@@ -556,7 +557,7 @@ impl DataPlane {
                 self.buf.clear();
                 self.cc_checked = 0;
                 self.wait_new_stream = true;
-                self.tune_time_ms = self.mono_us() / 1000;
+                self.tune_time_ms = Some(self.mono_us() / 1000);
                 self.update_tuner_pids();
             }
             Command::StartOutput {
@@ -673,10 +674,7 @@ impl DataPlane {
     /// was dropped while waiting for the new transponder.
     fn after_read(&mut self, now_ms: i64) -> bool {
         if self.wait_new_stream {
-            if self.tune_time_ms == 0 {
-                self.tune_time_ms = now_ms;
-            }
-            let elapsed = now_ms - self.tune_time_ms;
+            let elapsed = now_ms - *self.tune_time_ms.get_or_insert(now_ms);
             match post_tune_filter(self.buf.as_bytes(), &mut self.wait_transponder_id, elapsed) {
                 Some(offset) => {
                     self.buf.discard_front(offset);
@@ -688,7 +686,7 @@ impl DataPlane {
                     return false;
                 }
             }
-            self.tune_time_ms = 0;
+            self.tune_time_ms = None;
             self.wait_new_stream = false;
         }
         let checked = self.cc_checked.min(self.buf.len()) / DVB_FRAME * DVB_FRAME;
