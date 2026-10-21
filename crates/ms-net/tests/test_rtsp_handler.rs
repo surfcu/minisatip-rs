@@ -423,9 +423,19 @@ fn url_msys() {
 
 #[test]
 fn url_freq() {
-    assert_eq!(parse_one("freq=11550").freq, 11_550);
-    assert_eq!(parse_one("freq=11550.9").freq, 11_550);
+    // kHz, like the C++ `parse_float(val, 1000)`.
+    assert_eq!(parse_one("freq=11361.75").freq, 11_361_750);
+    assert_eq!(parse_one("freq=11362").freq, 11_362_000);
+    assert_eq!(parse_one("freq=538").freq, 538_000);
+    // The C++ rounds through `float` before multiplying and truncating.
+    assert_eq!(parse_one("freq=474.166").freq, 474_165);
+    assert_eq!(parse_one("freq=11550").freq, 11_550_000);
+    assert_eq!(parse_one("freq=11550.9").freq, 11_550_900);
+    assert_eq!(parse_one("freq=0").freq, 0);
     assert_eq!(parse_one("freq=abc").freq, 0);
+    assert_eq!(parse_one("freq=11362junk").freq, 11_362_000);
+    assert_eq!(parse_one("freq=-11362").freq, -11_362_000);
+    assert_eq!(parse_one("freq=-0.5").freq, -500);
 }
 
 #[test]
@@ -439,8 +449,13 @@ fn url_pol() {
 
 #[test]
 fn url_sr() {
-    assert_eq!(parse_one("sr=27500").sr, 27_500);
+    // sym/s, like the C++ `tp->sr = sr * 1000`.
+    assert_eq!(parse_one("sr=22000").sr, 22_000_000);
+    assert_eq!(parse_one("sr=27500").sr, 27_500_000);
+    assert_eq!(parse_one("sr=0").sr, 0);
     assert_eq!(parse_one("sr=-1").sr, 0);
+    assert_eq!(parse_one("sr=1000000").sr, 1_000_000_000);
+    assert_eq!(parse_one("sr=1000001").sr, 0);
     assert_eq!(parse_one("sr=2000000").sr, 0);
 }
 

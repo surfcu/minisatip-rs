@@ -1,7 +1,6 @@
 //! Injectable millisecond clock, so tests and the harness stay deterministic.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 /// Source of the current time in milliseconds.
@@ -11,29 +10,35 @@ pub trait Clock: Send + Sync {
 }
 
 /// Clock that only moves when told to; clones share the same time.
+/// A mutex rather than `AtomicU64`, which 32-bit MIPS does not provide.
 #[derive(Debug, Clone, Default)]
-pub struct ManualClock(Arc<AtomicU64>);
+pub struct ManualClock(Arc<Mutex<u64>>);
 
 impl ManualClock {
     /// A clock starting at `ms`.
     pub fn new(ms: u64) -> Self {
-        Self(Arc::new(AtomicU64::new(ms)))
+        Self(Arc::new(Mutex::new(ms)))
     }
 
     /// Moves the clock forward by `ms`.
     pub fn advance(&self, ms: u64) {
-        self.0.fetch_add(ms, Ordering::SeqCst);
+        let mut now = self.lock();
+        *now = now.wrapping_add(ms);
     }
 
     /// Sets the absolute time.
     pub fn set(&self, ms: u64) {
-        self.0.store(ms, Ordering::SeqCst);
+        *self.lock() = ms;
+    }
+
+    fn lock(&self) -> MutexGuard<'_, u64> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Clock for ManualClock {
     fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        *self.lock()
     }
 }
 
