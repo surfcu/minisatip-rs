@@ -1,7 +1,6 @@
 //! Time sources: `getTick()` milliseconds and `time(NULL)` for DATE_TIME.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub trait Clock: Send + Sync {
@@ -34,40 +33,49 @@ impl Clock for SystemClock {
 }
 
 /// Clock moved only by tests; clones share the same time.
+/// A mutex rather than 64-bit atomics, which 32-bit MIPS does not provide.
 #[derive(Debug, Clone, Default)]
-pub struct ManualClock {
-    tick: Arc<AtomicI64>,
-    unix: Arc<AtomicU64>,
+pub struct ManualClock(Arc<Mutex<ManualTime>>);
+
+#[derive(Debug, Default)]
+struct ManualTime {
+    tick: i64,
+    unix: u64,
 }
 
 impl ManualClock {
     pub fn new(tick_ms: i64, unix: u64) -> Self {
-        Self {
-            tick: Arc::new(AtomicI64::new(tick_ms)),
-            unix: Arc::new(AtomicU64::new(unix)),
-        }
+        Self(Arc::new(Mutex::new(ManualTime {
+            tick: tick_ms,
+            unix,
+        })))
     }
 
     /// Moves the tick forward by `ms`; the Unix time only moves with `set_unix`.
     pub fn advance(&self, ms: i64) {
-        self.tick.fetch_add(ms, Ordering::SeqCst);
+        let mut time = self.lock();
+        time.tick = time.tick.wrapping_add(ms);
     }
 
     pub fn set_tick(&self, ms: i64) {
-        self.tick.store(ms, Ordering::SeqCst);
+        self.lock().tick = ms;
     }
 
     pub fn set_unix(&self, secs: u64) {
-        self.unix.store(secs, Ordering::SeqCst);
+        self.lock().unix = secs;
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ManualTime> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Clock for ManualClock {
     fn tick_ms(&self) -> i64 {
-        self.tick.load(Ordering::SeqCst)
+        self.lock().tick
     }
 
     fn unix_time(&self) -> u64 {
-        self.unix.load(Ordering::SeqCst)
+        self.lock().unix
     }
 }
