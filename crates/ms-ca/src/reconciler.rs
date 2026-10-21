@@ -164,6 +164,13 @@ impl<P: CaPolicy> Reconciler<P> {
         }
     }
 
+    /// The `pmt->ca_mask` bit: registered and holding the program's current content.
+    pub fn is_sent(&self, id: i32, programs: &ProgramTable) -> bool {
+        self.actual
+            .iter()
+            .any(|(a, sent)| *a == id && sent.is_some() && sent.as_ref() == programs.get(id))
+    }
+
     /// Programs refused with `NoRetry`.
     pub fn rejected(&self) -> Vec<i32> {
         self.rejected.keys().copied().collect()

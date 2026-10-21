@@ -245,6 +245,16 @@ impl Ddci {
         self.adapters.entry(id).or_default();
     }
 
+    /// `set_ca_channels`: CAPMT count and programs per CAPMT of each `-c` CA.
+    pub fn set_ca_channels(&mut self, channels: &[ms_config::CaChannels]) {
+        for c in channels {
+            let cam = self.cams.entry(usize::from(c.adapter)).or_default();
+            cam.multiple_pmt = usize::try_from(c.multiple_pmt).unwrap_or(0);
+            // C++ keeps a negative count from malformed input; 0 sends no CAPMT either.
+            cam.max_ca_pmt = usize::try_from(c.max_ca_pmt).unwrap_or(0);
+        }
+    }
+
     /// `add_caid_mask(dvbca_id, i, caid, mask)`.
     pub fn add_caid_mask(&mut self, i: usize, caid: u16, mask: u16) {
         self.caid_masks.entry(i).or_default().push((caid, mask));
