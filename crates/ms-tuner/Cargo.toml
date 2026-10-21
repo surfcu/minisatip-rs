@@ -9,6 +9,8 @@ repository.workspace = true
 default = ["linux-dvb"]
 # Real /dev/dvb backend (/dev/dvb enumeration and ioctls).
 linux-dvb = []
+# Netceiver FFI to libnetceiver (libmcli); off by default like the C++ NETCVCLIENT probe.
+netceiver = []
 
 # satipc uses libc unconditionally, so it stays a plain dependency.
 [dependencies]
