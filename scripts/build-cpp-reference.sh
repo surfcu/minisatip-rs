@@ -12,6 +12,7 @@ fi
 src=${1:-$root/target/upstream/minisatip}
 repo=${MINISATIP_REPO:-https://github.com/catalinii/minisatip.git}
 ref=${MINISATIP_REF:-master}
+patch=$root/harness/cpp-replay.patch
 
 if [ ! -d "$src/.git" ]; then
     git clone --depth 1 --branch "$ref" "$repo" "$src"
@@ -19,17 +20,18 @@ fi
 cd "$src"
 
 # The patch adds src/replay.cpp and a REPLAY CMake option (off by default).
-if ! grep -q find_replay_adapter src/adapter.cpp; then
-    git apply "$root/harness/cpp-replay.patch"
+# A tree carrying an older revision of the patch fails here; reset it first.
+if ! git apply --reverse --check "$patch" 2>/dev/null; then
+    git apply "$patch"
 fi
 
-# Minimal oracle by default: the optional backends are off, as in the Rust
-# default build. --full keeps CA/CSA/DDCI for the CA milestones.
-opts=(-DCMAKE_BUILD_TYPE=Release -DREPLAY=ON -DSRT=OFF -DNETCVCLIENT=OFF)
+# Default oracle = the Rust default build: CA and DDCI are always compiled in
+# Rust (and on by default on Linux in C++); --full adds CSA (Rust `dvbcsa`).
+opts=(-DCMAKE_BUILD_TYPE=Release -DREPLAY=ON -DSRT=OFF -DNETCVCLIENT=OFF -DDVBCA=ON -DDDCI=ON)
 if [ "$full" = 1 ]; then
-    opts+=(-DDVBCSA=ON -DDVBCA=ON -DDDCI=ON)
+    opts+=(-DDVBCSA=ON)
 else
-    opts+=(-DDVBCSA=OFF -DDVBCA=OFF -DDDCI=OFF)
+    opts+=(-DDVBCSA=OFF)
 fi
 cmake -S . -B build-harness "${opts[@]}" ${CPP_CMAKE_ARGS:-}
 cmake --build build-harness -j"$(nproc)"

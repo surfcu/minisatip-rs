@@ -14,7 +14,11 @@ scripts/build-cpp-reference.sh          # prints the binary path last
 The script clones `catalinii/minisatip` (or reuses `target/upstream/minisatip`),
 applies `harness/cpp-replay.patch` and builds with the replay adapter enabled. The
 patch is the only C++ change: it adds a file-backed tuner and is off unless
-`REPLAY=ON`.
+`REPLAY=ON`. Like the Rust replay adapters, the C++ ones advertise DVB-S2/DVB-S,
+carry no frontend name and replace the local DVB adapters while a replay is set.
+
+The default build matches the Rust default build: DVBCA and DDCI on (always
+compiled in Rust), DVBCSA, SRT and NETCVCLIENT off; `--full` adds DVBCSA.
 
 Both binaries take the capture from the same environment variables:
 
@@ -50,8 +54,10 @@ checks every run of both sides against `DIR/<scenario>.txt`; `--record` writes o
 the first run of A.
 
 The fast subset is all twelve scenarios in `harness/scenarios/`; CI runs it ten
-times Rust-vs-Rust. The C++ reference is rebuilt by the separate `cpp-reference`
-CI job but is not downloaded by the harness job.
+times Rust-vs-Rust. The `cpp-reference` CI job builds the reference with the
+script above, uploads it, and runs every scenario three times C++-vs-Rust and
+against `harness/golden` (recorded from C++). If upstream no longer builds or
+takes the patch, that job warns and skips the comparison.
 
 ## Scenario format
 

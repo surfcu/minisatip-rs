@@ -1,6 +1,6 @@
-From e147a1f5face51c69780c6f3e4b72d8c4f73929a Mon Sep 17 00:00:00 2001
+From ca4d806a9e32de3a2ba067692ba5768972dbb915 Mon Sep 17 00:00:00 2001
 From: surfcu <59124393+surfcu@users.noreply.github.com>
-Date: Wed, 21 Oct 2026 10:19:45 +0300
+Date: Wed, 21 Oct 2026 16:31:33 +0300
 Subject: [PATCH] Add file-replay tuner for the differential harness
 
 ---
@@ -72,7 +72,7 @@ index 54c10eb..5b879ca 100644
  int get_free_adapter(transponder *tp);
 diff --git a/src/replay.cpp b/src/replay.cpp
 new file mode 100644
-index 0000000..dac8594
+index 0000000..6aa3ca8
 --- /dev/null
 +++ b/src/replay.cpp
 @@ -0,0 +1,198 @@
@@ -226,7 +226,8 @@ index 0000000..dac8594
 +    return SYS_UNDEFINED;
 +}
 +
-+std::string replay_name(int aid, int fd) { return "replay"; }
++// minisatip-rs replay adapters carry no frontend name.
++std::string replay_name(int aid, int fd) { return ""; }
 +
 +} // namespace
 +
@@ -239,6 +240,9 @@ index 0000000..dac8594
 +    int count = count_env ? atoi(count_env) : 1;
 +    if (count < 1)
 +        count = 1;
++    // As in minisatip-rs, a replay replaces the DVB adapters; the DVB scan
++    // would also reset pa/fn to -1, so init_all_hw would skip the replay.
++    opts.disable_dvb = 1;
 +    for (int i = 0; i < count && a_count < MAX_ADAPTERS; i++) {
 +        int na = a_count;
 +        if (!a[na])
@@ -266,10 +270,6 @@ index 0000000..dac8594
 +        // Same delivery systems as the minisatip-rs replay adapters.
 +        ad->sys[0] = (fe_delivery_system_t)SYS_DVBS2;
 +        ad->sys[1] = (fe_delivery_system_t)SYS_DVBS;
-+        ad->sys[2] = (fe_delivery_system_t)SYS_DVBT;
-+        ad->sys[3] = (fe_delivery_system_t)SYS_DVBT2;
-+        ad->sys[4] = (fe_delivery_system_t)SYS_DVBC_ANNEX_A;
-+        ad->sys[5] = (fe_delivery_system_t)SYS_DVBC2;
 +        a_count = na + 1;
 +    }
 +    LOG("replay: %d adapter(s) for %s", a_count, path);

@@ -562,15 +562,6 @@ impl Runtime {
                 })
                 .map(|active| (id, active.adapter))
         });
-        match sid {
-            Some(id) => {
-                self.conn_streams.insert(conn_id, id);
-            }
-            None => {
-                self.conn_streams.remove(&conn_id);
-            }
-        }
-        self.prune_outputs();
 
         // A 200 to a repeated HTTP GET is hidden (minisatip.cpp:2096-2102).
         let hidden = protocol == Protocol::Http
@@ -578,6 +569,9 @@ impl Runtime {
             && response
                 .as_ref()
                 .is_some_and(|response| response.status == 200);
+        // Queued before prune_outputs stops a torn-down output, whose flush
+        // still sends it (TEARDOWN, minisatip.cpp:1424-1429).
+        let mut write_failed = false;
         if let Some(response) = response.filter(|_| !hidden) {
             let bytes = response.to_bytes();
             let queued = priority.is_some_and(|(stream_id, adapter)| {
@@ -591,9 +585,20 @@ impl Runtime {
                         })
                     })
             });
-            if !queued && (writer.write_all(&bytes).is_err() || writer.flush().is_err()) {
-                return;
+            write_failed =
+                !queued && (writer.write_all(&bytes).is_err() || writer.flush().is_err());
+        }
+        match sid {
+            Some(id) => {
+                self.conn_streams.insert(conn_id, id);
             }
+            None => {
+                self.conn_streams.remove(&conn_id);
+            }
+        }
+        self.prune_outputs();
+        if write_failed {
+            return;
         }
         // read_http closes every connection that is not a `GET /?` stream
         // (minisatip.cpp:1520-1525).
