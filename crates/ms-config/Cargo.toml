@@ -5,5 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Reflects whether the binary was built with SRT support.
+srt = []
+
 [lints]
 workspace = true

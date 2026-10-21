@@ -93,8 +93,8 @@ fn adapter(manager: &SessionManager, aid: usize) -> &Adapter {
         .expect("adapter is missing")
 }
 
-fn freq_hz(params: &TuneParams) -> u32 {
-    params.freq * 1000
+fn freq_khz(params: &TuneParams) -> i32 {
+    params.freq
 }
 
 fn pol_code(pol: Polarization) -> i32 {
@@ -165,7 +165,7 @@ fn test_setup_stream_new() {
     assert!(sid.enabled, "allocated stream is not enabled");
     assert_eq!(sid.sock, 1000, "stream socket not set correctly");
     assert_eq!(
-        freq_hz(&sid.params),
+        freq_khz(&sid.params),
         11_362_000,
         "frequency in stream transponder parsed incorrectly"
     );
@@ -207,7 +207,7 @@ fn test_setup_stream_existing() {
 
     assert_eq!(sid2.id, allocated_sid, "did not reuse the same stream ID");
     assert_eq!(
-        freq_hz(&sid2.params),
+        freq_khz(&sid2.params),
         12_543_000,
         "frequency was not updated"
     );
@@ -295,7 +295,7 @@ fn test_setup_after_play_same_mux_keeps_adapter() {
     let ad = adapter(&manager, 0);
     assert_eq!(ad.sid_cnt, 1, "same-mux SETUP dropped the stream count");
     assert_eq!(
-        freq_hz(&ad.params),
+        freq_khz(&ad.params),
         12_073_000,
         "same-mux SETUP cleared the tuning"
     );
@@ -879,6 +879,53 @@ fn describe_dvb_s2_stream_with_pids() {
         "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 1,0,0\r\nt=0 0\r\n\
          m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
          a=fmtp:33 ver=1.0;src=1;tuner=1,255,1,15,11362,h,dvbs2,auto,auto,auto,22000,auto;pids=0,16\r\n\
+         b=AS:5000\r\na=sendonly\r\n"
+    );
+}
+
+// SAT>IP sends MHz; C++ stores kHz and prints DVB-S MHz with `%d`.
+#[test]
+fn describe_fractional_dvbs_frequency_truncates_to_khz() {
+    let mut manager = env();
+    manager.set_describe_options(describe_options());
+    let url = "?src=1&freq=11361.75&pol=h&sr=22000&msys=dvbs2&pids=0";
+    let id = setup(&mut manager, url);
+    assert_eq!(
+        play_code(manager.start_play(id, Protocol::Http)),
+        0,
+        "start_play failed"
+    );
+
+    let sdp = describe(&mut manager, Some(id), url);
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 1,0,0\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.0;src=1;tuner=1,255,1,15,11361,h,dvbs2,auto,auto,auto,22000,auto;pids=0\r\n\
+         b=AS:5000\r\na=sendonly\r\n"
+    );
+}
+
+// adapter.cpp:1511 prints `(double)freq / 1000.0` with `%.2f`. `parse_float`
+// rounds 474.166 through `float` to 474165 kHz, which prints as 474.17.
+#[test]
+fn describe_fractional_dvbt_frequency_matches_cpp_rounding() {
+    let mut manager = env_with_system(DeliverySystem::DvbT2);
+    manager.set_describe_options(describe_options());
+    let url = "?freq=474.166&bw=8&msys=dvbt2&pids=0";
+    let id = setup(&mut manager, url);
+    assert_eq!(
+        play_code(manager.start_play(id, Protocol::Http)),
+        0,
+        "start_play failed"
+    );
+
+    let sdp = describe(&mut manager, Some(id), url);
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 0,1,0\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.1;tuner=1,255,1,15,474.17,8,dvbt2,auto,auto,auto,auto,,0,0;pids=0\r\n\
          b=AS:5000\r\na=sendonly\r\n"
     );
 }

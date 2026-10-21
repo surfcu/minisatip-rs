@@ -181,10 +181,10 @@ fn tune_is_recorded_and_status_is_configurable() {
     let temp = temp_ts(&packet(0x100, 0, 0));
     let mut tuner = FileReplayTuner::open(&temp.path, FileReplayConfig::default()).unwrap();
     let params = TuneParams {
-        freq: 11_000,
+        freq: 11_000_000,
         pol: Polarization::Vertical,
         msys: DeliverySystem::DvbS2,
-        sr: 27_500,
+        sr: 27_500_000,
         src: 2,
         fec: 3,
         mtype: 8,

@@ -106,8 +106,8 @@ impl Default for AdapterConfig {
             sys: [DeliverySystem::Undefined; MAX_DELSYS],
             absolute_table: [0; MAX_SOURCES],
             master_source: None,
-            lnb_switch: 11_700,
-            lnb_circular: 10_750,
+            lnb_switch: 11_700_000,
+            lnb_circular: 10_750_000,
         }
     }
 }
@@ -173,6 +173,15 @@ impl Adapter {
     /// Replaces the tuner backend, mainly for tests.
     pub fn set_tuner(&mut self, tuner: Box<dyn AdapterTuner>) {
         self.tuner = tuner;
+    }
+
+    /// PIDs currently active or about to be activated on this adapter.
+    pub fn active_pids(&self) -> Vec<i32> {
+        self.pids
+            .iter()
+            .filter(|entry| matches!(entry.state, PidState::Active | PidState::New))
+            .map(|entry| entry.pid)
+            .collect()
     }
 }
 
@@ -265,6 +274,11 @@ impl Scheduler {
         if aid < MAX_ADAPTERS {
             self.disabled[aid] = disabled;
         }
+    }
+
+    /// Whether `aid` is disabled for allocation.
+    pub fn is_disabled(&self, aid: usize) -> bool {
+        self.disabled.get(aid).copied().unwrap_or(false)
     }
 
     fn enabled_adapter(&self, aid: i32) -> Option<&Adapter> {
@@ -410,7 +424,7 @@ impl Scheduler {
         let Some(adapter) = self.enabled_adapter(aid) else {
             return true;
         };
-        if (i64::from(tp.freq) - i64::from(adapter.params.freq)).abs() > 1 {
+        if (i64::from(tp.freq) - i64::from(adapter.params.freq)).abs() > 1_000 {
             return true;
         }
         if tp.plp != adapter.params.plp {
@@ -430,7 +444,7 @@ impl Scheduler {
         if tp.pol != Polarization::None && tp.pol != adapter.params.pol {
             return true;
         }
-        if tp.sr > 1 && adapter.params.sr > 1 && tp.sr != adapter.params.sr {
+        if tp.sr > 1_000 && adapter.params.sr > 1_000 && tp.sr != adapter.params.sr {
             return true;
         }
         if !mtype_is_auto(tp) && !mtype_is_auto(&adapter.params) && tp.mtype != adapter.params.mtype
@@ -883,7 +897,9 @@ fn lnb_hiband(adapter: &Adapter, tp: &TuneParams) -> i32 {
     if polarization_code(tp.pol) > 2 && adapter.config.lnb_circular > 0 {
         return 0;
     }
-    i32::from(adapter.config.lnb_switch > 0 && tp.freq > adapter.config.lnb_switch)
+    i32::from(
+        adapter.config.lnb_switch > 0 && i64::from(tp.freq) > i64::from(adapter.config.lnb_switch),
+    )
 }
 
 fn incompatible(adapter: &Adapter, pol: i32, hiband: Option<i32>, diseqc: i32) -> bool {
@@ -905,14 +921,14 @@ mod tests {
         }
     }
 
-    fn params(freq: u32, src: u8) -> TuneParams {
+    fn params(freq: i32, src: u8) -> TuneParams {
         TuneParams {
             freq,
             src,
             src_specified: true,
             msys: DeliverySystem::DvbS2,
             pol: Polarization::Horizontal,
-            sr: 27_500,
+            sr: 27_500_000,
             pids: PidSet::new(),
             ..TuneParams::default()
         }
@@ -931,13 +947,13 @@ mod tests {
     #[test]
     fn same_mux_selects_busy_adapter() {
         let mut scheduler = scheduler();
-        let tp = params(11_362, 1);
+        let tp = params(11_362_000, 1);
         assert_eq!(scheduler.get_free_adapter(&tp), Some(0));
         assert!(scheduler.set_adapter_for_stream(0, 0));
         assert!(scheduler.set_adapter_parameters(0, 0, &tp).is_ok());
 
         assert_eq!(scheduler.get_free_adapter(&tp), Some(0));
-        let other = params(12_543, 1);
+        let other = params(12_543_000, 1);
         assert_eq!(scheduler.get_free_adapter(&other), None);
         assert_eq!(scheduler.out_of_range_attrs(&other), None);
     }
@@ -945,7 +961,7 @@ mod tests {
     #[test]
     fn unsupported_delivery_system_reports_msys() {
         let mut scheduler = scheduler();
-        let mut tp = params(538, 0);
+        let mut tp = params(538_000, 0);
         tp.msys = DeliverySystem::DvbT2;
         assert_eq!(scheduler.get_free_adapter(&tp), None);
         assert_eq!(scheduler.out_of_range_attrs(&tp), Some("msys"));
@@ -955,29 +971,60 @@ mod tests {
     fn unmapped_src_reports_src() {
         let mut scheduler = scheduler();
         scheduler.set_absolute_switch(true);
-        let tp = params(11_362, 3);
+        let tp = params(11_362_000, 3);
         assert_eq!(scheduler.get_free_adapter(&tp), None);
         assert_eq!(scheduler.out_of_range_attrs(&tp), Some("src"));
     }
 
     #[test]
-    fn frequency_tolerance_is_one_khz() {
+    fn frequency_tolerance_is_one_mhz() {
         let mut scheduler = scheduler();
-        let tp = params(11_362, 1);
+        let tp = params(11_362_000, 1);
         assert!(scheduler.set_adapter_for_stream(0, 0));
         assert!(scheduler.set_adapter_parameters(0, 0, &tp).is_ok());
 
         let mut near = tp.clone();
-        near.freq = 11_363;
+        near.freq = 11_363_000;
+        assert!(
+            !scheduler.compare_tuning_parameters(0, &near),
+            "a 1000 kHz difference is the same mux"
+        );
+        near.freq = 11_362_999;
         assert!(!scheduler.compare_tuning_parameters(0, &near));
-        near.freq = 11_364;
-        assert!(scheduler.compare_tuning_parameters(0, &near));
+        near.freq = 11_363_001;
+        assert!(
+            scheduler.compare_tuning_parameters(0, &near),
+            "1001 kHz is a different mux"
+        );
+        near.freq = 11_360_999;
+        assert!(
+            scheduler.compare_tuning_parameters(0, &near),
+            "the threshold is symmetric"
+        );
+    }
+
+    #[test]
+    fn symbol_rate_comparison_uses_sym_per_second_threshold() {
+        let mut scheduler = scheduler();
+        let tp = params(11_362_000, 1);
+        assert!(scheduler.set_adapter_for_stream(0, 0));
+        assert!(scheduler.set_adapter_parameters(0, 0, &tp).is_ok());
+
+        let mut other = tp.clone();
+        other.sr = 22_000_000;
+        assert!(scheduler.compare_tuning_parameters(0, &other));
+
+        other.sr = 1_000;
+        assert!(
+            !scheduler.compare_tuning_parameters(0, &other),
+            "symbol rates at or below 1000 sym/s are not compared"
+        );
     }
 
     #[test]
     fn pid_table_capacity_and_release() {
         let mut scheduler = scheduler();
-        let tp = params(11_362, 1);
+        let tp = params(11_362_000, 1);
         assert!(scheduler.set_adapter_for_stream(0, 0));
         assert!(scheduler.set_adapter_parameters(0, 0, &tp).is_ok());
         assert!(scheduler.tune(0, 0).result.is_ok());
