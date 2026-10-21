@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+ms-tuner = { path = "../ms-tuner" }
+
 [lints]
 workspace = true

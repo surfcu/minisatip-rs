@@ -8,6 +8,7 @@ pub mod handler;
 pub mod response;
 pub mod rtsp;
 pub mod satip;
+pub mod session;
 pub mod socket;
 #[cfg(target_os = "linux")]
 pub mod sys;
@@ -22,4 +23,5 @@ pub use rtsp::{
     Header, ParseOutcome, Protocol, Request, SessionHeader, TransportKind, TransportMode,
     TransportSpec, parse_request, parse_transport,
 };
-pub use satip::{ParseReport, parse_satip_url, parse_satip_url_new};
+pub use satip::{ParseReport, merge_satip_url, parse_satip_url, parse_satip_url_new};
+pub use session::{SessionManager, Stream};

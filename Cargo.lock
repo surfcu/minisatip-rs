@@ -44,6 +44,7 @@ name = "ms-net"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ms-sched",
  "ms-tuner",
 ]
 
@@ -57,6 +58,9 @@ dependencies = [
 [[package]]
 name = "ms-sched"
 version = "0.1.0"
+dependencies = [
+ "ms-tuner",
+]
 
 [[package]]
 name = "ms-ts"

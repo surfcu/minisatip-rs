@@ -119,6 +119,16 @@ pub trait StreamBackend {
         None
     }
 
+    /// [`StreamBackend::setup_stream`] variant that also sees the request method.
+    fn setup_stream_for_request(
+        &mut self,
+        url: &str,
+        current: Option<StreamId>,
+        _method: &str,
+    ) -> Option<StreamId> {
+        self.setup_stream(url, current)
+    }
+
     /// Forces a session id onto a stream.
     fn set_session_id(&mut self, _id: StreamId, _session_id: i64) {}
 
@@ -230,12 +240,12 @@ pub fn handle_rtsp<B: StreamBackend>(
     }
 
     if request.uri.contains("freq") || request.uri.contains("pids") {
-        setup_stream(ctx, &request.uri);
+        setup_stream(ctx, &request.uri, &request.method);
     }
     if ctx.sid.is_none()
         && (request.is_method("PLAY") || request.is_method("GET") || request.is_method("SETUP"))
     {
-        setup_stream(ctx, &request.uri);
+        setup_stream(ctx, &request.uri, &request.method);
     }
     if let Some(id) = ctx.sid {
         ctx.backend.touch_stream(id);
@@ -359,7 +369,7 @@ pub fn handle_rtsp<B: StreamBackend>(
 
     if request.is_method("DESCRIBE") {
         if ctx.sid.is_none() && request.uri.contains('?') {
-            setup_stream(ctx, &request.uri);
+            setup_stream(ctx, &request.uri, &request.method);
         }
         let Some(sdp) = ctx.backend.describe_streams(ctx.sid, &request.uri) else {
             return Some(base_response(ctx, 404).with_cseq(cseq));
@@ -420,8 +430,8 @@ pub fn handle_http<B: StreamBackend>(
     Some(response)
 }
 
-fn setup_stream<B: StreamBackend>(ctx: &mut HandlerContext<'_, B>, url: &str) {
-    if let Some(id) = ctx.backend.setup_stream(url, ctx.sid) {
+fn setup_stream<B: StreamBackend>(ctx: &mut HandlerContext<'_, B>, url: &str, method: &str) {
+    if let Some(id) = ctx.backend.setup_stream_for_request(url, ctx.sid, method) {
         ctx.sid = Some(id);
     }
 }

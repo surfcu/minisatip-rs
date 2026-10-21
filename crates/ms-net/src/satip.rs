@@ -17,9 +17,18 @@ pub struct ParseReport {
     pub query_present: bool,
 }
 
-/// Applies a SAT>IP request URL to `params`, preserving unspecified values.
+/// Applies a SAT>IP request URL to fresh parameters.
 pub fn parse_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
     reset_tuning(params);
+    apply_satip_url(url, params)
+}
+
+/// Applies a SAT>IP request URL to `params`, preserving unspecified values.
+pub fn merge_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
+    apply_satip_url(url, params)
+}
+
+fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
     let Some((_, query)) = url.split_once('?') else {
         return ParseReport::default();
     };
@@ -48,9 +57,15 @@ pub fn parse_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
                 };
             }
             "fe" => params.fe = Some(parse_int_prefix(value, 0)),
-            "src" => params.src = u8::try_from(parse_int_prefix(value, 0)).unwrap_or(0),
+            "src" => {
+                params.src = u8::try_from(parse_int_prefix(value, 0)).unwrap_or(0);
+                params.src_specified = true;
+            }
             "ro" => params.ro = rolloff(value),
-            "mtype" => params.mtype = modulation(value),
+            "mtype" => {
+                params.mtype = modulation(value);
+                params.mtype_specified = true;
+            }
             "fec" => params.fec = code_rate(value),
             "plts" => params.plts = pilot(value),
             "gi" => params.gi = guard_interval(value),
@@ -106,8 +121,10 @@ fn reset_tuning(params: &mut TuneParams) {
     params.msys = DeliverySystem::Undefined;
     params.sr = 0;
     params.src = 0;
+    params.src_specified = false;
     params.fec = 0;
     params.mtype = 0;
+    params.mtype_specified = false;
     params.plts = None;
     params.ro = None;
     params.bw = None;

@@ -60,10 +60,14 @@ pub struct TuneParams {
     pub sr: u32,
     /// Source or diSEqC input.
     pub src: u8,
+    /// Whether `src` was present, like the C++ optional `diseqc`.
+    pub src_specified: bool,
     /// DVB code rate (`fe_code_rate_t`).
     pub fec: u8,
     /// Modulation (`fe_modulation_t`).
     pub mtype: u32,
+    /// Whether `mtype` was present, like the C++ optional field.
+    pub mtype_specified: bool,
     /// Pilot symbols (DVB-S2).
     pub plts: Option<bool>,
     /// Roll-off (`fe_rolloff_t`).
