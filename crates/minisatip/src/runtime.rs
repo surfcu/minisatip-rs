@@ -1764,10 +1764,11 @@ fn diseqc_params(opts: &Options, aid: usize) -> DiseqcParams {
         after_switch: opts.diseqc_after_switch,
         after_burst: opts.diseqc_after_burst,
         after_tone: opts.diseqc_after_tone,
-        lnb_low: opts.lnb_low / 1000,
-        lnb_high: opts.lnb_high / 1000,
-        lnb_switch: opts.lnb_switch / 1000,
-        lnb_circular: opts.lnb_circular / 1000,
+        // kHz, like TuneParams::freq; C++ copies opts as-is (adapter.cpp:102-106).
+        lnb_low: opts.lnb_low,
+        lnb_high: opts.lnb_high,
+        lnb_switch: opts.lnb_switch,
+        lnb_circular: opts.lnb_circular,
         ..DiseqcParams::default()
     };
     if let Some(entry) = opts
@@ -1815,10 +1816,10 @@ fn diseqc_params(opts: &Options, aid: usize) -> DiseqcParams {
         .rev()
         .find(|entry| usize::from(entry.adapter) == aid)
     {
-        params.lnb_low = entry.low / 1000;
-        params.lnb_high = entry.high / 1000;
-        params.lnb_switch = entry.switch / 1000;
-        params.lnb_circular = entry.circular / 1000;
+        params.lnb_low = entry.low;
+        params.lnb_high = entry.high;
+        params.lnb_switch = entry.switch;
+        params.lnb_circular = entry.circular;
     }
     params
 }
@@ -2096,6 +2097,34 @@ fn start_srt_listener(
 mod tests {
     use super::*;
     use ms_config::{SignalForce, SignalMultiplier};
+
+    // LNB values stay in kHz like TuneParams::freq (minisatip.cpp:678-681, adapter.cpp:102-106).
+    #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
+    #[test]
+    fn default_lnb_maps_ku_band_into_the_tuner_range() {
+        use ms_tuner::linux_dvb::{DvbTransponder, lnb_hiband, lnb_int_freq};
+        let opts = Options::default();
+        let params = diseqc_params(&opts, 0);
+        assert_eq!(params.lnb_low, 9_750_000);
+        assert_eq!(params.lnb_high, 10_600_000);
+        assert_eq!(params.lnb_switch, 11_700_000);
+        let high = ms_tuner::TuneParams {
+            freq: 11_794_000,
+            pol: ms_tuner::Polarization::Vertical,
+            ..ms_tuner::TuneParams::default()
+        };
+        let tp = DvbTransponder::from_params(&high, params);
+        assert_eq!(lnb_hiband(&tp, &params), 1);
+        assert_eq!(lnb_int_freq(&tp, &params), 1_194_000);
+        let low = ms_tuner::TuneParams {
+            freq: 10_847_000,
+            pol: ms_tuner::Polarization::Vertical,
+            ..ms_tuner::TuneParams::default()
+        };
+        let tp = DvbTransponder::from_params(&low, params);
+        assert_eq!(lnb_hiband(&tp, &params), 0);
+        assert_eq!(lnb_int_freq(&tp, &params), 1_097_000);
+    }
 
     #[test]
     fn atoi_ports_are_truncated_like_htons() {
