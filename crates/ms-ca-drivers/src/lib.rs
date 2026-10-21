@@ -2,6 +2,7 @@
 
 pub mod algo;
 pub mod ddci;
+pub mod descramble;
 pub mod dvbapi;
 pub mod en50221;
 pub mod hw_descrambler;

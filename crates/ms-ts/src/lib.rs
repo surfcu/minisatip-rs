@@ -4,6 +4,7 @@ pub mod crc;
 pub mod filter;
 pub mod packet;
 pub mod section;
+pub mod stage;
 
 pub use crc::crc32_mpeg2;
 pub use filter::{
@@ -11,3 +12,4 @@ pub use filter::{
 };
 pub use packet::{Afc, TS_PACKET_SIZE, TsPacket};
 pub use section::{MAX_SECTION_SIZE, SectionAssembler, wait_pusi};
+pub use stage::TsStage;
