@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::rtsp::parse_int_prefix;
@@ -23,6 +24,51 @@ pub const CONFLICT_WINDOW_MS: i64 = 15_000;
 pub const SATIP_SERVER_ST: &str = "urn:ses-com:device:SatIPServer:1";
 /// Root device search target.
 pub const ROOT_DEVICE_ST: &str = "upnp:rootdevice";
+
+/// Device identity that SSDP and the HTTP endpoints must agree on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// UUID without the `uuid:` prefix.
+    pub uuid: String,
+    /// SAT>IP device id.
+    pub device_id: i32,
+    /// UPnP boot id.
+    pub bootid: i32,
+}
+
+/// Identity shared between the SSDP thread and the web service.
+///
+/// C++ keeps these in `opts`, so an SSDP DEVICEID conflict is immediately
+/// visible to `/state.json` (minisatip.cpp:1837-1844).
+#[derive(Debug, Clone)]
+pub struct SharedIdentity(Arc<Mutex<DeviceIdentity>>);
+
+impl SharedIdentity {
+    /// Creates a shared identity.
+    pub fn new(uuid: String, device_id: i32, bootid: i32) -> Self {
+        Self(Arc::new(Mutex::new(DeviceIdentity {
+            uuid,
+            device_id,
+            bootid,
+        })))
+    }
+
+    /// Copies the current values.
+    pub fn snapshot(&self) -> DeviceIdentity {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Replaces the current values.
+    pub fn set(&self, identity: &DeviceIdentity) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = identity.clone();
+    }
+}
 
 /// Identity and URL values used in SSDP messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +310,7 @@ impl SsdpIo for UdpSsdpIo {
 pub struct SsdpServer<I: SsdpIo> {
     io: I,
     config: SsdpConfig,
+    identity: Option<SharedIdentity>,
     announced: bool,
     announce_time_ms: Option<i64>,
 }
@@ -274,9 +321,16 @@ impl<I: SsdpIo> SsdpServer<I> {
         Self {
             io,
             config,
+            identity: None,
             announced: false,
             announce_time_ms: None,
         }
+    }
+
+    /// Publishes DEVICEID/BOOTID/UUID changes to `identity`.
+    pub fn with_identity(mut self, identity: SharedIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Current identity and URLs.
@@ -377,6 +431,14 @@ impl<I: SsdpIo> SsdpServer<I> {
                     self.config.device_id = device_id;
                     self.config.uuid = uuid;
                 }
+            }
+            // C++ readBootID mutates the globals read by /state.json and /desc.xml.
+            if let Some(identity) = &self.identity {
+                identity.set(&DeviceIdentity {
+                    uuid: self.config.uuid.clone(),
+                    device_id: self.config.device_id,
+                    bootid: self.config.bootid,
+                });
             }
             action.device_id_conflict = true;
         } else {

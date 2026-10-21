@@ -11,6 +11,7 @@ use ms_tuner::DeliverySystem;
 
 use crate::handler::{HttpRoute, MAX_STREAMS};
 use crate::rtsp::Request;
+use crate::ssdp::{DeviceIdentity, SharedIdentity};
 
 /// UPnP device description path served by C++ (`DESC_XML`).
 pub const DESC_XML_PATH: &str = "/desc.xml";
@@ -305,17 +306,40 @@ impl TunerCounts {
 #[derive(Debug, Clone)]
 pub struct WebService {
     config: WebConfig,
+    identity: Option<SharedIdentity>,
 }
 
 impl WebService {
     /// Creates a service rooted at `config.document_root`.
     pub fn new(config: WebConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            identity: None,
+        }
+    }
+
+    /// Serves DEVICEID/BOOTID/UUID from `identity` instead of the static config,
+    /// so SSDP conflict handling is visible to HTTP clients.
+    pub fn with_identity(mut self, identity: SharedIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Current configuration.
     pub fn config(&self) -> &WebConfig {
         &self.config
+    }
+
+    /// Effective identity: the shared one when installed, else the config.
+    fn identity(&self) -> DeviceIdentity {
+        self.identity
+            .as_ref()
+            .map(SharedIdentity::snapshot)
+            .unwrap_or_else(|| DeviceIdentity {
+                uuid: self.config.uuid.clone(),
+                device_id: self.config.device_id,
+                bootid: self.config.bootid,
+            })
     }
 
     /// Routes an HTTP request; unhandled paths become 404 like C++ `read_http`.
@@ -332,6 +356,7 @@ impl WebService {
     /// Builds the UPnP device description (minisatip.cpp:1468-1494, 1575-1609).
     pub fn desc_xml(&self, state: &WebSnapshot) -> String {
         let adapters = state.tuner_counts().satip_cap();
+        let identity = self.identity();
         let playlist = self.config.playlist.as_deref().unwrap_or("");
         format!(
             concat!(
@@ -366,7 +391,7 @@ impl WebService {
             "minisatip",
             self.config.name_app,
             self.config.version,
-            self.config.uuid,
+            identity.uuid,
             self.config.http_host,
             adapters,
             playlist
@@ -376,6 +401,7 @@ impl WebService {
     /// Builds `/state.json` in C++ symbol order (`adapters_sym`, `stream_sym`,
     /// `minisatip_sym`).
     pub fn state_json(&self, state: &WebSnapshot) -> String {
+        let identity = self.identity();
         let none_adapter = AdapterState::default();
         let none_stream = StreamState::default();
         let adapters = |index: usize| {
@@ -512,9 +538,9 @@ impl WebService {
         json.int("has_pmt", 0);
         json.string("name_app", &self.config.name_app);
         json.string("http_host", &self.config.http_host);
-        json.string("uuid", &self.config.uuid);
-        json.int("bootid", self.config.bootid);
-        json.int("deviceid", self.config.device_id);
+        json.string("uuid", &identity.uuid);
+        json.int("bootid", identity.bootid);
+        json.int("deviceid", identity.device_id);
         json.int("http_port", i32::from(self.config.http_port));
         json.string("rtsp_host", &self.config.rtsp_host);
         json.string("datetime_compile", &state.runtime.datetime_compile);
@@ -588,15 +614,16 @@ impl WebService {
     /// (variables.cpp:113). Generated state values are supplied by
     /// [`Self::state_json`]; templates only use service-wide values.
     fn template_value(&self, name: &str, counts: TunerCounts) -> Option<String> {
+        let identity = self.identity();
         let values = [
             ("version", self.config.version.clone()),
-            ("uuid", self.config.uuid.clone()),
+            ("uuid", identity.uuid.clone()),
             ("http_host", self.config.http_host.clone()),
             ("rtsp_host", self.config.rtsp_host.clone()),
             ("name_app", self.config.name_app.clone()),
             ("http_port", self.config.http_port.to_string()),
-            ("bootid", self.config.bootid.to_string()),
-            ("deviceid", self.config.device_id.to_string()),
+            ("bootid", identity.bootid.to_string()),
+            ("deviceid", identity.device_id.to_string()),
             ("tuner_s2", counts.s2.to_string()),
             ("tuner_t2", counts.t2.to_string()),
             ("tuner_c2", counts.c2.to_string()),

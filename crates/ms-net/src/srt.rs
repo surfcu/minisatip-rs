@@ -166,6 +166,11 @@ impl<O: SrtOps + 'static> SrtListener<O> {
         &self.pending
     }
 
+    /// Library operations, shared with stream outputs.
+    pub fn ops(&self) -> &Arc<O> {
+        &self.ops
+    }
+
     /// Whether the listener socket is live.
     pub fn is_init(&self) -> bool {
         self.listener.load(Ordering::Acquire) != SRT_INVALID_SOCK
@@ -271,20 +276,10 @@ impl<O: SrtOps + 'static> SrtListener<O> {
 
     /// Sends TS data with the C++ chunking and error handling.
     pub fn send_ts(&self, sock: i32, data: &[u8]) -> Result<usize, SrtError> {
-        let mut total = 0;
-        for chunk in data.chunks(MAX_UDP_PACKET_SIZE) {
-            let mut offset = 0;
-            while offset < chunk.len() {
-                let sent = self.ops.send(sock, &chunk[offset..]);
-                if sent <= 0 {
-                    return Err(SrtError::Send);
-                }
-                let sent = sent as usize;
-                total += sent;
-                offset += sent;
-            }
+        match send_ts_partial(self.ops.as_ref(), sock, data) {
+            (total, false) => Ok(total),
+            _ => Err(SrtError::Send),
         }
-        Ok(total)
     }
 
     /// Sends all iovec-like buffers in order, like C++ `flush_stream`.
@@ -295,6 +290,26 @@ impl<O: SrtOps + 'static> SrtListener<O> {
         }
         Ok(total)
     }
+}
+
+/// Sends one buffer in `MAX_UDP_PACKET_SIZE` chunks and reports how many bytes
+/// went out before an error, matching the SRT branch of `flush_stream`
+/// (stream.cpp:800-823).
+pub(crate) fn send_ts_partial(ops: &dyn SrtOps, sock: i32, data: &[u8]) -> (usize, bool) {
+    let mut total = 0;
+    for chunk in data.chunks(MAX_UDP_PACKET_SIZE) {
+        let mut offset = 0;
+        while offset < chunk.len() {
+            let sent = ops.send(sock, &chunk[offset..]);
+            if sent <= 0 {
+                return (total, true);
+            }
+            let sent = sent as usize;
+            total += sent;
+            offset += sent;
+        }
+    }
+    (total, false)
 }
 
 impl<O: SrtOps + 'static> Drop for SrtListener<O> {

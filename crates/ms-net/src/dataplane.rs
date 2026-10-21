@@ -5,7 +5,7 @@ use crate::describe::{DescribeInput, describe_adapter};
 use crate::handler::{StreamId, StreamType};
 use crate::output::{OutputStats, STREAM_TIMER_MS, StreamOutput};
 use crate::rtp::DVB_FRAME;
-use ms_tuner::{PidSet, TsBuf, TuneParams, Tuner};
+use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
@@ -17,8 +17,15 @@ use std::time::{Duration, Instant, SystemTime};
 pub const ADAPTER_BUFFER: usize = 2000 * DVB_FRAME;
 /// Longest wait before a batch is forced out (the PCR interval).
 pub const FORCE_SEND_MS: i64 = 40;
+/// Time after a tune during which data is dropped until a new PAT appears
+/// (`read_dmx`, stream.cpp:1223-1244).
+pub const NEW_TRANSPONDER_WINDOW_MS: i64 = 200;
+/// Minimum interval between continuity-error reports to the control plane.
+const CC_REPORT_MS: i64 = 1000;
 /// Command poll interval while the tuner has no data.
 const IDLE_POLL: Duration = Duration::from_millis(5);
+/// Null-packet PID skipped by `check_cc` (stream.cpp:905).
+const PID_NULL: u16 = 8191;
 
 /// Clamps a threshold to `1..200` ms, with 200 for out-of-range values.
 pub fn clamp_threshold(threshold: i32) -> i64 {
@@ -66,6 +73,131 @@ impl Default for DataPlaneConfig {
             adapter_buffer: ADAPTER_BUFFER,
             threshold_ms: clamp_threshold(25),
         }
+    }
+}
+
+/// Finds the start of the first PAT carrying a transponder id other than
+/// `wait_transponder_id`, updating the remembered id (`check_new_transponder`,
+/// stream.cpp:864-889). Returns the offset of that PAT in `data`, if any.
+pub fn check_new_transponder(data: &[u8], wait_transponder_id: &mut i32) -> Option<usize> {
+    for offset in (0..data.len()).step_by(DVB_FRAME) {
+        let packet = &data[offset..];
+        if packet.len() < 10 {
+            break;
+        }
+        // PAT: payload-unit start, PID 0.
+        if packet[0] == 0x47 && packet[1] == 0x40 && packet[2] == 0 {
+            let tid = i32::from(packet[8]) * 256 + i32::from(packet[9]);
+            if tid != *wait_transponder_id {
+                *wait_transponder_id = tid;
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+/// Applies the post-tune window to one read buffer (`read_dmx`,
+/// stream.cpp:1223-1244).
+///
+/// Within [`NEW_TRANSPONDER_WINDOW_MS`] of the tune the buffer is kept only
+/// from the first PAT carrying a new transponder id; `None` means no such PAT
+/// was present and the whole read is dropped. After the window the buffer is
+/// used unchanged (`Some(0)`).
+pub fn post_tune_filter(
+    data: &[u8],
+    wait_transponder_id: &mut i32,
+    elapsed_ms: i64,
+) -> Option<usize> {
+    if elapsed_ms >= NEW_TRANSPONDER_WINDOW_MS {
+        return Some(0);
+    }
+    check_new_transponder(data, wait_transponder_id)
+}
+
+/// Per-PID continuity counters (`check_cc`, stream.cpp:891-974).
+///
+/// Only the parts that feed the web UI are kept: counters per active PID and
+/// the number of packets whose continuity counter was out of sequence. The
+/// missing-PID accounting of C++ is not reproduced because the tuner only
+/// delivers active PIDs (DEV-112).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ContinuityCounter {
+    last: BTreeMap<u16, i16>,
+    packets: u64,
+    errors: u64,
+}
+
+impl ContinuityCounter {
+    /// Creates an empty tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Total packets checked for an active PID (`p->packets`).
+    pub fn packets(&self) -> u64 {
+        self.packets
+    }
+
+    /// Packets with an unexpected continuity counter (`p->cc_err`).
+    pub fn errors(&self) -> u64 {
+        self.errors
+    }
+
+    /// Checks one 188-byte packet; `true` when its counter was out of sequence.
+    pub fn check_packet(&mut self, packet: &[u8]) -> bool {
+        if packet.len() < DVB_FRAME || packet[1] & 0x80 != 0 {
+            return false;
+        }
+        let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+        if pid == PID_NULL {
+            return false;
+        }
+        self.packets += 1;
+        if packet[3] & 0x10 == 0 {
+            return false;
+        }
+        let cc = i16::from(packet[3] & 0x0f);
+        let last = self.last.entry(pid).or_insert(-1);
+        let expected = if *last < 0 || *last > 15 {
+            cc
+        } else {
+            (*last + 1) % 16
+        };
+        let error = expected != cc;
+        if error {
+            self.errors += 1;
+        }
+        *last = cc;
+        error
+    }
+
+    /// Checks every complete packet in `data` whose PID is in `pids`.
+    ///
+    /// Like C++, checking is skipped entirely while `PID_ALL` is active.
+    pub fn check_buffer(&mut self, data: &[u8], pids: &PidSet) {
+        if pids.contains(PID_ALL) {
+            return;
+        }
+        for packet in data.as_chunks::<DVB_FRAME>().0 {
+            let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+            if pids.contains(pid) {
+                self.check_packet(packet);
+            }
+        }
+    }
+
+    /// Drops state for PIDs no longer routed (`update_pids` resets a re-added PID).
+    pub fn retain_pids(&mut self, pids: &PidSet) {
+        if pids.contains(PID_ALL) {
+            return;
+        }
+        self.last.retain(|pid, _| pids.contains(*pid));
+    }
+
+    /// Forgets every PID's counter.
+    pub fn reset(&mut self) {
+        self.last.clear();
     }
 }
 
@@ -127,6 +259,8 @@ pub enum Event {
     OutputClosed(StreamId),
     /// An output was removed by [`Command::StopOutput`].
     OutputStopped(StreamId, OutputStats),
+    /// Total continuity errors seen by this adapter (`ad->ccerr`).
+    ContinuityErrors(u64),
     /// The tuner failed to tune or read.
     TunerError(String),
 }
@@ -234,13 +368,19 @@ struct DataPlane {
     outputs: BTreeMap<StreamId, Subscriber>,
     tune: TuneParams,
     buf: TsBuf,
+    /// Bytes of `buf` already fed to the continuity checker.
+    cc_checked: usize,
+    active_pids: PidSet,
+    continuity: ContinuityCounter,
+    reported_cc_errors: u64,
+    last_cc_report_ms: i64,
+    wait_new_stream: bool,
+    tune_time_ms: i64,
+    wait_transponder_id: i32,
     threshold_ms: i64,
     last_send_ms: i64,
     origin: Instant,
     running: bool,
-    wait_new_stream: bool,
-    tune_time_ms: Option<i64>,
-    wait_transponder_id: u16,
 }
 
 impl DataPlane {
@@ -258,13 +398,18 @@ impl DataPlane {
             outputs: BTreeMap::new(),
             tune: TuneParams::default(),
             buf: TsBuf::new(config.adapter_buffer),
+            cc_checked: 0,
+            active_pids: PidSet::new(),
+            continuity: ContinuityCounter::new(),
+            reported_cc_errors: 0,
+            last_cc_report_ms: 0,
+            wait_new_stream: false,
+            tune_time_ms: 0,
+            wait_transponder_id: 0,
             threshold_ms: config.threshold_ms,
             last_send_ms: 0,
             origin: Instant::now(),
             running: true,
-            wait_new_stream: false,
-            tune_time_ms: None,
-            wait_transponder_id: 0,
         }
     }
 
@@ -305,7 +450,11 @@ impl DataPlane {
                     let _ = self.events.send(Event::TunerError(error.to_string()));
                 }
                 self.tune = *params;
+                // adapter.cpp:1074-1135: a tune restarts the new-transponder wait.
                 self.buf.clear();
+                self.cc_checked = 0;
+                self.wait_new_stream = true;
+                self.tune_time_ms = self.mono_us() / 1000;
                 self.update_tuner_pids();
             }
             Command::StartOutput {
@@ -373,7 +522,10 @@ impl DataPlane {
         }
         if let Err(error) = self.tuner.set_pids(&pids) {
             let _ = self.events.send(Event::TunerError(error.to_string()));
+            return;
         }
+        self.continuity.retain_pids(&pids);
+        self.active_pids = pids;
     }
 
     fn read_once(&mut self) -> bool {
@@ -390,25 +542,16 @@ impl DataPlane {
         let now = self.mono_us() / 1000;
         if read == 0 {
             // A replay at EOF never reads again, so a pending batch leaves after 40 ms.
-            if !self.buf.is_empty() && now - self.last_send_ms > FORCE_SEND_MS {
+            if !self.wait_new_stream
+                && !self.buf.is_empty()
+                && now - self.last_send_ms > FORCE_SEND_MS
+            {
                 self.process(now);
             }
             return false;
         }
-        // read_dmx's new-stream flush (src_stream.cpp:1241-1259).
-        if self.wait_new_stream {
-            let tune_time = *self.tune_time_ms.get_or_insert(now);
-            if now - tune_time < 200 {
-                match check_new_transponder(&mut self.wait_transponder_id, self.buf.as_bytes()) {
-                    Some(position) => self.buf.drain_prefix(position),
-                    None => {
-                        self.buf.clear();
-                        return false;
-                    }
-                }
-            }
-            self.tune_time_ms = None;
-            self.wait_new_stream = false;
+        if !self.after_read(now) {
+            return true;
         }
         let since = now - self.last_send_ms;
         let send = since > self.threshold_ms;
@@ -418,6 +561,36 @@ impl DataPlane {
         if send || force {
             self.process(now);
         }
+        true
+    }
+
+    /// Applies the post-tune filter and continuity check to freshly read data
+    /// (`read_dmx`, stream.cpp:1205-1245). Returns `false` when the whole read
+    /// was dropped while waiting for the new transponder.
+    fn after_read(&mut self, now_ms: i64) -> bool {
+        if self.wait_new_stream {
+            if self.tune_time_ms == 0 {
+                self.tune_time_ms = now_ms;
+            }
+            let elapsed = now_ms - self.tune_time_ms;
+            match post_tune_filter(self.buf.as_bytes(), &mut self.wait_transponder_id, elapsed) {
+                Some(offset) => {
+                    self.buf.discard_front(offset);
+                    self.cc_checked = self.cc_checked.saturating_sub(offset);
+                }
+                None => {
+                    self.buf.clear();
+                    self.cc_checked = 0;
+                    return false;
+                }
+            }
+            self.tune_time_ms = 0;
+            self.wait_new_stream = false;
+        }
+        let checked = self.cc_checked.min(self.buf.len()) / DVB_FRAME * DVB_FRAME;
+        self.continuity
+            .check_buffer(&self.buf.as_bytes()[checked..], &self.active_pids);
+        self.cc_checked = self.buf.len();
         true
     }
 
@@ -435,6 +608,7 @@ impl DataPlane {
             }
         }
         self.buf.clear();
+        self.cc_checked = 0;
         for stream_id in closed {
             self.close(stream_id);
         }
@@ -447,6 +621,11 @@ impl DataPlane {
         let signal = self.tuner.status();
         let mut closed = Vec::new();
         for (stream_id, subscriber) in &mut self.outputs {
+            // stream.cpp:1337-1340: a failed send (`sid->timeout = 1`) closes now.
+            if subscriber.output.forced_close() {
+                closed.push(*stream_id);
+                continue;
+            }
             if now - subscriber.last_timer_ms <= STREAM_TIMER_MS {
                 continue;
             }
@@ -471,6 +650,21 @@ impl DataPlane {
         for stream_id in closed {
             self.close(stream_id);
         }
+        self.report_continuity(now);
+    }
+
+    /// Publishes the continuity error count at most once per second.
+    fn report_continuity(&mut self, now_ms: i64) {
+        let errors = self.continuity.errors();
+        if errors == self.reported_cc_errors {
+            return;
+        }
+        if self.last_cc_report_ms != 0 && now_ms - self.last_cc_report_ms < CC_REPORT_MS {
+            return;
+        }
+        self.last_cc_report_ms = now_ms;
+        self.reported_cc_errors = errors;
+        let _ = self.events.send(Event::ContinuityErrors(errors));
     }
 
     fn flush_queues(&mut self) {
@@ -500,25 +694,6 @@ impl DataPlane {
     }
 }
 
-/// `check_new_transponder` (src_stream.cpp:864-886): returns the offset of the
-/// first PID-0 packet (PUSI, no adaptation) whose transport_stream_id differs
-/// from `wait_transponder_id`, and records it.
-fn check_new_transponder(wait_transponder_id: &mut u16, data: &[u8]) -> Option<usize> {
-    let mut offset = 0;
-    while offset + 10 <= data.len() {
-        let packet = &data[offset..];
-        if packet[0] == 0x47 && packet[1] == 0x40 && packet[2] == 0 {
-            let tid = u16::from(packet[8]) * 256 + u16::from(packet[9]);
-            if tid != *wait_transponder_id {
-                *wait_transponder_id = tid;
-                return Some(offset);
-            }
-        }
-        offset += DVB_FRAME;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,7 +716,7 @@ mod tests {
         data.extend_from_slice(&pat(2));
         data.extend_from_slice(&pat(2));
         let mut id = 1;
-        let position = check_new_transponder(&mut id, &data).expect("new transponder");
+        let position = check_new_transponder(&data, &mut id).expect("new transponder");
         assert_eq!(position, 2 * DVB_FRAME);
         assert_eq!(id, 2);
         // The caller drops the prefix and keeps the matching PAT and its suffix.
@@ -549,6 +724,6 @@ mod tests {
         assert_eq!(suffix.len(), 2 * DVB_FRAME);
         assert_eq!(u16::from(suffix[8]) * 256 + u16::from(suffix[9]), 2);
         // An already-recorded transponder is not new.
-        assert_eq!(check_new_transponder(&mut id, suffix), None);
+        assert_eq!(check_new_transponder(suffix, &mut id), None);
     }
 }
