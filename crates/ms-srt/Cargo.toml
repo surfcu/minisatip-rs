@@ -1,0 +1,17 @@
+[package]
+name = "ms-srt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Links libsrt and compiles the bindings; without it the crate is empty.
+srt = []
+
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

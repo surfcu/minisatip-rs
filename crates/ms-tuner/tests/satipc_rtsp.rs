@@ -10,6 +10,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use common::fake_satip_server::FakeSatipServer;
+#[cfg(feature = "srt")]
+use ms_srt::SRT_INVALID_SOCK;
 use ms_tuner::satipc::{
     Driver, MAX_QUALITY, MAX_STRENGTH, PidSlot, PidState, SatipServer, SatipcConfig, State,
     Transport,
@@ -442,6 +444,39 @@ fn test_rtsp_keepalive() {
     );
 }
 
+// Binds an ephemeral localhost UDP port and releases it, so the SRT
+// connect below fails fast against a closed port.
+#[cfg(feature = "srt")]
+fn closed_udp_port() -> u16 {
+    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .and_then(|socket| socket.local_addr())
+        .map_or(9, |address| address.port())
+}
+
+// Ported from tests/test_satipc_rtsp.cpp:500
+#[cfg(feature = "srt")]
+#[test]
+fn test_rtsp_srt_failure_keeps_socket() {
+    let _serial = serial();
+    let mut fx = RtspFixture::setup();
+
+    fx.d.client.transport = Transport::Srt;
+    fx.d.srt_sock = SRT_INVALID_SOCK;
+    fx.d.client.host = "127.0.0.1".to_owned();
+    fx.d.client.port = closed_udp_port();
+
+    // The dispatch deletes the socket on nonzero timeout returns.
+    assert_eq!(
+        fx.d.timeout(),
+        0,
+        "SRT failure must not delete the RTSP socket"
+    );
+    // The SRT restart branch ran and released its claim.
+    assert!(!fx.d.client.srt_restart_claimed);
+    assert_eq!(fx.d.srt_sock, SRT_INVALID_SOCK);
+    assert!(fx.d.client.rtsp_connected);
+}
+
 // Binds an ephemeral localhost TCP port and releases it, so a connect
 // fails fast with ECONNREFUSED.
 fn closed_tcp_port() -> u16 {
@@ -775,6 +810,177 @@ fn test_satipc_drop_raced_socket() {
     assert!(!d.client.data_open, "TCP dvr must reset");
     assert_fd_closed(dvr_fd, "the TCP media fd must be released");
     assert_peer_eof(&mut peer, "TCP dvr fd must close");
+}
+
+// Ported from tests/test_satipc_rtsp.cpp:757
+// Abort releases exactly the raced publish: matching state is torn
+// down, anything else (or nobody) is left untouched.
+#[cfg(feature = "srt")]
+#[test]
+fn test_satipc_abort_srt() {
+    let _serial = serial();
+    let mut d = Driver::new(&config(9, "127.0.0.1", 554, 5500));
+    assert!(ms_srt::startup());
+    let s = ms_srt::create_socket();
+    assert_ne!(s, SRT_INVALID_SOCK, "srt_create_socket");
+    // ad.sock = sockets_add(pipe, TYPE_DVR): the media entry exists.
+    d.client.data_open = true;
+    d.srt_sock = s;
+    d.client.srt_streamid = "abort-me".to_owned();
+    // sip.udp_sock and ad.dvr are one descriptor in Rust.
+    d.srt_udp = 4001;
+    d.abort_srt(s);
+    assert_eq!(d.srt_sock, SRT_INVALID_SOCK, "srt must invalidate");
+    assert!(d.client.srt_streamid.is_empty(), "streamid must clear");
+    assert_eq!(d.srt_udp, -1, "udp/dvr must reset");
+    // SOCK_TIMEOUT: the media entry stays, now without a descriptor.
+    assert!(d.client.data_open && d.srt_udp == -1, "handle must swap");
+    assert!(!ms_srt::is_connected(s), "closed srt must read down");
+    let s2 = ms_srt::create_socket();
+    d.srt_sock = s2;
+    d.client.srt_streamid = "keep-me".to_owned();
+    d.abort_srt(SRT_INVALID_SOCK);
+    assert!(
+        d.srt_sock == s2 && d.client.srt_streamid == "keep-me",
+        "invalid fresh must noop"
+    );
+    d.abort_srt(s);
+    assert_eq!(d.srt_sock, s2, "stale fresh must noop");
+    ms_srt::close(s2);
+    drop(d);
+    assert!(ms_srt::cleanup());
+}
+
+/// The SRT transport end to end: `satipc_open_srt` connects to the server's
+/// RTSP port with a numeric stream id, SETUP advertises that id, and
+/// `satipc_srt_read` delivers the TS the server sends.
+#[cfg(feature = "srt")]
+#[test]
+fn satipc_srt_connects_with_streamid_and_receives_ts() {
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
+
+    use ms_tuner::TsBuf;
+    use ms_tuner::satipc::Op;
+
+    let _serial = serial();
+    assert!(ms_srt::startup());
+    let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("udp bind");
+    let port = udp.local_addr().expect("local addr").port();
+    let listener = ms_srt::create_socket();
+    assert_ne!(listener, SRT_INVALID_SOCK, "listener socket");
+    assert!(ms_srt::bind_acquire(
+        listener,
+        std::os::fd::IntoRawFd::into_raw_fd(udp)
+    ));
+    let seen = Arc::new(Mutex::new(None::<String>));
+    let record = Arc::clone(&seen);
+    assert!(ms_srt::set_listen_callback(
+        listener,
+        Arc::new(move |streamid: Option<&str>, _sock| {
+            *record.lock().expect("streamid") = streamid.map(str::to_owned);
+            true
+        }),
+    ));
+    assert!(ms_srt::listen(listener, 1));
+    let acceptor = thread::spawn(move || ms_srt::accept(listener));
+
+    let mut cfg = config(0, "127.0.0.1", port, 5500);
+    cfg.server.transport = Transport::Srt;
+    let mut d = Driver::new(&cfg);
+    assert_eq!(d.open_srt(), 0, "SRT connect must succeed");
+    assert!(d.client.srt_connected);
+    assert!(d.srt_udp >= 0, "SRT owns the UDP descriptor");
+    let streamid = d.client.srt_streamid.clone();
+    assert!(
+        streamid.parse::<u32>().is_ok(),
+        "numeric streamid: {streamid}"
+    );
+    let server = acceptor.join().expect("accept thread");
+    assert_ne!(server, SRT_INVALID_SOCK, "server must accept");
+    assert_eq!(seen.lock().expect("streamid").as_deref(), Some(&*streamid));
+
+    // A second open reuses the connected socket and keeps the stream id.
+    let sock = d.srt_sock;
+    assert_eq!(d.open_srt(), 0);
+    assert_eq!(d.srt_sock, sock);
+    assert_eq!(d.client.srt_streamid, streamid);
+
+    d.client.enabled = true;
+    d.client.rtsp_connected = true;
+    d.client.http_request(Some("src=1"), "SETUP");
+    let setup = d
+        .client
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            Op::Send(data) => Some(String::from_utf8_lossy(data).into_owned()),
+            _ => None,
+        })
+        .expect("SETUP queued");
+    assert!(
+        setup.contains(&format!(
+            "\r\nTransport: RTP/AVP/SRT;srt_streamid={streamid}\r\n"
+        )),
+        "{setup}"
+    );
+    d.client.ops.clear();
+
+    let mut ts = Vec::new();
+    for index in 0..7u8 {
+        let mut packet = [0xffu8; 188];
+        packet[..4].copy_from_slice(&[0x47, 0, 0x11, 0x10 | index]);
+        ts.extend_from_slice(&packet);
+    }
+    // Live mode delivers after the 1 s latency; keep the stream flowing until
+    // the first messages arrive.
+    // satipc_open_device: the media entry is open.
+    d.client.data_open = true;
+    let mut buf = TsBuf::with_packets(64);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while buf.is_empty() && Instant::now() < deadline {
+        assert_eq!(ms_srt::send(server, &ts), ts.len() as i32);
+        d.read_media(&mut buf);
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!buf.is_empty(), "no TS received over SRT");
+    assert_eq!(buf.len() % ts.len(), 0, "whole SRT messages only");
+    for message in buf.as_bytes().chunks(ts.len()) {
+        assert_eq!(message, &ts[..]);
+    }
+
+    // Without the media entry nothing reads, though the socket stays up.
+    d.client.data_open = false;
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let mut idle = TsBuf::with_packets(64);
+    while Instant::now() < deadline {
+        assert_eq!(ms_srt::send(server, &ts), ts.len() as i32);
+        assert_eq!(
+            d.read_media(&mut idle),
+            0,
+            "closed media entry must not read"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        ms_srt::is_connected(d.srt_sock),
+        "SRT socket is kept for reuse"
+    );
+
+    // A RestartSrt dropped with the queue must release its claim.
+    d.device_open = true;
+    d.client.srt_restart_claimed = true;
+    d.close_device();
+    assert!(
+        !d.client.srt_restart_claimed,
+        "close must release the claim"
+    );
+
+    ms_srt::close(server);
+    ms_srt::close(listener);
+    drop(d);
+    assert!(ms_srt::cleanup());
 }
 
 // Ported from tests/test_satipc_rtsp.cpp:800

@@ -8,6 +8,7 @@ members = [
     "crates/ms-sched",
     "crates/ms-ca",
     "crates/ms-ca-drivers",
+    "crates/ms-srt",
     "crates/ms-net",
     "crates/ms-config",
     "crates/ms-harness",

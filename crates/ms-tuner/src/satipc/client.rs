@@ -51,6 +51,9 @@ pub enum Transport {
     Udp,
     /// RTP interleaved on the RTSP connection.
     Tcp,
+    /// TS over SRT from the server's RTSP port (`^` servers).
+    #[cfg(feature = "srt")]
+    Srt,
 }
 
 impl Transport {
@@ -59,6 +62,8 @@ impl Transport {
         match self {
             Self::Udp => "UDP",
             Self::Tcp => "TCP",
+            #[cfg(feature = "srt")]
+            Self::Srt => "SRT",
         }
     }
 }
@@ -92,6 +97,13 @@ pub enum Op {
     CloseAdapter,
     /// `satipc_open_rtsp_socket(ad, sip, false)`: reconnects.
     OpenRtsp,
+    /// `satipc_open_srt` before the first SETUP/PLAY; on success the driver
+    /// runs [`Client::request`] again.
+    #[cfg(feature = "srt")]
+    OpenSrt,
+    /// The SRT branch of `satipc_timeout`: reopens a broken SRT connection.
+    #[cfg(feature = "srt")]
+    RestartSrt,
 }
 
 /// Adapter PID slot state (`PID_STATE_*`).
@@ -234,6 +246,15 @@ pub struct Client {
     pub data_open: bool,
     /// `sockets_timeout(ad->fe_sock, ...)` in ms.
     pub fe_timeout_ms: i64,
+    /// `sip->srt_streamid`, advertised in the SETUP transport.
+    #[cfg(feature = "srt")]
+    pub srt_streamid: String,
+    /// `srt_socket_is_connected(sip->srt_sock)`, refreshed by the driver.
+    #[cfg(feature = "srt")]
+    pub srt_connected: bool,
+    /// `sip->srt_restart_claimed`.
+    #[cfg(feature = "srt")]
+    pub srt_restart_claimed: bool,
     /// `app_name version` sent as `User-Agent`.
     pub user_agent: String,
     /// Queued driver work.
@@ -297,6 +318,12 @@ impl Client {
             rtsp_connected: false,
             data_open: false,
             fe_timeout_ms: 25_000,
+            #[cfg(feature = "srt")]
+            srt_streamid: String::new(),
+            #[cfg(feature = "srt")]
+            srt_connected: false,
+            #[cfg(feature = "srt")]
+            srt_restart_claimed: false,
             user_agent: format!("minisatip {}", env!("CARGO_PKG_VERSION")),
             ops: VecDeque::new(),
             origin: Instant::now(),
@@ -577,6 +604,13 @@ impl Client {
             self.rtsp_socket_closed = false;
             self.last_connect = self.tick();
             self.ops.push_back(Op::OpenRtsp);
+            return 0;
+        }
+        // The claim serializes restarts; the driver releases it after the open.
+        #[cfg(feature = "srt")]
+        if self.transport == Transport::Srt && !self.srt_restart_claimed && !self.srt_connected {
+            self.srt_restart_claimed = true;
+            self.ops.push_back(Op::RestartSrt);
             return 0;
         }
         if self.expect_reply && self.tick() - self.last_response_sent > self.timeout_ms {
@@ -936,6 +970,14 @@ impl Client {
             self.err = false;
             self.session.clear();
             match self.transport {
+                #[cfg(feature = "srt")]
+                Transport::Srt => {
+                    let _ = write!(
+                        headers,
+                        "\r\nTransport: RTP/AVP/SRT;srt_streamid={}",
+                        self.srt_streamid
+                    );
+                }
                 Transport::Tcp => headers.push_str("\r\nTransport: RTP/AVP/TCP;interleaved=0-1"),
                 Transport::Udp => {
                     let _ = write!(
@@ -1063,6 +1105,13 @@ impl Client {
         }
         if self.state == State::Setup && self.option_no_setup {
             self.state = State::Play;
+        }
+        // No SRT socket, no SETUP: never advertise a dead streamid. The driver
+        // opens it and asks again; on failure the timeout path retries.
+        #[cfg(feature = "srt")]
+        if self.transport == Transport::Srt && !self.sent_transport && !self.srt_connected {
+            self.ops.push_back(Op::OpenSrt);
+            return;
         }
         match self.state {
             State::Setup => self.send_setup(),

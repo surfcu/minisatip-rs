@@ -11,10 +11,13 @@ default = ["linux-dvb"]
 linux-dvb = []
 # Netceiver FFI to libnetceiver (libmcli); off by default like the C++ NETCVCLIENT probe.
 netceiver = []
+# SRT transport for satipc servers marked `^`; links libsrt through ms-srt.
+srt = ["dep:ms-srt", "ms-srt/srt"]
 
 # satipc uses libc unconditionally, so it stays a plain dependency.
 [dependencies]
 libc = "0.2"
+ms-srt = { path = "../ms-srt", optional = true }
 
 [dev-dependencies]
 libc = "0.2"

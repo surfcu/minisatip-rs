@@ -173,6 +173,24 @@ pub fn delsys_name(sys: DeliverySystem) -> &'static str {
         .map_or("", |(key, _)| key)
 }
 
+/// `get_random_uint32`: four bytes of `/dev/urandom`, or a clock-derived value.
+#[cfg(feature = "srt")]
+pub fn random_u32() -> u32 {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 4];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return u32::from_ne_bytes(bytes);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    nanos ^ std::process::id().rotate_left(16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

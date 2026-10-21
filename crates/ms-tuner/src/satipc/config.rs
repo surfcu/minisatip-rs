@@ -59,13 +59,24 @@ pub fn parse_satip_servers(spec: &str, rtsp_over_tcp: bool) -> Result<Vec<SatipS
             Transport::Udp
         };
         let mut no_pids_all = false;
-        if token.starts_with('^') {
-            return Err("SRT support is disabled, install libsrt-openssl-dev".to_owned());
+        if let Some(rest) = token.strip_prefix('^') {
+            #[cfg(not(feature = "srt"))]
+            {
+                let _ = rest;
+                return Err("SRT support is disabled, install libsrt-openssl-dev".to_owned());
+            }
+            #[cfg(feature = "srt")]
+            {
+                transport = Transport::Srt;
+                token = rest;
+            }
         }
         if let Some(rest) = token.strip_prefix('*') {
             transport = match transport {
                 Transport::Tcp => Transport::Udp,
                 Transport::Udp => Transport::Tcp,
+                #[cfg(feature = "srt")]
+                Transport::Srt => Transport::Srt,
             };
             token = rest;
         }
@@ -302,7 +313,24 @@ mod tests {
         let servers = parse_satip_servers("a,*b", true).expect("parse");
         assert_eq!(servers[0].transport, Transport::Tcp);
         assert_eq!(servers[1].transport, Transport::Udp);
+    }
+
+    #[cfg(not(feature = "srt"))]
+    #[test]
+    fn srt_servers_need_the_srt_feature() {
         assert!(parse_satip_servers("^a", false).is_err());
+    }
+
+    #[cfg(feature = "srt")]
+    #[test]
+    fn srt_servers_ignore_the_tcp_toggle() {
+        let servers = parse_satip_servers("^a,^*b:8554,*c", false).expect("parse");
+        assert_eq!(servers[0].transport, Transport::Srt);
+        assert_eq!(servers[0].host, "a");
+        assert_eq!(servers[1].transport, Transport::Srt);
+        assert_eq!(servers[1].host, "b");
+        assert_eq!(servers[1].port, 8554);
+        assert_eq!(servers[2].transport, Transport::Tcp);
     }
 
     #[test]

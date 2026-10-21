@@ -1,11 +1,14 @@
 //! Socket driver for [`Client`] and the [`SatipcTuner`] backend.
 //!
 //! One I/O thread per adapter reads the RTSP (and, for UDP, RTCP) sockets and
-//! runs the timers; the data-plane thread reads RTP or drains interleaved TS.
+//! runs the timers; the data-plane thread reads RTP, SRT or drains interleaved
+//! TS.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::AsRawFd;
+#[cfg(feature = "srt")]
+use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -17,6 +20,8 @@ use super::media::{
     Frame, MAX_RTP_MSG, MAX_UDP_PACKET_SIZE, TcpDemux, process_rtp_datagram, push_packets,
 };
 use super::sys;
+#[cfg(feature = "srt")]
+use super::util::random_u32;
 use crate::tuner::{
     PidSet, Result, SignalStatus, TS_PACKET_SIZE, TsBuf, TuneParams, Tuner, TunerError,
 };
@@ -31,6 +36,9 @@ const IO_IDLE: Duration = Duration::from_millis(5);
 const TCP_TS_MAX: usize = 4 * 2000 * TS_PACKET_SIZE;
 /// Largest UDP datagram read (header plus `MAX_UDP_PACKET_SIZE`).
 const DATAGRAM_MAX: usize = 2048;
+/// `SRT_LATENCY_MS`.
+#[cfg(feature = "srt")]
+const SRT_LATENCY_MS: i32 = 1000;
 
 /// Settings for one satipc adapter.
 #[derive(Debug, Clone)]
@@ -65,6 +73,13 @@ pub struct Driver {
     pub rtp: Option<UdpSocket>,
     /// RTCP socket for UDP transport (`sip->rtcp`).
     pub rtcp: Option<UdpSocket>,
+    /// SRT media socket (`sip->srt_sock`), or `SRT_INVALID_SOCK`.
+    #[cfg(feature = "srt")]
+    pub srt_sock: i32,
+    /// UDP descriptor owned by the SRT socket (`sip->udp_sock`, also
+    /// `ad->dvr`), or -1.
+    #[cfg(feature = "srt")]
+    pub srt_udp: i32,
     /// The device is open (`ad->enabled`).
     pub device_open: bool,
     /// Interleaved TS waiting for the data plane.
@@ -97,6 +112,10 @@ impl Driver {
             rtsp: None,
             rtp: None,
             rtcp: None,
+            #[cfg(feature = "srt")]
+            srt_sock: ms_srt::SRT_INVALID_SOCK,
+            #[cfg(feature = "srt")]
+            srt_udp: -1,
             device_open: false,
             tcp_ts: Vec::new(),
             start_rtp: config.start_rtp,
@@ -133,7 +152,8 @@ impl Driver {
         self.client.rtsp_connected = true;
         self.client.fe_timeout_ms = 25_000;
         self.fe_rtime = self.client.tick();
-        self.client.data_open = self.client.transport == Transport::Tcp || self.rtp.is_some();
+        self.client.data_open =
+            self.client.transport == Transport::Tcp || self.rtp.is_some() || self.has_srt_udp();
         if self.client.data_open && !is_init {
             self.client.post_init();
         }
@@ -158,6 +178,116 @@ impl Driver {
         Ok(())
     }
 
+    #[cfg(feature = "srt")]
+    fn has_srt_udp(&self) -> bool {
+        self.srt_udp >= 0
+    }
+
+    #[cfg(not(feature = "srt"))]
+    fn has_srt_udp(&self) -> bool {
+        false
+    }
+
+    /// `satipc_open_srt`: reuses a connected SRT socket or connects a new one
+    /// to the server's RTSP port with a fresh stream id; 0 on success, 2 on
+    /// failure.
+    #[cfg(feature = "srt")]
+    pub fn open_srt(&mut self) -> i32 {
+        use ms_srt::{SRT_INVALID_SOCK, SockOpt};
+
+        if self.client.transport != Transport::Srt {
+            return 0;
+        }
+        if self.srt_sock != SRT_INVALID_SOCK && ms_srt::is_connected(self.srt_sock) {
+            self.client.srt_connected = true;
+            return 0;
+        }
+        self.client.srt_connected = false;
+        if self.srt_sock != SRT_INVALID_SOCK {
+            // Not connected any more; srt_close also closes the acquired UDP fd.
+            ms_srt::close(self.srt_sock);
+            self.srt_sock = SRT_INVALID_SOCK;
+        }
+        // The stale UDP descriptor went with the SRT socket: drop tracking.
+        self.srt_udp = -1;
+
+        srt_startup_once();
+        let Ok(udp) = sys::udp_bind(self.bind_dev_ip, 0) else {
+            return 2;
+        };
+        let sock = ms_srt::create_socket();
+        if sock == SRT_INVALID_SOCK {
+            return 2;
+        }
+        self.srt_sock = sock;
+        ms_srt::set_flag(sock, SockOpt::Latency, SRT_LATENCY_MS);
+        // No SRTO_RENDEZVOUS: caller mode, blocking for the synchronous connect.
+        self.client.srt_streamid = random_u32().to_string();
+        ms_srt::set_streamid(sock, &self.client.srt_streamid);
+        if !ms_srt::bind_acquire(sock, udp.as_raw_fd()) {
+            ms_srt::close(sock);
+            self.srt_sock = SRT_INVALID_SOCK;
+            self.client.srt_streamid.clear();
+            return 2;
+        }
+
+        // fill_sockaddr: the server address in the family of the UDP socket.
+        let ipv4 = udp.local_addr().is_ok_and(|local| local.is_ipv4());
+        let address = (self.client.host.as_str(), self.client.port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addresses| addresses.find(|address| address.is_ipv4() == ipv4));
+        // SRT now owns the UDP descriptor.
+        self.srt_udp = udp.into_raw_fd();
+        if !address.is_some_and(|address| ms_srt::connect(sock, address)) {
+            ms_srt::close(sock);
+            self.srt_sock = SRT_INVALID_SOCK;
+            self.client.srt_streamid.clear();
+            // srt_close also closed the acquired UDP descriptor.
+            self.srt_udp = -1;
+            return 2;
+        }
+        // Non-blocking reads after the connect.
+        ms_srt::set_flag(sock, SockOpt::RcvSyn, 0);
+        self.client.srt_connected = true;
+        0
+    }
+
+    /// `satipc_abort_srt`: releases SRT state published while the adapter was
+    /// closing; only the expected socket `fresh` is touched.
+    #[cfg(feature = "srt")]
+    pub fn abort_srt(&mut self, fresh: i32) {
+        if self.srt_sock != fresh || fresh == ms_srt::SRT_INVALID_SOCK {
+            return;
+        }
+        ms_srt::close(self.srt_sock);
+        self.srt_sock = ms_srt::SRT_INVALID_SOCK;
+        self.client.srt_streamid.clear();
+        self.client.srt_connected = false;
+        // The media entry (`ad->sock`) stays, now without a descriptor.
+        self.srt_udp = -1;
+    }
+
+    // The SRT branch of `satipc_timeout`, after the claim.
+    #[cfg(feature = "srt")]
+    fn restart_srt(&mut self) {
+        let fresh = if self.open_srt() == 0 && !self.device_open {
+            self.srt_sock
+        } else {
+            ms_srt::SRT_INVALID_SOCK
+        };
+        self.abort_srt(fresh);
+        self.client.srt_restart_claimed = false;
+    }
+
+    // Mirrors the lock-free `srt_socket_is_connected` the C++ checks inline.
+    fn sync_srt(&mut self) {
+        #[cfg(feature = "srt")]
+        {
+            self.client.srt_connected = ms_srt::is_connected(self.srt_sock);
+        }
+    }
+
     /// `satipc_drop_rtsp_socket`: releases an RTSP socket after a failed open.
     pub fn drop_rtsp_socket(&mut self) {
         self.rtsp = None;
@@ -179,6 +309,14 @@ impl Driver {
         self.client.last_connect = now;
         if self.open_rtsp_socket(true).is_err() {
             return 2;
+        }
+        #[cfg(feature = "srt")]
+        if self.client.transport == Transport::Srt {
+            let rv = self.open_srt();
+            if rv != 0 {
+                self.drop_rtsp_socket();
+                return rv;
+            }
         }
         if self.setup_rtp_udp_sockets().is_err() {
             self.drop_rtsp_socket();
@@ -204,6 +342,11 @@ impl Driver {
         self.client.rtsp_connected = false;
         self.client.data_open = false;
         self.client.ops.clear();
+        // A dropped RestartSrt must not leave its claim behind.
+        #[cfg(feature = "srt")]
+        {
+            self.client.srt_restart_claimed = false;
+        }
         self.device_open = false;
         self.standby_since = None;
     }
@@ -240,12 +383,21 @@ impl Driver {
                         self.client.ops.retain(|op| !matches!(op, Op::Send(_)));
                     }
                 }
+                #[cfg(feature = "srt")]
+                Op::OpenSrt => {
+                    if self.open_srt() == 0 {
+                        self.client.request();
+                    }
+                }
+                #[cfg(feature = "srt")]
+                Op::RestartSrt => self.restart_srt(),
             }
         }
     }
 
     /// `satipc_timeout` with its socket work done.
     pub fn timeout(&mut self) -> i32 {
+        self.sync_srt();
         let rv = self.client.timeout();
         self.fe_rtime = self.client.tick();
         self.run_ops();
@@ -265,20 +417,22 @@ impl Driver {
                 self.client.on_data_closed();
             }
             Transport::Udp => self.client.ops.push_back(Op::CloseAdapter),
+            #[cfg(feature = "srt")]
+            Transport::Srt => self.client.ops.push_back(Op::CloseAdapter),
         }
     }
 
     fn handle_rtsp_bytes(&mut self, bytes: &[u8]) {
         match self.client.transport {
-            Transport::Udp => {
+            Transport::Tcp => {
+                self.demux.push(bytes);
+                self.drain_demux();
+            }
+            _ => {
                 self.rbuf.extend_from_slice(bytes);
                 if self.client.reply(&self.rbuf) != ReplyOutcome::Incomplete {
                     self.rbuf.clear();
                 }
-            }
-            Transport::Tcp => {
-                self.demux.push(bytes);
-                self.drain_demux();
             }
         }
     }
@@ -307,16 +461,17 @@ impl Driver {
         if !self.device_open {
             return false;
         }
+        self.sync_srt();
         let mut work = false;
         let mut buf = [0u8; 16 * 1024];
         let room =
-            self.client.transport == Transport::Udp || self.tcp_ts.len() + 65_536 <= TCP_TS_MAX;
+            self.client.transport != Transport::Tcp || self.tcp_ts.len() + 65_536 <= TCP_TS_MAX;
         if room && let Some(stream) = self.rtsp.as_mut() {
             match stream.read(&mut buf) {
                 Ok(0) => self.rtsp_eof(),
                 Ok(read) => {
                     work = true;
-                    if self.client.transport == Transport::Udp {
+                    if self.client.transport != Transport::Tcp {
                         self.fe_rtime = self.client.tick();
                     }
                     self.handle_rtsp_bytes(&buf[..read]);
@@ -376,11 +531,38 @@ impl Driver {
                 self.tcp_ts.drain(..appended);
                 appended
             }
+            #[cfg(feature = "srt")]
+            Transport::Srt => self.read_srt(buf),
         }
+    }
+
+    /// `satipc_srt_read`: drains ready SRT messages while a whole one fits.
+    #[cfg(feature = "srt")]
+    fn read_srt(&mut self, buf: &mut TsBuf) -> usize {
+        // Without the media entry (`ad->sock`) nothing reads, even though the
+        // SRT socket itself is kept for reuse.
+        if !self.client.data_open || !ms_srt::is_connected(self.srt_sock) {
+            return 0;
+        }
+        let mut message = [0u8; MAX_UDP_PACKET_SIZE];
+        let mut total = 0;
+        while buf.remaining_bytes() >= MAX_UDP_PACKET_SIZE {
+            // SRT_EASYNCRCV (nothing ready) and errors both end the pass.
+            let read = ms_srt::recv(self.srt_sock, &mut message);
+            let Ok(read) = usize::try_from(read) else {
+                break;
+            };
+            if read == 0 {
+                break;
+            }
+            total += push_packets(&message[..read], buf);
+        }
+        total
     }
 
     /// Tunes, opening the device on first use (`init_hw` + `ad->tune`).
     pub fn tune(&mut self, params: &TuneParams) -> io::Result<()> {
+        self.sync_srt();
         if !self.device_open {
             let rv = self.open_device();
             if rv != 0 {
@@ -412,6 +594,7 @@ impl Driver {
         if !self.device_open {
             return;
         }
+        self.sync_srt();
         self.client.mark_pids(pids);
         self.client.update_pids();
         self.run_ops();
@@ -422,6 +605,7 @@ impl Driver {
         if !self.device_open {
             return;
         }
+        self.sync_srt();
         self.client.standby();
         self.client.tp = TuneParams {
             msys: self.client.sys0,
@@ -431,6 +615,25 @@ impl Driver {
         self.standby_since = Some(self.client.tick());
         self.run_ops();
     }
+}
+
+// The SRT socket outlives `close_device` for reuse, like C++; it ends with
+// the driver.
+#[cfg(feature = "srt")]
+impl Drop for Driver {
+    fn drop(&mut self) {
+        ms_srt::close(self.srt_sock);
+    }
+}
+
+/// `srt_startup` once per process; the runtime may also start the library for
+/// its SRT listener, which libsrt reference-counts.
+#[cfg(feature = "srt")]
+fn srt_startup_once() {
+    static STARTUP: std::sync::Once = std::sync::Once::new();
+    STARTUP.call_once(|| {
+        ms_srt::startup();
+    });
 }
 
 fn connect(host: &str, port: u16, source: Option<&str>) -> io::Result<TcpStream> {
