@@ -472,17 +472,17 @@ fn interleaved_reply_follows_a_complete_frame() -> io::Result<()> {
     assert_eq!(status, 200, "SETUP");
     let session = header_value(&headers, "Session").expect("Session header");
     let session = session.split(';').next().unwrap_or("").trim().to_owned();
-    let (status, _, _) = request(
-        &mut rtsp,
-        &format!("PLAY {base} RTSP/1.0\r\nCSeq: 2\r\nSession: {session}\r\n\r\n"),
+    rtsp.write_all(
+        format!("PLAY {base} RTSP/1.0\r\nCSeq: 2\r\nSession: {session}\r\n\r\n").as_bytes(),
     )?;
+    // Frames can follow the reply in the same read; keep them so parsing starts on a boundary.
+    let (status, _, _, mut raw) = read_response_and_rest(&mut rtsp)?;
     assert_eq!(status, 200, "PLAY");
 
     rtsp.write_all(
         format!("PLAY {base} RTSP/1.0\r\nCSeq: 3\r\nSession: {session}\r\n\r\n").as_bytes(),
     )?;
     rtsp.flush()?;
-    let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -729,6 +729,11 @@ fn http_get(port: u16, path: &str) -> io::Result<(u16, String, Vec<u8>)> {
 }
 
 fn read_response(stream: &mut TcpStream) -> io::Result<(u16, String, Vec<u8>)> {
+    read_response_and_rest(stream).map(|(status, head, body, _)| (status, head, body))
+}
+
+/// Like [`read_response`], also returning the bytes read past the response.
+fn read_response_and_rest(stream: &mut TcpStream) -> io::Result<(u16, String, Vec<u8>, Vec<u8>)> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let deadline = Instant::now() + TIMEOUT;
@@ -752,7 +757,8 @@ fn read_response(stream: &mut TcpStream) -> io::Result<(u16, String, Vec<u8>)> {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(0);
             if buffer.len() >= end + 4 + length {
-                return Ok((status, head, buffer[end + 4..end + 4 + length].to_vec()));
+                let body = buffer[end + 4..end + 4 + length].to_vec();
+                return Ok((status, head, body, buffer[end + 4 + length..].to_vec()));
             }
         }
         let read = stream.read(&mut chunk)?;
