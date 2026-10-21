@@ -4,7 +4,7 @@
 //! [`ms_sched::Scheduler`].
 
 use ms_sched::{Scheduler, SetParamsError, StreamId, TuneError};
-use ms_tuner::{DeliverySystem, Polarization, TuneParams};
+use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
 
 use crate::handler::{
     HttpResource, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType, TransportError,
@@ -67,13 +67,37 @@ impl Stream {
             rtsp_error: String::new(),
             session_id,
             remote_host: "0.0.0.0".to_owned(),
-            remote_port: server_port,
+            remote_port: 0,
             server_port,
             rtcp_server_port: server_port.wrapping_add(1),
             rtp_seq: 0,
             timeout_ms: 30_000,
             user_agent: String::new(),
             touched: false,
+        }
+    }
+}
+
+/// Deterministic inputs for the SDP header.
+#[derive(Debug, Clone)]
+pub struct DescribeOptions {
+    /// Local address printed in `o=` and used to pick `IP4` or `IP6`.
+    pub local_host: String,
+    /// Overrides the `o=` session id (default: the socket's stream id, else 0).
+    pub session_id: Option<i64>,
+    /// Overrides the `o=` session version (default: the session id).
+    pub session_version: Option<i64>,
+    /// Value printed in `t=`, e.g. `0 0`.
+    pub time: String,
+}
+
+impl Default for DescribeOptions {
+    fn default() -> Self {
+        Self {
+            local_host: "127.0.0.1".to_owned(),
+            session_id: None,
+            session_version: None,
+            time: "0 0".to_owned(),
         }
     }
 }
@@ -85,6 +109,7 @@ pub struct SessionManager {
     sock: i32,
     next_session_id: i64,
     start_rtp: u16,
+    describe: DescribeOptions,
 }
 
 impl Default for SessionManager {
@@ -109,6 +134,7 @@ impl SessionManager {
             sock: -1,
             next_session_id: 1000,
             start_rtp: 5500,
+            describe: DescribeOptions::default(),
         }
     }
 
@@ -130,6 +156,16 @@ impl SessionManager {
     /// Sets the first RTP server port.
     pub fn set_start_rtp(&mut self, start_rtp: u16) {
         self.start_rtp = start_rtp;
+    }
+
+    /// Replaces the SDP header inputs.
+    pub fn set_describe_options(&mut self, options: DescribeOptions) {
+        self.describe = options;
+    }
+
+    /// Mutable SDP header inputs.
+    pub fn describe_options_mut(&mut self) -> &mut DescribeOptions {
+        &mut self.describe
     }
 
     /// Live stream with `id`, or `None` when disabled.
@@ -394,61 +430,197 @@ impl SessionManager {
     }
 
     /// Builds SDP for the selected stream, or every live stream when unselected.
+    ///
+    /// Mirrors `describe_streams` in `stream.cpp:82`: a query string selects the
+    /// socket stream; `stream=` always selects and fails with `None` if unknown.
     pub fn describe_streams(&mut self, current: Option<StreamId>, url: &str) -> Option<String> {
-        let selected = if let Some(position) = url.find("stream=") {
+        let mut do_all = !url.contains('?');
+        let mut selected = current.filter(|id| self.slot_index(*id).is_some());
+        if let Some(position) = url.find("stream=") {
+            do_all = false;
             let number = parse_int_prefix(&url[position + "stream=".len()..], 0) - 1;
-            Some(self.slot_index(number)?)
-        } else {
-            current
-                .filter(|id| self.slot_index(*id).is_some())
-                .and_then(|id| self.slot_index(id))
-        };
-        let ids: Vec<StreamId> = match selected {
-            Some(index) => vec![index as StreamId],
-            None => (0..STREAM_SLOTS)
-                .filter(|index| {
-                    self.streams[*index]
-                        .as_ref()
-                        .is_some_and(|stream| stream.enabled)
-                })
-                .map(|index| index as StreamId)
-                .collect(),
-        };
-        if ids.is_empty() {
-            return None;
+            selected = self.slot_index(number).map(|index| index as StreamId);
+            selected?;
         }
 
+        // stream.cpp:92: the header uses the socket's stream, not `stream=`.
+        let header_session = self.describe.session_id.unwrap_or_else(|| {
+            current
+                .and_then(|id| self.stream(id))
+                .map_or(0, |stream| stream.session_id)
+        });
+        let header_version = self.describe.session_version.unwrap_or(header_session);
         let (s2, t, c) = self.tuner_counts();
-        let first = self.stream(ids[0]).expect("live stream");
         let mut sdp = format!(
-            "v=0\r\no=- {:010} {:010} IN IP4 0.0.0.0\r\ns=SatIPServer:1 {},{},{}\r\nt=0 0\r\n",
-            first.session_id, first.session_id, s2, t, c
+            "v=0\r\no=- {:010} {:010} IN {} {}\r\ns=SatIPServer:1 {},{},{}\r\nt={}\r\n",
+            header_session,
+            header_version,
+            if self.describe.local_host.contains(':') {
+                "IP6"
+            } else {
+                "IP4"
+            },
+            self.describe.local_host,
+            s2,
+            t,
+            c,
+            self.describe.time
         );
-        for id in ids {
-            let Some(stream) = self.stream(id) else {
-                continue;
-            };
+
+        let mut streams_enabled = 0;
+        if do_all {
+            for index in 0..STREAM_SLOTS {
+                let Some(stream) = self.streams[index].as_ref().filter(|stream| stream.enabled)
+                else {
+                    continue;
+                };
+                let id = index as StreamId;
+                let state = if stream.do_play {
+                    "sendonly"
+                } else {
+                    "inactive"
+                };
+                let port = stream.remote_port;
+                let fmtp = self.describe_adapter(id);
+                sdp.push_str(&format!(
+                    "m=video {port} RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream={}\r\na=fmtp:33 {fmtp}\r\na={state}\r\n",
+                    id + 1
+                ));
+                streams_enabled += 1;
+            }
+        }
+
+        // stream.cpp:134: no stream was listed, describe the selected one.
+        if streams_enabled == 0 {
+            let id = selected?;
+            let stream = self.stream(id)?;
             let state = if stream.do_play {
                 "sendonly"
             } else {
                 "inactive"
             };
+            let fmtp = self.describe_adapter(id);
             sdp.push_str(&format!(
-                "m=video {} RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream={}\r\n",
-                stream.remote_port,
+                "m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream={}\r\na=fmtp:33 {fmtp}\r\nb=AS:5000\r\na={state}\r\n",
                 id + 1
             ));
-            sdp.push_str(&format!(
-                "a=fmtp:33 ver=1.0;src={};tuner={},255,1,15,{},{};pids={}\r\n",
-                stream.params.src,
-                stream.adapter.max(0) + i32::from(stream.adapter >= 0),
-                stream.params.freq,
-                short_parameter(&stream.params),
-                pids_string(&stream.params),
-            ));
-            sdp.push_str(&format!("a={state}\r\n"));
         }
         Some(sdp)
+    }
+
+    /// One `a=fmtp:33` value, mirroring `describe_adapter` (`adapter.cpp:1448`).
+    fn describe_adapter(&self, id: StreamId) -> String {
+        let Some(stream) = self.stream(id) else {
+            return String::new();
+        };
+        let mut aid = stream.adapter;
+        let adapter = usize::try_from(aid)
+            .ok()
+            .and_then(|index| self.sched.adapter(index))
+            .filter(|adapter| adapter.config.enabled);
+        let use_ad = adapter.is_some() && stream.do_play;
+        if !use_ad && aid < 0 {
+            aid = 0;
+        }
+        let params = match adapter {
+            Some(adapter) if use_ad => &adapter.params,
+            _ => &stream.params,
+        };
+        // No signal source yet: print the C++ values for a tuner without status.
+        let (strength, status, snr) = (255, 1, 15);
+        let tuner = adapter
+            .and_then(|adapter| adapter.params.fe)
+            .filter(|fe| *fe > 0)
+            .unwrap_or(aid + 1);
+
+        let body = match params.msys {
+            // adapter.cpp:1488-1490: the undefined branch always prints `aid + 1`.
+            DeliverySystem::Undefined => {
+                format!("ver=1.0;src=1;tuner={},0,0,0,0,,,,,,,;pids=", aid + 1)
+            }
+            DeliverySystem::DvbS | DeliverySystem::DvbS2 => format!(
+                "ver=1.0;src={};tuner={tuner},{strength},{status},{snr},{},{},{},{},{},{},{},{};pids=",
+                i32::from(params.src),
+                params.freq,
+                polarization_name(params.pol),
+                delivery_system_name(params.msys),
+                modulation_name(params),
+                pilot_name(params.plts),
+                rolloff_name(params.ro),
+                params.sr,
+                fec_name(params),
+            ),
+            DeliverySystem::DvbT | DeliverySystem::DvbT2 => format!(
+                "ver=1.1;tuner={tuner},{strength},{status},{snr},{:.2},{},{},{},{},{},{},{},{},{};pids=",
+                f64::from(params.freq),
+                params.bw.unwrap_or(8_000_000) / 1_000_000,
+                delivery_system_name(params.msys),
+                transmission_mode_name(params.tmode),
+                modulation_name(params),
+                guard_interval_name(params.gi),
+                fec_name(params),
+                positive_or_empty(params.plp),
+                params.t2id.unwrap_or(0),
+                params.sm.unwrap_or(0),
+            ),
+            _ => format!(
+                "ver=1.2;tuner={tuner},{strength},{status},{snr},{:.2},{},{},{},{},{},{},{},{};pids=",
+                f64::from(params.freq),
+                params.bw.unwrap_or(8_000_000) / 1_000_000,
+                delivery_system_name(params.msys),
+                modulation_name(params),
+                params.sr,
+                params.c2tft.unwrap_or(0),
+                positive_or_empty(params.ds),
+                positive_or_empty(params.plp),
+                inversion_name(params.specinv),
+            ),
+        };
+        format!("{body}{}", self.stream_pids_text(id, aid, params, use_ad))
+    }
+
+    fn stream_pids_text(
+        &self,
+        id: StreamId,
+        aid: i32,
+        params: &TuneParams,
+        use_ad: bool,
+    ) -> String {
+        if use_ad {
+            let pids = self.sched.stream_pids(aid, id);
+            if pids.is_empty() {
+                return "none".to_owned();
+            }
+            return pids
+                .iter()
+                .map(|pid| {
+                    if *pid == i32::from(PID_ALL) {
+                        "all".to_owned()
+                    } else {
+                        pid.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+        }
+        if params.pids.is_all() {
+            return "all".to_owned();
+        }
+        if params.pids.is_empty() {
+            return "none".to_owned();
+        }
+        params
+            .pids
+            .iter()
+            .map(|pid| {
+                if pid == PID_ALL {
+                    "all".to_owned()
+                } else {
+                    pid.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn tuner_counts(&self) -> (usize, usize, usize) {
@@ -561,37 +733,162 @@ impl StreamBackend for SessionManager {
     }
 }
 
-fn pids_string(params: &TuneParams) -> String {
-    if params.pids.is_all() {
-        "all".to_owned()
-    } else if params.pids.is_empty() {
-        "none".to_owned()
-    } else {
-        params
-            .pids
-            .iter()
-            .map(|pid| pid.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-}
-
-fn short_parameter(params: &TuneParams) -> String {
-    let pol = match params.pol {
+fn polarization_name(pol: Polarization) -> &'static str {
+    match pol {
         Polarization::Vertical => "v",
         Polarization::Horizontal => "h",
         Polarization::Right => "r",
         Polarization::Left => "l",
-        Polarization::None => "h",
-    };
-    let msys = match params.msys {
+        Polarization::None => "",
+    }
+}
+
+fn delivery_system_name(sys: DeliverySystem) -> &'static str {
+    match sys {
         DeliverySystem::DvbS => "dvbs",
         DeliverySystem::DvbS2 => "dvbs2",
         DeliverySystem::DvbT => "dvbt",
         DeliverySystem::DvbT2 => "dvbt2",
         DeliverySystem::DvbC => "dvbc",
         DeliverySystem::DvbC2 => "dvbc2",
-        DeliverySystem::Undefined | DeliverySystem::Other(_) => "undefined",
-    };
-    format!("{pol},{msys},{},{}", params.sr, params.fec)
+        DeliverySystem::Undefined => "",
+        DeliverySystem::Other(value) => match value {
+            2 => "dvbcb",
+            4 => "dss",
+            7 => "dvbh",
+            8 => "isdbt",
+            9 => "isdbs",
+            10 => "isdbc",
+            11 => "atsc",
+            12 => "atscmh",
+            13 => "dmbth",
+            14 => "cmmb",
+            15 => "dab",
+            17 => "turbo",
+            18 => "dvbcc",
+            _ => "",
+        },
+    }
+}
+
+fn modulation_name(params: &TuneParams) -> &'static str {
+    if !params.mtype_specified {
+        return "auto";
+    }
+    match params.mtype {
+        0 => "qpsk",
+        1 => "16qam",
+        2 => "32qam",
+        3 => "64qam",
+        4 => "128qam",
+        5 => "256qam",
+        6 => "auto",
+        7 => "8vsb",
+        8 => "16vsb",
+        9 => "8psk",
+        10 => "16apsk",
+        11 => "32apsk",
+        12 => "dqpsk",
+        13 => "qam_4_nr",
+        14 => "64apsk",
+        15 => "128apsk",
+        16 => "256apsk",
+        _ => "",
+    }
+}
+
+fn pilot_name(pilot: Option<bool>) -> &'static str {
+    match pilot {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    }
+}
+
+fn rolloff_name(rolloff: Option<u8>) -> &'static str {
+    match rolloff {
+        Some(0) => "0.35",
+        Some(1) => "0.20",
+        Some(2) => "0.25",
+        Some(4) => "0.15",
+        Some(5) => "0.10",
+        Some(6) => "0.05",
+        // ROLLOFF_AUTO, and the value_or default when unset.
+        Some(3) | None => "auto",
+        Some(_) => "",
+    }
+}
+
+fn fec_name(params: &TuneParams) -> &'static str {
+    if !params.fec_specified {
+        return "auto";
+    }
+    match params.fec {
+        0 => "none",
+        1 => "12",
+        2 => "23",
+        3 => "34",
+        4 => "45",
+        5 => "56",
+        6 => "67",
+        7 => "78",
+        8 => "89",
+        9 => "auto",
+        10 => "35",
+        11 => "910",
+        12 => "25",
+        13 => "14",
+        14 => "13",
+        _ => "",
+    }
+}
+
+fn transmission_mode_name(mode: Option<i32>) -> &'static str {
+    match mode {
+        Some(0) => "2k",
+        Some(1) => "8k",
+        Some(3) => "4k",
+        Some(4) => "1k",
+        Some(5) => "16k",
+        Some(6) => "32k",
+        Some(7) => "c1",
+        Some(8) => "c3780",
+        // TRANSMISSION_MODE_AUTO, and the value_or default when unset.
+        Some(2) | None => "auto",
+        Some(_) => "",
+    }
+}
+
+fn guard_interval_name(guard: Option<i32>) -> &'static str {
+    match guard {
+        Some(0) => "132",
+        Some(1) => "116",
+        Some(2) => "18",
+        Some(3) => "14",
+        Some(5) => "1128",
+        Some(6) => "19128",
+        Some(7) => "19256",
+        Some(8) => "pn420",
+        Some(9) => "pn595",
+        Some(10) => "pn945",
+        // GUARD_INTERVAL_AUTO, and the value_or default when unset.
+        Some(4) | None => "auto",
+        Some(_) => "",
+    }
+}
+
+fn inversion_name(inversion: Option<i32>) -> &'static str {
+    match inversion {
+        Some(0) => "off",
+        Some(1) => "on",
+        // INVERSION_AUTO, and the value_or default when unset.
+        Some(2) | None => "auto",
+        Some(_) => "",
+    }
+}
+
+fn positive_or_empty(value: Option<i32>) -> String {
+    value
+        .filter(|value| *value >= 0)
+        .map_or_else(String::new, |value| value.to_string())
 }

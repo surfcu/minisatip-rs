@@ -1,9 +1,11 @@
 //! Ports of the upstream `tests/test_stream.cpp` cases against the real session layer.
 
-use ms_net::handler::{HandlerContext, MAX_STREAMS, PlayError, StreamType, handle_rtsp};
+use ms_net::handler::{
+    HandlerContext, MAX_STREAMS, PlayError, StreamBackend, StreamType, handle_rtsp,
+};
 use ms_net::response::Response;
 use ms_net::rtsp::{ParseOutcome, Protocol, Request, parse_request};
-use ms_net::session::{SessionManager, Stream};
+use ms_net::session::{DescribeOptions, SessionManager, Stream};
 use ms_sched::{
     Adapter, AdapterConfig, AdapterTuner, PID_STREAM_ID_UNDEFINED, Scheduler, TuneError,
 };
@@ -44,6 +46,27 @@ fn env_with(tuner: FakeTuner) -> SessionManager {
 
 fn env() -> SessionManager {
     env_with(FakeTuner::ok())
+}
+
+fn env_with_system(sys: DeliverySystem) -> SessionManager {
+    let mut sched = Scheduler::new();
+    sched.add_adapter(0, AdapterConfig::new(sys), Box::new(FakeTuner::ok()));
+    SessionManager::with_scheduler(sched)
+}
+
+fn describe_options() -> DescribeOptions {
+    DescribeOptions {
+        local_host: "127.0.0.1".to_owned(),
+        session_id: Some(1000),
+        session_version: Some(1000),
+        time: "0 0".to_owned(),
+    }
+}
+
+fn describe(manager: &mut SessionManager, current: Option<ms_net::StreamId>, url: &str) -> String {
+    manager
+        .describe_streams(current, url)
+        .expect("describe_streams returned NULL")
 }
 
 fn setup(manager: &mut SessionManager, url: &str) -> ms_net::StreamId {
@@ -831,5 +854,213 @@ fn test_read_rtsp_play_while_busy_returns_503() {
     assert!(
         bytes.contains("Content-Type: text/parameters"),
         "missing Content-Type"
+    );
+}
+
+// --- DESCRIBE / SDP -------------------------------------------------------
+
+// Expected text: stream.cpp:100-105 (header), stream.cpp:145-149 (single
+// stream); fmtp from adapter.cpp:1492-1505.
+#[test]
+fn describe_dvb_s2_stream_with_pids() {
+    let mut manager = env();
+    manager.set_describe_options(describe_options());
+    let url = "?src=1&freq=11362&pol=h&sr=22000&msys=dvbs2&pids=0,16";
+    let id = setup(&mut manager, url);
+    assert_eq!(
+        play_code(manager.start_play(id, Protocol::Http)),
+        0,
+        "start_play failed"
+    );
+
+    let sdp = describe(&mut manager, Some(id), url);
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 1,0,0\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.0;src=1;tuner=1,255,1,15,11362,h,dvbs2,auto,auto,auto,22000,auto;pids=0,16\r\n\
+         b=AS:5000\r\na=sendonly\r\n"
+    );
+}
+
+// Expected text: adapter.cpp:1506-1523 (ver=1.1 format).
+#[test]
+fn describe_dvb_t2_stream() {
+    let mut manager = env_with_system(DeliverySystem::DvbT2);
+    manager.set_describe_options(describe_options());
+    let url = "?freq=538&bw=8&msys=dvbt2&pids=0";
+    let id = setup(&mut manager, url);
+    assert_eq!(
+        play_code(manager.start_play(id, Protocol::Http)),
+        0,
+        "start_play failed"
+    );
+
+    let sdp = describe(&mut manager, Some(id), url);
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 0,1,0\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.1;tuner=1,255,1,15,538.00,8,dvbt2,auto,auto,auto,auto,,0,0;pids=0\r\n\
+         b=AS:5000\r\na=sendonly\r\n"
+    );
+}
+
+// Expected text: adapter.cpp:1524-1539 (ver=1.2 format).
+#[test]
+fn describe_dvb_c_stream() {
+    let mut manager = env_with_system(DeliverySystem::DvbC);
+    manager.set_describe_options(describe_options());
+    let url = "?freq=450&msys=dvbc&sr=6900&pids=0,16";
+    let id = setup(&mut manager, url);
+    assert_eq!(
+        play_code(manager.start_play(id, Protocol::Http)),
+        0,
+        "start_play failed"
+    );
+
+    let sdp = describe(&mut manager, Some(id), url);
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 0,0,1\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.2;tuner=1,255,1,15,450.00,8,dvbc,auto,6900,0,,,auto;pids=0,16\r\n\
+         b=AS:5000\r\na=sendonly\r\n"
+    );
+}
+
+// Expected pids: stream.cpp:1508-1536 (get_stream_pids prints `all`);
+// remainder from stream.cpp:145-149 and adapter.cpp:1492-1505.
+#[test]
+fn describe_stream_pids_all() {
+    let mut manager = env();
+    manager.set_describe_options(describe_options());
+    let url = "?src=1&freq=11362&pol=h&sr=22000&msys=dvbs2&pids=all";
+    let id = setup(&mut manager, url);
+    assert_eq!(
+        play_code(manager.start_play(id, Protocol::Http)),
+        0,
+        "start_play failed"
+    );
+
+    let sdp = describe(&mut manager, Some(id), url);
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 1,0,0\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.0;src=1;tuner=1,255,1,15,11362,h,dvbs2,auto,auto,auto,22000,auto;pids=all\r\n\
+         b=AS:5000\r\na=sendonly\r\n"
+    );
+}
+
+// Expected pids: adapter.cpp:1541-1546 prints `none` when no PID belongs to
+// the stream; remainder from adapter.cpp:1492-1505 and stream.cpp:145-149.
+#[test]
+fn describe_stream_with_no_pids() {
+    let mut manager = env();
+    manager.set_describe_options(describe_options());
+    let url = "?src=1&freq=11362&pol=h&sr=22000&msys=dvbs2";
+    let id = setup(&mut manager, url);
+    assert_eq!(
+        play_code(manager.start_play(id, Protocol::Http)),
+        0,
+        "start_play failed"
+    );
+
+    let sdp = describe(&mut manager, Some(id), url);
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 1,0,0\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.0;src=1;tuner=1,255,1,15,11362,h,dvbs2,auto,auto,auto,22000,auto;pids=none\r\n\
+         b=AS:5000\r\na=sendonly\r\n"
+    );
+}
+
+// Expected text: adapter.cpp:1548-1556 (stream transponder path joins PIDs
+// with ", ") and stream.cpp:145-149 (inactive, port 0, b=AS:5000).
+#[test]
+fn describe_inactive_stream() {
+    let mut manager = env();
+    manager.set_describe_options(describe_options());
+    let url = "?src=1&freq=11362&pol=h&sr=22000&msys=dvbs2&pids=0,16";
+    let id = setup(&mut manager, url);
+
+    let sdp = describe(&mut manager, Some(id), url);
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001000 0000001000 IN IP4 127.0.0.1\r\ns=SatIPServer:1 1,0,0\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.0;src=1;tuner=1,255,1,15,11362,h,dvbs2,auto,auto,auto,22000,auto;pids=0, 16\r\n\
+         b=AS:5000\r\na=inactive\r\n"
+    );
+}
+
+// Expected text: stream.cpp:117-133 lists every enabled stream with its
+// destination port; header fields are the injectable DescribeOptions.
+#[test]
+fn describe_multiple_streams() {
+    let mut manager = env();
+    manager.set_describe_options(DescribeOptions {
+        local_host: "192.168.1.5".to_owned(),
+        session_id: Some(1234),
+        session_version: Some(5678),
+        time: "0 0".to_owned(),
+    });
+    let first = setup(
+        &mut manager,
+        "?src=1&freq=11362&pol=h&sr=22000&msys=dvbs2&pids=0,16",
+    );
+    let second = setup(
+        &mut manager,
+        "?src=2&freq=12073&pol=v&sr=27500&msys=dvbs2&pids=0",
+    );
+    manager
+        .decode_transport(first, "RTP/AVP;unicast;client_port=5000-5001")
+        .expect("first transport failed");
+    manager
+        .decode_transport(second, "RTP/AVP;unicast;client_port=5002-5003")
+        .expect("second transport failed");
+
+    let sdp = describe(&mut manager, None, "rtsp://127.0.0.1/");
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000001234 0000005678 IN IP4 192.168.1.5\r\ns=SatIPServer:1 1,0,0\r\nt=0 0\r\n\
+         m=video 5000 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=1\r\n\
+         a=fmtp:33 ver=1.0;src=1;tuner=1,255,1,15,11362,h,dvbs2,auto,auto,auto,22000,auto;pids=0, 16\r\n\
+         a=inactive\r\n\
+         m=video 5002 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=2\r\n\
+         a=fmtp:33 ver=1.0;src=2;tuner=1,255,1,15,12073,v,dvbs2,auto,auto,auto,27500,auto;pids=0\r\n\
+         a=inactive\r\n"
+    );
+}
+
+// stream.cpp:109-115: `stream=` selects that stream only, while the header
+// still uses the socket's session id (stream.cpp:92).
+#[test]
+fn describe_stream_selection_uses_current_session_for_header() {
+    let mut manager = env();
+    manager.set_describe_options(DescribeOptions {
+        session_id: None,
+        session_version: None,
+        ..describe_options()
+    });
+    let first = setup(
+        &mut manager,
+        "?src=1&freq=11362&pol=h&sr=22000&msys=dvbs2&pids=0",
+    );
+    setup(
+        &mut manager,
+        "?src=2&freq=12073&pol=v&sr=27500&msys=dvbs2&pids=0",
+    );
+    manager.set_session_id(first, 4242);
+
+    let sdp = describe(&mut manager, Some(first), "rtsp://127.0.0.1/stream=2");
+    assert_eq!(
+        sdp,
+        "v=0\r\no=- 0000004242 0000004242 IN IP4 127.0.0.1\r\ns=SatIPServer:1 1,0,0\r\nt=0 0\r\n\
+         m=video 0 RTP/AVP 33\r\nc=IN IP4 0.0.0.0\r\na=control:stream=2\r\n\
+         a=fmtp:33 ver=1.0;src=2;tuner=1,255,1,15,12073,v,dvbs2,auto,auto,auto,27500,auto;pids=0\r\n\
+         b=AS:5000\r\na=inactive\r\n"
     );
 }

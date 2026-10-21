@@ -63,10 +63,17 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
             }
             "ro" => params.ro = rolloff(value),
             "mtype" => {
-                params.mtype = modulation(value);
-                params.mtype_specified = true;
+                if let Some(mtype) = modulation(value) {
+                    params.mtype = mtype;
+                    params.mtype_specified = true;
+                }
             }
-            "fec" => params.fec = code_rate(value),
+            "fec" => {
+                if let Some(fec) = code_rate(value) {
+                    params.fec = fec;
+                    params.fec_specified = true;
+                }
+            }
             "plts" => params.plts = pilot(value),
             "gi" => params.gi = guard_interval(value),
             "tmode" => params.tmode = transmission_mode(value),
@@ -123,6 +130,7 @@ fn reset_tuning(params: &mut TuneParams) {
     params.src = 0;
     params.src_specified = false;
     params.fec = 0;
+    params.fec_specified = false;
     params.mtype = 0;
     params.mtype_specified = false;
     params.plts = None;
@@ -215,45 +223,47 @@ fn rolloff(value: &str) -> Option<u8> {
     }
 }
 
-fn modulation(value: &str) -> u32 {
+fn modulation(value: &str) -> Option<u32> {
     match value.to_ascii_lowercase().as_str() {
-        "qpsk" => 0,
-        "16qam" => 1,
-        "32qam" => 2,
-        "64qam" => 3,
-        "128qam" => 4,
-        "256qam" => 5,
-        "8vsb" => 7,
-        "16vsb" => 8,
-        "8psk" => 9,
-        "16apsk" => 10,
-        "32apsk" => 11,
-        "dqpsk" => 12,
-        "qam_4_nr" => 13,
-        "64apsk" => 14,
-        "128apsk" => 15,
-        "256apsk" => 16,
-        _ => 0,
+        "qpsk" => Some(0),
+        "16qam" => Some(1),
+        "32qam" => Some(2),
+        "64qam" => Some(3),
+        "128qam" => Some(4),
+        "256qam" => Some(5),
+        "auto" => Some(6),
+        "8vsb" => Some(7),
+        "16vsb" => Some(8),
+        "8psk" => Some(9),
+        "16apsk" => Some(10),
+        "32apsk" => Some(11),
+        "dqpsk" => Some(12),
+        "qam_4_nr" => Some(13),
+        "64apsk" => Some(14),
+        "128apsk" => Some(15),
+        "256apsk" => Some(16),
+        _ => None,
     }
 }
 
-fn code_rate(value: &str) -> u8 {
+fn code_rate(value: &str) -> Option<u8> {
     match value.to_ascii_lowercase().as_str() {
-        "none" => 0,
-        "12" => 1,
-        "23" => 2,
-        "34" => 3,
-        "45" => 4,
-        "56" => 5,
-        "67" => 6,
-        "78" => 7,
-        "89" => 8,
-        "35" => 10,
-        "910" => 11,
-        "25" => 12,
-        "14" => 13,
-        "13" => 14,
-        _ => 0,
+        "none" => Some(0),
+        "12" => Some(1),
+        "23" => Some(2),
+        "34" => Some(3),
+        "45" => Some(4),
+        "56" => Some(5),
+        "67" => Some(6),
+        "78" => Some(7),
+        "89" => Some(8),
+        "auto" => Some(9),
+        "35" => Some(10),
+        "910" => Some(11),
+        "25" => Some(12),
+        "14" => Some(13),
+        "13" => Some(14),
+        _ => None,
     }
 }
 

@@ -689,6 +689,19 @@ impl Scheduler {
         }
     }
 
+    /// Active PIDs belonging to `sid`, in table order (C++ `get_stream_pids`).
+    pub fn stream_pids(&self, aid: i32, sid: StreamId) -> Vec<i32> {
+        let Some(adapter) = self.enabled_adapter(aid) else {
+            return Vec::new();
+        };
+        adapter
+            .pids
+            .iter()
+            .filter(|entry| entry.state == PidState::Active && entry.sids.contains(&sid))
+            .map(|entry| entry.pid)
+            .collect()
+    }
+
     /// Adds `pid` to `aid`'s table for `sid`; `false` when the table is full.
     pub fn mark_pid_add(&mut self, aid: i32, sid: StreamId, pid: i32) -> bool {
         if !(0..=PID_ALL).contains(&pid) {

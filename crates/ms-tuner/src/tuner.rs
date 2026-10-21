@@ -13,7 +13,6 @@ pub const PID_ALL: u16 = 8192;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeliverySystem {
     /// DVB-S.
-    #[default]
     DvbS,
     /// DVB-S2.
     DvbS2,
@@ -26,6 +25,7 @@ pub enum DeliverySystem {
     /// DVB-C2.
     DvbC2,
     /// Undefined delivery system (`SYS_UNDEFINED`).
+    #[default]
     Undefined,
     /// Any other `fe_delivery_system_t` value.
     Other(i32),
@@ -35,7 +35,6 @@ pub enum DeliverySystem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Polarization {
     /// Horizontal.
-    #[default]
     Horizontal,
     /// Vertical.
     Vertical,
@@ -44,6 +43,7 @@ pub enum Polarization {
     /// Circular right.
     Right,
     /// No polarisation specified.
+    #[default]
     None,
 }
 
@@ -64,6 +64,8 @@ pub struct TuneParams {
     pub src_specified: bool,
     /// DVB code rate (`fe_code_rate_t`).
     pub fec: u8,
+    /// Whether `fec` was present, like the C++ optional field.
+    pub fec_specified: bool,
     /// Modulation (`fe_modulation_t`).
     pub mtype: u32,
     /// Whether `mtype` was present, like the C++ optional field.
