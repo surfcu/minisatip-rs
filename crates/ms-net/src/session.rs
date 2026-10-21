@@ -7,7 +7,7 @@ use ms_sched::{MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
 use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crate::bandwidth::Bandwidth;
 use crate::handler::{
@@ -21,7 +21,10 @@ use crate::rtsp::{
 use crate::satip::{merge_satip_url, parse_satip_url_new};
 #[cfg(feature = "srt")]
 use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener};
-use crate::web::{AdapterState, RuntimeState, StreamState, WebService, WebSnapshot};
+use crate::web::{
+    ADAPTER_DVB, AdapterState, GUARD_INTERVAL_AUTO, QAM_AUTO, RuntimeState, StreamState,
+    WebService, WebSnapshot,
+};
 
 const STREAM_SLOTS: usize = MAX_STREAMS as usize;
 /// Extra time a client has to respond before the stream is closed
@@ -31,11 +34,6 @@ pub const TIMEOUT_GRACE_MS: i64 = 10_000;
 pub const TIMEOUT_FORCED: u32 = 1;
 /// Default session timeout (`opts.timeout_sec`).
 pub const DEFAULT_TIMEOUT_MS: u32 = 30_000;
-/// Linux DVB `QAM_AUTO`, the `ad_mtype` default (adapter.cpp:2400).
-const QAM_AUTO: u32 = 6;
-/// Linux DVB `GUARD_INTERVAL_AUTO`, the `ad_gi` default (adapter.cpp:2410).
-const GUARD_INTERVAL_AUTO: i32 = 4;
-
 /// Time source for session timeouts; tests install [`ManualClock`].
 pub trait Clock: Send + Sync {
     /// Milliseconds since an arbitrary origin.
@@ -1069,6 +1067,7 @@ impl SessionManager {
         let mut snapshot = WebSnapshot::new();
         snapshot.adapters = vec![AdapterState::default(); ms_sched::MAX_ADAPTERS];
         for aid in 0..ms_sched::MAX_ADAPTERS {
+            snapshot.adapters[aid].disabled = self.sched.is_disabled(aid);
             let Some(adapter) = self.sched.adapter(aid) else {
                 continue;
             };
@@ -1078,6 +1077,7 @@ impl SessionManager {
                 present: true,
                 enabled: adapter.config.enabled,
                 disabled: self.sched.is_disabled(aid),
+                kind: ADAPTER_DVB,
                 systems: adapter
                     .config
                     .sys
@@ -1092,20 +1092,17 @@ impl SessionManager {
                 bw: params.bw.unwrap_or(8_000_000),
                 stream: params.plp.unwrap_or(-1),
                 fe: params.fe.unwrap_or(0),
-                master: adapter.master_sid & 0xff,
-                sid_count: adapter.sid_cnt & 0xff,
+                master: adapter.master_sid,
+                sid_count: adapter.sid_cnt,
                 sys: if tuned {
                     delivery_system_code(params.msys)
                 } else {
                     0
                 },
                 // adapter.cpp:2399-2410 uses QAM_AUTO/GUARD_INTERVAL_AUTO
-                // defaults and exposes `ds` as ad_plp.
-                mtype: if params.mtype_specified {
-                    params.mtype
-                } else {
-                    QAM_AUTO
-                },
+                // defaults and exposes `ds` as ad_plp; copy_dvb_parameters
+                // keeps the DVB-S/S2 defaults for an unspecified mtype.
+                mtype: modulation_code(params, tuned),
                 t2id: params.t2id.unwrap_or(0),
                 c2tft: params.c2tft.unwrap_or(0),
                 plp: params.ds.unwrap_or(-1),
@@ -1139,7 +1136,7 @@ impl SessionManager {
                 ..StreamState::default()
             };
         }
-        snapshot.runtime = self.web_runtime.clone();
+        snapshot.runtime = self.web_runtime.at(SystemTime::now());
         self.bandwidth.calculate();
         snapshot.bandwidth = self.bandwidth.snapshot();
         snapshot
@@ -1274,6 +1271,17 @@ fn polarization_code(pol: Polarization) -> i32 {
         Polarization::Right => 3,
         Polarization::Left => 4,
         Polarization::None => 0,
+    }
+}
+
+/// `tp.mtype` after `copy_dvb_parameters` (dvb.cpp:456-460), or the
+/// `QAM_AUTO` getter default when unset (adapter.cpp:2397).
+fn modulation_code(params: &TuneParams, tuned: bool) -> u32 {
+    match (params.mtype_specified, tuned, params.msys) {
+        (true, _, _) => params.mtype,
+        (false, true, DeliverySystem::DvbS2) => 9,
+        (false, true, DeliverySystem::DvbS) => 0,
+        _ => QAM_AUTO as u32,
     }
 }
 

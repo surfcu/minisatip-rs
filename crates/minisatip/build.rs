@@ -1,7 +1,9 @@
-//! Stamps the build date and time used by `datetime_compile`.
+//! Stamps the build date and time used by `datetime_compile`/`minisatip_sym`.
 //!
 //! C++ composes the value from the compiler's `__DATE__`/`__TIME__`
 //! (minisatip.cpp:1149-1150), so it changes whenever the binary is compiled.
+//! `MINISATIP_DATETIME_COMPILE` and `MINISATIP_BUILD_STAMP` carry the same
+//! value under the names used by the runtime and the symbol table.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,4 +46,6 @@ fn main() {
     );
     // `__DATE__ | __TIME__` as assembled in minisatip.cpp:1149-1150.
     println!("cargo:rustc-env=MINISATIP_DATETIME_COMPILE={date} | {time}");
+    // Same value for the `minisatip_sym` symbol table.
+    println!("cargo:rustc-env=MINISATIP_BUILD_STAMP={date} | {time}");
 }

@@ -2,6 +2,7 @@
 //!
 //! The socket core is owned by [`socket::SocketTable`]; there is no global table.
 
+pub mod api;
 pub mod bandwidth;
 pub mod bind;
 pub mod dataplane;

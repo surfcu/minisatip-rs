@@ -27,7 +27,7 @@ use ms_net::socket::DEFAULT_FIFO_SIZE;
 use ms_net::ssdp::{
     ANNOUNCE_INTERVAL_MS, SharedIdentity, SsdpConfig, SsdpServer, UdpSsdpIo, read_boot_id, uuid4,
 };
-use ms_net::web::{RuntimeState, WebConfig, WebService};
+use ms_net::web::{ApiFeatures, RuntimeState, WebConfig, WebService, format_asctime};
 use ms_sched::{AdapterConfig, AdapterTuner, MAX_ADAPTERS, Scheduler, TuneError};
 use ms_tuner::{DeliverySystem, FileReplayConfig, FileReplayTuner, Pacing, PidSet, TuneParams};
 
@@ -187,17 +187,21 @@ impl Runtime {
             force_sadapter: opts.force_sadapter,
             force_tadapter: opts.force_tadapter,
             force_cadapter: opts.force_cadapter,
+            features: ApiFeatures::default(),
         })
         .with_identity(identity);
         session.set_web(web);
+        // minisatip.cpp:1149-1166; read_http refreshes the current time.
+        let start = SystemTime::now();
         session.set_web_runtime(RuntimeState {
             datetime_compile: env!("MINISATIP_DATETIME_COMPILE").to_owned(),
-            datetime_start: sys::asctime_now(),
-            datetime_current: sys::asctime_now(),
-            time_running: "00:00:00".to_owned(),
+            datetime_start: format_asctime(start),
+            datetime_current: " ".to_owned(),
+            time_running: "0".to_owned(),
             run_user: sys::run_user(),
             run_pid: i32::try_from(std::process::id()).unwrap_or(0),
             command_line: opts.command_line.clone(),
+            start_time: Some(start),
         });
 
         #[cfg(feature = "srt")]
