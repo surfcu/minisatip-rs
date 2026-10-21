@@ -70,10 +70,10 @@ pub fn run_once(
     norm.add_text(&workdir.display().to_string(), "<WORKDIR>");
     norm.add_text(&binary.path.display().to_string(), "<BINARY>");
     norm.add_text(&options.html.display().to_string(), "<HTML>");
-    norm.add_port(server.rtsp_port, "RTSP");
-    norm.add_port(server.http_port, "HTTP");
+    norm.add_port(server.rtsp_port, "RTSP")?;
+    norm.add_port(server.http_port, "HTTP")?;
     for offset in 0..RTP_RANGE {
-        norm.add_port(server.start_rtp + offset, &format!("SRTP+{offset}"));
+        norm.add_port(server.start_rtp + offset, &format!("SRTP+{offset}"))?;
     }
     let mut context = Context {
         server: &server,
@@ -109,10 +109,11 @@ impl Context<'_> {
             }
             Step::HttpStream(stream) => self.http_stream(number, stream),
             Step::Udp(name) => {
-                let pair = UdpPair::bind().map_err(|error| error.to_string())?;
-                self.norm.add_port(pair.rtp_port, &format!("{name}.rtp"));
+                // Client ports must not reuse a number that already has a placeholder.
+                let pair = UdpPair::bind(&self.norm.ports()).map_err(|error| error.to_string())?;
+                self.norm.add_port(pair.rtp_port, &format!("{name}.rtp"))?;
                 self.norm
-                    .add_port(pair.rtp_port + 1, &format!("{name}.rtcp"));
+                    .add_port(pair.rtp_port + 1, &format!("{name}.rtcp"))?;
                 self.udp.insert(name.clone(), pair);
                 Ok(())
             }
