@@ -174,6 +174,15 @@ impl Adapter {
     pub fn set_tuner(&mut self, tuner: Box<dyn AdapterTuner>) {
         self.tuner = tuner;
     }
+
+    /// PIDs currently active or about to be activated on this adapter.
+    pub fn active_pids(&self) -> Vec<i32> {
+        self.pids
+            .iter()
+            .filter(|entry| matches!(entry.state, PidState::Active | PidState::New))
+            .map(|entry| entry.pid)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -265,6 +274,11 @@ impl Scheduler {
         if aid < MAX_ADAPTERS {
             self.disabled[aid] = disabled;
         }
+    }
+
+    /// Whether `aid` is disabled for allocation.
+    pub fn is_disabled(&self, aid: usize) -> bool {
+        self.disabled.get(aid).copied().unwrap_or(false)
     }
 
     fn enabled_adapter(&self, aid: i32) -> Option<&Adapter> {

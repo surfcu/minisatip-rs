@@ -97,6 +97,37 @@ pub struct HttpResource {
     pub body: Vec<u8>,
 }
 
+/// A fully formed HTTP response body and headers produced by a backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRoute {
+    /// Status code.
+    pub status: u16,
+    /// Raw header lines without the trailing CRLF.
+    pub headers: Vec<String>,
+    /// Response body.
+    pub body: Vec<u8>,
+    /// Whether a HEAD request still receives `body` (C++ generated pages do).
+    pub body_on_head: bool,
+}
+
+impl HttpRoute {
+    /// Creates a route with no headers.
+    pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.into(),
+            body_on_head: false,
+        }
+    }
+
+    /// Adds raw header lines.
+    pub fn with_headers(mut self, headers: Vec<String>) -> Self {
+        self.headers = headers;
+        self
+    }
+}
+
 /// Session, stream and adapter decisions used by the RTSP handler.
 pub trait StreamBackend {
     /// Resolves a `Session` header id to a live stream.
@@ -161,6 +192,11 @@ pub trait StreamBackend {
 
     /// Returns a static HTTP resource.
     fn http_resource(&mut self, _uri: &str) -> Option<HttpResource> {
+        None
+    }
+
+    /// Serves a generated or file-backed HTTP resource, including raw headers.
+    fn http_route(&mut self, _request: &Request) -> Option<HttpRoute> {
         None
     }
 }
@@ -413,6 +449,14 @@ pub fn handle_http<B: StreamBackend>(
     }
     if request.is_method("GET") && request.uri.contains("/?") {
         return handle_rtsp(ctx, request);
+    }
+
+    if let Some(route) = ctx.backend.http_route(request) {
+        let mut response = base_response(ctx, route.status).with_headers(route.headers);
+        if route.body_on_head || !request.is_method("HEAD") {
+            response = response.with_body(route.body);
+        }
+        return Some(response);
     }
 
     let Some(resource) = ctx.backend.http_resource(&request.uri) else {

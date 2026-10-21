@@ -27,7 +27,7 @@ fn main() {
                 ..
             }
         ) {
-            print!("{}", ms_config::USAGE);
+            print!("{}", ms_config::usage_text());
         }
         std::process::exit(1);
     }
@@ -39,7 +39,7 @@ fn main() {
     }
     if opts.help {
         // usage() prints the banner and help text, then exits with status 1.
-        print!("{}", ms_config::USAGE);
+        print!("{}", ms_config::usage_text());
         std::process::exit(1);
     }
     // Server startup lands with the rest of M3.
