@@ -100,10 +100,10 @@ pub struct AdapterState {
     /// diSEqC position (`ad_pos`).
     pub pos: i32,
     /// Frequency in kHz (`ad_freq` is MHz).
-    pub freq: u32,
+    pub freq: i32,
     /// `ad_pol` value used by the web UI.
     pub pol: i32,
-    /// Symbol rate in kSym/s.
+    /// Symbol rate in sym/s (`ad_sr` is kSym/s).
     pub sr: u32,
     /// Bandwidth in Hz.
     pub bw: u32,
@@ -399,7 +399,7 @@ impl WebService {
         json.int_array("ad_pos", (0..MAX_ADAPTERS).map(|i| adapters(i).pos));
         json.int_array(
             "ad_freq",
-            (0..MAX_ADAPTERS).map(|i| (adapters(i).freq / 1000) as i32),
+            (0..MAX_ADAPTERS).map(|i| symbol_scaled_1000(adapters(i).freq)),
         );
         json.int_array(
             "ad_strength",
@@ -417,11 +417,11 @@ impl WebService {
         json.int_array("ad_pol", (0..MAX_ADAPTERS).map(|i| adapters(i).pol));
         json.int_array(
             "ad_sr",
-            (0..MAX_ADAPTERS).map(|i| (adapters(i).sr / 1000) as i32),
+            (0..MAX_ADAPTERS).map(|i| symbol_scaled_1000_u(adapters(i).sr)),
         );
         json.int_array(
             "ad_bw",
-            (0..MAX_ADAPTERS).map(|i| (adapters(i).bw / 1000) as i32),
+            (0..MAX_ADAPTERS).map(|i| symbol_scaled_1000_u(adapters(i).bw)),
         );
         json.int_array("ad_stream", (0..MAX_ADAPTERS).map(|i| adapters(i).stream));
         json.int_array("ad_fe", (0..MAX_ADAPTERS).map(|i| adapters(i).fe));
@@ -685,6 +685,20 @@ impl HeadBody for HttpRoute {
         self.body_on_head = true;
         self
     }
+}
+
+/// Reproduces the C++ symbol table's `value * (1.0f / 1000.0f)` cast to `int`.
+///
+/// `snprintf_pointer` multiplies the integer getter result by a `float`
+/// multiplier before truncating, which can round to the next MHz/kSym/s for
+/// values close to a boundary.
+fn symbol_scaled_1000(value: i32) -> i32 {
+    ((value as f32) * (1.0_f32 / 1000.0_f32)) as i32
+}
+
+/// [`symbol_scaled_1000`] for raw `u32` symbol values.
+fn symbol_scaled_1000_u(value: u32) -> i32 {
+    ((value as f32) * (1.0_f32 / 1000.0_f32)) as i32
 }
 
 fn streams_or_default<'a>(

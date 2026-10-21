@@ -290,10 +290,10 @@ fn rtcp_interleaved_uses_channel_one() {
 
 fn dvbs2_params() -> TuneParams {
     TuneParams {
-        freq: 11362,
+        freq: 11_362_000,
         pol: Polarization::Horizontal,
         msys: DeliverySystem::DvbS2,
-        sr: 22000,
+        sr: 22_000_000,
         src: 1,
         fec: 2,
         mtype: 9,
@@ -318,6 +318,32 @@ fn describe_dvbs2() {
         describe_adapter(&input),
         "ver=1.0;src=1;tuner=1,200,1,15,11362,h,dvbs2,8psk,on,0.35,22000,23;pids=0,16,17"
     );
+}
+
+#[test]
+fn rtcp_ses1_description_uses_khz_frequency() {
+    let mut tune = dvbs2_params();
+    tune.freq = 11_361_750;
+    let pids = PidSet::from_pids([0, 16]);
+    let input = DescribeInput {
+        adapter_id: 0,
+        tune: &tune,
+        signal: Some(SignalStatus::locked(200, 240)),
+        use_adapter: true,
+        pids: &pids,
+    };
+    let desc = describe_adapter(&input);
+    assert_eq!(
+        desc,
+        "ver=1.0;src=1;tuner=1,200,1,15,11361,h,dvbs2,8psk,on,0.35,22000,23;pids=0,16"
+    );
+
+    let packet = build_rtcp(&sample_info(), &desc, false);
+    assert_eq!(
+        usize::from(u16::from_be_bytes([packet[66], packet[67]])),
+        desc.len()
+    );
+    assert_eq!(&packet[68..68 + desc.len()], desc.as_bytes());
 }
 
 #[test]
@@ -365,7 +391,7 @@ fn describe_undefined_and_stream_pids() {
 #[test]
 fn describe_dvbt_and_dvbc() {
     let tune = TuneParams {
-        freq: 506,
+        freq: 506_000,
         msys: DeliverySystem::DvbT2,
         mtype: 5,
         bw: Some(8_000_000),
@@ -389,10 +415,10 @@ fn describe_dvbt_and_dvbc() {
     );
 
     let tune = TuneParams {
-        freq: 346,
+        freq: 346_000,
         msys: DeliverySystem::DvbC,
         mtype: 3,
-        sr: 6900,
+        sr: 6_900_000,
         specinv: Some(0),
         ..TuneParams::default()
     };

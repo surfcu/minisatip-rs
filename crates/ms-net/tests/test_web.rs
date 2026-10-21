@@ -352,6 +352,26 @@ fn state_json_uses_cpp_symbol_order_and_values() {
 }
 
 #[test]
+fn state_json_scales_symbols_through_cpp_float_multiplier() {
+    let service = WebService::new(config(PathBuf::from("html")));
+    let mut snapshot = WebSnapshot::new();
+    let mut tuned = adapter(&[DeliverySystem::DvbS2]);
+    // snprintf_pointer casts `(int)(value * 1.0f / 1000.0f)`, which rounds
+    // these up; plain integer division would report one less.
+    tuned.freq = 11_361_999;
+    tuned.sr = 22_000_999;
+    tuned.bw = 22_000_999;
+    snapshot.adapters = vec![tuned];
+
+    let json = service.state_json(&snapshot);
+    assert!(json.contains("\"ad_freq\":[11362,0,0,"));
+    assert!(json.contains("\"ad_sr\":[22001,0,0,"));
+    // Absent adapter slots keep the DVB-T default bandwidth (8 MHz), so only
+    // the first element is checked here.
+    assert!(json.contains("\"ad_bw\":[22001,"));
+}
+
+#[test]
 fn handler_serves_generated_and_static_resources() {
     let root = temp_dir();
     fs::write(root.join("status.html"), b"status").expect("write");

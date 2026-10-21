@@ -146,10 +146,10 @@ fn file_replay_to_udp_routes_only_subscribed_pids() {
     };
     let adapter = AdapterHandle::spawn(Box::new(tuner), config).unwrap();
     adapter.tune(TuneParams {
-        freq: 11362,
+        freq: 11_362_000,
         pol: Polarization::Horizontal,
         msys: DeliverySystem::DvbS2,
-        sr: 22000,
+        sr: 22_000_000,
         src: 1,
         ..TuneParams::default()
     });
