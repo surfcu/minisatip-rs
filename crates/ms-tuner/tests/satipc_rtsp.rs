@@ -4,7 +4,7 @@
 mod common;
 
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -43,7 +43,8 @@ tuner=1,215,1,12,0,0,0,0\r\n";
 const OPTIONS_OK: &str = "RTSP/1.0 200 OK\r\nCSeq: 9\r\n\
 Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n";
 
-// The socket tests count descriptors, so the tests of this file run one at a time.
+// The socket tests bind fixed RTP/RTCP ports, so the tests of this file run
+// one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -495,8 +496,29 @@ fn listen_on_loopback() -> (TcpListener, u16) {
     (listener, port)
 }
 
-fn count_open_fds() -> i64 {
-    std::fs::read_dir("/proc/self/fd").map_or(-1, |dir| dir.count() as i64)
+/// Asserts that the exact descriptor `fd` is closed, so a leaked socket is
+/// detected without counting every descriptor of the process (other test
+/// threads open and close sockets concurrently).
+#[allow(unsafe_code)]
+fn assert_fd_closed(fd: std::os::fd::RawFd, what: &str) {
+    // SAFETY: F_GETFD reads descriptor flags and takes no pointer argument.
+    let result = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert_eq!(result, -1, "{what}: fd {fd} must be closed");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF),
+        "{what}: fd {fd} must be closed"
+    );
+}
+
+/// The peer of a closed socket reads EOF; a leaked descriptor keeps it open
+/// until the read timeout expires.
+fn assert_peer_eof(peer: &mut TcpStream, what: &str) {
+    peer.set_nonblocking(false).expect("blocking");
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    let mut byte = [0u8; 1];
+    assert_eq!(peer.read(&mut byte).expect("read"), 0, "{what}");
 }
 
 // Occupies the RTP port without reuse so the setup bind fails.
@@ -698,24 +720,24 @@ fn test_satipc_receive_buffer_applied_to_tcp_media() {
 fn test_satipc_open_device_cleans_rtsp_on_rtp_failure() {
     let _serial = serial();
     let aid = 3;
-    let (_srv, port) = listen_on_loopback();
+    let (srv, port) = listen_on_loopback();
+    // accept() runs after open_device, so a missing connection must fail the
+    // test rather than block forever.
+    srv.set_nonblocking(true).expect("nonblocking");
     let start_rtp = 5500;
     let listen_udp = start_rtp + 1000 + aid as u16 * 2;
     let _block = block_udp(listen_udp);
     let mut d = Driver::new(&config(aid, "127.0.0.1", port, start_rtp));
 
-    let before = count_open_fds();
     let rv = d.open_device();
-    let after = count_open_fds();
     assert_ne!(rv, 0, "RTP setup must fail on the occupied port");
     assert!(
         d.rtsp.is_none() && !d.client.rtsp_connected,
         "failed open must drop the RTSP socket"
     );
-    assert!(
-        before >= 0 && after == before,
-        "failed open must not leak fds"
-    );
+    // The RTSP fd opened for the failed attempt is released: its peer sees EOF.
+    let (mut peer, _) = srv.accept().expect("accept");
+    assert_peer_eof(&mut peer, "failed open must not leak fds");
     assert_nothing_tracked(&d);
 }
 
@@ -731,18 +753,15 @@ fn test_satipc_drop_raced_socket() {
     let (mut peer, _) = srv.accept().expect("accept");
     d.client.rtsp_socket_closed = false;
     // tests/test_satipc_rtsp.cpp:710: the expected fd must be closed.
-    let before = count_open_fds();
+    let rtsp_fd = d.rtsp.as_ref().expect("rtsp").as_raw_fd();
     d.drop_rtsp_socket();
     assert!(
         d.rtsp.is_none() && !d.client.rtsp_connected,
         "fields must reset"
     );
     assert!(d.client.rtsp_socket_closed, "flag must return");
-    assert_eq!(count_open_fds(), before - 1, "exactly the RTSP fd closes");
-    peer.set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("timeout");
-    let mut byte = [0u8; 1];
-    assert_eq!(peer.read(&mut byte).expect("read"), 0, "fd must be closed");
+    assert_fd_closed(rtsp_fd, "exactly the RTSP fd closes");
+    assert_peer_eof(&mut peer, "fd must be closed");
 
     // TCP: the media socket is the RTSP socket and is released as well.
     let mut d = Driver::new(&config(8, "127.0.0.1", port, 5500));
@@ -751,21 +770,11 @@ fn test_satipc_drop_raced_socket() {
     let (mut peer, _) = srv.accept().expect("accept");
     assert!(d.client.data_open);
     // tests/test_satipc_rtsp.cpp:748: the TCP dvr fd must close.
-    let before = count_open_fds();
+    let dvr_fd = d.rtsp.as_ref().expect("rtsp").as_raw_fd();
     d.drop_rtsp_socket();
     assert!(!d.client.data_open, "TCP dvr must reset");
-    assert_eq!(
-        count_open_fds(),
-        before - 1,
-        "the TCP media fd must be released"
-    );
-    peer.set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("timeout");
-    assert_eq!(
-        peer.read(&mut byte).expect("read"),
-        0,
-        "TCP dvr fd must close"
-    );
+    assert_fd_closed(dvr_fd, "the TCP media fd must be released");
+    assert_peer_eof(&mut peer, "TCP dvr fd must close");
 }
 
 // Ported from tests/test_satipc_rtsp.cpp:800
@@ -797,19 +806,22 @@ fn test_rtsp_timeout_reopen_keeps_live_adapter() {
 fn test_satipc_open_device_full_table_closes_untracked() {
     let _serial = serial();
     let aid = 4;
-    let (_srv, port) = listen_on_loopback();
+    let (srv, port) = listen_on_loopback();
+    // accept() runs after open_device, so a missing connection must fail the
+    // test rather than block forever.
+    srv.set_nonblocking(true).expect("nonblocking");
     let start_rtp = 5500;
     let listen_udp = start_rtp + 1000 + aid as u16 * 2;
     let block4 = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, listen_udp)))
         .unwrap_or_else(|error| panic!("cannot occupy UDP port {listen_udp}: {error}"));
     let mut d = Driver::new(&config(aid, "127.0.0.1", port, start_rtp));
 
-    let before = count_open_fds();
     let rv = d.open_device();
-    let after = count_open_fds();
     assert_ne!(rv, 0, "RTP setup must fail on the occupied port");
     assert!(d.rtsp.is_none(), "untracked fd must be released");
-    assert!(before >= 0 && after == before, "no fd may leak");
+    // The RTSP fd opened for the failed attempt is released: its peer sees EOF.
+    let (mut peer, _) = srv.accept().expect("accept");
+    assert_peer_eof(&mut peer, "no fd may leak");
     assert_nothing_tracked(&d);
     drop(block4);
 }
