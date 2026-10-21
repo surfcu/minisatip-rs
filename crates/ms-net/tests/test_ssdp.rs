@@ -6,9 +6,10 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ms_net::ssdp::{
-    SsdpConfig, SsdpIo, SsdpServer, device_id_conflict, notify_messages, read_boot_id,
-    search_reply, st_matches,
+    SharedIdentity, SsdpConfig, SsdpIo, SsdpServer, device_id_conflict, notify_messages,
+    read_boot_id, search_reply, st_matches,
 };
+use ms_net::web::{WebConfig, WebService, WebSnapshot};
 
 const UUID: &str = "1234-5678";
 const DATE: &str = "Wed, 21 Oct 2026 10:00:00 GMT";
@@ -393,5 +394,49 @@ fn boot_id_file_is_incremented_and_device_id_kept() {
     let mut uuid = String::new();
     let (bootid, device_id) = read_boot_id(&dir, 5, &mut uuid).expect("read boot id");
     assert_eq!((bootid, device_id), (2, 5));
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn device_id_conflict_reaches_the_web_endpoints() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("msnet-ssdp-web-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&dir).expect("cache dir");
+    // readBootID adopts the stored identity; the conflict raises DEVICEID to it.
+    fs::write(dir.join("bootid"), "0 9 old-uuid").expect("bootid file");
+
+    let mut config = config();
+    config.cache_dir = Some(dir.clone());
+    let identity = SharedIdentity::new(config.uuid.clone(), config.device_id, config.bootid);
+    let mut server = SsdpServer::new(FakeIo::default(), config).with_identity(identity.clone());
+    server.announce(0).expect("announce");
+    let action = server
+        .handle(&search(2, "ssdp:all"), "10.0.0.9", 40000, DATE, 100)
+        .expect("handle");
+    assert!(action.device_id_conflict);
+
+    // minisatip.cpp:1837-1844: the new values are the process-wide globals.
+    let snapshot = identity.snapshot();
+    assert_eq!(snapshot.device_id, 9);
+    assert_eq!(snapshot.bootid, 1);
+    assert_eq!(snapshot.uuid, "old-uuid");
+
+    let web = WebService::new(WebConfig {
+        uuid: UUID.to_owned(),
+        device_id: 2,
+        bootid: 3,
+        ..WebConfig::default()
+    })
+    .with_identity(identity);
+    let state = web.state_json(&WebSnapshot::new());
+    assert!(state.contains("\"deviceid\":9"), "{state}");
+    assert!(state.contains("\"bootid\":1"), "{state}");
+    assert!(state.contains("\"uuid\":\"old-uuid\""), "{state}");
+    // desc.xml prints the UUID, which readBootID also replaced.
+    assert!(web.desc_xml(&WebSnapshot::new()).contains("uuid:old-uuid"));
+
     fs::remove_dir_all(dir).ok();
 }
