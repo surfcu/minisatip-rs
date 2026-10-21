@@ -22,6 +22,9 @@ dependencies = [
 [[package]]
 name = "ms-ca"
 version = "0.1.0"
+dependencies = [
+ "ms-ts",
+]
 
 [[package]]
 name = "ms-ca-drivers"
