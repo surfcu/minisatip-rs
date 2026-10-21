@@ -1,10 +1,12 @@
 //! Launching a server binary (C++ or Rust) on free local ports.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +39,7 @@ pub struct Server {
     pub http_port: u16,
     pub start_rtp: u16,
     pub log: PathBuf,
+    _rtp_lease: PortLease,
 }
 
 impl Drop for Server {
@@ -64,7 +67,8 @@ impl Server {
         fs::create_dir_all(&cache)?;
         let (rtsp_port, http_port) = free_tcp_pair()?;
         // TCP and UDP numbers can coincide; keep them apart so placeholders are unique.
-        let start_rtp = free_udp_range(RTP_RANGE, &[rtsp_port, http_port])?;
+        let rtp_lease = free_udp_range(RTP_RANGE, &[rtsp_port, http_port])?;
+        let start_rtp = rtp_lease.base();
         let log = launch.workdir.join(format!("{}.log", binary.label));
         let log_file = fs::File::create(&log)?;
         let mut args: Vec<String> = vec![
@@ -127,6 +131,7 @@ impl Server {
             rtsp_port,
             http_port,
             start_rtp,
+            _rtp_lease: rtp_lease,
             log,
         })
     }
@@ -164,9 +169,44 @@ fn free_tcp_pair() -> io::Result<(u16, u16)> {
     Ok((first.local_addr()?.port(), second.local_addr()?.port()))
 }
 
-/// A port `p` such that UDP `p..p+count` are all free right now and contain
-/// none of the `avoid` port numbers.
-pub fn free_udp_range(count: u16, avoid: &[u16]) -> io::Result<u16> {
+/// UDP ports leased to a server RTP range or a client pair in this process.
+static LEASED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+
+/// Exclusive claim on UDP `base..base+count` among parallel runs; released on drop.
+#[derive(Debug)]
+pub struct PortLease {
+    base: u16,
+    count: u16,
+}
+
+impl PortLease {
+    fn try_new(base: u16, count: u16) -> Option<Self> {
+        let mut leased = LEASED.lock().unwrap_or_else(PoisonError::into_inner);
+        let ports = base..base.checked_add(count)?;
+        if leased.range(ports.clone()).next().is_some() {
+            return None;
+        }
+        leased.extend(ports);
+        Some(Self { base, count })
+    }
+
+    pub fn base(&self) -> u16 {
+        self.base
+    }
+}
+
+impl Drop for PortLease {
+    fn drop(&mut self) {
+        let mut leased = LEASED.lock().unwrap_or_else(PoisonError::into_inner);
+        for port in self.base..self.base + self.count {
+            leased.remove(&port);
+        }
+    }
+}
+
+/// Leases UDP `p..p+count`, all free right now, containing none of the `avoid`
+/// ports and no port leased by another run (A and B run in parallel).
+pub fn free_udp_range(count: u16, avoid: &[u16]) -> io::Result<PortLease> {
     for _ in 0..200 {
         let probe = UdpSocket::bind(("127.0.0.1", 0))?;
         let base = probe.local_addr()?.port() & !1;
@@ -174,11 +214,14 @@ pub fn free_udp_range(count: u16, avoid: &[u16]) -> io::Result<u16> {
         if base < 1024 || base.checked_add(count).is_none() || overlaps(base, count, avoid) {
             continue;
         }
+        let Some(lease) = PortLease::try_new(base, count) else {
+            continue;
+        };
         let held: Vec<_> = (base..base + count)
             .map_while(|port| UdpSocket::bind(("127.0.0.1", port)).ok())
             .collect();
         if held.len() == usize::from(count) {
-            return Ok(base);
+            return Ok(lease);
         }
     }
     Err(io::Error::new(
@@ -205,6 +248,32 @@ mod tests {
     }
 
     #[test]
+    fn leases_are_exclusive_until_dropped() {
+        // Below the ephemeral range, so leases from parallel tests never meet these.
+        let first = PortLease::try_new(1100, 4).expect("free");
+        assert!(PortLease::try_new(1102, 4).is_none());
+        let second = PortLease::try_new(1104, 2).expect("adjacent range");
+        drop(first);
+        let third = PortLease::try_new(1102, 2).expect("released");
+        assert!(PortLease::try_new(1105, 1).is_none());
+        assert!(PortLease::try_new(u16::MAX, 2).is_none());
+        drop((second, third));
+    }
+
+    #[test]
+    fn leased_ports_are_not_handed_out_again() {
+        let lease = free_udp_range(2, &[]).unwrap();
+        for _ in 0..50 {
+            let other = free_udp_range(2, &[]).unwrap();
+            assert!(!overlaps(
+                other.base(),
+                2,
+                &[lease.base(), lease.base() + 1]
+            ));
+        }
+    }
+
+    #[test]
     fn free_udp_range_never_returns_an_avoided_port() {
         let all: Vec<u16> = (0..=u16::MAX).collect();
         assert!(free_udp_range(2, &all).is_err());
@@ -214,7 +283,7 @@ mod tests {
     fn free_udp_range_skips_avoided_ports() {
         let (rtsp, http) = free_tcp_pair().unwrap();
         for _ in 0..20 {
-            let base = free_udp_range(RTP_RANGE, &[rtsp, http]).unwrap();
+            let base = free_udp_range(RTP_RANGE, &[rtsp, http]).unwrap().base();
             assert!(
                 !overlaps(base, RTP_RANGE, &[rtsp, http]),
                 "{base} {rtsp} {http}"
