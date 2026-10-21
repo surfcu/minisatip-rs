@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# SRT output support; links libsrt only when enabled.
+srt = []
+
 [dependencies]
 libc = "0.2"
 ms-sched = { path = "../ms-sched" }

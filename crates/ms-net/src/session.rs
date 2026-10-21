@@ -3,16 +3,99 @@
 //! The manager owns all mutable state; adapter decisions are delegated to
 //! [`ms_sched::Scheduler`].
 
-use ms_sched::{Scheduler, SetParamsError, StreamId, TuneError};
+use ms_sched::{MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
 use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use crate::handler::{
-    HttpResource, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType, TransportError,
+    HttpResource, HttpRoute, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType,
+    TransportError,
 };
-use crate::rtsp::{Protocol, TransportKind, parse_int_prefix, parse_transport};
+use crate::rtsp::{Protocol, Request, TransportKind, parse_int_prefix, parse_transport};
 use crate::satip::{merge_satip_url, parse_satip_url_new};
+#[cfg(feature = "srt")]
+use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener};
+use crate::web::{AdapterState, RuntimeState, StreamState, WebService, WebSnapshot};
 
 const STREAM_SLOTS: usize = MAX_STREAMS as usize;
+/// Extra time a client has to respond before the stream is closed
+/// (`stream_timeout`, stream.cpp:1366).
+pub const TIMEOUT_GRACE_MS: i64 = 10_000;
+/// Timeout value meaning "close now" (`sid->timeout == 1`).
+pub const TIMEOUT_FORCED: u32 = 1;
+/// Default session timeout (`opts.timeout_sec`).
+pub const DEFAULT_TIMEOUT_MS: u32 = 30_000;
+
+/// Time source for session timeouts; tests install [`ManualClock`].
+pub trait Clock: Send + Sync {
+    /// Milliseconds since an arbitrary origin.
+    fn now_ms(&self) -> i64;
+}
+
+/// Wall-independent clock used by the server.
+#[derive(Debug)]
+pub struct MonotonicClock {
+    origin: Instant,
+}
+
+impl MonotonicClock {
+    /// Starts the clock now.
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now_ms(&self) -> i64 {
+        self.origin.elapsed().as_millis() as i64
+    }
+}
+
+/// Clock advanced explicitly by tests.
+#[derive(Debug, Default)]
+pub struct ManualClock {
+    // A mutex rather than `AtomicI64`, which 32-bit MIPS does not provide.
+    now_ms: Mutex<i64>,
+}
+
+impl ManualClock {
+    /// Creates a clock at `now_ms`.
+    pub fn new(now_ms: i64) -> Self {
+        Self {
+            now_ms: Mutex::new(now_ms),
+        }
+    }
+
+    /// Sets the current time.
+    pub fn set(&self, now_ms: i64) {
+        *self.lock() = now_ms;
+    }
+
+    /// Moves the clock forward by `delta_ms`.
+    pub fn advance(&self, delta_ms: i64) {
+        let mut now = self.lock();
+        *now = now.wrapping_add(delta_ms);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, i64> {
+        self.now_ms.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_ms(&self) -> i64 {
+        *self.lock()
+    }
+}
 
 /// One stream slot, mirroring the C++ `streams` structure.
 #[derive(Debug, Clone)]
@@ -45,16 +128,29 @@ pub struct Stream {
     pub rtcp_server_port: u16,
     /// RTP sequence number.
     pub rtp_seq: u16,
-    /// Idle timeout in milliseconds; zero disables it.
+    /// Idle timeout in milliseconds; zero disables it, one forces a close.
     pub timeout_ms: u32,
+    /// Last request or RTCP time (`sid->rtime`).
+    pub rtime_ms: i64,
     /// Client user agent.
     pub user_agent: String,
+    /// Accepted SRT socket, or `-1`.
+    pub srt_sock: i32,
+    /// Stream id used to match the SRT socket.
+    pub srt_streamid: String,
     /// Whether the stream was touched since creation.
     pub touched: bool,
 }
 
 impl Stream {
-    fn new(id: StreamId, sock: i32, session_id: i64, start_rtp: u16) -> Self {
+    fn new(
+        id: StreamId,
+        sock: i32,
+        session_id: i64,
+        start_rtp: u16,
+        timeout_ms: u32,
+        now_ms: i64,
+    ) -> Self {
         let server_port = start_rtp.wrapping_add((2 * id) as u16);
         Self {
             id,
@@ -71,8 +167,11 @@ impl Stream {
             server_port,
             rtcp_server_port: server_port.wrapping_add(1),
             rtp_seq: 0,
-            timeout_ms: 30_000,
+            timeout_ms,
+            rtime_ms: now_ms,
             user_agent: String::new(),
+            srt_sock: -1,
+            srt_streamid: String::new(),
             touched: false,
         }
     }
@@ -110,6 +209,13 @@ pub struct SessionManager {
     next_session_id: i64,
     start_rtp: u16,
     describe: DescribeOptions,
+    clock: Arc<dyn Clock>,
+    server_timeout_ms: u32,
+    adapter_ccerr: Vec<u64>,
+    web: Option<WebService>,
+    web_runtime: RuntimeState,
+    #[cfg(feature = "srt")]
+    srt: Option<SrtListener<LibSrtOps>>,
 }
 
 impl Default for SessionManager {
@@ -126,6 +232,11 @@ impl SessionManager {
 
     /// Creates an empty manager around an existing scheduler.
     pub fn with_scheduler(sched: Scheduler) -> Self {
+        Self::with_clock(sched, Arc::new(MonotonicClock::new()))
+    }
+
+    /// Creates an empty manager around an existing scheduler and clock.
+    pub fn with_clock(sched: Scheduler, clock: Arc<dyn Clock>) -> Self {
         let mut streams = Vec::with_capacity(STREAM_SLOTS);
         streams.resize_with(STREAM_SLOTS, || None);
         Self {
@@ -135,6 +246,59 @@ impl SessionManager {
             next_session_id: 1000,
             start_rtp: 5500,
             describe: DescribeOptions::default(),
+            clock,
+            server_timeout_ms: DEFAULT_TIMEOUT_MS,
+            adapter_ccerr: vec![0; MAX_ADAPTERS],
+            web: None,
+            web_runtime: RuntimeState::default(),
+            #[cfg(feature = "srt")]
+            srt: None,
+        }
+    }
+
+    /// Installs the web UI and generated HTTP endpoints.
+    pub fn set_web(&mut self, web: WebService) {
+        self.web = Some(web);
+    }
+
+    /// Sets the runtime values reported by `state.json`.
+    pub fn set_web_runtime(&mut self, runtime: RuntimeState) {
+        self.web_runtime = runtime;
+    }
+
+    /// Installs the listener whose pending pool serves SRT SETUPs.
+    #[cfg(feature = "srt")]
+    pub fn set_srt_listener(&mut self, listener: SrtListener<LibSrtOps>) {
+        self.srt = Some(listener);
+    }
+
+    /// Installed SRT listener, if any.
+    #[cfg(feature = "srt")]
+    pub fn srt_listener(&self) -> Option<&SrtListener<LibSrtOps>> {
+        self.srt.as_ref()
+    }
+
+    /// Removes the SRT listener so the caller can close it.
+    #[cfg(feature = "srt")]
+    pub fn take_srt_listener(&mut self) -> Option<SrtListener<LibSrtOps>> {
+        self.srt.take()
+    }
+
+    /// Sets the UDP destination used by a unicast stream.
+    ///
+    /// `decode_transport` cannot know the RTSP peer, and C++ falls back to the
+    /// peer address when the `Transport` header has no `destination=`
+    /// (stream.cpp:505-506).
+    pub fn set_udp_target(&mut self, id: StreamId, host: &str, port: u16) {
+        if let Some(index) = self.slot_index(id)
+            && let Some(stream) = self.streams[index].as_mut()
+        {
+            if !host.is_empty() {
+                stream.remote_host = host.to_owned();
+            }
+            if port != 0 {
+                stream.remote_port = port;
+            }
         }
     }
 
@@ -156,6 +320,69 @@ impl SessionManager {
     /// Sets the first RTP server port.
     pub fn set_start_rtp(&mut self, start_rtp: u16) {
         self.start_rtp = start_rtp;
+    }
+
+    /// Installs a clock, rebasing the idle time of every live stream.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+        let now = self.clock.now_ms();
+        for stream in self.streams.iter_mut().flatten() {
+            stream.rtime_ms = now;
+        }
+    }
+
+    /// Time source used for idle timeouts.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
+    /// Sets the default session timeout (`opts.timeout_sec`).
+    pub fn set_server_timeout_ms(&mut self, timeout_ms: u32) {
+        self.server_timeout_ms = timeout_ms;
+    }
+
+    /// Records the continuity error count of one adapter for the web UI.
+    pub fn set_adapter_ccerr(&mut self, adapter: usize, errors: u64) {
+        if let Some(slot) = self.adapter_ccerr.get_mut(adapter) {
+            *slot = errors;
+        }
+    }
+
+    /// Streams whose idle timeout expired, in slot order (`stream_timeout`,
+    /// stream.cpp:1332-1378). HTTP and SRT streams have no idle timeout.
+    pub fn expired_streams(&self) -> Vec<StreamId> {
+        let now = self.clock.now_ms();
+        let mut expired = Vec::new();
+        for slot in self
+            .streams
+            .iter()
+            .flatten()
+            .filter(|stream| stream.enabled)
+        {
+            if slot.timeout_ms == TIMEOUT_FORCED {
+                expired.push(slot.id);
+                continue;
+            }
+            if matches!(slot.stream_type, StreamType::Http | StreamType::RtspSrt) {
+                continue;
+            }
+            if slot.timeout_ms != 0
+                && now - slot.rtime_ms > i64::from(slot.timeout_ms) + TIMEOUT_GRACE_MS
+            {
+                expired.push(slot.id);
+            }
+        }
+        expired
+    }
+
+    /// Whether closing the control connection closes this stream
+    /// (`close_http`, minisatip.cpp:1678-1692). RTSP/UDP and not-yet-decoded
+    /// streams with an active timeout are kept.
+    pub fn closes_on_control_close(&self, id: StreamId) -> bool {
+        self.stream(id).is_none_or(|stream| {
+            !(matches!(stream.stream_type, StreamType::RtspUdp | StreamType::None)
+                && stream.timeout_ms != 0)
+        })
     }
 
     /// Replaces the SDP header inputs.
@@ -195,7 +422,16 @@ impl SessionManager {
         let id = index as StreamId;
         let session_id = self.next_session_id;
         self.next_session_id += 1;
-        self.streams[index] = Some(Stream::new(id, self.sock, session_id, self.start_rtp));
+        let timeout_ms = self.server_timeout_ms;
+        let now_ms = self.clock.now_ms();
+        self.streams[index] = Some(Stream::new(
+            id,
+            self.sock,
+            session_id,
+            self.start_rtp,
+            timeout_ms,
+            now_ms,
+        ));
         Some(id)
     }
 
@@ -378,13 +614,24 @@ impl SessionManager {
             return;
         };
         let adapter = self.streams[index].as_ref().expect("checked slot").adapter;
+        #[cfg(feature = "srt")]
+        let srt_socket = self.streams[index].as_ref().and_then(|stream| {
+            (stream.stream_type == StreamType::RtspSrt && stream.srt_sock != SRT_INVALID_SOCK)
+                .then(|| (stream.srt_sock, stream.srt_streamid.clone()))
+        });
         if let Some(stream) = self.streams[index].as_mut() {
             stream.enabled = false;
             stream.adapter = -1;
             stream.do_play = false;
+            stream.srt_sock = -1;
         }
         if adapter >= 0 {
             self.sched.close_adapter_for_stream(id, adapter);
+        }
+        // C++ returns a connected SRT socket to the pending pool (stream.cpp:379).
+        #[cfg(feature = "srt")]
+        if let (Some((sock, streamid)), Some(listener)) = (srt_socket, self.srt.as_ref()) {
+            listener.return_socket(sock, &streamid);
         }
     }
 
@@ -397,10 +644,28 @@ impl SessionManager {
         let stream = self.streams[index].as_mut().expect("checked slot");
         match spec.kind {
             TransportKind::Srt => {
-                if spec.srt_streamid.is_none() {
+                #[cfg(not(feature = "srt"))]
+                {
+                    // C++ DISABLE_SRT builds reject the transport (stream.cpp:412).
+                    let _ = &spec.srt_streamid;
                     return Err(TransportError);
                 }
-                stream.stream_type = StreamType::RtspSrt;
+                #[cfg(feature = "srt")]
+                {
+                    let Some(streamid) = spec.srt_streamid.as_deref() else {
+                        return Err(TransportError);
+                    };
+                    let Some(listener) = self.srt.as_ref() else {
+                        return Err(TransportError);
+                    };
+                    let sock = listener.take(streamid);
+                    if sock == SRT_INVALID_SOCK {
+                        return Err(TransportError);
+                    }
+                    stream.srt_sock = sock;
+                    stream.srt_streamid = streamid.to_owned();
+                    stream.stream_type = StreamType::RtspSrt;
+                }
             }
             TransportKind::Tcp => stream.stream_type = StreamType::RtspTcp,
             TransportKind::Udp => stream.stream_type = StreamType::RtspUdp,
@@ -541,18 +806,18 @@ impl SessionManager {
             DeliverySystem::DvbS | DeliverySystem::DvbS2 => format!(
                 "ver=1.0;src={};tuner={tuner},{strength},{status},{snr},{},{},{},{},{},{},{},{};pids=",
                 i32::from(params.src),
-                params.freq,
+                params.freq / 1_000,
                 polarization_name(params.pol),
                 delivery_system_name(params.msys),
                 modulation_name(params),
                 pilot_name(params.plts),
                 rolloff_name(params.ro),
-                params.sr,
+                params.sr / 1_000,
                 fec_name(params),
             ),
             DeliverySystem::DvbT | DeliverySystem::DvbT2 => format!(
                 "ver=1.1;tuner={tuner},{strength},{status},{snr},{:.2},{},{},{},{},{},{},{},{},{};pids=",
-                f64::from(params.freq),
+                f64::from(params.freq) / 1_000.0,
                 params.bw.unwrap_or(8_000_000) / 1_000_000,
                 delivery_system_name(params.msys),
                 transmission_mode_name(params.tmode),
@@ -565,11 +830,11 @@ impl SessionManager {
             ),
             _ => format!(
                 "ver=1.2;tuner={tuner},{strength},{status},{snr},{:.2},{},{},{},{},{},{},{},{};pids=",
-                f64::from(params.freq),
+                f64::from(params.freq) / 1_000.0,
                 params.bw.unwrap_or(8_000_000) / 1_000_000,
                 delivery_system_name(params.msys),
                 modulation_name(params),
-                params.sr,
+                params.sr / 1_000,
                 params.c2tft.unwrap_or(0),
                 positive_or_empty(params.ds),
                 positive_or_empty(params.plp),
@@ -647,16 +912,100 @@ impl SessionManager {
         }
         (s2, t, c)
     }
+
+    /// Captures adapter, stream and runtime values for the web endpoints.
+    pub fn web_snapshot(&self) -> WebSnapshot {
+        let mut snapshot = WebSnapshot::new();
+        snapshot.adapters = vec![AdapterState::default(); ms_sched::MAX_ADAPTERS];
+        for aid in 0..ms_sched::MAX_ADAPTERS {
+            let Some(adapter) = self.sched.adapter(aid) else {
+                continue;
+            };
+            let params = &adapter.params;
+            let tuned = params.freq > 0 || adapter.master_sid >= 0;
+            snapshot.adapters[aid] = AdapterState {
+                present: true,
+                enabled: adapter.config.enabled,
+                disabled: self.sched.is_disabled(aid),
+                systems: adapter
+                    .config
+                    .sys
+                    .iter()
+                    .copied()
+                    .filter(|sys| *sys != DeliverySystem::Undefined)
+                    .collect(),
+                pos: i32::from(params.src),
+                freq: params.freq,
+                pol: polarization_code(params.pol),
+                sr: params.sr,
+                bw: params.bw.unwrap_or(8_000_000),
+                stream: params.plp.unwrap_or(-1),
+                fe: params.fe.unwrap_or(0),
+                master: adapter.master_sid & 0xff,
+                sid_count: adapter.sid_cnt & 0xff,
+                sys: if tuned {
+                    delivery_system_code(params.msys)
+                } else {
+                    0
+                },
+                mtype: params.mtype,
+                t2id: params.t2id.unwrap_or(0),
+                c2tft: params.c2tft.unwrap_or(0),
+                plp: params.plp.unwrap_or(-1),
+                plsc: params.plsc.unwrap_or(-1),
+                sm: params.sm.unwrap_or(0),
+                gi: params.gi.unwrap_or(-1),
+                pids: adapter.active_pids(),
+                ccerr: self
+                    .adapter_ccerr
+                    .get(aid)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(i32::MAX as u64) as i32,
+                ..AdapterState::default()
+            };
+        }
+        snapshot.streams = vec![StreamState::default(); STREAM_SLOTS];
+        for (index, stream) in self.streams.iter().enumerate() {
+            let Some(stream) = stream else {
+                continue;
+            };
+            snapshot.streams[index] = StreamState {
+                enabled: stream.enabled,
+                play: stream.do_play,
+                adapter: stream.adapter,
+                user_agent: stream.user_agent.clone(),
+                rhost: stream.remote_host.clone(),
+                rport: stream.remote_port,
+                protocol: protocol_name(stream.stream_type).to_owned(),
+                pids: stream.params.pids.iter().map(i32::from).collect(),
+                ..StreamState::default()
+            };
+        }
+        snapshot.runtime = self.web_runtime.clone();
+        snapshot
+    }
+
+    /// Serves the configured web UI, or `None` when it is not installed.
+    pub fn web_route(&self, request: &Request) -> Option<HttpRoute> {
+        let web = self.web.as_ref()?;
+        web.route(request, &self.web_snapshot())
+    }
 }
 
 impl StreamBackend for SessionManager {
     fn find_session(&mut self, session_id: i64) -> Option<StreamId> {
-        (0..STREAM_SLOTS).find_map(|index| {
+        let found = (0..STREAM_SLOTS).find_map(|index| {
             self.streams[index]
                 .as_ref()
                 .filter(|stream| stream.enabled && stream.session_id == session_id)
                 .map(|stream| stream.id)
-        })
+        });
+        // C++ `find_session_id` refreshes `sid->rtime` (stream.cpp:1438).
+        if let Some(id) = found {
+            self.touch_stream(id);
+        }
+        found
     }
 
     fn get_stream(&self, id: StreamId) -> Option<StreamInfo> {
@@ -689,10 +1038,12 @@ impl StreamBackend for SessionManager {
     }
 
     fn touch_stream(&mut self, id: StreamId) {
+        let now = self.clock.now_ms();
         if let Some(index) = self.slot_index(id)
             && let Some(stream) = self.streams[index].as_mut()
         {
             stream.touched = true;
+            stream.rtime_ms = now;
         }
     }
 
@@ -730,6 +1081,42 @@ impl StreamBackend for SessionManager {
 
     fn http_resource(&mut self, _uri: &str) -> Option<HttpResource> {
         None
+    }
+
+    fn http_route(&mut self, request: &Request) -> Option<HttpRoute> {
+        self.web_route(request)
+    }
+}
+
+fn polarization_code(pol: Polarization) -> i32 {
+    match pol {
+        Polarization::Vertical => 1,
+        Polarization::Horizontal => 2,
+        Polarization::Right => 3,
+        Polarization::Left => 4,
+        Polarization::None => 0,
+    }
+}
+
+fn delivery_system_code(sys: DeliverySystem) -> i32 {
+    match sys {
+        DeliverySystem::DvbC => 1,
+        DeliverySystem::DvbT => 3,
+        DeliverySystem::DvbS => 5,
+        DeliverySystem::DvbS2 => 6,
+        DeliverySystem::DvbT2 => 16,
+        DeliverySystem::DvbC2 => 19,
+        DeliverySystem::Undefined | DeliverySystem::Other(_) => 0,
+    }
+}
+
+fn protocol_name(stream_type: StreamType) -> &'static str {
+    match stream_type {
+        StreamType::Http => "HTTP",
+        StreamType::RtspUdp => "RTP/UDP",
+        StreamType::RtspTcp => "RTP/TCP",
+        StreamType::RtspSrt => "SRT",
+        StreamType::None => "unkown",
     }
 }
 
@@ -891,4 +1278,46 @@ fn positive_or_empty(value: Option<i32>) -> String {
     value
         .filter(|value| *value >= 0)
         .map_or_else(String::new, |value| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manual_manager(clock: &Arc<ManualClock>) -> SessionManager {
+        let mut manager = SessionManager::new();
+        let manual: Arc<ManualClock> = Arc::clone(clock);
+        let clock: Arc<dyn Clock> = manual;
+        manager.set_clock(clock);
+        manager
+    }
+
+    #[test]
+    fn srt_streams_never_expire() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut manager = manual_manager(&clock);
+        let id = manager.add_stream().expect("slot");
+        manager.streams[id as usize]
+            .as_mut()
+            .expect("stream")
+            .stream_type = StreamType::RtspSrt;
+
+        // stream.cpp:1353: the timeout block skips HTTP and SRT streams.
+        clock.advance(10_000_000);
+        assert!(manager.expired_streams().is_empty());
+    }
+
+    #[test]
+    fn forced_timeout_closes_immediately() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut manager = manual_manager(&clock);
+        let id = manager.add_stream().expect("slot");
+        manager.streams[id as usize]
+            .as_mut()
+            .expect("stream")
+            .timeout_ms = TIMEOUT_FORCED;
+
+        // stream.cpp:1346: `sid->timeout == 1` closes without waiting.
+        assert_eq!(manager.expired_streams(), vec![id]);
+    }
 }
