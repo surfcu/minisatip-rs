@@ -290,6 +290,11 @@ impl Adapter {
         self.tuner = tuner;
     }
 
+    /// The adapter PID table (`ad->pids`), including inactive slots.
+    pub fn pid_entries(&self) -> &[PidEntry] {
+        &self.pids
+    }
+
     /// PIDs currently active or about to be activated on this adapter.
     pub fn active_pids(&self) -> Vec<i32> {
         self.pids
@@ -1104,24 +1109,57 @@ impl Scheduler {
         };
         let all_active =
             |state: PidState| state != PidState::Inactive && state != PidState::Deleted;
-        if adapter
+        let ci = adapter.config.adapter_type == AdapterType::Ci;
+        if !adapter
             .pids
             .iter()
             .any(|entry| all_active(entry.state) && entry.pid == PID_ALL)
         {
-            return;
-        }
-        let existing: Vec<i32> = adapter
-            .pids
-            .iter()
-            .filter(|entry| all_active(entry.state))
-            .map(|entry| entry.pid)
-            .collect();
-        for pid in [0, 1, 16, 18] {
-            if !existing.contains(&pid) {
-                let _ = self.mark_pid_add(index as i32, PID_STREAM_ID_UNDEFINED, pid);
+            let existing: Vec<i32> = adapter
+                .pids
+                .iter()
+                .filter(|entry| all_active(entry.state))
+                .map(|entry| entry.pid)
+                .collect();
+            // CI adapters only need pid 0, for the generated PAT (adapter.cpp:1046-1061).
+            for pid in [0, 1, 16, 18] {
+                if !existing.contains(&pid) && (!ci || pid == 0) {
+                    let _ = self.mark_pid_add(index as i32, PID_STREAM_ID_UNDEFINED, pid);
+                }
             }
         }
+        self.pmt_tune(index as i32);
+    }
+
+    /// `post_tune` for an adapter that is never tuned (`ddci_post_init`).
+    pub fn post_tune_adapter(&mut self, aid: usize) {
+        if self.adapters.get(aid).is_some_and(Option::is_some) {
+            self.post_tune(aid);
+            self.update_pids(aid);
+        }
+    }
+
+    /// Transport stream id of the adapter's last PAT (`ad->transponder_id`).
+    pub fn adapter_transponder_id(&self, aid: usize) -> u16 {
+        self.adapter(aid)
+            .map_or(0, |adapter| adapter.transponder_id)
+    }
+
+    /// Drops `sid`'s claim on one PID (`mark_pid_deleted`); apply it with
+    /// [`Self::update_adapter_pids`].
+    pub fn unmark_pid(&mut self, aid: usize, sid: StreamId, pid: i32) {
+        if self.adapters.get(aid).is_some_and(Option::is_some) {
+            self.mark_pid_deleted(aid, sid, Some(pid));
+        }
+    }
+
+    /// Applies pending PID changes of one adapter, as callers of the C++
+    /// `update_pids(aid)` do after adding filters. Returns 0 on success.
+    pub fn update_adapter_pids(&mut self, aid: usize) -> i32 {
+        if self.adapters.get(aid).is_none_or(Option::is_none) {
+            return 1;
+        }
+        self.update_pids(aid)
     }
 
     /// Applies pending DELETED/NEW entries and sorts the table

@@ -45,9 +45,14 @@ name = "minisatip"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ms-ca",
+ "ms-ca-drivers",
  "ms-config",
+ "ms-fakecam",
  "ms-net",
+ "ms-psi",
  "ms-sched",
+ "ms-ts",
  "ms-tuner",
 ]
 
@@ -97,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "ms-sched",
+ "ms-ts",
  "ms-tuner",
 ]
 

@@ -1,5 +1,9 @@
 //! Binary entry point: wiring, logging and signal handling.
 
+mod ca;
+mod ddci;
+mod dvbca;
+mod hw;
 mod runtime;
 mod sys;
 

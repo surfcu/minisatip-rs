@@ -44,10 +44,14 @@ pub struct CaService {
     pub sid: u16,
     /// PMT PID.
     pub pmt_pid: u16,
+    /// PCR PID from the section header (`SPMT::pcr_pid`).
+    pub pcr_pid: u16,
     /// CA descriptors, deduplicated by (CAID, PID) like `pmt_add_caid`.
     pub ca: Vec<CaDescriptor>,
     /// Elementary streams in PMT order, plus an independent PCR entry.
     pub streams: Vec<StreamPid>,
+    /// Streams the C++ parser classifies as audio or video (CAPMT ES filter).
+    pub av_pids: Vec<u16>,
 }
 
 impl CaService {
@@ -58,6 +62,7 @@ impl CaService {
             adapter,
             sid: pmt.header.table_id_extension,
             pmt_pid,
+            pcr_pid: pmt.pcr_pid_header,
             ..Self::default()
         };
         let es = pmt.streams.iter().flat_map(|s| s.descriptors.iter());
@@ -73,6 +78,12 @@ impl CaService {
                 stream_type: s.stream_type,
                 pid: s.elementary_pid,
             })
+            .collect();
+        service.av_pids = pmt
+            .streams
+            .iter()
+            .filter(|s| s.is_audio || s.is_video)
+            .map(|s| s.elementary_pid)
             .collect();
         service
     }

@@ -7,12 +7,13 @@ use crate::handler::{StreamId, StreamType};
 use crate::output::{OutputStats, STREAM_TIMER_MS, StreamOutput};
 use crate::rtp::DVB_FRAME;
 use ms_sched::{AdapterTuner, TuneError};
+use ms_ts::TsStage;
 use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner, TunerError};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,6 +36,11 @@ const PID_NULL: u16 = 8191;
 /// before the frontend ioctls finish. The bound only guards against a wedged
 /// adapter thread: expiry is reported as a hardware failure (`-500`).
 pub const TUNE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Locks a shared counter; a `Mutex` because 32-bit MIPS lacks `AtomicU64`.
+fn lock_counter(counter: &Mutex<u64>) -> MutexGuard<'_, u64> {
+    counter.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Clamps a threshold to `1..200` ms, with 200 for out-of-range values.
 pub fn clamp_threshold(threshold: i32) -> i64 {
@@ -267,6 +273,10 @@ pub enum Command {
     },
     /// Replaces the send threshold (see [`adapter_threshold`]).
     SetThreshold(i64),
+    /// PIDs with section filters; their packets are reported as [`Event::TablePackets`].
+    SetSectionPids(PidSet),
+    /// Reads the tuner even without outputs (a DDCI adapter feeding its CAM FIFO).
+    KeepReading(bool),
     /// Replies with an output's counters.
     Query {
         /// Target stream.
@@ -291,6 +301,13 @@ pub enum Event {
     ContinuityErrors(u64),
     /// The tuner failed to tune or read.
     TunerError(String),
+    /// Packets of a batch on section PIDs, before the stages ran (`process_filters`).
+    TablePackets {
+        /// Tunes handled before this batch; older batches belong to a previous mux.
+        generation: u64,
+        /// Whole TS packets in stream order.
+        packets: Vec<u8>,
+    },
 }
 
 /// Control-plane handle to one adapter's data-plane thread.
@@ -299,6 +316,7 @@ pub struct AdapterHandle {
     events: Receiver<Event>,
     // A mutex rather than `AtomicU64`, which 32-bit MIPS does not provide.
     epoch: Mutex<u64>,
+    tune_generation: Arc<Mutex<u64>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -314,15 +332,34 @@ impl AdapterHandle {
         config: DataPlaneConfig,
         bandwidth: Option<Arc<Bandwidth>>,
     ) -> io::Result<Self> {
+        Self::spawn_with_stages(tuner, config, bandwidth, Vec::new())
+    }
+
+    /// Spawns the data-plane thread with in-place stages run on every batch
+    /// before the outputs (`pmt_process_stream`: DDCI, decrypt, null marking).
+    pub fn spawn_with_stages(
+        tuner: Box<dyn Tuner + Send>,
+        config: DataPlaneConfig,
+        bandwidth: Option<Arc<Bandwidth>>,
+        stages: Vec<Box<dyn TsStage>>,
+    ) -> io::Result<Self> {
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
+        let tune_generation = Arc::new(Mutex::new(0));
+        let generation = Arc::clone(&tune_generation);
         let thread = thread::Builder::new()
             .name(format!("adapter{}", config.adapter_id))
-            .spawn(move || DataPlane::new(tuner, config, command_rx, event_tx, bandwidth).run())?;
+            .spawn(move || {
+                let mut plane = DataPlane::new(tuner, config, command_rx, event_tx, bandwidth);
+                plane.stages = stages;
+                plane.tune_generation = generation;
+                plane.run()
+            })?;
         Ok(Self {
             commands,
             events,
             epoch: Mutex::new(0),
+            tune_generation,
             thread: Some(thread),
         })
     }
@@ -381,7 +418,7 @@ impl AdapterHandle {
         setup_age_ms: i64,
     ) -> Option<u64> {
         let epoch = {
-            let mut epoch = self.epoch.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut epoch = lock_counter(&self.epoch);
             *epoch = epoch.wrapping_add(1);
             *epoch
         };
@@ -417,6 +454,11 @@ impl AdapterHandle {
             return None;
         }
         rx.recv().ok().flatten()
+    }
+
+    /// Tunes the thread has handled; it is raised before the tune is answered.
+    pub fn tune_generation(&self) -> u64 {
+        *lock_counter(&self.tune_generation)
     }
 
     /// Event receiver.
@@ -529,6 +571,10 @@ struct DataPlane {
     bandwidth: Option<Arc<Bandwidth>>,
     /// Last octets/packets/failed writes/FIFO-copied/FIFO-dropped per output.
     bandwidth_marks: BTreeMap<StreamId, (u64, u32, u32, u64, u64)>,
+    stages: Vec<Box<dyn TsStage>>,
+    section_pids: PidSet,
+    tune_generation: Arc<Mutex<u64>>,
+    keep_reading: bool,
 }
 
 impl DataPlane {
@@ -562,6 +608,10 @@ impl DataPlane {
             running: true,
             bandwidth,
             bandwidth_marks: BTreeMap::new(),
+            stages: Vec::new(),
+            section_pids: PidSet::new(),
+            tune_generation: Arc::new(Mutex::new(0)),
+            keep_reading: false,
         }
     }
 
@@ -577,12 +627,12 @@ impl DataPlane {
             if !self.running {
                 break;
             }
-            let got_data = !self.outputs.is_empty() && self.read_once();
+            let got_data = (self.keep_reading || !self.outputs.is_empty()) && self.read_once();
             self.timers();
             self.flush_queues();
             self.sync_bandwidth();
             if !got_data {
-                let wait = if self.outputs.is_empty() {
+                let wait = if self.outputs.is_empty() && !self.keep_reading {
                     Duration::from_millis(STREAM_TIMER_MS as u64)
                 } else {
                     IDLE_POLL
@@ -599,6 +649,10 @@ impl DataPlane {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Tune { params, reply } => {
+                {
+                    let mut generation = lock_counter(&self.tune_generation);
+                    *generation = generation.wrapping_add(1);
+                }
                 let result = self.tuner.tune(&params);
                 match reply {
                     Some(reply) => {
@@ -685,6 +739,8 @@ impl DataPlane {
                 }
             }
             Command::SetThreshold(threshold) => self.threshold_ms = threshold,
+            Command::SetSectionPids(pids) => self.section_pids = pids,
+            Command::KeepReading(on) => self.keep_reading = on,
             Command::Query { stream_id, reply } => {
                 let stats = self
                     .outputs
@@ -825,6 +881,10 @@ impl DataPlane {
 
     fn process(&mut self, now_ms: i64) {
         self.last_send_ms = now_ms;
+        self.tap_sections();
+        for stage in &mut self.stages {
+            stage.process(self.buf.as_bytes_mut());
+        }
         let mono = self.mono_us();
         let mut closed = Vec::new();
         for (stream_id, subscriber) in &mut self.outputs {
@@ -840,6 +900,27 @@ impl DataPlane {
         self.cc_checked = 0;
         for stream_id in closed {
             self.close(stream_id);
+        }
+    }
+
+    /// Copies packets on filtered PIDs for the control plane's section filters.
+    fn tap_sections(&mut self) {
+        if self.section_pids.is_empty() {
+            return;
+        }
+        let mut tapped = Vec::new();
+        for packet in self.buf.packets() {
+            let pid = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
+            if packet[0] == 0x47 && self.section_pids.contains_exact(pid) {
+                tapped.extend_from_slice(packet);
+            }
+        }
+        if !tapped.is_empty() {
+            let generation = *lock_counter(&self.tune_generation);
+            let _ = self.events.send(Event::TablePackets {
+                generation,
+                packets: tapped,
+            });
         }
     }
 
