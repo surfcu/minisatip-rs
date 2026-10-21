@@ -26,6 +26,10 @@ version = "0.1.0"
 [[package]]
 name = "ms-ca-drivers"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "ms-fakecam",
+]
 
 [[package]]
 name = "ms-config"
