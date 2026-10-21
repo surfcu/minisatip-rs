@@ -7,7 +7,7 @@ use ms_sched::{MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
 use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crate::handler::{
     HttpResource, HttpRoute, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType,
@@ -17,7 +17,10 @@ use crate::rtsp::{Protocol, Request, TransportKind, parse_int_prefix, parse_tran
 use crate::satip::{merge_satip_url, parse_satip_url_new};
 #[cfg(feature = "srt")]
 use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener};
-use crate::web::{AdapterState, RuntimeState, StreamState, WebService, WebSnapshot};
+use crate::web::{
+    ADAPTER_DVB, AdapterState, GUARD_INTERVAL_AUTO, QAM_AUTO, RuntimeState, StreamState,
+    WebService, WebSnapshot,
+};
 
 const STREAM_SLOTS: usize = MAX_STREAMS as usize;
 /// Extra time a client has to respond before the stream is closed
@@ -913,6 +916,7 @@ impl SessionManager {
         let mut snapshot = WebSnapshot::new();
         snapshot.adapters = vec![AdapterState::default(); ms_sched::MAX_ADAPTERS];
         for aid in 0..ms_sched::MAX_ADAPTERS {
+            snapshot.adapters[aid].disabled = self.sched.is_disabled(aid);
             let Some(adapter) = self.sched.adapter(aid) else {
                 continue;
             };
@@ -922,6 +926,7 @@ impl SessionManager {
                 present: true,
                 enabled: adapter.config.enabled,
                 disabled: self.sched.is_disabled(aid),
+                kind: ADAPTER_DVB,
                 systems: adapter
                     .config
                     .sys
@@ -936,20 +941,20 @@ impl SessionManager {
                 bw: params.bw.unwrap_or(8_000_000),
                 stream: params.plp.unwrap_or(-1),
                 fe: params.fe.unwrap_or(0),
-                master: adapter.master_sid & 0xff,
-                sid_count: adapter.sid_cnt & 0xff,
+                master: adapter.master_sid,
+                sid_count: adapter.sid_cnt,
                 sys: if tuned {
                     delivery_system_code(params.msys)
                 } else {
                     0
                 },
-                mtype: params.mtype,
+                mtype: modulation_code(params, tuned),
                 t2id: params.t2id.unwrap_or(0),
                 c2tft: params.c2tft.unwrap_or(0),
-                plp: params.plp.unwrap_or(-1),
+                plp: params.ds.unwrap_or(-1),
                 plsc: params.plsc.unwrap_or(-1),
                 sm: params.sm.unwrap_or(0),
-                gi: params.gi.unwrap_or(-1),
+                gi: params.gi.unwrap_or(GUARD_INTERVAL_AUTO),
                 pids: adapter.active_pids(),
                 ccerr: self
                     .adapter_ccerr
@@ -977,7 +982,7 @@ impl SessionManager {
                 ..StreamState::default()
             };
         }
-        snapshot.runtime = self.web_runtime.clone();
+        snapshot.runtime = self.web_runtime.at(SystemTime::now());
         snapshot
     }
 
@@ -1090,6 +1095,17 @@ fn polarization_code(pol: Polarization) -> i32 {
         Polarization::Right => 3,
         Polarization::Left => 4,
         Polarization::None => 0,
+    }
+}
+
+/// `tp.mtype` after `copy_dvb_parameters` (dvb.cpp:456-460), or the
+/// `QAM_AUTO` getter default when unset (adapter.cpp:2397).
+fn modulation_code(params: &TuneParams, tuned: bool) -> u32 {
+    match (params.mtype_specified, tuned, params.msys) {
+        (true, _, _) => params.mtype,
+        (false, true, DeliverySystem::DvbS2) => 9,
+        (false, true, DeliverySystem::DvbS) => 0,
+        _ => QAM_AUTO as u32,
     }
 }
 

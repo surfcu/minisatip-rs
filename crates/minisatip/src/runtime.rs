@@ -25,7 +25,7 @@ use ms_net::socket::DEFAULT_FIFO_SIZE;
 use ms_net::ssdp::{
     ANNOUNCE_INTERVAL_MS, SharedIdentity, SsdpConfig, SsdpServer, UdpSsdpIo, read_boot_id, uuid4,
 };
-use ms_net::web::{RuntimeState, WebConfig, WebService};
+use ms_net::web::{ApiFeatures, RuntimeState, WebConfig, WebService, format_asctime};
 use ms_sched::{AdapterConfig, AdapterTuner, MAX_ADAPTERS, Scheduler, TuneError};
 use ms_tuner::{DeliverySystem, FileReplayConfig, FileReplayTuner, Pacing, PidSet, TuneParams};
 
@@ -169,17 +169,21 @@ impl Runtime {
             playlist: opts.playlist.clone(),
             bootid,
             device_id,
+            features: ApiFeatures::default(),
         })
         .with_identity(identity);
         session.set_web(web);
+        // minisatip.cpp:1149-1166; read_http refreshes the current time.
+        let start = SystemTime::now();
         session.set_web_runtime(RuntimeState {
             datetime_compile: String::new(),
-            datetime_start: format_http_date(SystemTime::now()),
-            datetime_current: format_http_date(SystemTime::now()),
+            datetime_start: format_asctime(start),
+            datetime_current: " ".to_owned(),
             time_running: "0".to_owned(),
-            run_user: 0,
+            run_user: process_uid(),
             run_pid: i32::try_from(std::process::id()).unwrap_or(0),
             command_line: opts.command_line.clone(),
+            start_time: Some(start),
         });
 
         #[cfg(feature = "srt")]
@@ -931,4 +935,11 @@ fn start_srt_listener(
         return None;
     }
     Some(listener)
+}
+
+/// `getuid()` for `run_user` (minisatip.cpp:1165) without `unsafe`: the
+/// owner of `/proc/self` is the process's effective uid.
+fn process_uid() -> i32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").map_or(0, |meta| meta.uid() as i32)
 }

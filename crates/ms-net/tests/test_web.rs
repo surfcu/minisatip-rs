@@ -8,8 +8,8 @@ use ms_net::handler::{HandlerContext, handle_http};
 use ms_net::rtsp::{Protocol, Request};
 use ms_net::session::SessionManager;
 use ms_net::web::{
-    AdapterState, StreamState, TunerCounts, WebConfig, WebService, WebSnapshot, content_type,
-    substitute,
+    ADAPTER_DVB, AdapterState, ApiFeatures, StreamState, TunerCounts, WebConfig, WebService,
+    WebSnapshot, content_type,
 };
 use ms_tuner::DeliverySystem;
 
@@ -71,6 +71,7 @@ fn config(document_root: PathBuf) -> WebConfig {
         playlist: None,
         bootid: 4,
         device_id: 2,
+        features: ApiFeatures::default(),
     }
 }
 
@@ -78,6 +79,7 @@ fn adapter(systems: &[DeliverySystem]) -> AdapterState {
     AdapterState {
         present: true,
         enabled: true,
+        kind: ADAPTER_DVB,
         systems: systems.to_vec(),
         ..AdapterState::default()
     }
@@ -246,18 +248,17 @@ fn template_substitution_matches_process_file() {
 }
 
 #[test]
-fn substitute_skips_unknown_and_unterminated_variables() {
+fn template_skips_unknown_and_unterminated_variables() {
+    // is_var/var_eval (variables.cpp:83-109): unknown names expand to nothing,
+    // and a '$' with no closing '$' within 20 bytes is copied.
+    let service = WebService::new(config(PathBuf::from("html")));
+    let snapshot = WebSnapshot::new();
+    let run = |data: &[u8]| service.with_symbols(&snapshot, |table| table.process_file(data).0);
+    assert_eq!(run(b"a$version$b"), b"a1.2.3b".to_vec());
+    assert_eq!(run(b"a$unknown$b"), b"ab".to_vec());
+    assert_eq!(run(b"a$unterminated"), b"a$unterminated".to_vec());
     assert_eq!(
-        substitute(b"a$version$b", |_| Some("1".to_owned())),
-        b"a1b".to_vec()
-    );
-    assert_eq!(substitute(b"a$unknown$b", |_| None), b"ab".to_vec());
-    assert_eq!(
-        substitute(b"a$unterminated", |_| Some("x".to_owned())),
-        b"a$unterminated".to_vec()
-    );
-    assert_eq!(
-        substitute(b"$abcdefghijklmnopqrstu$", |_| Some("x".to_owned())),
+        run(b"$abcdefghijklmnopqrstu$"),
         b"$abcdefghijklmnopqrstu$".to_vec()
     );
 }
@@ -344,10 +345,13 @@ fn state_json_uses_cpp_symbol_order_and_values() {
     assert!(json.contains("\"st_enabled\":[1,0,0,"));
     assert!(json.contains("\"st_proto\":[\"HTTP\",\"\",\"\","));
     assert!(json.contains("\"st_pids\":[\"0,16\",\"\",\"\","));
-    assert!(json.contains("\"has_pmt\":0,"));
+    // minisatip.cpp:2181: has_pmt is 1 unless built with DISABLE_PMT.
+    assert!(json.contains("\"has_pmt\":1,"));
     assert!(json.contains("\"name_app\":\"minisatip\","));
     assert!(json.contains("\"deviceid\":2,"));
-    assert!(json.ends_with("\"command_line\":\"\"\n}\n"));
+    // minisatip_sym is followed by ca_sym; pmt_sym ends the list (symbols.cpp:27-41).
+    assert!(json.contains("\"command_line\":\"\",\n\"ca_enabled\":["));
+    assert!(json.ends_with("\"\"]\n}\n"));
     assert_eq!(json.matches("\"ad_enabled\":[").count(), 1);
 }
 
@@ -420,7 +424,13 @@ fn html_directory_is_served_byte_for_byte() {
                 .replace("$tuner_c$", "0")
                 .replace("$tuner_c2$", "0")
                 .replace("$tuner_t2$", "0");
-            assert_eq!(route.body, expected.as_bytes(), "{name}");
+            let mut expected = expected.into_bytes();
+            // process_file flushes past 8200 bytes and ends the body with
+            // "\r\n\r\n" instead of a Content-Length (utils.cpp:397-420).
+            if expected.len() > 8200 {
+                expected.extend_from_slice(b"\r\n\r\n");
+            }
+            assert_eq!(route.body, expected, "{name}");
         } else {
             assert_eq!(route.body, source, "{name}");
         }
