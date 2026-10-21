@@ -1,6 +1,7 @@
 //! `Tuner` trait and backends: linux-dvb, satipc, netceiver and file-replay.
 
 mod file;
+pub mod netceiver;
 mod tuner;
 
 #[cfg(feature = "linux-dvb")]

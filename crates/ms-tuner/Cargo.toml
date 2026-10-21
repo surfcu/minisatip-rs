@@ -9,6 +9,8 @@ repository.workspace = true
 default = ["linux-dvb"]
 # Real /dev/dvb backend; only compiled on Linux targets.
 linux-dvb = ["dep:libc"]
+# Netceiver FFI to libnetceiver (libmcli); off by default like the C++ NETCVCLIENT probe.
+netceiver = ["dep:libc"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2", optional = true }
