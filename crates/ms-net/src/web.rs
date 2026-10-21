@@ -171,13 +171,14 @@ impl Default for AdapterState {
             master: 0,
             sid_count: 0,
             sys: 0,
-            mtype: 0,
+            // adapter.cpp:2399-2410: QAM_AUTO and GUARD_INTERVAL_AUTO.
+            mtype: 6,
             t2id: 0,
             c2tft: 0,
             plp: -1,
             plsc: -1,
             sm: 0,
-            gi: -1,
+            gi: 4,
             pids: Vec::new(),
             ccerr: 0,
             decerr: 0,
@@ -586,9 +587,8 @@ impl WebService {
 
     fn static_route(&self, uri: &str, is_head: bool, state: &WebSnapshot) -> HttpRoute {
         let target = if uri == "/" { "/status.html" } else { uri };
-        let Some(relative) = target.strip_prefix('/') else {
-            return HttpRoute::new(404, Vec::new());
-        };
+        // minisatip.cpp:1647-1657 accepts a name without a leading '/'.
+        let relative = target.strip_prefix('/').unwrap_or(target);
         if relative.contains('/') || relative.contains("..") || relative.is_empty() {
             return HttpRoute::new(404, Vec::new());
         }

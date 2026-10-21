@@ -13,7 +13,10 @@ use crate::handler::{
     HttpResource, HttpRoute, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType,
     TransportError,
 };
-use crate::rtsp::{Protocol, Request, TransportKind, parse_int_prefix, parse_transport};
+use crate::rtsp::{
+    Protocol, Request, TransportKind, TransportMode, TransportSpec, parse_int_prefix,
+    parse_transport, split_tokens,
+};
 use crate::satip::{merge_satip_url, parse_satip_url_new};
 #[cfg(feature = "srt")]
 use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener};
@@ -27,6 +30,10 @@ pub const TIMEOUT_GRACE_MS: i64 = 10_000;
 pub const TIMEOUT_FORCED: u32 = 1;
 /// Default session timeout (`opts.timeout_sec`).
 pub const DEFAULT_TIMEOUT_MS: u32 = 30_000;
+/// Linux DVB `QAM_AUTO`, the `ad_mtype` default (adapter.cpp:2400).
+const QAM_AUTO: u32 = 6;
+/// Linux DVB `GUARD_INTERVAL_AUTO`, the `ad_gi` default (adapter.cpp:2410).
+const GUARD_INTERVAL_AUTO: i32 = 4;
 
 /// Time source for session timeouts; tests install [`ManualClock`].
 pub trait Clock: Send + Sync {
@@ -203,6 +210,8 @@ pub struct SessionManager {
     sock: i32,
     next_session_id: i64,
     start_rtp: u16,
+    rrtp: Option<String>,
+    disc_host: String,
     describe: DescribeOptions,
     clock: Arc<dyn Clock>,
     server_timeout_ms: u32,
@@ -240,6 +249,8 @@ impl SessionManager {
             sock: -1,
             next_session_id: 1000,
             start_rtp: 5500,
+            rrtp: None,
+            disc_host: "239.255.255.250".to_owned(),
             describe: DescribeOptions::default(),
             clock,
             server_timeout_ms: DEFAULT_TIMEOUT_MS,
@@ -259,6 +270,13 @@ impl SessionManager {
     /// Sets the runtime values reported by `state.json`.
     pub fn set_web_runtime(&mut self, runtime: RuntimeState) {
         self.web_runtime = runtime;
+    }
+
+    /// Refreshes the clock values recomputed per HTTP request
+    /// (minisatip.cpp:1155-1167).
+    pub fn set_web_clock(&mut self, current: String, running: String) {
+        self.web_runtime.datetime_current = current;
+        self.web_runtime.time_running = running;
     }
 
     /// Installs the listener whose pending pool serves SRT SETUPs.
@@ -486,6 +504,26 @@ impl SessionManager {
         Some(id)
     }
 
+    /// [`Self::start_play`] for a request from `peer_host:peer_port`; an HTTP
+    /// stream records the peer as its destination (stream.cpp:236-241).
+    pub fn start_play_from(
+        &mut self,
+        id: StreamId,
+        protocol: Protocol,
+        peer_host: &str,
+        peer_port: u16,
+    ) -> Result<(), PlayError> {
+        if protocol == Protocol::Http
+            && let Some(index) = self.slot_index(id)
+            && let Some(stream) = self.streams[index].as_mut()
+            && stream.stream_type == StreamType::None
+        {
+            stream.remote_host = peer_host.to_owned();
+            stream.remote_port = peer_port;
+        }
+        self.start_play(id, protocol)
+    }
+
     /// Starts playback, allocating or reusing an adapter as the C++ does.
     pub fn start_play(&mut self, id: StreamId, protocol: Protocol) -> Result<(), PlayError> {
         let Some(index) = self.slot_index(id) else {
@@ -630,13 +668,44 @@ impl SessionManager {
         }
     }
 
-    /// Applies a `Transport` header.
+    /// Sets `-r` (`opts.rrtp`) and the `opts.disc_host` fallback used by
+    /// `decode_transport` (stream.cpp:503-508).
+    pub fn set_transport_defaults(&mut self, rrtp: Option<String>, disc_host: &str) {
+        self.rrtp = rrtp.filter(|host| !host.is_empty());
+        self.disc_host = disc_host.to_owned();
+    }
+
+    /// Applies a `Transport` header without a known RTSP peer.
     pub fn decode_transport(&mut self, id: StreamId, value: &str) -> Result<(), TransportError> {
+        self.decode_transport_from(id, value, "", 0)
+    }
+
+    /// Applies a `Transport` header received from `peer_host:peer_port`.
+    pub fn decode_transport_from(
+        &mut self,
+        id: StreamId,
+        value: &str,
+        peer_host: &str,
+        peer_port: u16,
+    ) -> Result<(), TransportError> {
         let Some(index) = self.slot_index(id) else {
             return Err(TransportError);
         };
         let spec = parse_transport(value);
         let stream = self.streams[index].as_mut().expect("checked slot");
+        match spec.kind {
+            // stream.cpp:470-481: TCP takes the RTSP peer and ignores port tokens.
+            TransportKind::Tcp => {
+                stream.stream_type = StreamType::RtspTcp;
+                stream.remote_host = peer_host.to_owned();
+                stream.remote_port = peer_port;
+                return Ok(());
+            }
+            TransportKind::Udp => {
+                return self.decode_udp_transport(index, &spec, value, peer_host);
+            }
+            TransportKind::Srt => {}
+        }
         match spec.kind {
             TransportKind::Srt => {
                 #[cfg(not(feature = "srt"))]
@@ -662,16 +731,84 @@ impl SessionManager {
                     stream.stream_type = StreamType::RtspSrt;
                 }
             }
-            TransportKind::Tcp => stream.stream_type = StreamType::RtspTcp,
-            TransportKind::Udp => stream.stream_type = StreamType::RtspUdp,
-        }
-        if let Some(port) = spec.client_port.or(spec.port) {
-            stream.remote_port = port;
-        }
-        if let Some(destination) = spec.destination {
-            stream.remote_host = destination;
+            TransportKind::Tcp | TransportKind::Udp => {}
         }
         Ok(())
+    }
+
+    /// UDP branch of `decode_transport` (stream.cpp:484-606).
+    fn decode_udp_transport(
+        &mut self,
+        index: usize,
+        spec: &TransportSpec,
+        value: &str,
+        peer_host: &str,
+    ) -> Result<(), TransportError> {
+        // Tokens are scanned last to first, so the first `client_port=`/`port=` wins.
+        let port = split_tokens(value, ';')
+            .into_iter()
+            .find_map(|token| {
+                token
+                    .strip_prefix("client_port=")
+                    .or_else(|| token.strip_prefix("port="))
+            })
+            .map_or(0, |port| parse_int_prefix(port, 0));
+        let port = u16::try_from(port)
+            .ok()
+            .filter(|port| *port != 0)
+            .unwrap_or(self.start_rtp);
+        let mut dest = self
+            .rrtp
+            .clone()
+            .or_else(|| spec.destination.clone())
+            .unwrap_or_default();
+        if dest.is_empty() && spec.mode == Some(TransportMode::Unicast) {
+            dest = peer_host.to_owned();
+        }
+        if dest.is_empty() {
+            dest = self.disc_host.clone();
+        }
+
+        let stream = self.streams[index].as_mut().expect("checked slot");
+        match stream.stream_type {
+            // A stream with another transport keeps it (stream.cpp:513-547).
+            StreamType::RtspTcp | StreamType::RtspSrt | StreamType::Http => return Ok(()),
+            StreamType::RtspUdp if stream.remote_port == port && stream.remote_host == dest => {
+                return Ok(());
+            }
+            StreamType::RtspUdp | StreamType::None => {}
+        }
+        stream.stream_type = StreamType::RtspUdp;
+        stream.remote_host = dest.clone();
+        stream.remote_port = port;
+        let id = stream.id;
+
+        // A new UDP target closes other streams sending to it (stream.cpp:591-605).
+        let duplicates: Vec<StreamId> = self
+            .streams
+            .iter()
+            .flatten()
+            .filter(|other| {
+                other.enabled
+                    && other.id != id
+                    && other.remote_port == port
+                    && other.remote_host == dest
+            })
+            .map(|other| other.id)
+            .collect();
+        for other in duplicates {
+            self.close_stream(other);
+        }
+        Ok(())
+    }
+
+    /// Records the next RTP sequence number reported by `RTP-Info`.
+    pub fn set_rtp_seq(&mut self, id: StreamId, seq: u16) {
+        if let Some(index) = self.slot_index(id)
+            && let Some(stream) = self.streams[index].as_mut()
+        {
+            stream.rtp_seq = seq;
+        }
     }
 
     /// Stream details in handler form.
@@ -943,13 +1080,19 @@ impl SessionManager {
                 } else {
                     0
                 },
-                mtype: params.mtype,
+                // adapter.cpp:2399-2410 uses QAM_AUTO/GUARD_INTERVAL_AUTO
+                // defaults and exposes `ds` as ad_plp.
+                mtype: if params.mtype_specified {
+                    params.mtype
+                } else {
+                    QAM_AUTO
+                },
                 t2id: params.t2id.unwrap_or(0),
                 c2tft: params.c2tft.unwrap_or(0),
-                plp: params.plp.unwrap_or(-1),
+                plp: params.ds.unwrap_or(-1),
                 plsc: params.plsc.unwrap_or(-1),
                 sm: params.sm.unwrap_or(0),
-                gi: params.gi.unwrap_or(-1),
+                gi: params.gi.unwrap_or(GUARD_INTERVAL_AUTO),
                 pids: adapter.active_pids(),
                 ccerr: self
                     .adapter_ccerr
@@ -1064,6 +1207,26 @@ impl StreamBackend for SessionManager {
 
     fn decode_transport(&mut self, id: StreamId, value: &str) -> Result<(), TransportError> {
         SessionManager::decode_transport(self, id, value)
+    }
+
+    fn decode_transport_from(
+        &mut self,
+        id: StreamId,
+        value: &str,
+        peer_host: &str,
+        peer_port: u16,
+    ) -> Result<(), TransportError> {
+        SessionManager::decode_transport_from(self, id, value, peer_host, peer_port)
+    }
+
+    fn start_play_from(
+        &mut self,
+        id: StreamId,
+        protocol: Protocol,
+        peer_host: &str,
+        peer_port: u16,
+    ) -> Result<(), PlayError> {
+        SessionManager::start_play_from(self, id, protocol, peer_host, peer_port)
     }
 
     fn close_stream(&mut self, id: StreamId) {

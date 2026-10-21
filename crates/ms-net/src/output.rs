@@ -291,10 +291,18 @@ impl StreamOutput {
                 for datagram in batch.datagrams(buf) {
                     match rtp.send(&datagram) {
                         Ok(count) => sent += count as i32,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            self.udp_dropped += datagram.len() as u64;
+                        Err(error) => {
+                            self.failed_writes = self.failed_writes.wrapping_add(1);
+                            if error.kind() == io::ErrorKind::WouldBlock {
+                                self.udp_dropped += datagram.len() as u64;
+                            } else if matches!(
+                                error.kind(),
+                                io::ErrorKind::ConnectionRefused | io::ErrorKind::BrokenPipe
+                            ) {
+                                // socketworks.cpp:1334-1343: close the RTP stream.
+                                self.forced_close = true;
+                            }
                         }
-                        Err(_) => {}
                     }
                 }
                 sent
@@ -317,7 +325,10 @@ impl StreamOutput {
                     sent += count;
                     if failed {
                         self.forced_close = true;
-                        self.failed_writes = self.failed_writes.wrapping_add(1);
+                        // stream.cpp:824-829: a partial flush is not a failed write.
+                        if sent == 0 {
+                            self.failed_writes = self.failed_writes.wrapping_add(1);
+                        }
                         break;
                     }
                 }
@@ -381,10 +392,13 @@ impl StreamOutput {
         match &mut self.transport {
             Transport::Udp { rtcp, .. } => match rtcp.send(&packet) {
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.udp_dropped += packet.len() as u64;
+                Err(error) => {
+                    self.failed_writes = self.failed_writes.wrapping_add(1);
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        self.udp_dropped += packet.len() as u64;
+                    }
+                    // socketworks.cpp:1334-1335: RTCP sockets are not force-closed.
                 }
-                Err(_) => {}
             },
             Transport::Tcp { sink, .. } => {
                 if self.queue.write(sink.as_mut(), &packet, false) < 0 {
@@ -412,6 +426,12 @@ impl StreamOutput {
             #[cfg(feature = "srt")]
             Transport::Srt { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
         }
+    }
+
+    /// Requests that queued data be dropped up to the next RTSP header
+    /// (`sockets_set_flush_enqued_data`, stream.cpp:374).
+    pub fn set_flush_enqueued_data(&mut self) {
+        self.queue.set_flush_enqueued_data(true);
     }
 
     /// Flushes queued TCP data (`flush_socket`); UDP never queues.

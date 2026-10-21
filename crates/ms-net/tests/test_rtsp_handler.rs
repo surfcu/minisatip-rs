@@ -30,6 +30,7 @@ struct FakeBackend {
     play_error: Option<PlayError>,
     sdp: Option<String>,
     resources: BTreeMap<String, HttpResource>,
+    user_agents: BTreeMap<StreamId, String>,
 }
 
 impl FakeBackend {
@@ -135,6 +136,10 @@ impl StreamBackend for FakeBackend {
 
     fn http_resource(&mut self, uri: &str) -> Option<HttpResource> {
         self.resources.get(uri).cloned()
+    }
+
+    fn set_user_agent(&mut self, id: StreamId, agent: &str) {
+        self.user_agents.insert(id, agent.to_owned());
     }
 }
 
@@ -624,6 +629,24 @@ fn oversized_incomplete_buffer_is_discarded() {
 fn malformed_request_line_is_rejected() {
     assert_eq!(parse_request(b"garbage\r\n\r\n"), ParseOutcome::Malformed);
     assert_eq!(parse_request(b"OPTIONS\r\n\r\n"), ParseOutcome::Malformed);
+}
+
+#[test]
+fn user_agent_keeps_only_the_first_token() {
+    // header_parameter returns the next whitespace-delimited token
+    // (utils.cpp:145-172; minisatip.cpp:1320-1325).
+    let mut backend = FakeBackend::default();
+    backend.add_stream(StreamType::RtspUdp);
+    let request = request(
+        "PLAY rtsp://127.0.0.1/ RTSP/1.0\r\nCSeq: 1\r\nSession: 1000\r\nUser-Agent: Mozilla/5.0 (X11; Linux)\r\n\r\n",
+    );
+    let response =
+        handle_rtsp(&mut context(&mut backend, Protocol::Rtsp), &request).expect("PLAY answered");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        backend.user_agents.get(&0).map(String::as_str),
+        Some("Mozilla/5.0")
+    );
 }
 
 #[test]

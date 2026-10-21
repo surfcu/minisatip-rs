@@ -85,6 +85,9 @@ impl Request {
 
     /// Whether the method matches case-insensitively.
     pub fn is_method(&self, method: &str) -> bool {
+        // read_rtsp dispatches with starts_with_case_insensitive
+        // (minisatip.cpp:1249-1320); the exact-case completeness gate is
+        // covered by DEV-027.
         self.method.eq_ignore_ascii_case(method)
     }
 

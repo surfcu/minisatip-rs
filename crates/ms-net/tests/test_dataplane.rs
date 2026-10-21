@@ -202,7 +202,7 @@ fn file_replay_to_udp_routes_only_subscribed_pids() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut stopped = None;
     while Instant::now() < deadline && stopped.is_none() {
-        if let Ok(Event::OutputStopped(id, stats)) =
+        if let Ok(Event::OutputStopped(id, stats, _)) =
             adapter.events().recv_timeout(Duration::from_millis(100))
         {
             stopped = Some((id, stats));

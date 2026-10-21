@@ -138,6 +138,8 @@ fn srt_partial_send_accounts_sent_bytes_and_forces_close() {
     // rv > 0 still counts one flush and the bytes that went out.
     assert_eq!(stats.packets, 1);
     assert_eq!(stats.octets, 100);
+    // stream.cpp:824-829: only rv == 0 with a failure bumps failed_writes.
+    assert_eq!(stats.failed_writes, 0);
 }
 
 #[test]

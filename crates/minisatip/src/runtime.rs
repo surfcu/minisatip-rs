@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use ms_config::Options;
+use ms_net::bind::{BindOptions, resolve_bind_opts};
 use ms_net::dataplane::{AdapterHandle, Command, DataPlaneConfig};
 use ms_net::handler::{HandlerContext, StreamBackend, StreamType, handle_http, handle_rtsp};
 use ms_net::output::{OutputConfig, StreamOutput, UdpTarget};
@@ -67,14 +68,18 @@ struct ConnectionRequest {
 
 enum Inbound {
     Request(Box<ConnectionRequest>),
+    /// An interleaved RTP/RTCP frame was received (minisatip.cpp:1187-1189).
+    Interleaved(u64),
     Closed(u64),
 }
 
-/// Outputs started by PLAY/GET, tracked so they can be stopped.
+/// Outputs started by PLAY/GET, tracked so they can be stopped or re-targeted.
 struct ActiveOutput {
     conn_id: u64,
     adapter: i32,
+    epoch: u64,
     stream_type: StreamType,
+    dest: Option<SocketAddr>,
 }
 
 /// Adapter tuner that forwards tunes to the data-plane thread.
@@ -97,6 +102,7 @@ struct Runtime {
     outputs: HashMap<i32, ActiveOutput>,
     conn_streams: HashMap<u64, i32>,
     started: Instant,
+    start_unix: i64,
 }
 
 impl Runtime {
@@ -146,6 +152,7 @@ impl Runtime {
 
         let mut session = SessionManager::with_scheduler(scheduler);
         session.set_start_rtp(config.start_rtp);
+        session.set_transport_defaults(config.rrtp.clone(), &opts.disc_host);
         session.set_server_timeout_ms(config.timeout_ms);
         session.set_describe_options(DescribeOptions {
             local_host: config.advertised_host.clone(),
@@ -172,10 +179,10 @@ impl Runtime {
         session.set_web(web);
         session.set_web_runtime(RuntimeState {
             datetime_compile: String::new(),
-            datetime_start: format_http_date(SystemTime::now()),
-            datetime_current: format_http_date(SystemTime::now()),
-            time_running: "0".to_owned(),
-            run_user: 0,
+            datetime_start: sys::asctime_now(),
+            datetime_current: sys::asctime_now(),
+            time_running: "00:00:00".to_owned(),
+            run_user: sys::run_user(),
             run_pid: i32::try_from(std::process::id()).unwrap_or(0),
             command_line: opts.command_line.clone(),
         });
@@ -192,6 +199,7 @@ impl Runtime {
             outputs: HashMap::new(),
             conn_streams: HashMap::new(),
             started: Instant::now(),
+            start_unix: sys::now_seconds(),
         })
     }
 
@@ -199,6 +207,11 @@ impl Runtime {
         while !shutdown.load(Ordering::SeqCst) && !sys::shutdown_requested() {
             match receiver.recv_timeout(LOOP_TICK) {
                 Ok(Inbound::Request(message)) => self.handle_request(*message),
+                Ok(Inbound::Interleaved(conn_id)) => {
+                    if let Some(id) = self.conn_streams.get(&conn_id).copied() {
+                        self.session.touch_stream(id);
+                    }
+                }
                 Ok(Inbound::Closed(conn_id)) => self.close_connection(conn_id),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -233,6 +246,16 @@ impl Runtime {
             reads,
         } = message;
         let before = self.conn_streams.get(&conn_id).copied();
+        if request.is_method("PLAY")
+            && let Some(id) = before
+        {
+            self.refresh_sequence(id);
+        }
+        if !protocol.is_rtsp() {
+            let running = sys::now_seconds() - self.start_unix;
+            self.session
+                .set_web_clock(sys::asctime_now(), sys::elapsed_string(running));
+        }
         // describe_streams prints the socket's local address (stream.cpp:97-105).
         self.session.describe_options_mut().local_host = local_ip.clone();
 
@@ -240,6 +263,7 @@ impl Runtime {
             let mut ctx = HandlerContext::new(&mut self.session, protocol);
             ctx.sid = before;
             ctx.peer_host = peer.ip().to_string();
+            ctx.peer_port = peer.port();
             ctx.local_host = local_ip;
             ctx.timeout_ms = self.config.timeout_ms;
             ctx.start_rtp = self.config.start_rtp;
@@ -253,6 +277,16 @@ impl Runtime {
             (response, ctx.sid)
         };
 
+        // Interleaved replies take the socket's priority lane
+        // (minisatip.cpp:2177) so they never split a `$` frame.
+        let priority = before.and_then(|id| {
+            self.outputs
+                .get(&id)
+                .filter(|active| {
+                    active.conn_id == conn_id && active.stream_type == StreamType::RtspTcp
+                })
+                .map(|active| (id, active.adapter))
+        });
         match sid {
             Some(id) => {
                 self.conn_streams.insert(conn_id, id);
@@ -261,9 +295,7 @@ impl Runtime {
                 self.conn_streams.remove(&conn_id);
             }
         }
-        if let Some(id) = sid {
-            self.apply_transport_defaults(id, peer.ip());
-        }
+        self.prune_outputs();
 
         // A 200 to a repeated HTTP GET is hidden (minisatip.cpp:2096-2102).
         let hidden = protocol == Protocol::Http
@@ -273,7 +305,18 @@ impl Runtime {
                 .is_some_and(|response| response.status == 200);
         if let Some(response) = response.filter(|_| !hidden) {
             let bytes = response.to_bytes();
-            if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+            let queued = priority.is_some_and(|(stream_id, adapter)| {
+                self.handles
+                    .get(adapter as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|handle| {
+                        handle.send(Command::WritePriority {
+                            stream_id,
+                            data: bytes.clone(),
+                        })
+                    })
+            });
+            if !queued && (writer.write_all(&bytes).is_err() || writer.flush().is_err()) {
                 return;
             }
         }
@@ -295,38 +338,65 @@ impl Runtime {
             }
             return;
         }
-        if self.session.stream(id).is_some_and(|stream| stream.do_play) {
-            if self.outputs.contains_key(&id) {
-                self.sync_pids(id);
-            } else {
-                self.start_output(id, conn_id, peer, writer);
-            }
-        }
+        self.sync_output(id, conn_id, peer, writer);
         self.update_thresholds();
     }
 
-    /// C++ falls back to the RTSP peer when `destination=` is absent and lets
-    /// `-r` override the destination (stream.cpp:503-508).
-    fn apply_transport_defaults(&mut self, id: i32, peer: IpAddr) {
+    /// Copies the live RTP sequence into the session for `RTP-Info`
+    /// (minisatip.cpp:1416-1418).
+    fn refresh_sequence(&mut self, id: i32) {
+        let Some(active) = self.outputs.get(&id) else {
+            return;
+        };
+        let Some(handle) = self
+            .handles
+            .get(active.adapter as usize)
+            .and_then(Option::as_ref)
+        else {
+            return;
+        };
+        if let Some(stats) = handle.query(id) {
+            self.session.set_rtp_seq(id, stats.seq);
+        }
+    }
+
+    /// Reconciles a live output with a re-SETUP/PLAY (`stream.cpp:513-556`):
+    /// a new client port or transport replaces the RTP socket, an unchanged
+    /// one keeps streaming.
+    fn sync_output(&mut self, id: i32, conn_id: u64, peer: SocketAddr, writer: TcpStream) {
         let Some(stream) = self.session.stream(id) else {
             return;
         };
-        if stream.stream_type != StreamType::RtspUdp {
+        let (stream_type, adapter, do_play) = (stream.stream_type, stream.adapter, stream.do_play);
+        let dest = udp_destination(stream);
+        let Some(active) = self
+            .outputs
+            .get(&id)
+            .map(|active| (active.adapter, active.stream_type, active.dest))
+        else {
+            if do_play {
+                self.start_output(id, conn_id, peer, writer);
+            }
+            return;
+        };
+        let (active_adapter, active_type, active_dest) = active;
+        if active_adapter != adapter || active_type != stream_type {
+            self.stop_output(id);
+            if adapter >= 0 {
+                self.start_output(id, conn_id, peer, writer);
+            }
             return;
         }
-        let host = self.config.rrtp.clone().unwrap_or_else(|| {
-            if stream.remote_host.is_empty() || stream.remote_host == "0.0.0.0" {
-                peer.to_string()
-            } else {
-                stream.remote_host.clone()
-            }
-        });
-        let port = if stream.remote_port == 0 {
-            self.config.start_rtp
-        } else {
-            stream.remote_port
-        };
-        self.session.set_udp_target(id, &host, port);
+        if let Some(dest) = dest
+            && active_dest != Some(dest)
+            && let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref)
+        {
+            handle.send(Command::SetDestination {
+                stream_id: id,
+                dest,
+            });
+        }
+        self.sync_pids(id);
     }
 
     fn start_output(&mut self, id: i32, conn_id: u64, peer: SocketAddr, writer: TcpStream) {
@@ -357,15 +427,21 @@ impl Runtime {
             fifo_size: self.config.fifo_size,
         };
         let now_ms = self.started.elapsed().as_millis() as i64;
-        let output = match stream_type {
-            StreamType::RtspUdp => {
-                let Ok(destination) = remote_host.parse::<IpAddr>() else {
+        let dest = match stream_type {
+            StreamType::RtspUdp => match remote_host.parse::<IpAddr>() {
+                Ok(destination) => Some(SocketAddr::new(destination, remote_port)),
+                Err(_) => {
                     eprintln!("minisatip: invalid RTP destination {remote_host}");
                     return;
-                };
+                }
+            },
+            _ => None,
+        };
+        let output = match stream_type {
+            StreamType::RtspUdp => {
                 let target = UdpTarget {
                     local: SocketAddr::new(self.config.bind_ip, server_port),
-                    dest: SocketAddr::new(destination, remote_port),
+                    dest: dest.expect("parsed above"),
                     ttl: None,
                 };
                 StreamOutput::udp(target, config, now_ms)
@@ -405,13 +481,15 @@ impl Runtime {
         match output {
             Ok(output) => {
                 let pids = self.stream_pids(id, adapter);
-                if handle.start_output(id, output, pids) {
+                if let Some(epoch) = handle.start_output(id, output, pids) {
                     self.outputs.insert(
                         id,
                         ActiveOutput {
                             conn_id,
                             adapter,
+                            epoch,
                             stream_type,
+                            dest,
                         },
                     );
                 }
@@ -442,6 +520,21 @@ impl Runtime {
             }
         }
         set
+    }
+
+    /// Stops outputs whose stream was closed behind the runtime's back
+    /// (`close_stream`, stream.cpp:351-379).
+    fn prune_outputs(&mut self) {
+        let dead: Vec<i32> = self
+            .outputs
+            .keys()
+            .copied()
+            .filter(|id| self.session.stream(*id).is_none())
+            .collect();
+        for id in dead {
+            self.stop_output(id);
+            self.conn_streams.retain(|_, sid| *sid != id);
+        }
     }
 
     fn stop_output(&mut self, id: i32) {
@@ -488,11 +581,17 @@ impl Runtime {
             };
             while let Ok(event) = handle.events().try_recv() {
                 match event {
-                    ms_net::dataplane::Event::OutputClosed(id)
-                    | ms_net::dataplane::Event::OutputStopped(id, _) => {
-                        self.outputs.remove(&id);
-                        self.session.close_stream(id);
+                    // Only the tracked generation may close the stream; a
+                    // stale event belongs to a restarted output.
+                    ms_net::dataplane::Event::OutputClosed(id, epoch) => {
+                        if self.outputs.get(&id).map(|active| active.epoch) == Some(epoch) {
+                            self.outputs.remove(&id);
+                            self.session.close_stream(id);
+                        }
                     }
+                    // StopOutput is always requested here, and the caller
+                    // decides whether the stream lives on (stream.cpp:513-556).
+                    ms_net::dataplane::Event::OutputStopped(..) => {}
                     ms_net::dataplane::Event::TunerError(error) => {
                         eprintln!("minisatip: adapter {aid}: {error}");
                     }
@@ -560,6 +659,22 @@ impl Runtime {
     }
 }
 
+/// Resolves `--bind`/`--bind-http` like `getaddrinfo` (socketworks.cpp:55-98).
+fn resolve_bind_address(host: Option<&str>) -> Result<Option<IpAddr>, String> {
+    let Some(host) = host.filter(|host| !host.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(address) = host.parse() {
+        return Ok(Some(address));
+    }
+    (host, 0)
+        .to_socket_addrs()
+        .map_err(|error| format!("cannot resolve {host}: {error}"))?
+        .next()
+        .map(|address| Some(address.ip()))
+        .ok_or_else(|| format!("cannot resolve {host}"))
+}
+
 /// Runs the server until SIGINT/SIGTERM.
 pub fn run(opts: &Options) -> Result<(), String> {
     sys::install_shutdown_handlers();
@@ -570,22 +685,25 @@ pub fn run(opts: &Options) -> Result<(), String> {
         .map_err(|_| format!("invalid HTTP port {}", opts.http_port))?;
     let start_rtp = u16::try_from(opts.start_rtp)
         .map_err(|_| format!("invalid RTP port {}", opts.start_rtp))?;
-    let bind_ip = opts
-        .bind
-        .as_deref()
-        .and_then(|host| host.parse::<IpAddr>().ok())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let http_bind_ip = opts
-        .bind_http
-        .as_deref()
-        .and_then(|host| host.parse::<IpAddr>().ok())
-        .unwrap_or(bind_ip);
-    // set_options: `lip` is `--bind` or getlocalip() (minisatip.cpp:1125-1128).
-    let advertised_host = opts
-        .bind
-        .clone()
-        .filter(|bind| !bind.is_empty())
-        .unwrap_or_else(|| local_ip(&opts.disc_host, opts.use_ipv4_only != 0));
+    // resolve_bind_opts: --bind-dev sets both addresses, and hostnames are
+    // resolved through getaddrinfo (socketworks.cpp:138-168).
+    let mut binds = BindOptions::new(
+        opts.bind.as_deref(),
+        opts.bind_http.as_deref(),
+        opts.bind_dev.as_deref(),
+    );
+    resolve_bind_opts(&mut binds, &ms_net::sys::SystemDevices)
+        .map_err(|error| format!("bind options: {error}"))?;
+    let bind_ip =
+        resolve_bind_address(binds.bind.as_deref())?.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let http_bind_ip = resolve_bind_address(binds.bind_http.as_deref())?.unwrap_or(bind_ip);
+    // set_options: `lip` is the resolved `--bind` or getlocalip()
+    // (minisatip.cpp:1125-1128).
+    let advertised_host = if binds.bind.is_some() {
+        bind_ip.to_string()
+    } else {
+        local_ip(&opts.disc_host, opts.use_ipv4_only != 0)
+    };
 
     let rtsp_listener = TcpListener::bind(SocketAddr::new(bind_ip, rtsp_port))
         .map_err(|error| format!("cannot bind RTSP port {rtsp_port}: {error}"))?;
@@ -603,10 +721,10 @@ pub fn run(opts: &Options) -> Result<(), String> {
     let (mut uuid, mut bootid, mut device_id) =
         (opts.uuid.clone(), opts.bootid.max(0), opts.device_id.max(0));
     let cache_dir = PathBuf::from(&opts.cache_dir);
-    if cache_dir.is_dir()
-        && let Ok((stored_bootid, stored_device_id)) =
-            read_boot_id(&cache_dir, device_id, &mut uuid)
-    {
+    // minisatip.cpp:1934-1937 creates the cache dir and exits on failure.
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("cannot create {}: {error}", cache_dir.display()))?;
+    if let Ok((stored_bootid, stored_device_id)) = read_boot_id(&cache_dir, device_id, &mut uuid) {
         bootid = stored_bootid;
         device_id = stored_device_id;
     }
@@ -686,7 +804,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
             xml_path: opts.xml_path.clone(),
             disc_host: opts.disc_host.clone(),
             local_ip: advertised_host.clone(),
-            cache_dir: cache_dir.is_dir().then_some(cache_dir.clone()),
+            cache_dir: Some(cache_dir.clone()),
             disabled: false,
         };
         Some(spawn_ssdp(
@@ -734,6 +852,14 @@ fn local_ip(disc_host: &str, ipv4_only: bool) -> String {
         })
         .map(|addr| addr.ip().to_string())
         .unwrap_or_default()
+}
+
+fn udp_destination(stream: &ms_net::session::Stream) -> Option<SocketAddr> {
+    if stream.stream_type != StreamType::RtspUdp {
+        return None;
+    }
+    let ip = stream.remote_host.parse::<IpAddr>().ok()?;
+    Some(SocketAddr::new(ip, stream.remote_port))
 }
 
 fn fifo_size(max_sbuf: i32) -> usize {
@@ -863,6 +989,7 @@ fn serve_connection(
                         | ParseOutcome::Ignored { consumed } => {
                             if consumed > 0 {
                                 buffer.drain(..consumed);
+                                let _ = requests.send(Inbound::Interleaved(conn_id));
                             }
                             break;
                         }

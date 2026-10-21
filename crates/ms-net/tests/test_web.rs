@@ -297,6 +297,22 @@ fn root_serves_status_html_and_missing_files_are_404() {
 }
 
 #[test]
+fn static_name_without_leading_slash_is_served() {
+    // minisatip.cpp:1647-1657 guards on `url.substr(1)` but readfile uses
+    // the original name, so `GET status.html` opens html/status.html.
+    let root = temp_dir();
+    fs::write(root.join("status.html"), b"ok").expect("write");
+    let service = WebService::new(config(root.clone()));
+    let snapshot = WebSnapshot::new();
+    let route = service
+        .route(&get("status.html"), &snapshot)
+        .expect("route");
+    assert_eq!(route.status, 200);
+    assert_eq!(route.body, b"ok");
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn traversal_and_nested_paths_are_rejected() {
     // read_http:1647-1648 rejects any '/' after the first and any "..".
     let root = temp_dir();
@@ -339,6 +355,10 @@ fn state_json_uses_cpp_symbol_order_and_values() {
     assert!(json.contains("\"ad_type\":[1,0,0,"));
     assert!(json.contains("\"ad_freq\":[11362,0,0,"));
     assert!(json.contains("\"ad_sr\":[22,0,0,"));
+    // adapter.cpp:2399-2410: QAM_AUTO, GUARD_INTERVAL_AUTO and `ds` defaults.
+    assert!(json.contains("\"ad_mtype\":[6,6,6,"));
+    assert!(json.contains("\"ad_gi\":[4,4,4,"));
+    assert!(json.contains("\"ad_plp\":[-1,-1,-1,"));
     assert!(json.contains("\"ad_pids\":[\"0,16\",\"\",\"\","));
     assert!(json.contains("\"tuner_s2\":1,"));
     assert!(json.contains("\"st_enabled\":[1,0,0,"));

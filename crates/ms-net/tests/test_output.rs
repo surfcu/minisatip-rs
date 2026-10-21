@@ -6,7 +6,7 @@ use ms_tuner::PidSet;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 fn ts_packet(pid: u16, fill: u8) -> [u8; 188] {
     let mut packet = [fill; 188];
@@ -79,6 +79,27 @@ fn recv(socket: &UdpSocket) -> Vec<u8> {
 fn rtp_server_port_numbering() {
     assert_eq!(rtp_server_port(5500, 0), 5500);
     assert_eq!(rtp_server_port(5500, 3), 5506);
+}
+
+#[test]
+fn udp_send_refused_forces_close() {
+    // socketworks.cpp:1334-1343: ECONNREFUSED on an RTP socket closes the stream.
+    let (rx_rtp, rx_rtcp) = udp_pair();
+    let dest = rx_rtp.local_addr().unwrap();
+    drop((rx_rtp, rx_rtcp));
+    let mut output = udp_output(dest, 0x1234);
+    let buf = buffer(&[0x100]);
+    let pids = PidSet::from_pids([0x100]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !output.forced_close() && Instant::now() < deadline {
+        output.process(&buf, &pids, 1000, 5_000_000).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        output.forced_close(),
+        "refused RTP destination is not closed"
+    );
+    assert!(output.stats().failed_writes > 0);
 }
 
 #[test]

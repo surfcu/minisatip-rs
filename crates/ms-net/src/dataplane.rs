@@ -9,6 +9,7 @@ use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -209,6 +210,8 @@ pub enum Command {
     StartOutput {
         /// Stream that owns the output.
         stream_id: StreamId,
+        /// Generation reported back in output events.
+        epoch: u64,
         /// The output.
         output: Box<StreamOutput>,
         /// PIDs routed to it.
@@ -256,9 +259,9 @@ pub enum Event {
     /// An RTCP packet arrived from the client (`rtcp_confirm`).
     RtcpReceived(StreamId),
     /// A write failed; the output was removed (C++ closes the stream).
-    OutputClosed(StreamId),
+    OutputClosed(StreamId, u64),
     /// An output was removed by [`Command::StopOutput`].
-    OutputStopped(StreamId, OutputStats),
+    OutputStopped(StreamId, OutputStats, u64),
     /// Total continuity errors seen by this adapter (`ad->ccerr`).
     ContinuityErrors(u64),
     /// The tuner failed to tune or read.
@@ -269,6 +272,7 @@ pub enum Event {
 pub struct AdapterHandle {
     commands: Sender<Command>,
     events: Receiver<Event>,
+    epoch: AtomicU64,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -283,6 +287,7 @@ impl AdapterHandle {
         Ok(Self {
             commands,
             events,
+            epoch: AtomicU64::new(0),
             thread: Some(thread),
         })
     }
@@ -302,13 +307,21 @@ impl AdapterHandle {
         self.send(Command::Tune(Box::new(params)))
     }
 
-    /// Starts an output for `stream_id`.
-    pub fn start_output(&self, stream_id: StreamId, output: StreamOutput, pids: PidSet) -> bool {
+    /// Starts an output for `stream_id`, returning its generation.
+    pub fn start_output(
+        &self,
+        stream_id: StreamId,
+        output: StreamOutput,
+        pids: PidSet,
+    ) -> Option<u64> {
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         self.send(Command::StartOutput {
             stream_id,
+            epoch,
             output: Box::new(output),
             pids,
         })
+        .then_some(epoch)
     }
 
     /// Replaces the PIDs of `stream_id`.
@@ -355,6 +368,7 @@ impl Drop for AdapterHandle {
 }
 
 struct Subscriber {
+    epoch: u64,
     output: StreamOutput,
     pids: PidSet,
     last_timer_ms: i64,
@@ -459,6 +473,7 @@ impl DataPlane {
             }
             Command::StartOutput {
                 stream_id,
+                epoch,
                 output,
                 pids,
             } => {
@@ -466,6 +481,7 @@ impl DataPlane {
                 self.outputs.insert(
                     stream_id,
                     Subscriber {
+                        epoch,
                         output: *output,
                         pids,
                         last_timer_ms: now,
@@ -482,9 +498,14 @@ impl DataPlane {
             Command::StopOutput(stream_id) => {
                 if let Some(subscriber) = self.outputs.remove(&stream_id) {
                     let mut output = subscriber.output;
+                    // close_stream drops queued bytes up to the next RTSP
+                    // header before the pending reply (stream.cpp:374).
+                    output.set_flush_enqueued_data();
                     let _ = output.flush_queue();
                     let stats = output.stats();
-                    let _ = self.events.send(Event::OutputStopped(stream_id, stats));
+                    let _ =
+                        self.events
+                            .send(Event::OutputStopped(stream_id, stats, subscriber.epoch));
                     self.update_tuner_pids();
                 }
             }
@@ -676,8 +697,10 @@ impl DataPlane {
     }
 
     fn close(&mut self, stream_id: StreamId) {
-        if self.outputs.remove(&stream_id).is_some() {
-            let _ = self.events.send(Event::OutputClosed(stream_id));
+        if let Some(subscriber) = self.outputs.remove(&stream_id) {
+            let _ = self
+                .events
+                .send(Event::OutputClosed(stream_id, subscriber.epoch));
             self.update_tuner_pids();
         }
     }

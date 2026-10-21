@@ -182,6 +182,28 @@ pub trait StreamBackend {
         Ok(())
     }
 
+    /// [`StreamBackend::decode_transport`] with the RTSP peer address.
+    fn decode_transport_from(
+        &mut self,
+        id: StreamId,
+        value: &str,
+        _peer_host: &str,
+        _peer_port: u16,
+    ) -> Result<(), TransportError> {
+        self.decode_transport(id, value)
+    }
+
+    /// [`StreamBackend::start_play`] with the client address.
+    fn start_play_from(
+        &mut self,
+        id: StreamId,
+        protocol: Protocol,
+        _peer_host: &str,
+        _peer_port: u16,
+    ) -> Result<(), PlayError> {
+        self.start_play(id, protocol)
+    }
+
     /// Closes and disables a stream.
     fn close_stream(&mut self, _id: StreamId) {}
 
@@ -211,6 +233,8 @@ pub struct HandlerContext<'a, B: StreamBackend> {
     pub sid: Option<StreamId>,
     /// Remote peer address.
     pub peer_host: String,
+    /// Remote peer port.
+    pub peer_port: u16,
     /// Local address used in `Content-Base` and `source=`.
     pub local_host: String,
     /// Preformatted `Date` header value.
@@ -235,6 +259,7 @@ impl<'a, B: StreamBackend> HandlerContext<'a, B> {
             protocol,
             sid: None,
             peer_host: "127.0.0.1".to_owned(),
+            peer_port: 0,
             local_host: "127.0.0.1".to_owned(),
             date: format_http_date(SystemTime::now()),
             server: format!("minisatip/{}", env!("CARGO_PKG_VERSION")),
@@ -303,7 +328,12 @@ pub fn handle_rtsp<B: StreamBackend>(
             let Some(id) = ctx.sid else {
                 return Some(base_response(ctx, 400).with_cseq(cseq));
             };
-            if ctx.backend.decode_transport(id, &header.value).is_err() {
+            let peer = (ctx.peer_host.as_str(), ctx.peer_port);
+            if ctx
+                .backend
+                .decode_transport_from(id, &header.value, peer.0, peer.1)
+                .is_err()
+            {
                 return Some(base_response(ctx, 400).with_cseq(cseq));
             }
         } else if header.value.contains("LIVE555") || header.value.contains("Lavf") {
@@ -311,7 +341,9 @@ pub fn handle_rtsp<B: StreamBackend>(
                 ctx.backend.disable_timeout(id);
             }
         } else if header.is("User-Agent") || (user_agent.is_none() && header.is("Server")) {
-            user_agent = Some(header.value.as_str());
+            // header_parameter keeps only the first whitespace token
+            // (utils.cpp:145-172; minisatip.cpp:1297-1301).
+            user_agent = Some(header.value.split_whitespace().next().unwrap_or(""));
         }
     }
 
@@ -334,7 +366,9 @@ pub fn handle_rtsp<B: StreamBackend>(
             ctx.backend.set_user_agent(id, agent);
         }
         if (request.is_method("PLAY") || request.is_method("GET"))
-            && let Err(error) = ctx.backend.start_play(id, ctx.protocol)
+            && let Err(error) =
+                ctx.backend
+                    .start_play_from(id, ctx.protocol, &ctx.peer_host, ctx.peer_port)
         {
             let body = error.body.filter(|body| !body.is_empty());
             let mut response = base_response(ctx, error.status).with_cseq(cseq);
