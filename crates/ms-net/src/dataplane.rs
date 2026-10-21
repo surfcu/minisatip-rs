@@ -10,9 +10,8 @@ use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -283,7 +282,8 @@ pub enum Event {
 pub struct AdapterHandle {
     commands: Sender<Command>,
     events: Receiver<Event>,
-    epoch: AtomicU64,
+    // A mutex rather than `AtomicU64`, which 32-bit MIPS does not provide.
+    epoch: Mutex<u64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -307,7 +307,7 @@ impl AdapterHandle {
         Ok(Self {
             commands,
             events,
-            epoch: AtomicU64::new(0),
+            epoch: Mutex::new(0),
             thread: Some(thread),
         })
     }
@@ -345,7 +345,11 @@ impl AdapterHandle {
         pids: PidSet,
         setup_age_ms: i64,
     ) -> Option<u64> {
-        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let epoch = {
+            let mut epoch = self.epoch.lock().unwrap_or_else(PoisonError::into_inner);
+            *epoch = epoch.wrapping_add(1);
+            *epoch
+        };
         self.send(Command::StartOutput {
             stream_id,
             epoch,
