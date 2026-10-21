@@ -63,7 +63,8 @@ impl Server {
         let _ = fs::remove_dir_all(&cache);
         fs::create_dir_all(&cache)?;
         let (rtsp_port, http_port) = free_tcp_pair()?;
-        let start_rtp = free_udp_range(RTP_RANGE)?;
+        // TCP and UDP numbers can coincide; keep them apart so placeholders are unique.
+        let start_rtp = free_udp_range(RTP_RANGE, &[rtsp_port, http_port])?;
         let log = launch.workdir.join(format!("{}.log", binary.label));
         let log_file = fs::File::create(&log)?;
         let mut args: Vec<String> = vec![
@@ -163,13 +164,14 @@ fn free_tcp_pair() -> io::Result<(u16, u16)> {
     Ok((first.local_addr()?.port(), second.local_addr()?.port()))
 }
 
-/// A port `p` such that UDP `p..p+count` are all free right now.
-pub fn free_udp_range(count: u16) -> io::Result<u16> {
+/// A port `p` such that UDP `p..p+count` are all free right now and contain
+/// none of the `avoid` port numbers.
+pub fn free_udp_range(count: u16, avoid: &[u16]) -> io::Result<u16> {
     for _ in 0..200 {
         let probe = UdpSocket::bind(("127.0.0.1", 0))?;
         let base = probe.local_addr()?.port() & !1;
         drop(probe);
-        if base < 1024 || base.checked_add(count).is_none() {
+        if base < 1024 || base.checked_add(count).is_none() || overlaps(base, count, avoid) {
             continue;
         }
         let held: Vec<_> = (base..base + count)
@@ -183,4 +185,33 @@ pub fn free_udp_range(count: u16) -> io::Result<u16> {
         io::ErrorKind::AddrNotAvailable,
         "no free UDP port range",
     ))
+}
+
+fn overlaps(base: u16, count: u16, avoid: &[u16]) -> bool {
+    avoid.iter().any(|port| (base..base + count).contains(port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlap_covers_exactly_the_range() {
+        assert!(overlaps(40000, 32, &[40000]));
+        assert!(overlaps(40000, 32, &[1, 40031]));
+        assert!(!overlaps(40000, 32, &[39999, 40032]));
+        assert!(!overlaps(40000, 32, &[]));
+    }
+
+    #[test]
+    fn free_udp_range_skips_avoided_ports() {
+        let (rtsp, http) = free_tcp_pair().unwrap();
+        for _ in 0..20 {
+            let base = free_udp_range(RTP_RANGE, &[rtsp, http]).unwrap();
+            assert!(
+                !overlaps(base, RTP_RANGE, &[rtsp, http]),
+                "{base} {rtsp} {http}"
+            );
+        }
+    }
 }
