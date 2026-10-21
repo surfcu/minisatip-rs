@@ -1,12 +1,17 @@
-//! Differential test runner that compares the C++ and Rust binaries.
+//! Differential test runner that compares the C++ and Rust binaries (PLAN §5).
+//!
+//! Both binaries get the same generated TS capture, arguments and YAML
+//! scenario; their normalised transcripts must be identical.
 
-/// Placeholder scaffolding until the M1 implementation lands.
-pub fn placeholder() {}
+pub mod analysis;
+pub mod client;
+pub mod diff;
+pub mod normalize;
+pub mod runner;
+pub mod scenario;
+pub mod server;
+pub mod tsgen;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_is_linked() {
-        super::placeholder();
-    }
-}
+pub use runner::{Comparison, Outcome, RunOptions, compare, run_once};
+pub use scenario::Scenario;
+pub use server::Binary;
