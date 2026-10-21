@@ -52,6 +52,23 @@ impl CaRegistry {
         self.devices[i].get_or_insert_with(|| CaDevice::new(i, clock))
     }
 
+    /// `set_ca_channels`: the `-c` CAIDs, appended to each slot and kept over the CAM's.
+    pub fn set_ca_channels(&mut self, channels: &[ms_config::CaChannels]) {
+        for c in channels {
+            let Some(i) = index(i32::from(c.adapter)) else {
+                continue;
+            };
+            let dev = self.device(i);
+            for &caid in &c.caids {
+                if dev.caids.len() < MAX_CAID {
+                    // `ca_device_t::caid[]` is uint16_t.
+                    dev.caids.push(caid as u16);
+                    dev.has_forced_caids = true;
+                }
+            }
+        }
+    }
+
     pub fn insert(&mut self, dev: CaDevice) {
         let i = dev.id;
         self.devices[i] = Some(dev);
