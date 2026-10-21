@@ -1,0 +1,25 @@
+# scenario errors
+== 1 rtsp c > OPTIONS rtsp://127.0.0.1:<RTSP>/ RTSP/1.0
+RTSP/1.0 400 Bad Request
+Date: <DATE>
+CSeq: 1
+Server: minisatip/<VER>
+== 2 rtsp c > PLAY rtsp://127.0.0.1:<RTSP>/stream=99 RTSP/1.0
+RTSP/1.0 454 Session Not Found
+Date: <DATE>
+CSeq: 9
+Server: minisatip/<VER>
+== 3 rtsp c > TEARDOWN rtsp://127.0.0.1:<RTSP>/stream=99 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 2
+Server: minisatip/<VER>
+Session: <SESSION1>
+== 4 rtsp c > GET rtsp://127.0.0.1:<RTSP>/ RTSP/1.0
+RTSP/1.0 404 Not Found
+Date: <DATE>
+Server: minisatip/<VER>
+== 5 http > GET /missing.html HTTP/1.0
+HTTP/1.0 404 Not Found
+Date: <DATE>
+Server: minisatip/<VER>

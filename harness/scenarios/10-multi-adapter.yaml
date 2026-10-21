@@ -1,0 +1,24 @@
+name: multi-adapter
+description: Two concurrent sessions tune two different transports on two adapters
+capture: fta
+adapters: 2
+fast: true
+steps:
+  - udp: u1
+  - udp: u2
+  - rtsp:
+      conn: c1
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,17,256,257"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c1, method: PLAY, url: "{base}/stream={stream:c1}", session: true }
+  - rtsp:
+      conn: c2
+      method: SETUP
+      url: "{base}/?src=2&freq=11508&pol=v&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,17,256,257"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u2}-{rtcp:u2}" }
+  - rtsp: { conn: c2, method: PLAY, url: "{base}/stream={stream:c2}", session: true }
+  - capture: { from: u1 }
+  - capture: { from: u2 }
+  - rtsp: { conn: c1, method: TEARDOWN, url: "{base}/stream={stream:c1}", session: true }
+  - rtsp: { conn: c2, method: TEARDOWN, url: "{base}/stream={stream:c2}", session: true }

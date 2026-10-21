@@ -21,6 +21,8 @@ pub struct Response {
     pub extra_headers: Option<Vec<String>>,
     /// Message body; a non-empty body adds `Content-Length`.
     pub body: Vec<u8>,
+    /// `process_file` mode: no `Content-Length` and a trailing CRLF pair.
+    pub streamed: bool,
     /// Preformatted `Date` header value.
     pub date: String,
     /// `Server` header value, e.g. `minisatip/1.0.0`.
@@ -37,6 +39,7 @@ impl Response {
             session_id: None,
             extra_headers: None,
             body: Vec::new(),
+            streamed: false,
             date,
             server,
         }
@@ -63,6 +66,13 @@ impl Response {
     /// Sets the body.
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
+        self
+    }
+
+    /// Streams the body like the C++ `process_file` (no length, trailing CRLF pair).
+    pub fn with_streamed_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self.streamed = true;
         self
     }
 
@@ -111,7 +121,13 @@ impl Response {
                 out.push_str("\r\n");
             }
         }
-        if self.body.is_empty() {
+        if self.streamed {
+            out.push_str("\r\n");
+            let mut bytes = out.into_bytes();
+            bytes.extend_from_slice(&self.body);
+            bytes.extend_from_slice(b"\r\n\r\n");
+            bytes
+        } else if self.body.is_empty() {
             out.push_str("\r\n");
             out.into_bytes()
         } else {
@@ -187,4 +203,32 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         year += 1;
     }
     (year, month as u32, day as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http() -> Response {
+        Response::new(Protocol::Http, 200, "date".to_owned(), "server".to_owned())
+    }
+
+    #[test]
+    fn streamed_body_omits_length_and_ends_with_crlf_pair() {
+        let text = String::from_utf8(
+            http()
+                .with_headers(vec!["Content-Type: text/html".to_owned()])
+                .with_streamed_body("abc")
+                .to_bytes(),
+        )
+        .expect("utf8");
+        assert!(!text.contains("Content-Length"), "{text}");
+        assert!(text.contains("\r\n\r\nabc\r\n\r\n"), "{text}");
+    }
+
+    #[test]
+    fn plain_body_adds_content_length() {
+        let text = String::from_utf8(http().with_body("abc").to_bytes()).expect("utf8");
+        assert!(text.contains("Content-Length: 3\r\n\r\nabc"), "{text}");
+    }
 }

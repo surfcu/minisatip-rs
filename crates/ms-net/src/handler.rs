@@ -182,6 +182,16 @@ pub trait StreamBackend {
         Ok(())
     }
 
+    /// Fills destination defaults that need the RTSP peer (stream.cpp:503-510).
+    fn apply_transport_defaults(
+        &mut self,
+        _id: StreamId,
+        _peer_host: &str,
+        _default_rtp: Option<&str>,
+        _start_rtp: u16,
+    ) {
+    }
+
     /// Closes and disables a stream.
     fn close_stream(&mut self, _id: StreamId) {}
 
@@ -221,6 +231,8 @@ pub struct HandlerContext<'a, B: StreamBackend> {
     pub timeout_ms: u32,
     /// First RTP port assigned to streams.
     pub start_rtp: u16,
+    /// `-r`: overrides the RTP destination host.
+    pub rrtp: Option<String>,
     /// RTSP listening port reported for SRT.
     pub rtsp_port: u16,
     /// Value reported in `RTP-Info` as `rtptime`.
@@ -240,6 +252,7 @@ impl<'a, B: StreamBackend> HandlerContext<'a, B> {
             server: format!("minisatip/{}", env!("CARGO_PKG_VERSION")),
             timeout_ms: 30_000,
             start_rtp: 5500,
+            rrtp: None,
             rtsp_port: 554,
             rtptime_seconds: 0,
         }
@@ -306,6 +319,9 @@ pub fn handle_rtsp<B: StreamBackend>(
             if ctx.backend.decode_transport(id, &header.value).is_err() {
                 return Some(base_response(ctx, 400).with_cseq(cseq));
             }
+            let (peer, rrtp, start_rtp) = (ctx.peer_host.clone(), ctx.rrtp.clone(), ctx.start_rtp);
+            ctx.backend
+                .apply_transport_defaults(id, &peer, rrtp.as_deref(), start_rtp);
         } else if header.value.contains("LIVE555") || header.value.contains("Lavf") {
             if let Some(id) = ctx.sid {
                 ctx.backend.disable_timeout(id);
@@ -345,6 +361,8 @@ pub fn handle_rtsp<B: StreamBackend>(
             }
             return Some(response);
         }
+        // start_play may switch an undecoded stream to HTTP (session.rs:505).
+        let info = ctx.backend.get_stream(id).unwrap_or(info);
 
         let mut headers = Vec::new();
         if transport.is_some_and(|value| !value.is_empty()) {
@@ -452,9 +470,19 @@ pub fn handle_http<B: StreamBackend>(
     }
 
     if let Some(route) = ctx.backend.http_route(request) {
+        let templated = route.headers.iter().any(|line| {
+            line.to_ascii_lowercase().starts_with("content-type:")
+                && (line.contains("html") || line.contains("xml"))
+        });
+        // process_file streams past 8200 processed bytes without Content-Length.
+        let streamed = templated && route.body.len() > 8200;
         let mut response = base_response(ctx, route.status).with_headers(route.headers);
         if route.body_on_head || !request.is_method("HEAD") {
-            response = response.with_body(route.body);
+            response = if streamed {
+                response.with_streamed_body(route.body)
+            } else {
+                response.with_body(route.body)
+            };
         }
         return Some(response);
     }
@@ -469,7 +497,14 @@ pub fn handle_http<B: StreamBackend>(
     };
     let mut response = base_response(ctx, 200).with_headers(headers);
     if !request.is_method("HEAD") {
-        response = response.with_body(resource.body);
+        let templated =
+            resource.content_type.contains("html") || resource.content_type.contains("xml");
+        // process_file streams past 8200 processed bytes without Content-Length (utils.cpp:397).
+        response = if templated && resource.body.len() > 8200 {
+            response.with_streamed_body(resource.body)
+        } else {
+            response.with_body(resource.body)
+        };
     }
     Some(response)
 }

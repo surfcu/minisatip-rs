@@ -1,0 +1,16 @@
+# scenario http-stream
+== 1 http-stream h > GET /?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,17,256,257 HTTP/1.0
+HTTP/1.0 200 OK
+Date: <DATE>
+Server: minisatip/<VER>
+Content-Type: video/mp2t
+Connection: close
+== 2 capture h
+ts: period=complete packets=208 sync_errors=0 cc_errors=0 order=d540cc50c2679ce5
+pid 0x0000 packets=32 scrambled=0
+pid 0x0011 packets=16 scrambled=0
+pid 0x0100 packets=32 scrambled=0
+pid 0x0101 packets=128 scrambled=0
+section pid=0x0000 table=0x00 ext=0x0457 v=0 len=16 crc=e38505be count=32
+section pid=0x0011 table=0x42 ext=0x0457 v=0 len=43 crc=76c3bb2f count=16
+section pid=0x0100 table=0x02 ext=0x0001 v=0 len=26 crc=47267c13 count=32

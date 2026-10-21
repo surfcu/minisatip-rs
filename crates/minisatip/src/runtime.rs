@@ -242,6 +242,7 @@ impl Runtime {
             ctx.local_host = local_ip;
             ctx.timeout_ms = self.config.timeout_ms;
             ctx.start_rtp = self.config.start_rtp;
+            ctx.rrtp = self.config.rrtp.clone();
             ctx.rtsp_port = self.config.rtsp_port;
             ctx.rtptime_seconds = self.started.elapsed().as_secs() as i64;
             let response = if protocol.is_rtsp() {
@@ -294,25 +295,12 @@ impl Runtime {
     /// C++ falls back to the RTSP peer when `destination=` is absent and lets
     /// `-r` override the destination (stream.cpp:503-508).
     fn apply_transport_defaults(&mut self, id: i32, peer: IpAddr) {
-        let Some(stream) = self.session.stream(id) else {
-            return;
-        };
-        if stream.stream_type != StreamType::RtspUdp {
-            return;
-        }
-        let host = self.config.rrtp.clone().unwrap_or_else(|| {
-            if stream.remote_host.is_empty() || stream.remote_host == "0.0.0.0" {
-                peer.to_string()
-            } else {
-                stream.remote_host.clone()
-            }
-        });
-        let port = if stream.remote_port == 0 {
-            self.config.start_rtp
-        } else {
-            stream.remote_port
-        };
-        self.session.set_udp_target(id, &host, port);
+        self.session.apply_transport_defaults(
+            id,
+            &peer.to_string(),
+            self.config.rrtp.as_deref(),
+            self.config.start_rtp,
+        );
     }
 
     fn start_output(&mut self, id: i32, conn_id: u64, peer: SocketAddr, writer: TcpStream) {

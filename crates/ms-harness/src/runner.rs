@@ -29,6 +29,8 @@ struct Context<'a> {
     conns: HashMap<String, RtspConn>,
     udp: HashMap<String, UdpPair>,
     streams: HashMap<String, HttpStream>,
+    /// Session and stream ids of closed RTSP connections.
+    closed: HashMap<String, (Option<String>, Option<String>)>,
     out: Vec<String>,
 }
 
@@ -63,6 +65,11 @@ pub fn run_once(
     };
     let server = Server::start(binary, &launch).map_err(|error| error.to_string())?;
     let mut norm = Normalizer::default();
+    let cache = workdir.join(format!("{}-cache", binary.label));
+    norm.add_text(&cache.display().to_string(), "<CACHE>");
+    norm.add_text(&workdir.display().to_string(), "<WORKDIR>");
+    norm.add_text(&binary.path.display().to_string(), "<BINARY>");
+    norm.add_text(&options.html.display().to_string(), "<HTML>");
     norm.add_port(server.rtsp_port, "RTSP");
     norm.add_port(server.http_port, "HTTP");
     for offset in 0..RTP_RANGE {
@@ -74,6 +81,7 @@ pub fn run_once(
         conns: HashMap::new(),
         udp: HashMap::new(),
         streams: HashMap::new(),
+        closed: HashMap::new(),
         out: vec![format!("# scenario {}", scenario.name)],
     };
     for (number, step) in scenario.steps.iter().enumerate() {
@@ -124,6 +132,8 @@ impl Context<'_> {
             Step::Close(name) => {
                 if let Some(mut conn) = self.conns.remove(name) {
                     conn.close();
+                    let ids = (conn.session.clone(), conn.stream_id.clone());
+                    self.closed.insert(name.clone(), ids);
                 } else if let Some(mut stream) = self.streams.remove(name) {
                     stream.close();
                 } else if self.udp.remove(name).is_none() {
@@ -170,8 +180,14 @@ impl Context<'_> {
                 .udp
                 .get(name)
                 .map(|pair| (pair.rtp_port + 1).to_string()),
-            "session" => self.conns.get(name).and_then(|conn| conn.session.clone()),
-            "stream" => self.conns.get(name).and_then(|conn| conn.stream_id.clone()),
+            "session" => match self.conns.get(name) {
+                Some(conn) => conn.session.clone(),
+                None => self.closed.get(name).and_then(|ids| ids.0.clone()),
+            },
+            "stream" => match self.conns.get(name) {
+                Some(conn) => conn.stream_id.clone(),
+                None => self.closed.get(name).and_then(|ids| ids.1.clone()),
+            },
             _ => None,
         }
     }
@@ -239,22 +255,39 @@ impl Context<'_> {
 
     fn record_message(&mut self, head: &str, body: &[u8], mode: &BodyMode) {
         let head = self.norm.text(&head.replace('\r', ""));
-        self.out.extend(head.lines().map(str::to_owned));
         if body.is_empty() || matches!(mode, BodyMode::None) {
+            self.out.extend(head.lines().map(str::to_owned));
             return;
         }
-        self.out.push("--".to_owned());
         let text = String::from_utf8(body.to_vec());
-        match (mode, text) {
+        let rendered: Option<Vec<String>> = match (mode, text) {
             (BodyMode::Full, Ok(text)) => {
                 let text = self.norm.text(&text.replace('\r', ""));
-                self.out.extend(text.lines().map(str::to_owned));
+                Some(text.lines().map(str::to_owned).collect())
             }
             (BodyMode::Numbers, Ok(text)) => {
                 let text = normalize::all_numbers(&self.norm.text(&text.replace('\r', "")));
-                self.out.extend(text.lines().map(str::to_owned));
+                Some(text.lines().map(str::to_owned).collect())
             }
-            _ => {
+            _ => None,
+        };
+        match rendered {
+            Some(lines) => {
+                // Normalised bodies change length, so recompute the echoed header.
+                let length = lines.join("\n").len();
+                for line in head.lines() {
+                    if normalize::header(line, "content-length").is_some() {
+                        self.out.push(format!("Content-Length: {length}"));
+                    } else {
+                        self.out.push(line.to_owned());
+                    }
+                }
+                self.out.push("--".to_owned());
+                self.out.extend(lines);
+            }
+            None => {
+                self.out.extend(head.lines().map(str::to_owned));
+                self.out.push("--".to_owned());
                 let hash = body.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
                     (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
                 });

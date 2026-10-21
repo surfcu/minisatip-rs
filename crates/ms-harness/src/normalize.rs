@@ -7,12 +7,20 @@ use std::collections::HashMap;
 pub struct Normalizer {
     ports: HashMap<String, String>,
     sessions: Vec<(String, String)>,
+    texts: Vec<(String, String)>,
 }
 
 impl Normalizer {
     /// Replaces every occurrence of `port` as a whole number by `<name>`.
     pub fn add_port(&mut self, port: u16, name: &str) {
         self.ports.insert(port.to_string(), format!("<{name}>"));
+    }
+
+    /// Replaces every occurrence of `from` by `to` (per-binary paths).
+    pub fn add_text(&mut self, from: &str, to: &str) {
+        if !from.is_empty() {
+            self.texts.push((from.to_owned(), to.to_owned()));
+        }
     }
 
     /// Registers a session id seen in a `Session:` header.
@@ -43,12 +51,17 @@ impl Normalizer {
             }
         }
         let mut out = line.to_owned();
+        for (from, to) in &self.texts {
+            out = out.replace(from.as_str(), to);
+        }
         for (id, name) in &self.sessions {
             out = out.replace(id.as_str(), name);
         }
         out = replace_after(&out, "minisatip/", "<VER>", |c| {
             !c.is_whitespace() && c != '<'
         });
+        out = replace_after(&out, "<modelNumber>", "<VER>", |c| c != '<');
+        out = replace_after(&out, "\"version\":\"", "<VER>", |c| c != '"');
         out = replace_after(&out, "ssrc=", "<SSRC>", |c| c.is_ascii_hexdigit());
         out = replace_after(&out, "seq=", "<SEQ>", |c| c.is_ascii_digit());
         out = replace_after(&out, "rtptime=", "<RTPTIME>", |c| c.is_ascii_digit());
@@ -208,6 +221,20 @@ mod tests {
         let mut norm = Normalizer::default();
         let out = norm.text("o=- 534863118 534863118 IN IP4 127.0.0.1\nuuid:2fac1234-31f8-11b4-a222-08002b34c003::x");
         assert_eq!(out, "o=- <SDPID> <SDPVER> IN IP4 127.0.0.1\nuuid:<UUID>::x");
+    }
+
+    #[test]
+    fn normalises_every_version_field() {
+        let mut norm = Normalizer::default();
+        let out = norm.text(
+            "Server: minisatip/2.0.167~e34c2d1\n<modelNumber>2.0.167</modelNumber>\n\
+             {\"version\":\"2.0.167\",\"name\":\"x\"}",
+        );
+        assert_eq!(
+            out,
+            "Server: minisatip/<VER>\n<modelNumber><VER></modelNumber>\n\
+             {\"version\":\"<VER>\",\"name\":\"x\"}"
+        );
     }
 
     #[test]

@@ -102,6 +102,17 @@ fn es_index(packet: &[u8]) -> Option<u32> {
     }
 }
 
+/// Section carried by a PSI packet; identical bytes repeat every replay cycle.
+fn psi_section(packet: &[u8]) -> Option<Vec<u8>> {
+    if packet[0] != 0x47 || packet[1] & 0x40 == 0 {
+        return None;
+    }
+    let data = payload(packet)?;
+    let pointer = usize::from(*data.first()?);
+    let section = data.get(1 + pointer..)?;
+    (section.len() >= 8).then(|| section.to_vec())
+}
+
 /// Start and end of the first complete replay period, if one was received.
 fn period(packets: &[&[u8]]) -> Option<(usize, usize)> {
     let indexed: Vec<(usize, u32)> = packets
@@ -110,8 +121,41 @@ fn period(packets: &[&[u8]]) -> Option<(usize, usize)> {
         .filter(|(_, packet)| packet[0] == 0x47)
         .filter_map(|(position, packet)| es_index(packet).map(|index| (position, index)))
         .collect();
-    let anchor = indexed.iter().map(|(_, index)| *index).min()?;
-    let mut hits = indexed.iter().filter(|(_, index)| *index == anchor);
+    if let Some(anchor) = indexed.iter().map(|(_, index)| *index).min() {
+        return span(&indexed, |index| *index == anchor);
+    }
+    // PID-filtered captures may carry only PSI: anchor on the section with the
+    // longest repeat, so the window covers whole cycles whatever the start.
+    let sections: Vec<(usize, Vec<u8>)> = packets
+        .iter()
+        .enumerate()
+        .filter_map(|(position, packet)| psi_section(packet).map(|key| (position, key)))
+        .collect();
+    let mut best: Option<(&Vec<u8>, usize, usize)> = None;
+    for (_, key) in &sections {
+        let mut hits = sections
+            .iter()
+            .filter(|(_, other)| other == key)
+            .map(|(position, _)| *position);
+        let (Some(start), Some(end)) = (hits.next(), hits.next()) else {
+            continue;
+        };
+        let longer = match best {
+            None => true,
+            Some((best_key, best_start, best_end)) => {
+                end - start > best_end - best_start
+                    || (end - start == best_end - best_start && key < best_key)
+            }
+        };
+        if longer {
+            best = Some((key, start, end));
+        }
+    }
+    best.map(|(_, start, end)| (start, end))
+}
+
+fn span<T>(hits: &[(usize, T)], matches: impl Fn(&T) -> bool) -> Option<(usize, usize)> {
+    let mut hits = hits.iter().filter(|(_, item)| matches(item));
     let start = hits.next()?.0;
     let end = hits.next()?.0;
     Some((start, end))
@@ -274,6 +318,28 @@ mod tests {
         );
         assert!(a.iter().all(|line| !line.contains("BAD-CRC")));
         assert!(a[0].contains("cc_errors=0"), "{a:?}");
+    }
+
+    #[test]
+    fn psi_only_capture_period_is_start_independent() {
+        let file = generate("fta").expect("fta");
+        let psi: Vec<u8> = file
+            .chunks(TS)
+            .filter(|packet| matches!(pid(packet), 0 | 0x11 | 0x100))
+            .flatten()
+            .copied()
+            .collect();
+        let shifted = |skip: usize| {
+            let mut out = psi[skip * TS..].to_vec();
+            out.extend_from_slice(&psi);
+            out.extend_from_slice(&psi[..skip * TS]);
+            out
+        };
+        let a = summarize(&Units::Ts(&shifted(1)));
+        let b = summarize(&Units::Ts(&shifted(5)));
+        assert_eq!(a, b);
+        assert!(a[0].contains("period=complete"), "{a:?}");
+        assert!(a.iter().any(|line| line.contains("table=0x02")), "{a:?}");
     }
 
     #[test]

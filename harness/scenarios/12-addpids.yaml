@@ -1,0 +1,22 @@
+name: addpids
+description: addpids and delpids on a playing stream, then play again
+capture: fta
+fast: true
+steps:
+  - udp: u1
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,17,256,257"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - capture: { from: u1 }
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?addpids=258&delpids=257"
+      session: true
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - capture: { from: u1 }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }

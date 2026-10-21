@@ -47,6 +47,11 @@ Cross builds use [`cross`](https://github.com/cross-rs/cross); see
 `.github/workflows/ci.yml` for the musl target matrix. The C++ reference build is
 also produced there.
 
+The differential harness runs both binaries over the YAML scenarios in
+`harness/scenarios/` and diffs normalised RTSP/HTTP/RTP output. See
+[docs/harness.md](docs/harness.md) for the scenario format, normalisation rules
+and commands; `cargo run -p ms-harness -- run --fast --runs 10` is the CI subset.
+
 ## Running the binary
 
 The binary starts an RTSP listener (`-y`, default 554), an HTTP listener (`-x`,

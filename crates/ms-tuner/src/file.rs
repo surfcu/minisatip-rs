@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 /// Largest delay behind the fixed-bitrate schedule that is still caught up.
 const MAX_PACING_LAG: Duration = Duration::from_millis(200);
+/// Fixed-bitrate reads return after this much audio/video time, so the caller
+/// can process commands (e.g. TEARDOWN) instead of blocking in `read`.
+const PACE_QUANTUM: Duration = Duration::from_millis(50);
 
 /// Pacing applied while replaying a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -168,8 +171,15 @@ impl Tuner for FileReplayTuner {
         let mut written = 0;
         let mut scanned = 0u64;
         let mut packet = [0u8; TS_PACKET_SIZE];
+        let quantum = match self.config.pacing {
+            Pacing::FixedBitrate(rate) if rate > 0 => {
+                (rate / 8 * PACE_QUANTUM.as_micros() as u64 / 1_000_000).max(TS_PACKET_SIZE as u64)
+                    as usize
+            }
+            _ => usize::MAX,
+        };
 
-        while buf.remaining_bytes() >= TS_PACKET_SIZE {
+        while buf.remaining_bytes() >= TS_PACKET_SIZE && written < quantum {
             match read_packet(&mut self.file, &mut packet)? {
                 PacketRead::Full => {}
                 PacketRead::Eof => {

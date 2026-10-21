@@ -1,0 +1,56 @@
+# scenario pmt-version
+== 2 rtsp c > DESCRIBE rtsp://127.0.0.1:<RTSP>/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=all RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION1>
+CSeq: 1
+Server: minisatip/<VER>
+Content-type: application/sdp
+Content-Base: rtsp://127.0.0.1/
+Content-Length: 234
+--
+v=0
+o=- <SDPID> <SDPVER> IN IP4 127.0.0.1
+s=SatIPServer:1 1,1,1
+t=0 0
+m=video 0 RTP/AVP 33
+c=IN IP4 0.0.0.0
+a=control:stream=1
+a=fmtp:33 ver=1.0;src=1;tuner=1,255,1,15,11494,h,dvbs2,8psk,off,0.35,22000,23;pids=all
+b=AS:5000
+a=inactive
+== 3 rtsp c > SETUP rtsp://127.0.0.1:<RTSP>/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=all RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 2
+Server: minisatip/<VER>
+Transport: RTP/AVP;unicast;destination=127.0.0.1;source=127.0.0.1;client_port=<u1.rtp>-<u1.rtcp>;server_port=<SRTP+0>-<SRTP+1>
+Session: <SESSION1>;timeout=30
+com.ses.streamID: 1
+== 4 rtsp c > PLAY rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION1>
+CSeq: 3
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=1;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 5 capture u1
+rtp: version=2 pt=33 ssrc=constant seq_gaps=0 bad_payload=0
+ts: period=complete packets=256 sync_errors=0 cc_errors=0 order=eb5511c15d2f0625
+pid 0x0000 packets=32 scrambled=0
+pid 0x0011 packets=16 scrambled=0
+pid 0x0100 packets=32 scrambled=0
+pid 0x0101 packets=128 scrambled=0
+pid 0x0102 packets=32 scrambled=0
+pid 0x0103 packets=16 scrambled=0
+section pid=0x0000 table=0x00 ext=0x0457 v=0 len=16 crc=e38505be count=32
+section pid=0x0011 table=0x42 ext=0x0457 v=0 len=43 crc=76c3bb2f count=16
+section pid=0x0100 table=0x02 ext=0x0001 v=0 len=26 crc=47267c13 count=16
+section pid=0x0100 table=0x02 ext=0x0001 v=1 len=31 crc=40c42e03 count=16
+== 6 rtsp c > TEARDOWN rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 4
+Server: minisatip/<VER>
+Session: <SESSION1>

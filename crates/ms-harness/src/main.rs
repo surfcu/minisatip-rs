@@ -124,6 +124,7 @@ fn options(args: &Args) -> Result<RunOptions, String> {
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ms-harness-{}", std::process::id())));
     std::fs::create_dir_all(&workroot).map_err(|error| error.to_string())?;
+    let workroot = std::fs::canonicalize(&workroot).map_err(|error| format!("--work: {error}"))?;
     let html = std::fs::canonicalize(&args.html)
         .map_err(|error| format!("--html {}: {error}", args.html.display()))?;
     Ok(RunOptions { html, workroot })

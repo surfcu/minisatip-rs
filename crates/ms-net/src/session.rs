@@ -279,20 +279,28 @@ impl SessionManager {
         self.srt.take()
     }
 
-    /// Sets the UDP destination used by a unicast stream.
-    ///
-    /// `decode_transport` cannot know the RTSP peer, and C++ falls back to the
-    /// peer address when the `Transport` header has no `destination=`
-    /// (stream.cpp:505-506).
-    pub fn set_udp_target(&mut self, id: StreamId, host: &str, port: u16) {
+    /// Applies the destination defaults `decode_transport` takes from the RTSP
+    /// peer and `-r` (stream.cpp:503-510), before the SETUP reply is built.
+    pub fn apply_transport_defaults(
+        &mut self,
+        id: StreamId,
+        peer_host: &str,
+        default_rtp: Option<&str>,
+        start_rtp: u16,
+    ) {
         if let Some(index) = self.slot_index(id)
             && let Some(stream) = self.streams[index].as_mut()
+            && stream.stream_type == StreamType::RtspUdp
         {
-            if !host.is_empty() {
-                stream.remote_host = host.to_owned();
-            }
-            if port != 0 {
-                stream.remote_port = port;
+            stream.remote_host = match default_rtp {
+                Some(host) => host.to_owned(),
+                None if stream.remote_host.is_empty() || stream.remote_host == "0.0.0.0" => {
+                    peer_host.to_owned()
+                }
+                None => stream.remote_host.clone(),
+            };
+            if stream.remote_port == 0 {
+                stream.remote_port = start_rtp;
             }
         }
     }
@@ -1064,6 +1072,16 @@ impl StreamBackend for SessionManager {
 
     fn decode_transport(&mut self, id: StreamId, value: &str) -> Result<(), TransportError> {
         SessionManager::decode_transport(self, id, value)
+    }
+
+    fn apply_transport_defaults(
+        &mut self,
+        id: StreamId,
+        peer_host: &str,
+        default_rtp: Option<&str>,
+        start_rtp: u16,
+    ) {
+        SessionManager::apply_transport_defaults(self, id, peer_host, default_rtp, start_rtp);
     }
 
     fn close_stream(&mut self, id: StreamId) {

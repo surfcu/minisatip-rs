@@ -1,0 +1,18 @@
+name: http-state
+description: /state.json and /bandwidth.json before, during and after a stream
+capture: fta
+fast: true
+steps:
+  - http: { path: /state.json, body: numbers }
+  - udp: u1
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,17,256"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - capture: { from: u1, packets: 2000 }
+  - http: { path: /state.json, body: numbers }
+  - http: { path: /bandwidth.json }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }
+  - http: { path: /state.json, body: numbers }

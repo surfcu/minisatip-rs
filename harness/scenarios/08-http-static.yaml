@@ -1,0 +1,11 @@
+name: http-static
+description: Web UI assets, HEAD and missing paths
+capture: fta
+fast: true
+steps:
+  - http: { path: / }
+  - http: { path: /status.html }
+  - http: { path: /status.html, method: HEAD }
+  - http: { path: /favicon.png }
+  - http: { path: /missing.html }
+  - http: { path: /status.html, method: POST }
