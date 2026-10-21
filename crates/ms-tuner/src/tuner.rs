@@ -50,7 +50,7 @@ pub enum Polarization {
 /// Tuning parameters passed from the RTSP layer; backend-specific fields are optional.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TuneParams {
-    /// Frequency in kHz.
+    /// Frequency in MHz (the integral SAT>IP `freq=` value; see DEV-030).
     pub freq: u32,
     /// Polarisation.
     pub pol: Polarization,
@@ -155,6 +155,11 @@ impl PidSet {
         self.pids.contains(&pid) || self.pids.contains(&PID_ALL)
     }
 
+    /// Exact membership, without the `PID_ALL` sentinel widening the answer.
+    pub fn contains_exact(&self, pid: u16) -> bool {
+        self.pids.contains(&pid)
+    }
+
     /// Whether the set contains the `PID_ALL` sentinel.
     pub fn is_all(&self) -> bool {
         self.pids.contains(&PID_ALL)
@@ -213,12 +218,15 @@ impl SignalStatus {
 pub enum TunerError {
     /// The backing file or device failed.
     Io(io::Error),
+    /// The backend rejected the request with a C++-style negative code.
+    Backend(i32),
 }
 
 impl fmt::Display for TunerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "tuner I/O error: {error}"),
+            Self::Backend(code) => write!(f, "tuner backend error: {code}"),
         }
     }
 }
@@ -227,6 +235,7 @@ impl std::error::Error for TunerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Backend(_) => None,
         }
     }
 }

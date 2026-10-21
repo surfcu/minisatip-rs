@@ -58,8 +58,10 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
             }
             "fe" => params.fe = Some(parse_int_prefix(value, 0)),
             "src" => {
-                params.src = u8::try_from(parse_int_prefix(value, 0)).unwrap_or(0);
-                params.src_specified = true;
+                let src = parse_int_prefix(value, 0);
+                params.src = u8::try_from(src).unwrap_or(0);
+                // `src=0` is unset, like `tp->diseqc = d ? optional(d) : nullopt`.
+                params.src_specified = src != 0;
             }
             "ro" => params.ro = rolloff(value),
             "mtype" => {
