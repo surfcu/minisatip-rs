@@ -54,12 +54,20 @@ dependencies = [
 [[package]]
 name = "ms-ca"
 version = "0.1.0"
+dependencies = [
+ "ms-psi",
+ "ms-ts",
+]
 
 [[package]]
 name = "ms-ca-drivers"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ms-ca",
+ "ms-fakecam",
+ "ms-psi",
+ "ms-ts",
  "ms-tuner",
 ]
 

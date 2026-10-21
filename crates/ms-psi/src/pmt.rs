@@ -29,6 +29,8 @@ pub struct Pmt {
     pub header: SectionHeader,
     /// PCR PID, zeroed when it names an elementary stream (C++ behaviour).
     pub pcr_pid: u16,
+    /// PCR PID as written in the section, before the zeroing above (`SPMT::pcr_pid`).
+    pub pcr_pid_header: u16,
     /// Program-level descriptors.
     pub program_info: Vec<Descriptor>,
     /// Elementary streams in section order, plus an independent PCR entry.
@@ -49,6 +51,7 @@ impl Pmt {
 
         let end = header.payload_end();
         let mut pcr_pid = be16(section, 8)? & 0x1FFF;
+        let pcr_pid_header = pcr_pid;
         let program_info_length = (be16(section, 10)? & 0x0FFF) as usize;
         let es_start = 12usize
             .checked_add(program_info_length)
@@ -115,6 +118,7 @@ impl Pmt {
         Ok(Self {
             header,
             pcr_pid,
+            pcr_pid_header,
             program_info,
             streams,
         })
@@ -195,6 +199,7 @@ mod tests {
         let section = build_section(PMT_TABLE_ID, 7, 0, &payload);
         let pmt = Pmt::parse(&section, CrcCheck::Verify).unwrap();
         assert_eq!(pmt.pcr_pid, 0);
+        assert_eq!(pmt.pcr_pid_header, 0x101);
         assert_eq!(pmt.streams.len(), 1);
     }
 

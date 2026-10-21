@@ -1,0 +1,49 @@
+//! Byte FIFO with one read index per reader (`SFIFO`, `fifo_push`, `fifo_pop_offset`).
+
+/// Ring buffer addressed by monotonic indices.
+#[derive(Clone, Debug)]
+pub struct Fifo {
+    data: Vec<u8>,
+    pub write_index: u64,
+}
+
+impl Fifo {
+    pub fn new(size: usize) -> Self {
+        Self {
+            data: vec![0; size],
+            write_index: 0,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Appends, overwriting the oldest bytes when full (`fifo_push_force`).
+    pub fn push(&mut self, src: &[u8]) -> usize {
+        let cap = self.data.len() as u64;
+        if cap == 0 {
+            return 0;
+        }
+        for &b in src {
+            self.data[(self.write_index % cap) as usize] = b;
+            self.write_index += 1;
+        }
+        src.len()
+    }
+
+    /// Copies up to `dst.len()` bytes from `read_index`, advancing it.
+    pub fn pop_offset(&self, dst: &mut [u8], read_index: &mut u64) -> usize {
+        let cap = self.data.len() as u64;
+        if *read_index + cap < self.write_index {
+            *read_index = self.write_index - cap;
+        }
+        let avail = self.write_index.saturating_sub(*read_index) as usize;
+        let n = avail.min(dst.len());
+        for (i, d) in dst.iter_mut().take(n).enumerate() {
+            *d = self.data[((*read_index + i as u64) % cap) as usize];
+        }
+        *read_index += n as u64;
+        n
+    }
+}

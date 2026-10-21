@@ -6,10 +6,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ms-ca = { path = "../ms-ca" }
 ms-tuner = { path = "../ms-tuner" }
+ms-ts = { path = "../ms-ts" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+ms-fakecam = { path = "../ms-fakecam" }
+ms-psi = { path = "../ms-psi" }
 
 [lints]
 workspace = true
