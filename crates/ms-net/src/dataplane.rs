@@ -421,7 +421,9 @@ struct DataPlane {
     reported_cc_errors: u64,
     last_cc_report_ms: i64,
     wait_new_stream: bool,
-    tune_time_ms: i64,
+    /// Start of the 200 ms new-transponder window; `None` when it is not
+    /// running yet.
+    tune_time_ms: Option<i64>,
     wait_transponder_id: i32,
     threshold_ms: i64,
     last_send_ms: i64,
@@ -454,7 +456,7 @@ impl DataPlane {
             reported_cc_errors: 0,
             last_cc_report_ms: 0,
             wait_new_stream: false,
-            tune_time_ms: 0,
+            tune_time_ms: None,
             wait_transponder_id: 0,
             threshold_ms: config.threshold_ms,
             last_send_ms: 0,
@@ -507,7 +509,7 @@ impl DataPlane {
                 self.buf.clear();
                 self.cc_checked = 0;
                 self.wait_new_stream = true;
-                self.tune_time_ms = self.mono_us() / 1000;
+                self.tune_time_ms = Some(self.mono_us() / 1000);
                 self.update_tuner_pids();
             }
             Command::StartOutput {
@@ -555,6 +557,7 @@ impl DataPlane {
                         self.events
                             .send(Event::OutputStopped(stream_id, stats, subscriber.epoch));
                     self.update_tuner_pids();
+                    self.standby_if_idle();
                 }
             }
             Command::WritePriority { stream_id, data } => {
@@ -636,6 +639,11 @@ impl DataPlane {
 
     fn read_once(&mut self) -> bool {
         let started = Instant::now();
+        // The satipc driver raises this when PLAY follows a tune
+        // (src_satipc.cpp:211-216); read_dmx's new-stream flush follows.
+        if self.tuner.take_wait_new_stream() {
+            self.wait_new_stream = true;
+        }
         let read = match self.tuner.read(&mut self.buf) {
             Ok(read) => read,
             Err(error) => {
@@ -658,6 +666,7 @@ impl DataPlane {
             }
             return false;
         }
+        // read_dmx's new-stream flush (src_stream.cpp:1241-1259).
         if !self.after_read(now) {
             return true;
         }
@@ -677,10 +686,10 @@ impl DataPlane {
     /// was dropped while waiting for the new transponder.
     fn after_read(&mut self, now_ms: i64) -> bool {
         if self.wait_new_stream {
-            if self.tune_time_ms == 0 {
-                self.tune_time_ms = now_ms;
-            }
-            let elapsed = now_ms - self.tune_time_ms;
+            // The window starts at the tune, or at the first read when the
+            // tuner raised the hook (src_stream.cpp:1241-1259).
+            let tune_time = *self.tune_time_ms.get_or_insert(now_ms);
+            let elapsed = now_ms - tune_time;
             match post_tune_filter(self.buf.as_bytes(), &mut self.wait_transponder_id, elapsed) {
                 Some(offset) => {
                     self.buf.discard_front(offset);
@@ -692,7 +701,7 @@ impl DataPlane {
                     return false;
                 }
             }
-            self.tune_time_ms = 0;
+            self.tune_time_ms = None;
             self.wait_new_stream = false;
         }
         let checked = self.cc_checked.min(self.buf.len()) / DVB_FRAME * DVB_FRAME;
@@ -793,6 +802,47 @@ impl DataPlane {
                 .events
                 .send(Event::OutputClosed(stream_id, subscriber.epoch));
             self.update_tuner_pids();
+            self.standby_if_idle();
         }
+    }
+
+    fn standby_if_idle(&mut self) {
+        if self.outputs.is_empty() {
+            self.tuner.standby();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pat(tsid: u16) -> [u8; DVB_FRAME] {
+        let mut packet = [0xff; DVB_FRAME];
+        packet[0] = 0x47;
+        packet[1] = 0x40;
+        packet[2] = 0x00;
+        packet[8] = (tsid >> 8) as u8;
+        packet[9] = tsid as u8;
+        packet
+    }
+
+    #[test]
+    fn new_transponder_keeps_its_suffix() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&pat(1));
+        data.extend_from_slice(&pat(1));
+        data.extend_from_slice(&pat(2));
+        data.extend_from_slice(&pat(2));
+        let mut id: i32 = 1;
+        let position = check_new_transponder(&data, &mut id).expect("new transponder");
+        assert_eq!(position, 2 * DVB_FRAME);
+        assert_eq!(id, 2);
+        // The caller drops the prefix and keeps the matching PAT and its suffix.
+        let suffix = &data[position..];
+        assert_eq!(suffix.len(), 2 * DVB_FRAME);
+        assert_eq!(u16::from(suffix[8]) * 256 + u16::from(suffix[9]), 2);
+        // An already-recorded transponder is not new.
+        assert_eq!(check_new_transponder(suffix, &mut id), None);
     }
 }

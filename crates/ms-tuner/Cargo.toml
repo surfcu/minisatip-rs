@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

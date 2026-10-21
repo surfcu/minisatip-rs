@@ -105,6 +105,9 @@ version = "0.1.0"
 [[package]]
 name = "ms-tuner"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "proc-macro2"

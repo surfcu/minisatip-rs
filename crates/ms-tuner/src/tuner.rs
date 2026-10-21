@@ -319,6 +319,26 @@ impl TsBuf {
         self.data.extend_from_slice(packet);
         true
     }
+
+    /// Appends the whole TS packets of `data` that fit; returns bytes appended.
+    /// Backends use this to fill the buffer from their media source.
+    pub fn push_data(&mut self, data: &[u8]) -> usize {
+        let mut appended = 0;
+        for packet in data.as_chunks::<TS_PACKET_SIZE>().0 {
+            if !self.push_packet(packet) {
+                break;
+            }
+            appended += TS_PACKET_SIZE;
+        }
+        appended
+    }
+
+    /// Drops the first `bytes` (rounded down to a whole packet), like the C++
+    /// `memmove` in `check_new_transponder` (src_stream.cpp:877).
+    pub fn drain_prefix(&mut self, bytes: usize) {
+        let bytes = (bytes.min(self.data.len())) / TS_PACKET_SIZE * TS_PACKET_SIZE;
+        self.data.drain(..bytes);
+    }
 }
 
 /// A tuning backend.
@@ -331,4 +351,11 @@ pub trait Tuner {
     fn status(&self) -> SignalStatus;
     /// Appends whole TS packets to `buf` and returns the bytes appended.
     fn read(&mut self, buf: &mut TsBuf) -> Result<usize>;
+    /// The last output stopped (`ad->standby`); the default does nothing.
+    fn standby(&mut self) {}
+    /// Takes `ad->wait_new_stream` after a tuner restart. Only satipc sets it
+    /// (`satipc_handle_play`, src_satipc.cpp:211-216).
+    fn take_wait_new_stream(&mut self) -> bool {
+        false
+    }
 }

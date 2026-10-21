@@ -235,6 +235,15 @@ impl Scheduler {
         }
     }
 
+    /// Removes the adapter at `aid` (`disable_satip_server`: `a[i]->type = 0`).
+    pub fn remove_adapter(&mut self, aid: usize) -> Option<Adapter> {
+        if aid < MAX_ADAPTERS {
+            self.adapters[aid].take()
+        } else {
+            None
+        }
+    }
+
     /// Adapter at `aid`, initialized or not.
     pub fn adapter(&self, aid: usize) -> Option<&Adapter> {
         self.adapters.get(aid).and_then(Option::as_ref)

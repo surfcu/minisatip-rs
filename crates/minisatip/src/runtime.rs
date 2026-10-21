@@ -29,7 +29,13 @@ use ms_net::ssdp::{
 };
 use ms_net::web::{ApiFeatures, RuntimeState, WebConfig, WebService, format_asctime};
 use ms_sched::{AdapterConfig, AdapterTuner, MAX_ADAPTERS, Scheduler, TuneError};
-use ms_tuner::{DeliverySystem, FileReplayConfig, FileReplayTuner, Pacing, PidSet, TuneParams};
+use ms_tuner::satipc::{
+    MAX_DVBAPI_SYSTEMS, SatipServer, SatipcConfig, SatipcTuner, delsys_code, fetch_satip_xml,
+    parse_satip_servers, parse_satip_xml,
+};
+use ms_tuner::{
+    DeliverySystem, FileReplayConfig, FileReplayTuner, Pacing, PidSet, TuneParams, Tuner,
+};
 
 use crate::sys;
 
@@ -57,6 +63,82 @@ struct ServerConfig {
     bind_dev: Option<String>,
     /// `-H`/`--output-buffer`: RTP/RTCP `SO_SNDBUF` when positive.
     output_buffer: i32,
+}
+
+/// Settings shared by start-up and dynamically added satipc adapters.
+#[derive(Debug, Clone)]
+struct SatipSettings {
+    start_rtp: u16,
+    adapter_timeout_ms: i64,
+    bind_dev_ip: Option<IpAddr>,
+    receive_buffer: i32,
+    adapter_buffer: i32,
+    threshold_ms: i64,
+    global_strength: f32,
+    global_snr: f32,
+    multipliers: Vec<(u8, f32, f32)>,
+    enabled_adapters: Option<Vec<u8>>,
+}
+
+impl SatipSettings {
+    fn from_options(opts: &Options, start_rtp: u16) -> Self {
+        Self {
+            start_rtp,
+            adapter_timeout_ms: i64::from(opts.adapter_timeout),
+            // bind_dev_ip(): the address of `--bind-dev`, never `--bind`.
+            bind_dev_ip: opts
+                .bind_dev
+                .as_deref()
+                .and_then(ms_net::sys::dev_ip)
+                .map(IpAddr::V4),
+            receive_buffer: opts.satipc_buffer,
+            adapter_buffer: opts.adapter_buffer,
+            threshold_ms: ms_net::dataplane::clamp_threshold(opts.udp_threshold),
+            global_strength: opts.strength_multiplier,
+            global_snr: opts.snr_multiplier,
+            multipliers: opts
+                .signal_multipliers
+                .iter()
+                .map(|entry| (entry.adapter, entry.strength, entry.snr))
+                .collect(),
+            enabled_adapters: opts.enabled_adapters.clone(),
+        }
+    }
+
+    /// `ad->strength_multiplier` / `ad->snr_multiplier` for `aid`.
+    fn signal_multipliers(&self, aid: usize) -> (f32, f32) {
+        let adapter = u8::try_from(aid).ok();
+        self.multipliers
+            .iter()
+            .rev()
+            .find(|(entry, _, _)| Some(*entry) == adapter)
+            .map_or(
+                (self.global_strength, self.global_snr),
+                |(_, strength, snr)| (*strength, *snr),
+            )
+    }
+
+    fn adapter_disabled(&self, aid: usize) -> bool {
+        self.enabled_adapters
+            .as_ref()
+            .is_some_and(|list| u8::try_from(aid).map_or(true, |id| !list.contains(&id)))
+    }
+}
+
+/// One configured satipc adapter (`satip[i]` with its host and port).
+struct SatipAdapter {
+    aid: usize,
+    host: String,
+    port: u16,
+    delsys: DeliverySystem,
+}
+
+/// `--satip-xml` polling state (`satip_getxml` timer).
+struct SatipXmlPoll {
+    urls: Vec<String>,
+    over_tcp: bool,
+    next: Instant,
+    interval: Duration,
 }
 
 /// An RTSP connection request forwarded by a reader thread.
@@ -110,6 +192,12 @@ struct Runtime {
     conn_streams: HashMap<u64, i32>,
     started: Instant,
     start_unix: i64,
+    /// Process-wide counters fed by every data plane, including satipc
+    /// adapters added later by the XML poll.
+    bandwidth: Arc<Bandwidth>,
+    satip: SatipSettings,
+    satip_adapters: Vec<SatipAdapter>,
+    xml_poll: Option<SatipXmlPoll>,
 }
 
 impl Runtime {
@@ -137,20 +225,8 @@ impl Runtime {
                     },
                 )
                 .map_err(|error| format!("cannot replay {}: {error}", path.display()))?;
-                let buffer = usize::try_from(opts.adapter_buffer)
-                    .ok()
-                    .filter(|size| *size > 0)
-                    .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
-                let handle = AdapterHandle::spawn_with_bandwidth(
-                    Box::new(tuner),
-                    DataPlaneConfig {
-                        adapter_id: aid as i32,
-                        adapter_buffer: buffer,
-                        threshold_ms: ms_net::dataplane::clamp_threshold(opts.udp_threshold),
-                    },
-                    Some(Arc::clone(&bandwidth)),
-                )
-                .map_err(|error| format!("cannot start adapter {aid}: {error}"))?;
+                let handle =
+                    spawn_adapter(opts, aid, Box::new(tuner), Some(Arc::clone(&bandwidth)))?;
                 let bridge = DataPlaneTuner {
                     commands: handle.command_sender(),
                 };
@@ -158,6 +234,47 @@ impl Runtime {
                 handles[aid] = Some(handle);
             }
         }
+
+        // find_satip_adapter runs after the local adapters (find_adapters).
+        let satip = SatipSettings::from_options(opts, config.start_rtp);
+        let mut satip_adapters = Vec::new();
+        for server in satip_servers(opts)? {
+            let Some(aid) = (0..MAX_ADAPTERS)
+                .find(|aid| handles[*aid].is_none() && !satip.adapter_disabled(*aid))
+            else {
+                eprintln!("minisatip: MAX_ADAPTERS reached");
+                break;
+            };
+            let handle = spawn_satip(&satip, &server, aid, Some(Arc::clone(&bandwidth)))?;
+            let bridge = DataPlaneTuner {
+                commands: handle.command_sender(),
+            };
+            scheduler.add_adapter(aid, satipc_adapter_config(&server), Box::new(bridge));
+            handles[aid] = Some(handle);
+            satip_adapters.push(SatipAdapter {
+                aid,
+                host: server.host,
+                port: server.port,
+                delsys: server.delsys,
+            });
+        }
+        let xml_poll = opts.satip_xml.as_deref().and_then(|urls| {
+            let urls: Vec<String> = urls
+                .split(|c: char| c == ',' || (c as u32) < 33)
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if urls.is_empty() {
+                return None;
+            }
+            let interval = xml_poll_interval();
+            Some(SatipXmlPoll {
+                urls,
+                over_tcp: opts.satip_rtsp_over_tcp != 0,
+                next: Instant::now() + interval,
+                interval,
+            })
+        });
 
         let mut session = SessionManager::with_scheduler(scheduler);
         session.set_bandwidth(Arc::clone(&bandwidth));
@@ -217,6 +334,10 @@ impl Runtime {
             conn_streams: HashMap::new(),
             started: Instant::now(),
             start_unix: sys::now_seconds(),
+            bandwidth: Arc::clone(&bandwidth),
+            satip,
+            satip_adapters,
+            xml_poll,
         })
     }
 
@@ -235,6 +356,127 @@ impl Runtime {
             }
             self.expire_streams();
             self.drain_events();
+            self.poll_satip_xml();
+        }
+    }
+
+    /// `add_satip_server`: installs one satipc adapter in the first free slot.
+    fn add_satip_adapter(&mut self, server: SatipServer) -> Result<(), String> {
+        let Some(aid) = (0..MAX_ADAPTERS)
+            .find(|aid| self.handles[*aid].is_none() && !self.satip.adapter_disabled(*aid))
+        else {
+            eprintln!("minisatip: MAX_ADAPTERS reached");
+            return Ok(());
+        };
+        let handle = spawn_satip(&self.satip, &server, aid, Some(Arc::clone(&self.bandwidth)))?;
+        let bridge = DataPlaneTuner {
+            commands: handle.command_sender(),
+        };
+        self.session.scheduler_mut().add_adapter(
+            aid,
+            satipc_adapter_config(&server),
+            Box::new(bridge),
+        );
+        self.handles[aid] = Some(handle);
+        self.satip_adapters.push(SatipAdapter {
+            aid,
+            host: server.host,
+            port: server.port,
+            delsys: server.delsys,
+        });
+        Ok(())
+    }
+
+    /// `disable_satip_server`: closes the adapters and frees their slots.
+    fn remove_satip_server(&mut self, host: &str, port: u16) {
+        let aids: Vec<usize> = self
+            .satip_adapters
+            .iter()
+            .filter(|entry| entry.host == host && entry.port == port)
+            .map(|entry| entry.aid)
+            .collect();
+        for aid in aids {
+            let adapter = i32::try_from(aid).unwrap_or(i32::MAX);
+            let ids: Vec<i32> = (0..ms_net::handler::MAX_STREAMS)
+                .filter(|id| {
+                    self.session
+                        .stream(*id)
+                        .is_some_and(|stream| stream.adapter == adapter)
+                })
+                .collect();
+            for id in ids {
+                self.stop_output(id);
+                self.session.close_stream(id);
+            }
+            let stale: Vec<i32> = self
+                .outputs
+                .iter()
+                .filter(|(_, active)| active.adapter == adapter)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in stale {
+                self.stop_output(id);
+                self.session.close_stream(id);
+            }
+            if let Some(handle) = self.handles[aid].take() {
+                handle.stop();
+            }
+            self.session.scheduler_mut().remove_adapter(aid);
+        }
+        self.satip_adapters
+            .retain(|entry| entry.host != host || entry.port != port);
+    }
+
+    /// `satip_getxml`: fetches every URL once the 120 s timer elapsed.
+    fn poll_satip_xml(&mut self) {
+        let Some(poll) = self.xml_poll.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < poll.next {
+            return;
+        }
+        let urls = poll.urls.clone();
+        let over_tcp = poll.over_tcp;
+        let interval = poll.interval;
+        if let Some(poll) = self.xml_poll.as_mut() {
+            poll.next = now + interval;
+        }
+        for url in urls {
+            self.reconcile_satip_xml(&url, over_tcp);
+        }
+    }
+
+    /// `satip_getxml_data`: compares the advertised tuners with the configured
+    /// adapters and replaces them when the counts differ.
+    fn reconcile_satip_xml(&mut self, url: &str, over_tcp: bool) {
+        let Ok((host, xml)) = fetch_satip_xml(url) else {
+            eprintln!("minisatip: cannot read satip xml from {url}");
+            return;
+        };
+        let Some(description) = parse_satip_xml(&xml, &host) else {
+            eprintln!("minisatip: no satipcap found for {url}");
+            return;
+        };
+        // detect_tuners_satip counts the adapters already configured for host:port.
+        let mut detected = [0i32; MAX_DVBAPI_SYSTEMS];
+        for entry in &self.satip_adapters {
+            if entry.host == description.host
+                && entry.port == description.port
+                && let Ok(code) = usize::try_from(delsys_code(entry.delsys))
+                && let Some(count) = detected.get_mut(code)
+            {
+                *count += 1;
+            }
+        }
+        if detected == description.tuners {
+            return;
+        }
+        self.remove_satip_server(&description.host, description.port);
+        for server in description.servers(over_tcp) {
+            if let Err(error) = self.add_satip_adapter(server) {
+                eprintln!("minisatip: cannot update satip xml {url}: {error}");
+            }
         }
     }
 
@@ -996,6 +1238,145 @@ fn adapter_config() -> AdapterConfig {
     config
 }
 
+fn satipc_adapter_config(server: &SatipServer) -> AdapterConfig {
+    let [sys0, sys1] = server.systems();
+    let mut config = AdapterConfig::new(sys0);
+    config.sys[1] = sys1;
+    config
+}
+
+fn spawn_adapter(
+    opts: &Options,
+    aid: usize,
+    tuner: Box<dyn Tuner + Send>,
+    bandwidth: Option<Arc<Bandwidth>>,
+) -> Result<AdapterHandle, String> {
+    let buffer = usize::try_from(opts.adapter_buffer)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
+    spawn_adapter_with(
+        aid,
+        tuner,
+        buffer,
+        ms_net::dataplane::clamp_threshold(opts.udp_threshold),
+        bandwidth,
+    )
+}
+
+fn spawn_adapter_with(
+    aid: usize,
+    tuner: Box<dyn Tuner + Send>,
+    buffer: usize,
+    threshold_ms: i64,
+    bandwidth: Option<Arc<Bandwidth>>,
+) -> Result<AdapterHandle, String> {
+    let adapter_id = i32::try_from(aid).map_err(|_| format!("adapter index {aid} out of range"))?;
+    AdapterHandle::spawn_with_bandwidth(
+        tuner,
+        DataPlaneConfig {
+            adapter_id,
+            adapter_buffer: buffer,
+            threshold_ms,
+        },
+        bandwidth,
+    )
+    .map_err(|error| format!("cannot start adapter {aid}: {error}"))
+}
+
+/// `add_satip_server` for an allocated slot.
+fn spawn_satip(
+    settings: &SatipSettings,
+    server: &SatipServer,
+    aid: usize,
+    bandwidth: Option<Arc<Bandwidth>>,
+) -> Result<AdapterHandle, String> {
+    let (strength, snr) = settings.signal_multipliers(aid);
+    let config = SatipcConfig {
+        adapter_id: aid,
+        server: server.clone(),
+        start_rtp: settings.start_rtp,
+        user_agent: format!("minisatip {}", env!("CARGO_PKG_VERSION")),
+        adapter_timeout_ms: settings.adapter_timeout_ms,
+        // src_satipc.cpp:605: both multipliers zero hides the server signal.
+        ignore_signal: strength == 0.0 && snr == 0.0,
+        bind_dev_ip: settings.bind_dev_ip,
+        receive_buffer: settings.receive_buffer,
+    };
+    if !server.source_ip.is_empty() && settings.bind_dev_ip.is_some() {
+        eprintln!(
+            "minisatip: AD{aid}: per-server source {} overrides --bind-dev source {:?}",
+            server.source_ip, settings.bind_dev_ip
+        );
+    }
+    let tuner = SatipcTuner::new(&config)
+        .map_err(|error| format!("cannot start satip adapter {aid}: {error}"))?;
+    let buffer = usize::try_from(settings.adapter_buffer)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
+    spawn_adapter_with(
+        aid,
+        Box::new(tuner),
+        buffer,
+        settings.threshold_ms,
+        bandwidth,
+    )
+}
+
+/// `satip_getxml` timer period (src_minisatip.cpp:2006).
+const SATIP_XML_POLL_MS: u64 = 120_000;
+
+fn xml_poll_interval() -> Duration {
+    let millis = std::env::var("MINISATIP_SATIP_XML_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(SATIP_XML_POLL_MS);
+    Duration::from_millis(millis)
+}
+
+/// `find_satip_adapter` plus the start-up `satip_getxml` pass.
+fn satip_servers(opts: &Options) -> Result<Vec<SatipServer>, String> {
+    let over_tcp = opts.satip_rtsp_over_tcp != 0;
+    let mut servers = match opts.satip_servers.as_deref() {
+        Some(spec) => parse_satip_servers(spec, over_tcp)?,
+        None => Vec::new(),
+    };
+    let Some(urls) = opts.satip_xml.as_deref() else {
+        return Ok(servers);
+    };
+    for url in urls
+        .split(|c: char| c == ',' || (c as u32) < 33)
+        .filter(|url| !url.is_empty())
+    {
+        let Ok((host, xml)) = fetch_satip_xml(url) else {
+            eprintln!("minisatip: cannot read satip xml from {url}");
+            continue;
+        };
+        let Some(description) = parse_satip_xml(&xml, &host) else {
+            eprintln!("minisatip: no satipcap found for {url}");
+            continue;
+        };
+        // detect_tuners_satip counts the adapters already configured for host:port.
+        let mut detected = [0i32; MAX_DVBAPI_SYSTEMS];
+        for server in &servers {
+            if server.host == description.host
+                && server.port == description.port
+                && let Ok(code) = usize::try_from(delsys_code(server.delsys))
+                && let Some(count) = detected.get_mut(code)
+            {
+                *count += 1;
+            }
+        }
+        if detected == description.tuners {
+            continue;
+        }
+        servers.retain(|server| server.host != description.host || server.port != description.port);
+        servers.extend(description.servers(over_tcp));
+    }
+    Ok(servers)
+}
+
 fn spawn_listener(
     listener: TcpListener,
     protocol: Protocol,
@@ -1211,6 +1592,7 @@ fn start_srt_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_config::{SignalForce, SignalMultiplier};
 
     #[test]
     fn atoi_ports_are_truncated_like_htons() {
@@ -1249,5 +1631,73 @@ mod tests {
         // getlocalip connects a UDP socket and reads getsockname (socketworks.cpp:239-244).
         assert_eq!(local_ip("127.0.0.1", true), "127.0.0.1");
         assert_eq!(local_ip("not a host", true), "");
+    }
+
+    fn multiplier(adapter: u8, strength: f32, snr: f32) -> SignalMultiplier {
+        SignalMultiplier {
+            adapter,
+            strength,
+            snr,
+            force: SignalForce {
+                strength_percent: false,
+                strength_decibel: false,
+                snr_percent: false,
+                snr_decibel: false,
+            },
+        }
+    }
+
+    // src_adapter.cpp:2204-2217: a per-adapter -M entry overrides the globals;
+    // adapters without an entry keep the global values.
+    #[test]
+    fn per_adapter_multipliers_override_globals() {
+        let opts = Options {
+            strength_multiplier: 1.0,
+            snr_multiplier: 1.0,
+            signal_multipliers: vec![multiplier(2, 0.0, 1.0), multiplier(3, 0.0, 0.0)],
+            ..Options::default()
+        };
+        let settings = SatipSettings::from_options(&opts, 5500);
+        assert_eq!(settings.signal_multipliers(0), (1.0, 1.0));
+        assert_eq!(settings.signal_multipliers(2), (0.0, 1.0));
+        assert_eq!(settings.signal_multipliers(3), (0.0, 0.0));
+    }
+
+    // src_satipc.cpp:605: only both-zero multipliers hide the server signal.
+    #[test]
+    fn satipc_ignores_signal_only_when_both_multipliers_are_zero() {
+        let opts = Options {
+            signal_multipliers: vec![multiplier(0, 0.0, 1.0), multiplier(1, 0.0, 0.0)],
+            ..Options::default()
+        };
+        let settings = SatipSettings::from_options(&opts, 5500);
+        let ignore = |aid| {
+            let (strength, snr) = settings.signal_multipliers(aid);
+            strength == 0.0 && snr == 0.0
+        };
+        assert!(!ignore(0), "one non-zero multiplier keeps the signal");
+        assert!(ignore(1), "both zero multipliers hide the signal");
+        assert!(!ignore(2), "globals default to one");
+    }
+
+    // src_satipc.cpp:816-822: bind_dev_ip() is the RTSP source and UDP bind
+    // address; it is NULL unless --bind-dev was given.
+    #[test]
+    fn bind_dev_ip_comes_only_from_bind_dev() {
+        let mut opts = Options {
+            bind: Some("127.0.0.2".to_owned()),
+            ..Options::default()
+        };
+        let settings = SatipSettings::from_options(&opts, 5500);
+        assert_eq!(settings.bind_dev_ip, None, "--bind is not bind_dev_ip()");
+
+        opts.bind_dev = Some("lo".to_owned());
+        // `lo` resolves to 127.0.0.1 on every Linux host running the suite.
+        let settings = SatipSettings::from_options(&opts, 5500);
+        assert_eq!(
+            settings.bind_dev_ip,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "--bind-dev must resolve to its IPv4 address"
+        );
     }
 }
