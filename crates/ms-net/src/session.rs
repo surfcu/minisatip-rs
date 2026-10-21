@@ -5,8 +5,7 @@
 
 use ms_sched::{MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
 use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use crate::handler::{
@@ -64,31 +63,37 @@ impl Clock for MonotonicClock {
 /// Clock advanced explicitly by tests.
 #[derive(Debug, Default)]
 pub struct ManualClock {
-    now_ms: AtomicI64,
+    // A mutex rather than `AtomicI64`, which 32-bit MIPS does not provide.
+    now_ms: Mutex<i64>,
 }
 
 impl ManualClock {
     /// Creates a clock at `now_ms`.
     pub fn new(now_ms: i64) -> Self {
         Self {
-            now_ms: AtomicI64::new(now_ms),
+            now_ms: Mutex::new(now_ms),
         }
     }
 
     /// Sets the current time.
     pub fn set(&self, now_ms: i64) {
-        self.now_ms.store(now_ms, Ordering::SeqCst);
+        *self.lock() = now_ms;
     }
 
     /// Moves the clock forward by `delta_ms`.
     pub fn advance(&self, delta_ms: i64) {
-        self.now_ms.fetch_add(delta_ms, Ordering::SeqCst);
+        let mut now = self.lock();
+        *now = now.wrapping_add(delta_ms);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, i64> {
+        self.now_ms.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Clock for ManualClock {
     fn now_ms(&self) -> i64 {
-        self.now_ms.load(Ordering::SeqCst)
+        *self.lock()
     }
 }
 
