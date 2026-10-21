@@ -103,12 +103,14 @@ pub struct UdpPair {
     pub rtp: Shared,
     pub rtcp: Shared,
     _workers: Vec<Worker>,
+    _lease: crate::server::PortLease,
 }
 
 impl UdpPair {
     /// Binds a free RTP/RTCP pair that uses none of the `avoid` port numbers.
     pub fn bind(avoid: &[u16]) -> io::Result<Self> {
-        let base = crate::server::free_udp_range(2, avoid)?;
+        let lease = crate::server::free_udp_range(2, avoid)?;
+        let base = lease.base();
         let rtp_socket = UdpSocket::bind(("127.0.0.1", base))?;
         let rtcp_socket = UdpSocket::bind(("127.0.0.1", base + 1))?;
         let rtp = Shared::default();
@@ -122,6 +124,7 @@ impl UdpPair {
             rtp,
             rtcp,
             _workers: workers,
+            _lease: lease,
         })
     }
 }
