@@ -462,13 +462,10 @@ fn html_directory_is_served_byte_for_byte() {
                 .replace("$tuner_c$", "0")
                 .replace("$tuner_c2$", "0")
                 .replace("$tuner_t2$", "0");
-            let mut expected = expected.into_bytes();
-            // process_file flushes past 8200 bytes and ends the body with
-            // "\r\n\r\n" instead of a Content-Length (utils.cpp:397-420).
-            if expected.len() > 8200 {
-                expected.extend_from_slice(b"\r\n\r\n");
-            }
-            assert_eq!(route.body, expected, "{name}");
+            // process_file flushes past 8200 bytes (utils.cpp:397-420); the
+            // streamed response, not the route body, carries the "\r\n\r\n".
+            assert_eq!(route.streamed, expected.len() > 8200, "{name}");
+            assert_eq!(route.body, expected.into_bytes(), "{name}");
         } else {
             assert_eq!(route.body, source, "{name}");
         }
@@ -544,8 +541,9 @@ fn large_html_files_stream_without_content_length() {
     let text = String::from_utf8(bytes).expect("utf-8");
     assert!(!text.contains("Content-Length:"), "{text}");
     let (_, body) = text.split_once("\r\n\r\n").expect("header end");
-    assert!(body.ends_with("\r\n\r\n"), "streamed body terminator");
-    assert_eq!(body.len(), response.body.len() + 4);
+    // Exactly one terminator after the content (utils.cpp:415-417).
+    assert!(body.ends_with("x\r\n\r\n"), "streamed body terminator");
+    assert_eq!(body.len(), "1.2.3".len() + 8200 + 4);
     fs::remove_dir_all(root).ok();
 }
 

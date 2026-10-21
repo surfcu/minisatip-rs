@@ -502,6 +502,58 @@ fn interleaved_reply_follows_a_complete_frame() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn interleaved_teardown_is_answered() -> io::Result<()> {
+    // minisatip.cpp:1424-1429: TEARDOWN runs close_stream, then replies 200 on
+    // the RTSP socket; the flush keeps the reply (stream.cpp:374).
+    let capture = generate_ts()?;
+    let server = start_server(&capture)?;
+    let mut rtsp = TcpStream::connect(("127.0.0.1", server.rtsp_port))?;
+    rtsp.set_read_timeout(Some(TIMEOUT))?;
+    rtsp.set_write_timeout(Some(TIMEOUT))?;
+    let base = format!("rtsp://127.0.0.1:{}/", server.rtsp_port);
+    let url = format!("{base}?freq=11500&msys=dvbs2&sr=27500&pids=0");
+    let (status, headers, _) = request(
+        &mut rtsp,
+        &format!(
+            "SETUP {url} RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;interleaved=0-1\r\n\r\n"
+        ),
+    )?;
+    assert_eq!(status, 200, "SETUP");
+    let session = header_value(&headers, "Session").expect("Session header");
+    let session = session.split(';').next().unwrap_or("").trim().to_owned();
+    let (status, _, _) = request(
+        &mut rtsp,
+        &format!("PLAY {base} RTSP/1.0\r\nCSeq: 2\r\nSession: {session}\r\n\r\n"),
+    )?;
+    assert_eq!(status, 200, "PLAY");
+
+    rtsp.write_all(
+        format!("TEARDOWN {base} RTSP/1.0\r\nCSeq: 3\r\nSession: {session}\r\n\r\n").as_bytes(),
+    )?;
+    rtsp.flush()?;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let index = frame_end(&raw);
+        if let Some(end) = raw[index..].windows(4).position(|w| w == b"\r\n\r\n") {
+            let reply = String::from_utf8_lossy(&raw[index..index + end]).into_owned();
+            assert!(reply.starts_with("RTSP/1.0 200"), "{reply}");
+            assert!(reply.contains("CSeq: 3"), "{reply}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no reply to interleaved TEARDOWN"
+        );
+        let read = rtsp.read(&mut chunk)?;
+        assert!(read > 0, "connection closed before the TEARDOWN reply");
+        raw.extend_from_slice(&chunk[..read]);
+    }
+    Ok(())
+}
+
 /// Returns the end of the leading run of complete `$` frames.
 fn frame_end(data: &[u8]) -> usize {
     let mut index = 0;
