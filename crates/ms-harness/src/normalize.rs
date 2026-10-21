@@ -12,16 +12,17 @@ pub struct Normalizer {
 
 impl Normalizer {
     /// Replaces every occurrence of `port` as a whole number by `<name>`.
-    /// Fails when `port` already has another name, which would be ambiguous.
+    /// Fails when the port or the name is already mapped differently (ambiguous).
     pub fn add_port(&mut self, port: u16, name: &str) -> Result<(), String> {
-        let name = format!("<{name}>");
-        match self.ports.get(&port.to_string()) {
-            Some(known) if *known != name => Err(format!("port {port} is both {known} and {name}")),
-            _ => {
-                self.ports.insert(port.to_string(), name);
-                Ok(())
-            }
+        let (port, name) = (port.to_string(), format!("<{name}>"));
+        if let Some(known) = self.ports.get(&port).filter(|known| **known != name) {
+            return Err(format!("port {port} is both {known} and {name}"));
         }
+        if let Some((other, _)) = self.ports.iter().find(|(p, n)| **n == name && **p != port) {
+            return Err(format!("{name} is both port {other} and port {port}"));
+        }
+        self.ports.insert(port, name);
+        Ok(())
     }
 
     /// Ports that already have a placeholder.
@@ -272,6 +273,11 @@ mod tests {
         let error = norm.add_port(40001, "SRTP+31").unwrap_err();
         assert!(
             error.contains("<RTSP>") && error.contains("<SRTP+31>"),
+            "{error}"
+        );
+        let error = norm.add_port(40002, "RTSP").unwrap_err();
+        assert!(
+            error.contains("40001") && error.contains("40002"),
             "{error}"
         );
         assert_eq!(norm.text("127.0.0.1:40001"), "127.0.0.1:<RTSP>");
