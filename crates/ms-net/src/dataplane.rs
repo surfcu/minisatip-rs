@@ -158,6 +158,11 @@ impl AdapterHandle {
         self.commands.send(command).is_ok()
     }
 
+    /// Clone of the command sender, e.g. for an [`ms_sched::AdapterTuner`] bridge.
+    pub fn command_sender(&self) -> Sender<Command> {
+        self.commands.clone()
+    }
+
     /// Tunes the adapter.
     pub fn tune(&self, params: TuneParams) -> bool {
         self.send(Command::Tune(Box::new(params)))
