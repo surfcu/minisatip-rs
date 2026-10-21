@@ -25,7 +25,13 @@ use ms_net::socket::DEFAULT_FIFO_SIZE;
 use ms_net::ssdp::{ANNOUNCE_INTERVAL_MS, SsdpConfig, SsdpServer, UdpSsdpIo, read_boot_id, uuid4};
 use ms_net::web::{RuntimeState, WebConfig, WebService};
 use ms_sched::{AdapterConfig, AdapterTuner, MAX_ADAPTERS, Scheduler, TuneError};
-use ms_tuner::{DeliverySystem, FileReplayConfig, FileReplayTuner, Pacing, PidSet, TuneParams};
+use ms_tuner::satipc::{
+    MAX_DVBAPI_SYSTEMS, SatipServer, SatipcConfig, SatipcTuner, delsys_code, fetch_satip_xml,
+    parse_satip_servers, parse_satip_xml,
+};
+use ms_tuner::{
+    DeliverySystem, FileReplayConfig, FileReplayTuner, Pacing, PidSet, TuneParams, Tuner,
+};
 
 use crate::sys;
 
@@ -116,25 +122,45 @@ impl Runtime {
                     },
                 )
                 .map_err(|error| format!("cannot replay {}: {error}", path.display()))?;
-                let buffer = usize::try_from(opts.adapter_buffer)
-                    .ok()
-                    .filter(|size| *size > 0)
-                    .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
-                let handle = AdapterHandle::spawn(
-                    Box::new(tuner),
-                    DataPlaneConfig {
-                        adapter_id: aid as i32,
-                        adapter_buffer: buffer,
-                        threshold_ms: ms_net::dataplane::clamp_threshold(opts.udp_threshold),
-                    },
-                )
-                .map_err(|error| format!("cannot start adapter {aid}: {error}"))?;
+                let handle = spawn_adapter(opts, aid, Box::new(tuner))?;
                 let bridge = DataPlaneTuner {
                     commands: handle.command_sender(),
                 };
                 scheduler.add_adapter(aid, adapter_config(), Box::new(bridge));
                 handles[aid] = Some(handle);
             }
+        }
+
+        // find_satip_adapter runs after the local adapters (find_adapters).
+        for server in satip_servers(opts)? {
+            let Some(aid) = (0..MAX_ADAPTERS)
+                .find(|aid| handles[*aid].is_none() && !adapter_disabled(opts, *aid))
+            else {
+                eprintln!("minisatip: MAX_ADAPTERS reached");
+                break;
+            };
+            let config = SatipcConfig {
+                adapter_id: aid,
+                server: server.clone(),
+                start_rtp: config.start_rtp,
+                user_agent: format!("minisatip {}", env!("CARGO_PKG_VERSION")),
+                adapter_timeout_ms: i64::from(opts.adapter_timeout),
+                ignore_signal: opts.strength_multiplier == 0.0 && opts.snr_multiplier == 0.0,
+            };
+            if !server.source_ip.is_empty() {
+                eprintln!(
+                    "minisatip: AD{aid}: source address {} is not supported, using the default route",
+                    server.source_ip
+                );
+            }
+            let tuner = SatipcTuner::new(&config)
+                .map_err(|error| format!("cannot start satip adapter {aid}: {error}"))?;
+            let handle = spawn_adapter(opts, aid, Box::new(tuner))?;
+            let bridge = DataPlaneTuner {
+                commands: handle.command_sender(),
+            };
+            scheduler.add_adapter(aid, satipc_adapter_config(&server), Box::new(bridge));
+            handles[aid] = Some(handle);
         }
 
         let mut session = SessionManager::with_scheduler(scheduler);
@@ -656,6 +682,82 @@ fn adapter_config() -> AdapterConfig {
     config.sys[4] = DeliverySystem::DvbC;
     config.sys[5] = DeliverySystem::DvbC2;
     config
+}
+
+fn satipc_adapter_config(server: &SatipServer) -> AdapterConfig {
+    let [sys0, sys1] = server.systems();
+    let mut config = AdapterConfig::new(sys0);
+    config.sys[1] = sys1;
+    config
+}
+
+fn spawn_adapter(
+    opts: &Options,
+    aid: usize,
+    tuner: Box<dyn Tuner + Send>,
+) -> Result<AdapterHandle, String> {
+    let buffer = usize::try_from(opts.adapter_buffer)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
+    let adapter_id = i32::try_from(aid).map_err(|_| format!("adapter index {aid} out of range"))?;
+    AdapterHandle::spawn(
+        tuner,
+        DataPlaneConfig {
+            adapter_id,
+            adapter_buffer: buffer,
+            threshold_ms: ms_net::dataplane::clamp_threshold(opts.udp_threshold),
+        },
+    )
+    .map_err(|error| format!("cannot start adapter {aid}: {error}"))
+}
+
+fn adapter_disabled(opts: &Options, aid: usize) -> bool {
+    opts.enabled_adapters
+        .as_ref()
+        .is_some_and(|list| u8::try_from(aid).map_or(true, |id| !list.contains(&id)))
+}
+
+/// `find_satip_adapter` plus the start-up `satip_getxml` pass.
+fn satip_servers(opts: &Options) -> Result<Vec<SatipServer>, String> {
+    let over_tcp = opts.satip_rtsp_over_tcp != 0;
+    let mut servers = match opts.satip_servers.as_deref() {
+        Some(spec) => parse_satip_servers(spec, over_tcp)?,
+        None => Vec::new(),
+    };
+    let Some(urls) = opts.satip_xml.as_deref() else {
+        return Ok(servers);
+    };
+    for url in urls
+        .split(|c: char| c == ',' || (c as u32) < 33)
+        .filter(|url| !url.is_empty())
+    {
+        let Ok((host, xml)) = fetch_satip_xml(url) else {
+            eprintln!("minisatip: cannot read satip xml from {url}");
+            continue;
+        };
+        let Some(description) = parse_satip_xml(&xml, &host) else {
+            eprintln!("minisatip: no satipcap found for {url}");
+            continue;
+        };
+        // detect_tuners_satip counts the adapters already configured for host:port.
+        let mut detected = [0i32; MAX_DVBAPI_SYSTEMS];
+        for server in &servers {
+            if server.host == description.host
+                && server.port == description.port
+                && let Ok(code) = usize::try_from(delsys_code(server.delsys))
+                && let Some(count) = detected.get_mut(code)
+            {
+                *count += 1;
+            }
+        }
+        if detected == description.tuners {
+            continue;
+        }
+        servers.retain(|server| server.host != description.host || server.port != description.port);
+        servers.extend(description.servers(over_tcp));
+    }
+    Ok(servers)
 }
 
 fn spawn_listener(

@@ -502,6 +502,7 @@ impl Client {
 
     /// `satipc_rtcp_reply` signal part: parses the `SES1` APP payload.
     pub fn rtcp_reply(&mut self, b: &[u8]) {
+        self.rtsp_socket_closed = false;
         if b.len() >= 24 && b[0] == 0x80 && b[1] == 0xC8 && self.transport == Transport::Udp {
             self.repno = self.repno.wrapping_add(1);
         }
