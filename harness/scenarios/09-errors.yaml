@@ -1,0 +1,16 @@
+name: errors
+description: Rejected requests - transport without a stream, unknown sessions and paths
+capture: fta
+fast: true
+steps:
+  - rtsp:
+      conn: c
+      method: OPTIONS
+      url: "{base}/"
+      headers: { Transport: "RTP/AVP;unicast;client_port=5000-5001" }
+  - rtsp:
+      conn: c
+      raw: "PLAY rtsp://127.0.0.1:{rtsp}/stream=99 RTSP/1.0\r\nCSeq: 9\r\nSession: 1234567890\r\n\r\n"
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream=99", session: false }
+  - rtsp: { conn: c, method: GET, url: "{base}/" }
+  - http: { path: /missing.html }

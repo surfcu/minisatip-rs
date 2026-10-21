@@ -35,6 +35,24 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  harness:
+    name: Differential harness (Rust vs Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Build servers and harness
+        run: cargo build -p minisatip -p ms-harness
+
+      # Fast scenarios only; ten runs prove the transcripts are deterministic.
+      - name: Run scenarios
+        run: cargo run -q -p ms-harness -- run --fast --runs 10
+
   cross:
     name: cross (${{ matrix.target }})
     runs-on: ubuntu-latest

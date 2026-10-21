@@ -133,7 +133,7 @@ impl Runtime {
                     &path,
                     FileReplayConfig {
                         looping: true,
-                        pacing: Pacing::None,
+                        pacing: replay_pacing(),
                     },
                 )
                 .map_err(|error| format!("cannot replay {}: {error}", path.display()))?;
@@ -284,6 +284,7 @@ impl Runtime {
             ctx.local_host = local_ip;
             ctx.timeout_ms = self.config.timeout_ms;
             ctx.start_rtp = self.config.start_rtp;
+            ctx.rrtp = self.config.rrtp.clone();
             ctx.rtsp_port = self.config.rtsp_port;
             ctx.rtptime_seconds = self.started.elapsed().as_secs() as i64;
             let response = if protocol.is_rtsp() {
@@ -958,6 +959,15 @@ fn fifo_size(max_sbuf: i32) -> usize {
 /// advertised (minisatip.cpp:1130-1136).
 fn port16(value: i32) -> u16 {
     value as u16
+}
+
+/// `MINISATIP_REPLAY_BITRATE=<bit/s>` paces the replay (DEV-120); unset or 0 is unpaced.
+fn replay_pacing() -> Pacing {
+    std::env::var("MINISATIP_REPLAY_BITRATE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bits| *bits > 0)
+        .map_or(Pacing::None, Pacing::FixedBitrate)
 }
 
 fn adapter_ids(opts: &Options) -> Vec<usize> {

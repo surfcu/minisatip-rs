@@ -1,0 +1,10 @@
+name: http-desc
+description: UPnP /desc.xml with one and two adapters, including a HEAD request
+capture: fta
+adapters: 2
+fast: true
+steps:
+  - http: { path: /desc.xml }
+  - http: { path: /desc.xml, method: HEAD }
+  - http: { path: /satip.xml }
+  - http: { path: /nope.xml }

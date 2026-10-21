@@ -1,0 +1,46 @@
+# scenario fta-pids-all
+== 2 rtsp c > SETUP rtsp://127.0.0.1:<RTSP>/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=all RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 1
+Server: minisatip/<VER>
+Transport: RTP/AVP;unicast;destination=127.0.0.1;source=127.0.0.1;client_port=<u1.rtp>-<u1.rtcp>;server_port=<SRTP+0>-<SRTP+1>
+Session: <SESSION1>;timeout=30
+com.ses.streamID: 1
+== 3 rtsp c > PLAY rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION1>
+CSeq: 2
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=1;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 4 capture u1
+rtp: version=2 pt=33 ssrc=constant seq_gaps=0 bad_payload=0
+ts: period=complete packets=496 sync_errors=0 cc_errors=0 order=76556c0725614d65
+pid 0x0000 packets=32 scrambled=0
+pid 0x0011 packets=16 scrambled=0
+pid 0x0100 packets=32 scrambled=0
+pid 0x0101 packets=64 scrambled=0
+pid 0x0102 packets=32 scrambled=0
+pid 0x01ff packets=32 scrambled=0
+pid 0x0200 packets=32 scrambled=0
+pid 0x0201 packets=64 scrambled=0
+pid 0x0202 packets=32 scrambled=0
+pid 0x0300 packets=32 scrambled=0
+pid 0x0301 packets=64 scrambled=0
+pid 0x0302 packets=32 scrambled=0
+pid 0x1fff packets=32 scrambled=0
+section pid=0x0000 table=0x00 ext=0x0457 v=0 len=24 crc=28938acf count=32
+section pid=0x0011 table=0x42 ext=0x0457 v=0 len=101 crc=cfe0f091 count=16
+section pid=0x0100 table=0x02 ext=0x0001 v=0 len=26 crc=47267c13 count=32
+section pid=0x0200 table=0x02 ext=0x0002 v=0 len=26 crc=7ae0190b count=32
+section pid=0x0300 table=0x02 ext=0x0003 v=0 len=26 crc=921d316e count=32
+== 5 rtsp c > TEARDOWN rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 3
+Server: minisatip/<VER>
+Session: <SESSION1>
+== 6 silence u1
+silent
