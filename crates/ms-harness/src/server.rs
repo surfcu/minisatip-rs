@@ -188,7 +188,7 @@ pub fn free_udp_range(count: u16, avoid: &[u16]) -> io::Result<u16> {
 }
 
 fn overlaps(base: u16, count: u16, avoid: &[u16]) -> bool {
-    avoid.iter().any(|port| (base..base + count).contains(port))
+    avoid.iter().any(|port| port.wrapping_sub(base) < count)
 }
 
 #[cfg(test)]
@@ -201,6 +201,13 @@ mod tests {
         assert!(overlaps(40000, 32, &[1, 40031]));
         assert!(!overlaps(40000, 32, &[39999, 40032]));
         assert!(!overlaps(40000, 32, &[]));
+        assert!(overlaps(u16::MAX - 1, 32, &[u16::MAX]));
+    }
+
+    #[test]
+    fn free_udp_range_never_returns_an_avoided_port() {
+        let all: Vec<u16> = (0..=u16::MAX).collect();
+        assert!(free_udp_range(2, &all).is_err());
     }
 
     #[test]
