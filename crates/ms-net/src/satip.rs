@@ -47,7 +47,11 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
         match key {
             "msys" => params.msys = delivery_system(value),
             "freq" => params.freq = parse_float(value, 1_000.0),
-            "pol" => params.pol = polarization(value),
+            "pol" => {
+                params.pol = polarization(value);
+                params.pol_specified =
+                    matches!(value.to_ascii_lowercase().as_str(), "v" | "h" | "r" | "l");
+            }
             "sr" => {
                 let sr = parse_int_prefix(value, 0);
                 params.sr = if (0..=1_000_000).contains(&sr) {
@@ -127,6 +131,7 @@ pub fn parse_satip_url_new(url: &str) -> (TuneParams, ParseReport) {
 fn reset_tuning(params: &mut TuneParams) {
     params.freq = 0;
     params.pol = Polarization::None;
+    params.pol_specified = false;
     params.msys = DeliverySystem::Undefined;
     params.sr = 0;
     params.src = 0;

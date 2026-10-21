@@ -388,6 +388,46 @@ fn describe_undefined_and_stream_pids() {
     );
 }
 
+// Ported from tests/test_adapter.cpp:149
+#[test]
+fn test_describe_adapter_large_plp_ds() {
+    let pids = PidSet::new();
+    let tune = TuneParams {
+        msys: DeliverySystem::DvbT2,
+        plp: Some(2_147_483_647),
+        ..TuneParams::default()
+    };
+    let input = DescribeInput {
+        adapter_id: 0,
+        tune: &tune,
+        signal: None,
+        use_adapter: false,
+        pids: &pids,
+    };
+    assert!(
+        describe_adapter(&input).contains(",2147483647,"),
+        "DVB-T2 plp printed"
+    );
+
+    let tune = TuneParams {
+        msys: DeliverySystem::DvbC2,
+        ds: Some(2_147_483_646),
+        plp: Some(2_147_483_647),
+        ..TuneParams::default()
+    };
+    let input = DescribeInput {
+        adapter_id: 0,
+        tune: &tune,
+        signal: None,
+        use_adapter: false,
+        pids: &pids,
+    };
+    assert!(
+        describe_adapter(&input).contains(",2147483646,2147483647,"),
+        "DVB-C2 ds and plp printed"
+    );
+}
+
 #[test]
 fn describe_dvbt_and_dvbc() {
     let tune = TuneParams {

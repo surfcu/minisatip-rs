@@ -9,6 +9,7 @@ use super::device::{
     DemuxFd, DiseqcMessage, DtvProperty, DtvStat, DvbDevice, FrontendInfo, MiniCmd, PesOutput,
     SecDevice, Tone, Voltage,
 };
+use super::enumerate::{DeviceTree, FrontendProbe, ProbedFrontend, probe_device};
 use super::ioc::NATIVE_IOCTLS;
 
 const DEV_FRONTEND: &str = "/dev/dvb/adapter{}/frontend{}";
@@ -146,6 +147,37 @@ fn open_path(path: &str, flags: i32) -> io::Result<i32> {
         Err(io::Error::last_os_error())
     } else {
         Ok(fd)
+    }
+}
+
+fn accessible(path: &str, mode: libc::c_int) -> bool {
+    let Ok(c_path) = CString::new(path) else {
+        return false;
+    };
+    // SAFETY: c_path is a valid NUL-terminated string; access(2) only reads it.
+    unsafe { libc::access(c_path.as_ptr(), mode) == 0 }
+}
+
+/// Real `/dev/dvb` tree used by `find_dvb_adapter`.
+pub struct LinuxDeviceTree;
+
+impl DeviceTree for LinuxDeviceTree {
+    fn readable(&self, path: &str) -> bool {
+        accessible(path, libc::R_OK)
+    }
+
+    fn writable(&self, path: &str) -> bool {
+        accessible(path, libc::W_OK)
+    }
+}
+
+/// Opens each discovered frontend to read `FE_GET_INFO` and `DTV_ENUM_DELSYS`.
+pub struct LinuxFrontendProbe;
+
+impl FrontendProbe for LinuxFrontendProbe {
+    fn probe(&self, adapter: u32, frontend: u32) -> Option<ProbedFrontend> {
+        let mut dev = LinuxDvbDevice::open(adapter, frontend).ok()?;
+        Some(probe_device(&mut dev))
     }
 }
 

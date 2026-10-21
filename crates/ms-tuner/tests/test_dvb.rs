@@ -42,6 +42,9 @@ struct FakeDevice {
     events: usize,
     stats: Option<[DtvStat; 3]>,
     info: String,
+    info_fe_type: u32,
+    info_caps: u32,
+    delsys: Vec<u32>,
     status: Option<i32>,
     ber: Option<u32>,
     strength: Option<u16>,
@@ -60,6 +63,9 @@ impl FakeDevice {
             events: 0,
             stats: None,
             info: "Mock FE".to_string(),
+            info_fe_type: 0,
+            info_caps: 0,
+            delsys: vec![SYS_DVBS2 as u32],
             status: None,
             ber: None,
             strength: None,
@@ -180,15 +186,15 @@ impl DvbDevice for FakeDevice {
 
     fn enum_delsys(&mut self) -> io::Result<Vec<u32>> {
         self.calls.push(Call::EnumDelsys);
-        Ok(vec![SYS_DVBS2 as u32])
+        Ok(self.delsys.clone())
     }
 
     fn get_info(&mut self) -> io::Result<FrontendInfo> {
         self.calls.push(Call::GetInfo);
         Ok(FrontendInfo {
             name: self.info.clone(),
-            fe_type: 0,
-            caps: 0,
+            fe_type: self.info_fe_type,
+            caps: self.info_caps,
         })
     }
 
@@ -294,6 +300,137 @@ fn sat_transponder(freq_khz: i32) -> DvbTransponder {
         sr: Some(22_000_000),
         ..DvbTransponder::default()
     }
+}
+
+// Ported from tests/test_adapter.cpp:32
+#[test]
+fn test_get_lnb_hiband_universal() {
+    let diseqc_param = DiseqcParams {
+        lnb_low: 9_750_000,
+        lnb_high: 10_600_000,
+        lnb_switch: 11_700_000,
+        ..DiseqcParams::default()
+    };
+    let mut tp = DvbTransponder {
+        freq: Some(10_778_000),
+        ..DvbTransponder::default()
+    };
+
+    let hiband = lnb_hiband(&tp, &diseqc_param);
+    assert_eq!(hiband, 0, "Universal LNB hiband parsed incorrectly");
+
+    tp.freq = Some(12_322_000);
+    let hiband = lnb_hiband(&tp, &diseqc_param);
+    assert_eq!(hiband, 1, "Universal LNB hiband parsed incorrectly");
+}
+
+// Ported from tests/test_adapter.cpp:48
+#[test]
+fn test_get_lnb_int_freq_universal() {
+    let diseqc_param = DiseqcParams {
+        lnb_low: 9_750_000,
+        lnb_high: 10_600_000,
+        lnb_switch: 11_700_000,
+        ..DiseqcParams::default()
+    };
+    let mut tp = DvbTransponder {
+        freq: Some(10_778_000),
+        ..DvbTransponder::default()
+    };
+
+    assert_eq!(
+        lnb_int_freq(&tp, &diseqc_param),
+        1_028_000,
+        "Universal LNB IF parsed incorrectly"
+    );
+
+    tp.freq = Some(12_322_000);
+    assert_eq!(
+        lnb_int_freq(&tp, &diseqc_param),
+        1_722_000,
+        "Universal LNB IF parsed incorrectly"
+    );
+}
+
+// Ported from tests/test_adapter.cpp:64
+#[test]
+fn test_get_lnb_hiband_kuband() {
+    let diseqc_param = DiseqcParams {
+        lnb_low: 10_750_000,
+        lnb_high: 0,
+        lnb_switch: 0,
+        ..DiseqcParams::default()
+    };
+    let tp = DvbTransponder {
+        freq: Some(12_267_000),
+        ..DvbTransponder::default()
+    };
+
+    let hiband = lnb_hiband(&tp, &diseqc_param);
+    assert_eq!(hiband, 0, "Ku-band LNB hiband parsed incorrectly");
+}
+
+// Ported from tests/test_adapter.cpp:79
+#[test]
+fn test_get_lnb_int_freq_kuband() {
+    let diseqc_param = DiseqcParams {
+        lnb_low: 10_750_000,
+        lnb_high: 0,
+        lnb_switch: 0,
+        ..DiseqcParams::default()
+    };
+    let tp = DvbTransponder {
+        freq: Some(12_267_000),
+        ..DvbTransponder::default()
+    };
+
+    assert_eq!(
+        lnb_int_freq(&tp, &diseqc_param),
+        1_517_000,
+        "Ku-band LNB IF parsed incorrectly"
+    );
+}
+
+// Ported from tests/test_adapter.cpp:94
+#[test]
+fn test_get_lnb_hiband_cband() {
+    let diseqc_param = DiseqcParams {
+        lnb_low: 5_150_000,
+        lnb_high: 0,
+        lnb_switch: 0,
+        ..DiseqcParams::default()
+    };
+    let tp = DvbTransponder {
+        freq: Some(3_773_000),
+        ..DvbTransponder::default()
+    };
+
+    let hiband = lnb_hiband(&tp, &diseqc_param);
+    assert_eq!(hiband, 0, "C-band LNB hiband parsed incorrectly");
+}
+
+// Ported from tests/test_adapter.cpp:109
+#[test]
+fn test_get_lnb_int_freq_cband() {
+    let mut diseqc_param = DiseqcParams {
+        lnb_low: 5_150_000,
+        lnb_high: 0,
+        lnb_switch: 0,
+        ..DiseqcParams::default()
+    };
+    let tp = DvbTransponder {
+        freq: Some(3_773_000),
+        ..DvbTransponder::default()
+    };
+
+    let freq = lnb_int_freq(&tp, &diseqc_param);
+    assert_eq!(freq, 1_377_000, "C-band LNB IF parsed incorrectly");
+
+    // Should also work with low = high = switch
+    diseqc_param.lnb_high = 5_150_000;
+    diseqc_param.lnb_switch = 5_150_000;
+    let freq = lnb_int_freq(&tp, &diseqc_param);
+    assert_eq!(freq, 1_377_000, "C-band LNB IF parsed incorrectly");
 }
 
 #[test]
@@ -1400,6 +1537,43 @@ fn signal_scaling_matches_cpp_tables() {
     assert_eq!(snr_decibels(100_000, 1.0), (999, 65_535));
     assert_eq!(apply_multiplier(65_000, 2.0), 65_535);
     assert_eq!(apply_multiplier(0x4000, 1.0), 0x4000);
+}
+
+// C++ dvb_delsys: DTV_ENUM_DELSYS wins, FE_GET_INFO supplies the name
+// (dvb.cpp:1856-1951).
+#[test]
+fn probe_device_uses_enum_delsys_and_frontend_name() {
+    let mut dev = FakeDevice::new();
+    dev.info = "TurboSight TBS 6903".to_owned();
+    dev.delsys = vec![SYS_DVBS2 as u32, SYS_DVBS as u32];
+
+    let probed = probe_device(&mut dev);
+    assert_eq!(probed.name, "TurboSight TBS 6903");
+    assert_eq!(
+        probed.systems,
+        vec![DeliverySystem::DvbS2, DeliverySystem::DvbS]
+    );
+    assert_eq!(
+        dev.calls,
+        vec![Call::EnumDelsys, Call::GetInfo],
+        "dvb_delsys queries ENUM_DELSYS before FE_GET_INFO"
+    );
+}
+
+// C++ falls back to the FE_GET_INFO type/caps when the API is older than 5.5
+// and DTV_ENUM_DELSYS returns nothing (dvb.cpp:1886-1926).
+#[test]
+fn probe_device_falls_back_to_frontend_info() {
+    let mut dev = FakeDevice::new();
+    dev.delsys.clear();
+    dev.info_fe_type = FE_QPSK;
+    dev.info_caps = FE_CAN_2G_MODULATION;
+
+    let probed = probe_device(&mut dev);
+    assert_eq!(
+        probed.systems,
+        vec![DeliverySystem::DvbS2, DeliverySystem::DvbS]
+    );
 }
 
 #[test]

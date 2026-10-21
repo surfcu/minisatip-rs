@@ -25,17 +25,31 @@ pub struct LinuxDvbTuner<D: DvbDevice = LinuxDvbDevice> {
 impl LinuxDvbTuner<LinuxDvbDevice> {
     /// Opens `/dev/dvb/adapterN/frontendM` and `/dev/dvb/adapterN/dvrM`.
     pub fn open(adapter: u32, frontend: u32) -> io::Result<Self> {
+        Self::open_with_buffer(adapter, frontend, DVR_BUFFER)
+    }
+
+    /// Opens a frontend with an explicit DVR buffer size (`-b`).
+    pub fn open_with_buffer(adapter: u32, frontend: u32, dvr_buffer: i32) -> io::Result<Self> {
         let dev = LinuxDvbDevice::open(adapter, frontend)?;
-        Ok(Self::with_device(dev, AdapterState::alloc()))
+        Ok(Self::with_dvr_buffer(
+            dev,
+            AdapterState::alloc(),
+            dvr_buffer,
+        ))
     }
 }
 
 impl<D: DvbDevice> LinuxDvbTuner<D> {
     /// Wraps an already-open device and adapter state.
-    pub fn with_device(mut dev: D, mut state: AdapterState) -> Self {
+    pub fn with_device(dev: D, state: AdapterState) -> Self {
+        Self::with_dvr_buffer(dev, state, DVR_BUFFER)
+    }
+
+    /// Wraps a device, setting `DMX_SET_BUFFER_SIZE` to `dvr_buffer` bytes
+    /// (`-b`, dvb.cpp:926).
+    pub fn with_dvr_buffer(mut dev: D, mut state: AdapterState, dvr_buffer: i32) -> Self {
         state.fe = 1;
-        // dvb_open_device sets the DVR buffer size once (dvb.cpp:926).
-        let _ = dev.set_buffer_size(dev.stream_fd(), DVR_BUFFER);
+        let _ = dev.set_buffer_size(dev.stream_fd(), dvr_buffer);
         Self {
             dev,
             state,

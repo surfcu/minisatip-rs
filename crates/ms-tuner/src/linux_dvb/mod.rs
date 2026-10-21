@@ -6,6 +6,7 @@
 mod consts;
 mod device;
 mod diseqc;
+mod enumerate;
 mod ioc;
 mod signal;
 mod state;
@@ -20,6 +21,7 @@ mod sys;
 pub use consts::*;
 pub use device::*;
 pub use diseqc::*;
+pub use enumerate::*;
 pub use ioc::*;
 pub use signal::*;
 pub use state::*;
@@ -27,3 +29,5 @@ pub use transponder::*;
 
 #[cfg(target_os = "linux")]
 pub use backend::LinuxDvbTuner;
+#[cfg(target_os = "linux")]
+pub use sys::{LinuxDeviceTree, LinuxFrontendProbe};

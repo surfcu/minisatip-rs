@@ -56,6 +56,12 @@ pub struct TuneParams {
     pub freq: i32,
     /// Polarisation.
     pub pol: Polarization,
+    /// Whether `pol` was present, like the C++ optional `tp->pol`.
+    ///
+    /// An explicitly specified `pol=0` maps to `Polarization::None` but is
+    /// distinct from an absent value in `compare_slave_parameters`, where C++
+    /// uses `value_or(-1)`.
+    pub pol_specified: bool,
     /// Delivery system (`msys`).
     pub msys: DeliverySystem,
     /// Symbol rate in sym/s, like the C++ `transponder::sr` (`sr * 1000`).

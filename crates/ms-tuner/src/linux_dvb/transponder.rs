@@ -127,7 +127,8 @@ impl DvbTransponder {
             Polarization::Horizontal => Some(2),
             Polarization::Right => Some(3),
             Polarization::Left => Some(4),
-            Polarization::None => None,
+            // An explicit `pol=0` is the C++ optional value 0, not nullopt.
+            Polarization::None => p.pol_specified.then_some(0),
         };
         let mut tp = Self {
             sys: delsys_number(p.msys),

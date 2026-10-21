@@ -5,7 +5,8 @@ use crate::describe::{DescribeInput, describe_adapter};
 use crate::handler::{StreamId, StreamType};
 use crate::output::{OutputStats, STREAM_TIMER_MS, StreamOutput};
 use crate::rtp::DVB_FRAME;
-use ms_tuner::{PidSet, TsBuf, TuneParams, Tuner};
+use ms_sched::{AdapterTuner, TuneError};
+use ms_tuner::{PidSet, TsBuf, TuneParams, Tuner, TunerError};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
@@ -19,6 +20,12 @@ pub const ADAPTER_BUFFER: usize = 2000 * DVB_FRAME;
 pub const FORCE_SEND_MS: i64 = 40;
 /// Command poll interval while the tuner has no data.
 const IDLE_POLL: Duration = Duration::from_millis(5);
+/// Upper bound the control plane waits for a tune result.
+///
+/// C++ tunes synchronously in the request path, so SETUP/PLAY cannot answer
+/// before the frontend ioctls finish. The bound only guards against a wedged
+/// adapter thread: expiry is reported as a hardware failure (`-500`).
+pub const TUNE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Clamps a threshold to `1..200` ms, with 200 for out-of-range values.
 pub fn clamp_threshold(threshold: i32) -> i64 {
@@ -72,7 +79,12 @@ impl Default for DataPlaneConfig {
 /// Messages from the control plane.
 pub enum Command {
     /// Tunes the tuner; the parameters also feed the RTCP description.
-    Tune(Box<TuneParams>),
+    Tune {
+        /// Tuning parameters.
+        params: Box<TuneParams>,
+        /// When set, the thread reports the backend result before continuing.
+        reply: Option<Sender<Result<(), TunerError>>>,
+    },
     /// Starts sending `pids` to a new output.
     StartOutput {
         /// Stream that owns the output.
@@ -89,6 +101,9 @@ pub enum Command {
         /// New PIDs.
         pids: PidSet,
     },
+    /// Replaces the PID set owned by the scheduler (adapter table, defaults
+    /// included). The tuner filters the union of this set and the outputs.
+    SetBasePids(PidSet),
     /// Removes an output; its final stats are reported as [`Event::OutputStopped`].
     StopOutput(StreamId),
     /// Queues an RTSP reply on an interleaved output's priority lane.
@@ -163,9 +178,29 @@ impl AdapterHandle {
         self.commands.clone()
     }
 
-    /// Tunes the adapter.
+    /// Tunes the adapter without waiting for the backend result.
     pub fn tune(&self, params: TuneParams) -> bool {
-        self.send(Command::Tune(Box::new(params)))
+        self.send(Command::Tune {
+            params: Box::new(params),
+            reply: None,
+        })
+    }
+
+    /// Tunes the adapter and waits up to `timeout` for the backend result.
+    ///
+    /// The C++ request path tunes synchronously; the control plane uses this to
+    /// turn a failing `FE_SET_PROPERTY` into the matching RTSP error. A
+    /// stopped thread or timeout is reported as a hardware failure.
+    pub fn tune_wait(&self, params: TuneParams, timeout: Duration) -> Result<(), TunerError> {
+        let (reply, rx) = mpsc::channel();
+        if !self.send(Command::Tune {
+            params: Box::new(params),
+            reply: Some(reply),
+        }) {
+            return Err(TunerError::Backend(-500));
+        }
+        rx.recv_timeout(timeout)
+            .unwrap_or(Err(TunerError::Backend(-500)))
     }
 
     /// Starts an output for `stream_id`.
@@ -180,6 +215,11 @@ impl AdapterHandle {
     /// Replaces the PIDs of `stream_id`.
     pub fn set_pids(&self, stream_id: StreamId, pids: PidSet) -> bool {
         self.send(Command::SetPids { stream_id, pids })
+    }
+
+    /// Replaces the scheduler-owned (adapter table) PID set.
+    pub fn set_base_pids(&self, pids: PidSet) -> bool {
+        self.send(Command::SetBasePids(pids))
     }
 
     /// Stops the output of `stream_id`.
@@ -220,6 +260,58 @@ impl Drop for AdapterHandle {
     }
 }
 
+/// [`AdapterTuner`] that forwards to an adapter's data-plane thread.
+///
+/// Tuning blocks until the thread reports the backend result, matching the
+/// synchronous C++ request path; the other commands stay asynchronous.
+pub struct DataPlaneTuner {
+    commands: Sender<Command>,
+    timeout: Duration,
+}
+
+impl DataPlaneTuner {
+    /// Creates a bridge that waits up to [`TUNE_REPLY_TIMEOUT`].
+    pub fn new(commands: Sender<Command>) -> Self {
+        Self {
+            commands,
+            timeout: TUNE_REPLY_TIMEOUT,
+        }
+    }
+
+    /// Creates a bridge with an explicit reply timeout.
+    pub fn with_timeout(commands: Sender<Command>, timeout: Duration) -> Self {
+        Self { commands, timeout }
+    }
+}
+
+impl AdapterTuner for DataPlaneTuner {
+    fn tune(&mut self, params: &TuneParams) -> Result<(), TuneError> {
+        let (reply, rx) = mpsc::channel();
+        if self
+            .commands
+            .send(Command::Tune {
+                params: Box::new(params.clone()),
+                reply: Some(reply),
+            })
+            .is_err()
+        {
+            return Err(TuneError::Hardware);
+        }
+        match rx.recv_timeout(self.timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(TunerError::Backend(-403))) => Err(TuneError::OutOfRange),
+            Ok(Err(TunerError::Backend(-503))) => Err(TuneError::Pids),
+            Ok(Err(_)) | Err(_) => Err(TuneError::Hardware),
+        }
+    }
+
+    fn set_pids(&mut self, pids: &PidSet) -> Result<(), TuneError> {
+        self.commands
+            .send(Command::SetBasePids(pids.clone()))
+            .map_err(|_| TuneError::Pids)
+    }
+}
+
 struct Subscriber {
     output: StreamOutput,
     pids: PidSet,
@@ -232,6 +324,7 @@ struct DataPlane {
     commands: Receiver<Command>,
     events: Sender<Event>,
     outputs: BTreeMap<StreamId, Subscriber>,
+    base_pids: PidSet,
     tune: TuneParams,
     buf: TsBuf,
     threshold_ms: i64,
@@ -253,6 +346,7 @@ impl DataPlane {
             commands,
             events,
             outputs: BTreeMap::new(),
+            base_pids: PidSet::new(),
             tune: TuneParams::default(),
             buf: TsBuf::new(config.adapter_buffer),
             threshold_ms: config.threshold_ms,
@@ -294,9 +388,17 @@ impl DataPlane {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Tune(params) => {
-                if let Err(error) = self.tuner.tune(&params) {
-                    let _ = self.events.send(Event::TunerError(error.to_string()));
+            Command::Tune { params, reply } => {
+                let result = self.tuner.tune(&params);
+                match reply {
+                    Some(reply) => {
+                        let _ = reply.send(result);
+                    }
+                    None => {
+                        if let Err(error) = result {
+                            let _ = self.events.send(Event::TunerError(error.to_string()));
+                        }
+                    }
                 }
                 self.tune = *params;
                 self.buf.clear();
@@ -323,6 +425,10 @@ impl DataPlane {
                     subscriber.pids = pids;
                     self.update_tuner_pids();
                 }
+            }
+            Command::SetBasePids(pids) => {
+                self.base_pids = pids;
+                self.update_tuner_pids();
             }
             Command::StopOutput(stream_id) => {
                 if let Some(subscriber) = self.outputs.remove(&stream_id) {
@@ -360,7 +466,9 @@ impl DataPlane {
     }
 
     fn update_tuner_pids(&mut self) {
-        let mut pids = PidSet::new();
+        // The scheduler owns the adapter table (defaults included); outputs add
+        // their own PIDs so a START between two scheduler updates keeps them.
+        let mut pids = self.base_pids.clone();
         for subscriber in self.outputs.values() {
             pids.extend(subscriber.pids.iter());
         }
