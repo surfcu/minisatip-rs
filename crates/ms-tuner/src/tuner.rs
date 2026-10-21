@@ -318,6 +318,11 @@ impl TsBuf {
         &self.data
     }
 
+    /// Buffered bytes for in-place stages (descrambling, DDCI remapping).
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     /// Iterates over whole buffered packets.
     pub fn packets(&self) -> impl Iterator<Item = &[u8]> {
         self.data

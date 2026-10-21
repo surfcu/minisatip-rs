@@ -15,6 +15,7 @@ libc = "0.2"
 ms-sched = { path = "../ms-sched" }
 ms-srt = { path = "../ms-srt", optional = true }
 ms-tuner = { path = "../ms-tuner" }
+ms-ts = { path = "../ms-ts" }
 
 [lints]
 workspace = true

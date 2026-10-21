@@ -123,14 +123,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   cpp-reference:
-    name: C++ reference build
+    name: Differential harness (C++ vs Rust)
     runs-on: ubuntu-latest
     steps:
-      - name: Check out C++ reference
-        uses: actions/checkout@v4
-        with:
-          repository: catalinii/minisatip
-          path: cpp-reference
+      - uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
@@ -138,29 +134,38 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential libssl-dev libdvbcsa-dev libxml2-dev zlib1g-dev cmake
 
-      - name: Build
-        working-directory: cpp-reference
-        run: |
-          if [ -x ./configure ]; then
-            ./configure && make -j"$(nproc)"
-          else
-            # Upstream master uses CMake; keep the configure path for the fork.
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-            cmake --build build -j"$(nproc)"
-          fi
+      # Upstream master plus harness/cpp-replay.patch, as built locally. If
+      # upstream no longer builds or takes the patch, the comparison is skipped.
+      - name: Build C++ reference
+        id: cpp
+        continue-on-error: true
+        run: scripts/build-cpp-reference.sh target/upstream/minisatip
 
-      - name: Collect binary
-        run: |
-          mkdir -p artifacts
-          if [ -f cpp-reference/minisatip ]; then
-            cp cpp-reference/minisatip artifacts/minisatip
-          else
-            cp cpp-reference/build/minisatip artifacts/minisatip
-          fi
+      - name: Report skipped comparison
+        if: steps.cpp.outcome != 'success'
+        run: echo "::warning::C++ reference unavailable; C++-vs-Rust scenarios skipped"
 
       - name: Upload binary
+        if: steps.cpp.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: minisatip-cpp-reference
-          path: artifacts/minisatip
+          path: target/upstream/minisatip/build-harness/minisatip
           if-no-files-found: error
+
+      - name: Install Rust
+        if: steps.cpp.outcome == 'success'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Build servers and harness
+        if: steps.cpp.outcome == 'success'
+        run: cargo build -p minisatip -p ms-harness
+
+      # Every scenario, three runs each, against the oracle and the goldens.
+      - name: Run scenarios
+        if: steps.cpp.outcome == 'success'
+        run: >-
+          cargo run -q -p ms-harness -- run --runs 3 --golden harness/golden
+          --cpp target/upstream/minisatip/build-harness/minisatip

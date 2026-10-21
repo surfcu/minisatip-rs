@@ -7,10 +7,10 @@ Cache-Control: no-cache
 Content-type: text/xml
 X-SATIP-RTSP-Port: <RTSP>
 Connection: close
-Content-Length: 1191
+Content-Length: 1175
 --
 <?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0" configId="1"><specVersion><major>1</major><minor>1</minor></specVersion><device><deviceType>urn:ses-com:device:SatIPServer:1</deviceType><friendlyName>minisatip</friendlyName><manufacturer>cata</manufacturer><manufacturerURL>http://github.com/catalinii/minisatip</manufacturerURL><modelDescription>minisatip for Linux</modelDescription><modelName>minisatip</modelName><modelNumber><VER></modelNumber><modelURL></modelURL><serialNumber>1</serialNumber><UDN>uuid:<UUID></UDN><iconList><icon><mimetype>image/png</mimetype><width>48</width><height>48</height><depth>24</depth><url>/sm.png</url></icon><icon><mimetype>image/png</mimetype><width>120</width><height>120</height><depth>24</depth><url>/lr.png</url></icon><icon><mimetype>image/jpeg</mimetype><width>48</width><height>48</height><depth>24</depth><url>/sm.jpg</url></icon><icon><mimetype>image/jpeg</mimetype><width>120</width><height>120</height><depth>24</depth><url>/lr.jpg</url></icon></iconList><presentationURL>http://127.0.0.1:<HTTP>/</presentationURL>
-<satip:X_SATIPCAP xmlns:satip="urn:ses-com:satip">DVBS2-2,DVBT2-2,DVBC2-2</satip:X_SATIPCAP></device></root>
+<satip:X_SATIPCAP xmlns:satip="urn:ses-com:satip">DVBS2-2</satip:X_SATIPCAP></device></root>
 == 2 http > HEAD /desc.xml HTTP/1.0
 HTTP/1.0 200 OK
 Date: <DATE>
@@ -19,10 +19,10 @@ Cache-Control: no-cache
 Content-type: text/xml
 X-SATIP-RTSP-Port: <RTSP>
 Connection: close
-Content-Length: 1191
+Content-Length: 1175
 --
 <?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0" configId="1"><specVersion><major>1</major><minor>1</minor></specVersion><device><deviceType>urn:ses-com:device:SatIPServer:1</deviceType><friendlyName>minisatip</friendlyName><manufacturer>cata</manufacturer><manufacturerURL>http://github.com/catalinii/minisatip</manufacturerURL><modelDescription>minisatip for Linux</modelDescription><modelName>minisatip</modelName><modelNumber><VER></modelNumber><modelURL></modelURL><serialNumber>1</serialNumber><UDN>uuid:<UUID></UDN><iconList><icon><mimetype>image/png</mimetype><width>48</width><height>48</height><depth>24</depth><url>/sm.png</url></icon><icon><mimetype>image/png</mimetype><width>120</width><height>120</height><depth>24</depth><url>/lr.png</url></icon><icon><mimetype>image/jpeg</mimetype><width>48</width><height>48</height><depth>24</depth><url>/sm.jpg</url></icon><icon><mimetype>image/jpeg</mimetype><width>120</width><height>120</height><depth>24</depth><url>/lr.jpg</url></icon></iconList><presentationURL>http://127.0.0.1:<HTTP>/</presentationURL>
-<satip:X_SATIPCAP xmlns:satip="urn:ses-com:satip">DVBS2-2,DVBT2-2,DVBC2-2</satip:X_SATIPCAP></device></root>
+<satip:X_SATIPCAP xmlns:satip="urn:ses-com:satip">DVBS2-2</satip:X_SATIPCAP></device></root>
 == 3 http > GET /satip.xml HTTP/1.0
 HTTP/1.0 200 OK
 Date: <DATE>
@@ -32,7 +32,7 @@ Content-type: text/xml
 Content-Length: 1205
 --
 <?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0" configId="0"><specVersion><major>1</major><minor>1</minor></specVersion><device><deviceType>urn:ses-com:device:SatIPServer:1</deviceType><friendlyName>minisatip</friendlyName><manufacturer>cata</manufacturer><manufacturerURL>http://github.com/catalinii/minisatip</manufacturerURL><modelDescription>minisatip for Linux</modelDescription><modelName>minisatip</modelName><modelNumber><VER></modelNumber><modelURL></modelURL><serialNumber>1</serialNumber><UDN>uuid:<UUID></UDN><iconList><icon><mimetype>image/png</mimetype><width>48</width><height>48</height><depth>24</depth><url>/sm.png</url></icon><icon><mimetype>image/png</mimetype><width>120</width><height>120</height><depth>24</depth><url>/lr.png</url></icon><icon><mimetype>image/jpeg</mimetype><width>48</width><height>48</height><depth>24</depth><url>/sm.jpg</url></icon><icon><mimetype>image/jpeg</mimetype><width>120</width><height>120</height><depth>24</depth><url>/lr.jpg</url></icon></iconList><presentationURL>http://127.0.0.1:<HTTP>/</presentationURL>
-<satip:X_SATIPCAP xmlns:satip="urn:ses-com:satip">DVBS2-2,DVBT-0,DVBC-0,DVBC2-2,DVBT2-2</satip:X_SATIPCAP></device></root>
+<satip:X_SATIPCAP xmlns:satip="urn:ses-com:satip">DVBS2-2,DVBT-0,DVBC-0,DVBC2-0,DVBT2-0</satip:X_SATIPCAP></device></root>
 == 4 http > GET /nope.xml HTTP/1.0
 HTTP/1.0 404 Not Found
 Date: <DATE>

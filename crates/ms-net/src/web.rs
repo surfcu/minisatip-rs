@@ -816,17 +816,17 @@ impl WebService {
         let templated = headers
             .iter()
             .any(|line| line.contains("html") || line.contains("xml"));
+        let mut flushed = false;
         if templated {
-            data = self.with_symbols(state, |table| table.process_file(&data).0);
+            (data, flushed) = self.with_symbols(state, |table| table.process_file(&data));
         }
-        let route = HttpRoute::new(200, data).with_headers(headers);
-        // process_file returns the response without Content-Length once
-        // `io > sizeof(outp) - 100` triggers its first flush
-        // (utils.cpp:379-419).
-        if templated && route.body.len() > 8200 {
-            route.streaming()
+        // After its first flush process_file sends no Content-Length and ends
+        // with one "\r\n\r\n" (utils.cpp:379-419), which the streamed response adds.
+        if flushed {
+            data.truncate(data.len().saturating_sub(4));
+            HttpRoute::new(200, data).with_headers(headers).streaming()
         } else {
-            route
+            HttpRoute::new(200, data).with_headers(headers)
         }
     }
 }

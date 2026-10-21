@@ -19,6 +19,18 @@ pub enum DescramblerCommand {
         /// PIDs whose scrambled packets belong to the service.
         pids: Vec<u16>,
     },
+    /// Remap a service's PIDs and keep its CWs; adds it when unknown.
+    UpdatePids {
+        /// PMT slot id.
+        pmt_id: usize,
+        /// PIDs whose scrambled packets belong to the service.
+        pids: Vec<u16>,
+    },
+    /// Re-validate the next CW (`disable_cw` after a CAPMT send).
+    DisableCw {
+        /// PMT slot id.
+        pmt_id: usize,
+    },
     /// Stop tracking a service and drop its CWs.
     RemoveService {
         /// PMT slot id.
@@ -110,6 +122,10 @@ impl DescramblerStage {
             DescramblerCommand::AddService { pmt_id, pids } => {
                 self.descrambler.add_service(pmt_id, &pids)
             }
+            DescramblerCommand::UpdatePids { pmt_id, pids } => {
+                self.descrambler.set_service_pids(pmt_id, &pids)
+            }
+            DescramblerCommand::DisableCw { pmt_id } => self.descrambler.disable_cw(pmt_id),
             DescramblerCommand::RemoveService { pmt_id } => self.descrambler.remove_service(pmt_id),
             DescramblerCommand::Ca(CaEvent::ControlWord {
                 pmt_id,

@@ -183,6 +183,18 @@ impl ProgramTable {
         id as i32
     }
 
+    /// Stores a program under its own id, replacing any previous one; the
+    /// id comes from another table (the scheduler's PMT slots).
+    pub fn insert(&mut self, program: Program) {
+        let Ok(id) = usize::try_from(program.id) else {
+            return;
+        };
+        if id >= self.slots.len() {
+            self.slots.resize(id + 1, None);
+        }
+        self.slots[id] = Some(program);
+    }
+
     /// `pmt_del`.
     pub fn del(&mut self, id: i32) {
         if let Some(slot) = usize::try_from(id).ok().and_then(|i| self.slots.get_mut(i)) {
