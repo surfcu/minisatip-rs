@@ -655,3 +655,85 @@ fn continuity_counter_skips_all_pid_mode_and_forgets_removed_pids() {
         "re-added PID starts over"
     );
 }
+
+/// Marks every packet it sees, to check that stages run before the outputs.
+struct MarkStage(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl ms_ts::TsStage for MarkStage {
+    fn process(&mut self, buf: &mut [u8]) {
+        for packet in buf.chunks_mut(188) {
+            packet[187] = 0xA5;
+        }
+        self.0
+            .fetch_add(buf.len() as u64 / 188, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn section_pids_are_tapped_and_stages_rewrite_the_batch() {
+    let path = write_capture("stage");
+    let tuner = FileReplayTuner::open(
+        &path,
+        FileReplayConfig {
+            looping: true,
+            pacing: ms_tuner::Pacing::FixedBitrate(4_000_000),
+        },
+    )
+    .unwrap();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let handle = AdapterHandle::spawn_with_stages(
+        Box::new(tuner),
+        DataPlaneConfig::default(),
+        None,
+        vec![Box::new(MarkStage(std::sync::Arc::clone(&seen)))],
+    )
+    .unwrap();
+    assert_eq!(handle.tune_generation(), 0);
+    handle
+        .tune_wait(TuneParams::default(), Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        handle.tune_generation(),
+        1,
+        "raised before the tune answers"
+    );
+    handle.send(ms_net::dataplane::Command::SetSectionPids(
+        PidSet::from_pids([0x100]),
+    ));
+    let (socket, _) = udp_pair();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let dest = socket.local_addr().unwrap();
+    handle.start_output(1, output_to(dest, 7), PidSet::from_pids([0x100, 0x101]));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut tapped = None;
+    while tapped.is_none() && std::time::Instant::now() < deadline {
+        if let Ok(Event::TablePackets {
+            generation,
+            packets,
+        }) = handle.events().recv_timeout(Duration::from_millis(100))
+        {
+            tapped = Some((generation, packets));
+        }
+    }
+    let (generation, packets) = tapped.expect("no TablePackets event");
+    assert_eq!(generation, 1);
+    assert!(!packets.is_empty());
+    for packet in packets.chunks(188) {
+        assert_eq!(
+            (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]),
+            0x100
+        );
+        assert_ne!(packet[187], 0xA5, "tapped before the stages ran");
+    }
+    let mut buf = [0u8; 2048];
+    let len = socket.recv(&mut buf).unwrap();
+    for packet in buf[12..len].chunks(188) {
+        assert_eq!(packet[187], 0xA5, "outputs see the stage's rewrite");
+    }
+    assert!(seen.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    handle.stop();
+    let _ = std::fs::remove_file(path);
+}

@@ -3,6 +3,7 @@
 
 use std::ffi::c_uint;
 use std::marker::{PhantomData, PhantomPinned};
+use std::sync::Arc;
 
 use ms_ca::CwAlgo;
 
@@ -38,9 +39,9 @@ unsafe extern "C" {
 
 /// Registers CSA, and iCAM CSA when libdvbcsa has `dvbcsa_bs_key_set_ecm`.
 pub(super) fn register(registry: &mut CipherRegistry) {
-    registry.register(CwAlgo::Csa, || Box::new(Csa::new(false)));
+    registry.register(CwAlgo::Csa, Arc::new(|| Box::new(Csa::new(false))));
     #[cfg(feature = "dvbcsa-icam")]
-    registry.register(CwAlgo::CsaIcam, || Box::new(Csa::new(true)));
+    registry.register(CwAlgo::CsaIcam, Arc::new(|| Box::new(Csa::new(true))));
 }
 
 /// One bitslice CSA key (`dvbcsa_create_key`).

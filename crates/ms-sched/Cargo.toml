@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ms-ca = { path = "../ms-ca" }
+ms-psi = { path = "../ms-psi" }
 ms-tuner = { path = "../ms-tuner" }
 
 [lints]

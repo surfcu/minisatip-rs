@@ -21,7 +21,7 @@ pub const DDCI_BUFFER: usize = 20000 * 188;
 pub const MAX_ADAPTERS: usize = 100;
 pub const DVB_FRAME: usize = 188;
 /// `DDCI_SID` (`MAX_STREAMS + 1`): the stream id DDCI marks its pids with.
-pub const DDCI_SID: i32 = 101;
+pub const DDCI_SID: i32 = 257; // MAX_STREAMS + 1 (stream.h:13)
 pub const PID_STREAM_ID_UNDEFINED: i32 = -1;
 
 /// One channel slot of a DDCI device (`ddci_pmt_t`).
