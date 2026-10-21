@@ -50,13 +50,15 @@ pub enum Polarization {
 /// Tuning parameters passed from the RTSP layer; backend-specific fields are optional.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TuneParams {
-    /// Frequency in MHz (the integral SAT>IP `freq=` value; see DEV-030).
-    pub freq: u32,
+    /// Frequency in kHz, like the C++ `transponder::freq`.
+    ///
+    /// SAT>IP sends MHz, so `freq=11361.75` parses to `11_361_750`.
+    pub freq: i32,
     /// Polarisation.
     pub pol: Polarization,
     /// Delivery system (`msys`).
     pub msys: DeliverySystem,
-    /// Symbol rate in kSym/s.
+    /// Symbol rate in sym/s, like the C++ `transponder::sr` (`sr * 1000`).
     pub sr: u32,
     /// Source or diSEqC input.
     pub src: u8,

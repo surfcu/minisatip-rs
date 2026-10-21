@@ -8,8 +8,8 @@ fn parse(parameters: &str) -> ms_tuner::TuneParams {
     params
 }
 
-// C++ stores `freq` in kHz; `TuneParams::freq` carries the SAT>IP MHz value
-// (DEV-030), so 11 361 750 kHz is 11 361 MHz after the same truncation.
+// C++ stores `freq` in kHz and `sr` in sym/s; `TuneParams` uses the same units
+// (DEV-030 is withdrawn), so `freq=11361.75` keeps its 750 kHz.
 // Ported from tests/test_dvb.cpp:46
 #[test]
 fn test_detect_dvb_parameters_general() {
@@ -21,14 +21,14 @@ fn test_detect_dvb_parameters_general() {
     assert_eq!(tp.fe, Some(0), "fe parsed incorrectly");
     assert!(tp.src_specified, "src parsed incorrectly");
     assert_eq!(tp.src, 1, "src parsed incorrectly");
-    assert_eq!(tp.freq, 11_361, "freq parsed incorrectly");
+    assert_eq!(tp.freq, 11_361_750, "freq parsed incorrectly");
     assert_eq!(tp.pol, Polarization::Horizontal, "pol parsed incorrectly");
     assert_eq!(tp.ro, Some(0), "ro parsed incorrectly");
     assert_eq!(tp.msys, DeliverySystem::DvbS2, "msys parsed incorrectly");
     assert_eq!(tp.mtype, 0, "mtype parsed incorrectly");
     assert!(tp.mtype_specified, "mtype must be marked as specified");
     assert_eq!(tp.plts, Some(false), "plts parsed incorrectly");
-    assert_eq!(tp.sr, 22_000, "sr parsed incorrectly");
+    assert_eq!(tp.sr, 22_000_000, "sr parsed incorrectly");
     assert_eq!(tp.fec, 2, "fec parsed incorrectly");
     assert!(tp.fec_specified, "fec must be marked as specified");
     assert!(

@@ -120,7 +120,7 @@ pub fn delsys_number(sys: DeliverySystem) -> Option<i32> {
 }
 
 impl DvbTransponder {
-    /// Converts SAT>IP parameters (integral MHz, kSym/s) and applies `copy_dvb_parameters` defaults.
+    /// Copies SAT>IP parameters (already kHz and sym/s) and applies `copy_dvb_parameters` defaults.
     pub fn from_params(p: &TuneParams, diseqc_param: DiseqcParams) -> Self {
         let pol = match p.pol {
             Polarization::Vertical => Some(1),
@@ -131,8 +131,8 @@ impl DvbTransponder {
         };
         let mut tp = Self {
             sys: delsys_number(p.msys),
-            // TuneParams carries the SAT>IP MHz value; the C++ transponder uses kHz (DEV-030).
-            freq: (p.freq > 0).then(|| i32::try_from(i64::from(p.freq) * 1000).unwrap_or(i32::MAX)),
+            // TuneParams already uses the C++ transponder units: kHz.
+            freq: (p.freq > 0).then_some(p.freq),
             inversion: p.specinv,
             mtype: p.mtype_specified.then_some(p.mtype as i32),
             fe: p.fe,
@@ -144,7 +144,7 @@ impl DvbTransponder {
             ro: p.ro.map(i32::from),
             plts: p.plts.map(|on| if on { PILOT_ON } else { PILOT_OFF }),
             fec: p.fec_specified.then_some(i32::from(p.fec)),
-            sr: (p.sr > 0).then(|| (p.sr as i32).saturating_mul(1000)),
+            sr: (p.sr > 0).then(|| i32::try_from(p.sr).unwrap_or(i32::MAX)),
             pol,
             diseqc: (p.src_specified && p.src > 0).then_some(i32::from(p.src)),
             diseqc_param,

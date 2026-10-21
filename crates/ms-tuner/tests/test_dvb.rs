@@ -784,10 +784,10 @@ fn dvb_tune_dvbs2_property_sequence() {
     let mut dev = FakeDevice::new();
     let mut state = state_with_switch(1, 0, 0);
     let params = TuneParams {
-        freq: 11_500,
+        freq: 11_500_000,
         pol: Polarization::Horizontal,
         msys: DeliverySystem::DvbS2,
-        sr: 22_000,
+        sr: 22_000_000,
         fec: 2,
         fec_specified: true,
         mtype: 0,
@@ -824,11 +824,36 @@ fn dvb_tune_dvbs2_property_sequence() {
 }
 
 #[test]
+fn dvb_tune_keeps_sub_mhz_frequency_from_satip_url() {
+    // SAT>IP `freq=11361.75` parses to 11_361_750 kHz (see ported_test_dvb).
+    // C++ get_lnb_int_freq returns 11_361_750 - 9_750_000 = 1_611_750 kHz, and
+    // dvb_tune uses that as DTV_FREQUENCY for DVB-S.
+    let mut dev = FakeDevice::new();
+    let mut state = state_with_switch(1, 0, 0);
+    let params = TuneParams {
+        freq: 11_361_750,
+        pol: Polarization::Horizontal,
+        msys: DeliverySystem::DvbS2,
+        sr: 22_000_000,
+        ..TuneParams::default()
+    };
+    let tp = DvbTransponder::from_params(&params, state.tp.diseqc_param);
+
+    assert_eq!(tp.freq, Some(11_361_750));
+    assert_eq!(lnb_int_freq(&tp, &tp.diseqc_param), 1_611_750);
+    assert_eq!(state.tune(&mut dev, &tp), 0);
+
+    let props = dev.last_properties();
+    assert!(props.contains(&prop(DTV_FREQUENCY, 1_611_750)));
+    assert!(props.contains(&prop(DTV_SYMBOL_RATE, 22_000_000)));
+}
+
+#[test]
 fn dvb_tune_dvbt2_property_sequence() {
     let mut dev = FakeDevice::new();
     let mut state = state_with_switch(1, 0, 0);
     let params = TuneParams {
-        freq: 474,
+        freq: 474_000,
         msys: DeliverySystem::DvbT2,
         bw: Some(8_000_000),
         fec: 3,
@@ -866,9 +891,9 @@ fn dvb_tune_dvbc_property_sequence() {
     let mut dev = FakeDevice::new();
     let mut state = state_with_switch(1, 0, 0);
     let params = TuneParams {
-        freq: 474,
+        freq: 474_000,
         msys: DeliverySystem::DvbC,
-        sr: 6_900,
+        sr: 6_900_000,
         plp: Some(1),
         ds: Some(2),
         mtype: 5,
@@ -896,7 +921,7 @@ fn dvb_tune_atsc_and_isdbt_property_sequences() {
     let mut dev = FakeDevice::new();
     let mut state = state_with_switch(1, 0, 0);
     let atsc = TuneParams {
-        freq: 474,
+        freq: 474_000,
         msys: DeliverySystem::Other(SYS_ATSC),
         ..TuneParams::default()
     };
@@ -914,7 +939,7 @@ fn dvb_tune_atsc_and_isdbt_property_sequences() {
     );
 
     let isdbt = TuneParams {
-        freq: 474,
+        freq: 474_000,
         msys: DeliverySystem::Other(SYS_ISDBT),
         bw: Some(6_000_000),
         ..TuneParams::default()
@@ -938,11 +963,15 @@ fn dvb_tune_atsc_and_isdbt_property_sequences() {
 #[test]
 fn dvb_tune_rejects_out_of_range_frequencies() {
     let cases = [
-        (DeliverySystem::DvbS2, 1_u32, "SAT intermediate frequency"),
-        (DeliverySystem::DvbT2, 1_000, "DVB-T frequency"),
-        (DeliverySystem::DvbC, 1_000, "DVB-C frequency"),
-        (DeliverySystem::Other(SYS_ATSC), 1_000, "ATSC frequency"),
-        (DeliverySystem::Other(SYS_ISDBT), 1_000, "ISDB-T frequency"),
+        (DeliverySystem::DvbS2, 1_000, "SAT intermediate frequency"),
+        (DeliverySystem::DvbT2, 1_000_000, "DVB-T frequency"),
+        (DeliverySystem::DvbC, 1_000_000, "DVB-C frequency"),
+        (DeliverySystem::Other(SYS_ATSC), 1_000_000, "ATSC frequency"),
+        (
+            DeliverySystem::Other(SYS_ISDBT),
+            1_000_000,
+            "ISDB-T frequency",
+        ),
     ];
     for (msys, freq, name) in cases {
         let mut dev = FakeDevice::new();

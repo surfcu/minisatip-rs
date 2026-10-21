@@ -1,7 +1,7 @@
 //! SAT>IP URL query parsing into [`TuneParams`].
 //!
-//! Frequencies are stored in kHz and symbol rates in kSym/s, matching the
-//! `TuneParams` documentation (the C++ stores Hz and sym/s internally).
+//! Frequencies are stored in kHz and symbol rates in sym/s, matching the C++
+//! `detect_dvb_parameters` (`parse_float(val, 1000)` and `sr * 1000`).
 
 use crate::rtsp::{parse_int_prefix, split_tokens};
 use ms_tuner::{DeliverySystem, PID_ALL, PidSet, Polarization, TuneParams};
@@ -46,12 +46,12 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
         let (key, value) = token.split_once('=').unwrap_or((token, ""));
         match key {
             "msys" => params.msys = delivery_system(value),
-            "freq" => params.freq = parse_float(value, 1.0).max(0) as u32,
+            "freq" => params.freq = parse_float(value, 1_000.0),
             "pol" => params.pol = polarization(value),
             "sr" => {
                 let sr = parse_int_prefix(value, 0);
                 params.sr = if (0..=1_000_000).contains(&sr) {
-                    sr as u32
+                    sr as u32 * 1_000
                 } else {
                     0
                 };

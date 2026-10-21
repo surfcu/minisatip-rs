@@ -47,10 +47,11 @@ fn main() {
     };
     let src: u8 = parse_number(&positional[5]);
     let params = TuneParams {
-        freq: parse_number(&positional[3]),
+        // The CLI stays in MHz/kSym/s; `TuneParams` uses C++ kHz/sym/s.
+        freq: parse_number::<i32>(&positional[3]).saturating_mul(1_000),
         pol,
         msys,
-        sr: parse_number(&positional[6]),
+        sr: parse_number::<u32>(&positional[6]).saturating_mul(1_000),
         src,
         src_specified: src > 0,
         ..TuneParams::default()

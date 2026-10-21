@@ -7,10 +7,14 @@ use ms_sched::{Scheduler, SetParamsError, StreamId, TuneError};
 use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
 
 use crate::handler::{
-    HttpResource, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType, TransportError,
+    HttpResource, HttpRoute, MAX_STREAMS, PlayError, StreamBackend, StreamInfo, StreamType,
+    TransportError,
 };
-use crate::rtsp::{Protocol, TransportKind, parse_int_prefix, parse_transport};
+use crate::rtsp::{Protocol, Request, TransportKind, parse_int_prefix, parse_transport};
 use crate::satip::{merge_satip_url, parse_satip_url_new};
+#[cfg(feature = "srt")]
+use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener};
+use crate::web::{AdapterState, RuntimeState, StreamState, WebService, WebSnapshot};
 
 const STREAM_SLOTS: usize = MAX_STREAMS as usize;
 
@@ -49,6 +53,10 @@ pub struct Stream {
     pub timeout_ms: u32,
     /// Client user agent.
     pub user_agent: String,
+    /// Accepted SRT socket, or `-1`.
+    pub srt_sock: i32,
+    /// Stream id used to match the SRT socket.
+    pub srt_streamid: String,
     /// Whether the stream was touched since creation.
     pub touched: bool,
 }
@@ -73,6 +81,8 @@ impl Stream {
             rtp_seq: 0,
             timeout_ms: 30_000,
             user_agent: String::new(),
+            srt_sock: -1,
+            srt_streamid: String::new(),
             touched: false,
         }
     }
@@ -110,6 +120,10 @@ pub struct SessionManager {
     next_session_id: i64,
     start_rtp: u16,
     describe: DescribeOptions,
+    web: Option<WebService>,
+    web_runtime: RuntimeState,
+    #[cfg(feature = "srt")]
+    srt: Option<SrtListener<LibSrtOps>>,
 }
 
 impl Default for SessionManager {
@@ -135,6 +149,56 @@ impl SessionManager {
             next_session_id: 1000,
             start_rtp: 5500,
             describe: DescribeOptions::default(),
+            web: None,
+            web_runtime: RuntimeState::default(),
+            #[cfg(feature = "srt")]
+            srt: None,
+        }
+    }
+
+    /// Installs the web UI and generated HTTP endpoints.
+    pub fn set_web(&mut self, web: WebService) {
+        self.web = Some(web);
+    }
+
+    /// Sets the runtime values reported by `state.json`.
+    pub fn set_web_runtime(&mut self, runtime: RuntimeState) {
+        self.web_runtime = runtime;
+    }
+
+    /// Installs the listener whose pending pool serves SRT SETUPs.
+    #[cfg(feature = "srt")]
+    pub fn set_srt_listener(&mut self, listener: SrtListener<LibSrtOps>) {
+        self.srt = Some(listener);
+    }
+
+    /// Installed SRT listener, if any.
+    #[cfg(feature = "srt")]
+    pub fn srt_listener(&self) -> Option<&SrtListener<LibSrtOps>> {
+        self.srt.as_ref()
+    }
+
+    /// Removes the SRT listener so the caller can close it.
+    #[cfg(feature = "srt")]
+    pub fn take_srt_listener(&mut self) -> Option<SrtListener<LibSrtOps>> {
+        self.srt.take()
+    }
+
+    /// Sets the UDP destination used by a unicast stream.
+    ///
+    /// `decode_transport` cannot know the RTSP peer, and C++ falls back to the
+    /// peer address when the `Transport` header has no `destination=`
+    /// (stream.cpp:505-506).
+    pub fn set_udp_target(&mut self, id: StreamId, host: &str, port: u16) {
+        if let Some(index) = self.slot_index(id)
+            && let Some(stream) = self.streams[index].as_mut()
+        {
+            if !host.is_empty() {
+                stream.remote_host = host.to_owned();
+            }
+            if port != 0 {
+                stream.remote_port = port;
+            }
         }
     }
 
@@ -378,13 +442,24 @@ impl SessionManager {
             return;
         };
         let adapter = self.streams[index].as_ref().expect("checked slot").adapter;
+        #[cfg(feature = "srt")]
+        let srt_socket = self.streams[index].as_ref().and_then(|stream| {
+            (stream.stream_type == StreamType::RtspSrt && stream.srt_sock != SRT_INVALID_SOCK)
+                .then(|| (stream.srt_sock, stream.srt_streamid.clone()))
+        });
         if let Some(stream) = self.streams[index].as_mut() {
             stream.enabled = false;
             stream.adapter = -1;
             stream.do_play = false;
+            stream.srt_sock = -1;
         }
         if adapter >= 0 {
             self.sched.close_adapter_for_stream(id, adapter);
+        }
+        // C++ returns a connected SRT socket to the pending pool (stream.cpp:379).
+        #[cfg(feature = "srt")]
+        if let (Some((sock, streamid)), Some(listener)) = (srt_socket, self.srt.as_ref()) {
+            listener.return_socket(sock, &streamid);
         }
     }
 
@@ -397,10 +472,28 @@ impl SessionManager {
         let stream = self.streams[index].as_mut().expect("checked slot");
         match spec.kind {
             TransportKind::Srt => {
-                if spec.srt_streamid.is_none() {
+                #[cfg(not(feature = "srt"))]
+                {
+                    // C++ DISABLE_SRT builds reject the transport (stream.cpp:412).
+                    let _ = &spec.srt_streamid;
                     return Err(TransportError);
                 }
-                stream.stream_type = StreamType::RtspSrt;
+                #[cfg(feature = "srt")]
+                {
+                    let Some(streamid) = spec.srt_streamid.as_deref() else {
+                        return Err(TransportError);
+                    };
+                    let Some(listener) = self.srt.as_ref() else {
+                        return Err(TransportError);
+                    };
+                    let sock = listener.take(streamid);
+                    if sock == SRT_INVALID_SOCK {
+                        return Err(TransportError);
+                    }
+                    stream.srt_sock = sock;
+                    stream.srt_streamid = streamid.to_owned();
+                    stream.stream_type = StreamType::RtspSrt;
+                }
             }
             TransportKind::Tcp => stream.stream_type = StreamType::RtspTcp,
             TransportKind::Udp => stream.stream_type = StreamType::RtspUdp,
@@ -541,18 +634,18 @@ impl SessionManager {
             DeliverySystem::DvbS | DeliverySystem::DvbS2 => format!(
                 "ver=1.0;src={};tuner={tuner},{strength},{status},{snr},{},{},{},{},{},{},{},{};pids=",
                 i32::from(params.src),
-                params.freq,
+                params.freq / 1_000,
                 polarization_name(params.pol),
                 delivery_system_name(params.msys),
                 modulation_name(params),
                 pilot_name(params.plts),
                 rolloff_name(params.ro),
-                params.sr,
+                params.sr / 1_000,
                 fec_name(params),
             ),
             DeliverySystem::DvbT | DeliverySystem::DvbT2 => format!(
                 "ver=1.1;tuner={tuner},{strength},{status},{snr},{:.2},{},{},{},{},{},{},{},{},{};pids=",
-                f64::from(params.freq),
+                f64::from(params.freq) / 1_000.0,
                 params.bw.unwrap_or(8_000_000) / 1_000_000,
                 delivery_system_name(params.msys),
                 transmission_mode_name(params.tmode),
@@ -565,11 +658,11 @@ impl SessionManager {
             ),
             _ => format!(
                 "ver=1.2;tuner={tuner},{strength},{status},{snr},{:.2},{},{},{},{},{},{},{},{};pids=",
-                f64::from(params.freq),
+                f64::from(params.freq) / 1_000.0,
                 params.bw.unwrap_or(8_000_000) / 1_000_000,
                 delivery_system_name(params.msys),
                 modulation_name(params),
-                params.sr,
+                params.sr / 1_000,
                 params.c2tft.unwrap_or(0),
                 positive_or_empty(params.ds),
                 positive_or_empty(params.plp),
@@ -646,6 +739,79 @@ impl SessionManager {
             }
         }
         (s2, t, c)
+    }
+
+    /// Captures adapter, stream and runtime values for the web endpoints.
+    pub fn web_snapshot(&self) -> WebSnapshot {
+        let mut snapshot = WebSnapshot::new();
+        snapshot.adapters = vec![AdapterState::default(); ms_sched::MAX_ADAPTERS];
+        for aid in 0..ms_sched::MAX_ADAPTERS {
+            let Some(adapter) = self.sched.adapter(aid) else {
+                continue;
+            };
+            let params = &adapter.params;
+            let tuned = params.freq > 0 || adapter.master_sid >= 0;
+            snapshot.adapters[aid] = AdapterState {
+                present: true,
+                enabled: adapter.config.enabled,
+                disabled: self.sched.is_disabled(aid),
+                systems: adapter
+                    .config
+                    .sys
+                    .iter()
+                    .copied()
+                    .filter(|sys| *sys != DeliverySystem::Undefined)
+                    .collect(),
+                pos: i32::from(params.src),
+                freq: params.freq,
+                pol: polarization_code(params.pol),
+                sr: params.sr,
+                bw: params.bw.unwrap_or(8_000_000),
+                stream: params.plp.unwrap_or(-1),
+                fe: params.fe.unwrap_or(0),
+                master: adapter.master_sid & 0xff,
+                sid_count: adapter.sid_cnt & 0xff,
+                sys: if tuned {
+                    delivery_system_code(params.msys)
+                } else {
+                    0
+                },
+                mtype: params.mtype,
+                t2id: params.t2id.unwrap_or(0),
+                c2tft: params.c2tft.unwrap_or(0),
+                plp: params.plp.unwrap_or(-1),
+                plsc: params.plsc.unwrap_or(-1),
+                sm: params.sm.unwrap_or(0),
+                gi: params.gi.unwrap_or(-1),
+                pids: adapter.active_pids(),
+                ..AdapterState::default()
+            };
+        }
+        snapshot.streams = vec![StreamState::default(); STREAM_SLOTS];
+        for (index, stream) in self.streams.iter().enumerate() {
+            let Some(stream) = stream else {
+                continue;
+            };
+            snapshot.streams[index] = StreamState {
+                enabled: stream.enabled,
+                play: stream.do_play,
+                adapter: stream.adapter,
+                user_agent: stream.user_agent.clone(),
+                rhost: stream.remote_host.clone(),
+                rport: stream.remote_port,
+                protocol: protocol_name(stream.stream_type).to_owned(),
+                pids: stream.params.pids.iter().map(i32::from).collect(),
+                ..StreamState::default()
+            };
+        }
+        snapshot.runtime = self.web_runtime.clone();
+        snapshot
+    }
+
+    /// Serves the configured web UI, or `None` when it is not installed.
+    pub fn web_route(&self, request: &Request) -> Option<HttpRoute> {
+        let web = self.web.as_ref()?;
+        web.route(request, &self.web_snapshot())
     }
 }
 
@@ -730,6 +896,42 @@ impl StreamBackend for SessionManager {
 
     fn http_resource(&mut self, _uri: &str) -> Option<HttpResource> {
         None
+    }
+
+    fn http_route(&mut self, request: &Request) -> Option<HttpRoute> {
+        self.web_route(request)
+    }
+}
+
+fn polarization_code(pol: Polarization) -> i32 {
+    match pol {
+        Polarization::Vertical => 1,
+        Polarization::Horizontal => 2,
+        Polarization::Right => 3,
+        Polarization::Left => 4,
+        Polarization::None => 0,
+    }
+}
+
+fn delivery_system_code(sys: DeliverySystem) -> i32 {
+    match sys {
+        DeliverySystem::DvbC => 1,
+        DeliverySystem::DvbT => 3,
+        DeliverySystem::DvbS => 5,
+        DeliverySystem::DvbS2 => 6,
+        DeliverySystem::DvbT2 => 16,
+        DeliverySystem::DvbC2 => 19,
+        DeliverySystem::Undefined | DeliverySystem::Other(_) => 0,
+    }
+}
+
+fn protocol_name(stream_type: StreamType) -> &'static str {
+    match stream_type {
+        StreamType::Http => "HTTP",
+        StreamType::RtspUdp => "RTP/UDP",
+        StreamType::RtspTcp => "RTP/TCP",
+        StreamType::RtspSrt => "SRT",
+        StreamType::None => "unkown",
     }
 }
 
