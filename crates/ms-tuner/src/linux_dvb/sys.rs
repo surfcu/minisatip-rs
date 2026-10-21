@@ -101,11 +101,15 @@ impl DtvPropertyRaw {
         u32::from_ne_bytes(bytes)
     }
 
+    /// One entry of `u.buffer.data[32]`: a `__u8` per delivery system (dvb.cpp `dvb_delsys`).
     fn buffer_data(&self, index: usize) -> u32 {
-        let start = index * 4;
-        let mut bytes = [0u8; 4];
-        bytes.copy_from_slice(&self.u[start..start + 4]);
-        u32::from_ne_bytes(bytes)
+        u32::from(self.u[index])
+    }
+
+    /// `DTV_ENUM_DELSYS` result: `u.buffer.len` byte-sized entries of `u.buffer.data[32]`.
+    fn delsys_list(&self) -> Vec<u32> {
+        let len = (self.buffer_len() as usize).min(32);
+        (0..len).map(|i| self.buffer_data(i)).collect()
     }
 }
 
@@ -346,8 +350,7 @@ impl DvbDevice for LinuxDvbDevice {
             props: raw.as_mut_ptr(),
         };
         ioctl_ptr(self.fe, NATIVE_IOCTLS.fe_get_property, &mut sequence)?;
-        let len = raw[0].buffer_len().min(8) as usize;
-        Ok((0..len).map(|i| raw[0].buffer_data(i)).collect())
+        Ok(raw[0].delsys_list())
     }
 
     fn get_info(&mut self) -> io::Result<FrontendInfo> {
@@ -484,6 +487,29 @@ mod tests {
         );
     }
 
+    // DTV_ENUM_DELSYS fills u.buffer.data[] with one byte per system (dvb.cpp dvb_delsys).
+    #[test]
+    fn enum_delsys_reads_one_byte_per_system() {
+        let mut raw = DtvPropertyRaw::new(DTV_ENUM_DELSYS, 0);
+        raw.u[..3].copy_from_slice(&[5, 6, 7]); // SYS_DVBS, SYS_DVBS2, SYS_DSS
+        raw.u[32..36].copy_from_slice(&3u32.to_ne_bytes());
+        assert_eq!(raw.delsys_list(), vec![5, 6, 7]);
+        let systems: Vec<_> = raw
+            .delsys_list()
+            .into_iter()
+            .filter_map(crate::linux_dvb::enumerate::delivery_system_from_number)
+            .collect();
+        assert!(systems.contains(&crate::DeliverySystem::DvbS));
+        assert!(systems.contains(&crate::DeliverySystem::DvbS2));
+    }
+
+    #[test]
+    fn enum_delsys_len_is_capped_at_the_buffer() {
+        let mut raw = DtvPropertyRaw::new(DTV_ENUM_DELSYS, 0);
+        raw.u[32..36].copy_from_slice(&200u32.to_ne_bytes());
+        assert_eq!(raw.delsys_list().len(), 32);
+    }
+
     #[test]
     fn device_paths_use_both_numbers() {
         assert_eq!(path(DEV_FRONTEND, 1, 2), "/dev/dvb/adapter1/frontend2");
@@ -495,9 +521,10 @@ mod tests {
     fn property_buffer_helpers_use_the_kernel_offsets() {
         let mut property = DtvPropertyRaw::new(DTV_ENUM_DELSYS, 0);
         assert_eq!(property.stat_len(), 0);
+        // u.buffer: __u8 data[32] then __u32 len at offset 32 (linux/dvb/frontend.h).
         property.u[32..36].copy_from_slice(&2u32.to_ne_bytes());
-        property.u[0..4].copy_from_slice(&3u32.to_ne_bytes());
-        property.u[4..8].copy_from_slice(&5u32.to_ne_bytes());
+        property.u[0] = 3;
+        property.u[1] = 5;
         assert_eq!(property.buffer_len(), 2);
         assert_eq!(property.buffer_data(0), 3);
         assert_eq!(property.buffer_data(1), 5);
