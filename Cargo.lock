@@ -34,6 +34,9 @@ version = "0.1.0"
 [[package]]
 name = "ms-fakecam"
 version = "0.1.0"
+dependencies = [
+ "ms-ts",
+]
 
 [[package]]
 name = "ms-harness"
