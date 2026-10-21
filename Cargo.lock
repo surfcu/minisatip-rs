@@ -23,6 +23,7 @@ dependencies = [
 name = "ms-ca"
 version = "0.1.0"
 dependencies = [
+ "ms-psi",
  "ms-ts",
 ]
 

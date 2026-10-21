@@ -66,8 +66,8 @@ pub enum Step {
 pub struct Reconciler<P: CaPolicy> {
     pub policy: P,
     pub device: CaDevice,
-    /// Programs registered on the CAM, with the content last pushed, in join order.
-    actual: Vec<(i32, Program)>,
+    /// Programs registered on the CAM, with the content last pushed (`None`: re-send due), in join order.
+    actual: Vec<(i32, Option<Program>)>,
     /// Programs that last answered `Retry`.
     pending: BTreeMap<i32, Program>,
     /// Programs refused with `NoRetry` (`disabled_ca_mask`), until their content changes.
@@ -116,11 +116,20 @@ impl<P: CaPolicy> Reconciler<P> {
                 continue;
             };
             match self.actual.iter().position(|(a, _)| *a == id) {
-                Some(i) if self.actual[i].1 != *current => {
+                Some(i) if self.actual[i].1.as_ref() != Some(current) => {
                     let r = self
                         .policy
                         .join(&mut self.device, id, true, programs, driver);
-                    self.actual[i].1 = current.clone();
+                    match r {
+                        TablesResult::Ok => self.actual[i].1 = Some(current.clone()),
+                        TablesResult::Retry => self.actual[i].1 = None,
+                        TablesResult::NoRetry => {
+                            // A rejected re-send releases the stale registration.
+                            self.policy.leave(&mut self.device, id, programs, driver);
+                            self.actual.remove(i);
+                            self.rejected.insert(id, current.clone());
+                        }
+                    }
                     steps.push(Step::Updated(id, r));
                 }
                 Some(_) => {}
@@ -132,7 +141,7 @@ impl<P: CaPolicy> Reconciler<P> {
                     match r {
                         TablesResult::Ok => {
                             self.pending.remove(&id);
-                            self.actual.push((id, current.clone()));
+                            self.actual.push((id, Some(current.clone())));
                         }
                         TablesResult::Retry => {
                             self.pending.insert(id, current.clone());
@@ -146,6 +155,18 @@ impl<P: CaPolicy> Reconciler<P> {
             }
         }
         steps
+    }
+
+    /// Forces a re-send as an update on the next reconcile (`pmt->ca_mask = 0`).
+    pub fn invalidate(&mut self, id: i32) {
+        if let Some(e) = self.actual.iter_mut().find(|(a, _)| *a == id) {
+            e.1 = None;
+        }
+    }
+
+    /// Programs refused with `NoRetry`.
+    pub fn rejected(&self) -> Vec<i32> {
+        self.rejected.keys().copied().collect()
     }
 
     /// Programs waiting for a retry (CAM busy or initializing).

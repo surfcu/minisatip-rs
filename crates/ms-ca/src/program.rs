@@ -106,6 +106,38 @@ impl Program {
         }
     }
 
+    /// Refreshes sid, version, PCR, CA descriptors and streams from a parsed PMT (`process_pmt`).
+    pub fn apply_pmt(&mut self, pmt: &ms_psi::Pmt) {
+        self.sid = pmt.header.table_id_extension;
+        self.version = i32::from(pmt.header.version_number);
+        // C++ stores the section's PCR pid; ms-psi zeroes it for the ES loop.
+        self.pcr_pid = pmt.pcr_pid_header;
+        self.caids.clear();
+        for d in pmt.program_info.iter().filter(|d| d.is_ca()) {
+            if let (Some(caid), Some(pid)) = (d.ca_system_id(), d.ca_pid()) {
+                self.add_caid(caid, pid, d.private_data());
+            }
+        }
+        self.streams = pmt
+            .streams
+            .iter()
+            .map(|s| EsStream {
+                stream_type: s.stream_type,
+                pid: s.elementary_pid,
+                is_audio: s.is_audio,
+                is_video: s.is_video,
+                descriptors: s
+                    .descriptors
+                    .iter()
+                    .map(|d| RawDescriptor {
+                        tag: d.tag,
+                        data: d.data.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+    }
+
     /// `match_caid`: any CAID of the program matches `caid` under `mask`.
     pub fn match_caid(&self, caid: u16, mask: u16) -> bool {
         self.caids.iter().any(|c| c.caid & mask == caid)
