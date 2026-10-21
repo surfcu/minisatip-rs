@@ -32,8 +32,9 @@ pub fn dev_ip(dev: &str) -> Option<Ipv4Addr> {
     for (slot, byte) in request.ifr_name.iter_mut().zip(dev.as_bytes()) {
         *slot = *byte as libc::c_char;
     }
+    // `libc::Ioctl` is the request type: c_ulong on glibc, c_int on musl.
     // SAFETY: SIOCGIFADDR writes an address into the zero-initialised ifreq.
-    let result = unsafe { libc::ioctl(fd, libc::SIOCGIFADDR, &mut request) };
+    let result = unsafe { libc::ioctl(fd, libc::SIOCGIFADDR as libc::Ioctl, &mut request) };
     // SAFETY: fd was returned by socket(2) and is owned by this function.
     unsafe { libc::close(fd) };
     if result != 0 {
