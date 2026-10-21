@@ -215,6 +215,11 @@ fn replay_serves_rtsp_and_http() -> io::Result<()> {
     let json = String::from_utf8_lossy(&body);
     assert!(json.contains("\"ad_type\""), "state: {json}");
     assert!(json.contains("\"st_enabled\""), "state: {json}");
+    // set_options: rtsp_host is always `lip:rtsp_port` (minisatip.cpp:1135-1136).
+    let rtsp_host = format!("\"rtsp_host\":\"127.0.0.1:{}\"", server.rtsp_port);
+    assert!(json.contains(&rtsp_host), "state: {json}");
+    let http_host = format!("\"http_host\":\"127.0.0.1:{}\"", server.http_port);
+    assert!(json.contains(&http_host), "state: {json}");
 
     Ok(())
 }

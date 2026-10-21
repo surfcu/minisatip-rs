@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +41,8 @@ const SSDP_READ_TIMEOUT: Duration = Duration::from_millis(200);
 struct ServerConfig {
     bind_ip: IpAddr,
     advertised_host: String,
+    http_host: String,
+    rtsp_host: String,
     start_rtp: u16,
     rtsp_port: u16,
     http_port: u16,
@@ -157,14 +159,8 @@ impl Runtime {
             name_app: opts.name_app.clone(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             uuid: uuid.clone(),
-            http_host: opts
-                .http_host
-                .clone()
-                .unwrap_or_else(|| format!("{}:{}", config.advertised_host, config.http_port)),
-            rtsp_host: opts
-                .rtsp_host
-                .clone()
-                .unwrap_or_else(|| config.advertised_host.clone()),
+            http_host: config.http_host.clone(),
+            rtsp_host: config.rtsp_host.clone(),
             http_port: config.http_port,
             rtsp_port: config.rtsp_port,
             xml_path: opts.xml_path.clone(),
@@ -582,11 +578,12 @@ pub fn run(opts: &Options) -> Result<(), String> {
         .as_deref()
         .and_then(|host| host.parse::<IpAddr>().ok())
         .unwrap_or(bind_ip);
-    let advertised_host = match bind_ip {
-        IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_owned(),
-        IpAddr::V6(ip) if ip.is_unspecified() => "::1".to_owned(),
-        ip => ip.to_string(),
-    };
+    // set_options: `lip` is `--bind` or getlocalip() (minisatip.cpp:1125-1128).
+    let advertised_host = opts
+        .bind
+        .clone()
+        .filter(|bind| !bind.is_empty())
+        .unwrap_or_else(|| local_ip(&opts.disc_host, opts.use_ipv4_only != 0));
 
     let rtsp_listener = TcpListener::bind(SocketAddr::new(bind_ip, rtsp_port))
         .map_err(|error| format!("cannot bind RTSP port {rtsp_port}: {error}"))?;
@@ -621,9 +618,16 @@ pub fn run(opts: &Options) -> Result<(), String> {
         device_id = 1;
     }
 
+    // minisatip.cpp:1130-1136: `-w` overrides http_host; rtsp_host always has the port.
+    let http_host = opts
+        .http_host
+        .clone()
+        .unwrap_or_else(|| format!("{advertised_host}:{http_port}"));
     let config = ServerConfig {
         bind_ip,
         advertised_host: advertised_host.clone(),
+        http_host: http_host.clone(),
+        rtsp_host: format!("{advertised_host}:{rtsp_port}"),
         start_rtp,
         rtsp_port,
         http_port,
@@ -676,7 +680,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
             bootid,
             name_app: opts.name_app.clone(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            http_host: format!("{advertised_host}:{http_port}"),
+            http_host,
             xml_path: opts.xml_path.clone(),
             disc_host: opts.disc_host.clone(),
             local_ip: advertised_host.clone(),
@@ -704,6 +708,30 @@ pub fn run(opts: &Options) -> Result<(), String> {
     }
     runtime.shutdown();
     Ok(())
+}
+
+/// getlocalip (socketworks.cpp:223-248): the source address of a UDP socket
+/// connected to `disc_host:1900`, or empty when there is no route.
+fn local_ip(disc_host: &str, ipv4_only: bool) -> String {
+    let Some(target) = (disc_host, 1900)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.find(|addr| !ipv4_only || addr.is_ipv4()))
+    else {
+        return String::new();
+    };
+    let any: SocketAddr = if target.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    UdpSocket::bind(any)
+        .and_then(|socket| {
+            socket.connect(target)?;
+            socket.local_addr()
+        })
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_default()
 }
 
 fn fifo_size(max_sbuf: i32) -> usize {
@@ -950,4 +978,16 @@ fn start_srt_listener(
         return None;
     }
     Some(listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_ip_is_the_route_source_address() {
+        // getlocalip connects a UDP socket and reads getsockname (socketworks.cpp:239-244).
+        assert_eq!(local_ip("127.0.0.1", true), "127.0.0.1");
+        assert_eq!(local_ip("not a host", true), "");
+    }
 }
