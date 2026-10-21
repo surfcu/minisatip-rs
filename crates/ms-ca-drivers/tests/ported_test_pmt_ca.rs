@@ -230,6 +230,7 @@ fn test_pmt_update_e2e_single_capmt_update() {
     let caps = CaCaps {
         max_ca_pmt: 4,
         multiple_pmt: 0,
+        ..CaCaps::default()
     };
     let mut drv = fake_cam(
         CamConfig {

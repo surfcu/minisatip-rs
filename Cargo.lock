@@ -65,6 +65,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "ms-ca",
+ "ms-config",
  "ms-fakecam",
  "ms-psi",
  "ms-ts",

@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 ms-ca = { path = "../ms-ca" }
+ms-config = { path = "../ms-config" }
 ms-tuner = { path = "../ms-tuner" }
 ms-ts = { path = "../ms-ts" }
 
@@ -16,6 +17,7 @@ libc = "0.2"
 [dev-dependencies]
 ms-fakecam = { path = "../ms-fakecam" }
 ms-psi = { path = "../ms-psi" }
+ms-ts = { path = "../ms-ts" }
 
 [lints]
 workspace = true
