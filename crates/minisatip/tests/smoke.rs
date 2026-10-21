@@ -97,25 +97,21 @@ impl Server {
     }
 }
 
-#[test]
-fn replay_serves_rtsp_and_http() -> io::Result<()> {
-    let capture = generate_ts()?;
-    let mut started = None;
+fn start_server(capture: &Capture) -> io::Result<Server> {
     let mut last_error = None;
     for _ in 0..3 {
         match Server::start(&capture.0) {
-            Ok(server) => {
-                started = Some(server);
-                break;
-            }
+            Ok(server) => return Ok(server),
             Err(error) => last_error = Some(error),
         }
     }
-    let server = match (started, last_error) {
-        (Some(server), _) => server,
-        (None, Some(error)) => return Err(error),
-        (None, None) => unreachable!("the retry loop runs at least once"),
-    };
+    Err(last_error.unwrap_or_else(|| io::Error::other("server did not start")))
+}
+
+#[test]
+fn replay_serves_rtsp_and_http() -> io::Result<()> {
+    let capture = generate_ts()?;
+    let server = start_server(&capture)?;
 
     let mut rtsp = TcpStream::connect(("127.0.0.1", server.rtsp_port))?;
     rtsp.set_read_timeout(Some(TIMEOUT))?;
@@ -220,6 +216,59 @@ fn replay_serves_rtsp_and_http() -> io::Result<()> {
     assert!(json.contains("\"ad_type\""), "state: {json}");
     assert!(json.contains("\"st_enabled\""), "state: {json}");
 
+    Ok(())
+}
+
+#[test]
+fn http_page_closes_connection() -> io::Result<()> {
+    let capture = generate_ts()?;
+    let server = start_server(&capture)?;
+    let mut stream = TcpStream::connect(("127.0.0.1", server.http_port))?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    let (status, _, _) = request(&mut stream, "GET /desc.xml HTTP/1.0\r\n\r\n")?;
+    assert_eq!(status, 200);
+    // read_http sets a 1 ms socket timeout for non-stream URLs (minisatip.cpp:1525).
+    let mut rest = [0u8; 16];
+    assert_eq!(
+        stream.read(&mut rest)?,
+        0,
+        "server must close the connection"
+    );
+    Ok(())
+}
+
+#[test]
+fn http_reget_hides_reply() -> io::Result<()> {
+    let capture = generate_ts()?;
+    let server = start_server(&capture)?;
+    let mut stream = TcpStream::connect(("127.0.0.1", server.http_port))?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    let (status, _, _) = request(
+        &mut stream,
+        "GET /?freq=11500&msys=dvbs2&sr=27500&pids=0 HTTP/1.0\r\n\r\n",
+    )?;
+    assert_eq!(status, 200);
+    stream.write_all(b"GET /?addpids=100 HTTP/1.0\r\n\r\n")?;
+    // http_response hides a 200 on a later read event (minisatip.cpp:2096-2102).
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = Instant::now() + TIMEOUT;
+    let has_pid_100 = |data: &[u8]| {
+        data.windows(3)
+            .any(|window| window[0] == 0x47 && window[1] & 0x1f == 0 && window[2] == 100)
+    };
+    while !has_pid_100(&data) && Instant::now() < deadline {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..read]);
+    }
+    assert!(has_pid_100(&data), "addpids must take effect");
+    assert!(
+        !data.windows(5).any(|window| window == b"HTTP/"),
+        "no second HTTP header inside the stream"
+    );
     Ok(())
 }
 

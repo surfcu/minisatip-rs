@@ -59,6 +59,8 @@ struct ConnectionRequest {
     local_ip: String,
     writer: TcpStream,
     request: Request,
+    /// Read events on the connection so far (`sockets::iteration`).
+    reads: u64,
 }
 
 enum Inbound {
@@ -232,6 +234,7 @@ impl Runtime {
             local_ip,
             mut writer,
             request,
+            reads,
         } = message;
         let before = self.conn_streams.get(&conn_id).copied();
 
@@ -264,11 +267,24 @@ impl Runtime {
             self.apply_transport_defaults(id, peer.ip());
         }
 
-        if let Some(response) = response {
+        // A 200 to a repeated HTTP GET is hidden (minisatip.cpp:2096-2102).
+        let hidden = protocol == Protocol::Http
+            && reads > 1
+            && response
+                .as_ref()
+                .is_some_and(|response| response.status == 200);
+        if let Some(response) = response.filter(|_| !hidden) {
             let bytes = response.to_bytes();
             if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
                 return;
             }
+        }
+        // read_http closes every connection that is not a `GET /?` stream
+        // (minisatip.cpp:1520-1525).
+        if protocol == Protocol::Http
+            && !(request.method.eq_ignore_ascii_case("GET") && request.uri.contains("/?"))
+        {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
         }
 
         let Some(id) = sid else {
@@ -786,10 +802,12 @@ fn serve_connection(
     };
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
+    let mut reads = 0u64;
     while !shutdown.load(Ordering::SeqCst) {
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
+                reads += 1;
                 buffer.extend_from_slice(&chunk[..read]);
                 loop {
                     match parse_request(&buffer) {
@@ -805,6 +823,7 @@ fn serve_connection(
                                 local_ip: local_ip.clone(),
                                 writer,
                                 request,
+                                reads,
                             };
                             if requests.send(Inbound::Request(Box::new(message))).is_err() {
                                 return;
