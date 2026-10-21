@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -832,7 +832,8 @@ pub fn run(opts: &Options) -> Result<(), String> {
 
     let (requests, receiver) = mpsc::channel();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let next_id = Arc::new(AtomicU64::new(1));
+    // A mutex rather than `AtomicU64`, which 32-bit MIPS does not provide.
+    let next_id = Arc::new(Mutex::new(1_u64));
     let listeners = vec![
         spawn_listener(
             rtsp_listener,
@@ -988,7 +989,7 @@ fn spawn_listener(
     name: &str,
     requests: Sender<Inbound>,
     shutdown: Arc<AtomicBool>,
-    next_id: Arc<AtomicU64>,
+    next_id: Arc<Mutex<u64>>,
 ) -> Result<JoinHandle<()>, String> {
     listener
         .set_nonblocking(true)
@@ -1004,12 +1005,17 @@ fn accept_loop(
     protocol: Protocol,
     requests: Sender<Inbound>,
     shutdown: Arc<AtomicBool>,
-    next_id: Arc<AtomicU64>,
+    next_id: Arc<Mutex<u64>>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
-                let conn_id = next_id.fetch_add(1, Ordering::SeqCst);
+                let conn_id = {
+                    let mut next = next_id.lock().unwrap_or_else(PoisonError::into_inner);
+                    let conn_id = *next;
+                    *next = next.wrapping_add(1);
+                    conn_id
+                };
                 let requests = requests.clone();
                 let shutdown = Arc::clone(&shutdown);
                 let spawn = thread::Builder::new()
