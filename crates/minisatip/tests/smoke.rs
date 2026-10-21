@@ -38,15 +38,21 @@ impl Drop for Server {
 
 impl Server {
     fn start(replay: &Path) -> io::Result<Self> {
+        Self::start_bound(replay, Some("127.0.0.1"))
+    }
+
+    fn start_bound(replay: &Path, bind: Option<&str>) -> io::Result<Self> {
         let dir = unique_dir();
         fs::create_dir_all(&dir)?;
         let (rtsp_port, http_port) = free_tcp_ports()?;
         let start_rtp = free_udp_pair()?;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_minisatip"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_minisatip"));
+        if let Some(bind) = bind {
+            command.args(["-V", bind]);
+        }
+        let mut child = command
             .args([
                 "--disable-ssdp",
-                "-V",
-                "127.0.0.1",
                 "-x",
                 &http_port.to_string(),
                 "-y",
@@ -221,6 +227,31 @@ fn replay_serves_rtsp_and_http() -> io::Result<()> {
     let http_host = format!("\"http_host\":\"127.0.0.1:{}\"", server.http_port);
     assert!(json.contains(&http_host), "state: {json}");
 
+    Ok(())
+}
+
+#[test]
+fn describe_uses_connection_address() -> io::Result<()> {
+    let capture = generate_ts()?;
+    let server = Server::start_bound(&capture.0, None)?;
+    let mut rtsp = TcpStream::connect(("127.0.0.1", server.rtsp_port))?;
+    rtsp.set_read_timeout(Some(TIMEOUT))?;
+    let url = format!(
+        "rtsp://127.0.0.1:{}/?freq=11500&msys=dvbs2&sr=27500&pids=0",
+        server.rtsp_port
+    );
+    let (status, headers, body) = request(
+        &mut rtsp,
+        &format!("DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n"),
+    )?;
+    assert_eq!(status, 200);
+    // describe_streams and Content-Base both use get_sock_shost (stream.cpp:97-105).
+    assert!(
+        headers.contains("Content-Base: rtsp://127.0.0.1/"),
+        "{headers}"
+    );
+    let sdp = String::from_utf8_lossy(&body);
+    assert!(sdp.contains(" IN IP4 127.0.0.1\r\n"), "SDP: {sdp}");
     Ok(())
 }
 

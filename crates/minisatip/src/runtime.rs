@@ -233,6 +233,8 @@ impl Runtime {
             reads,
         } = message;
         let before = self.conn_streams.get(&conn_id).copied();
+        // describe_streams prints the socket's local address (stream.cpp:97-105).
+        self.session.describe_options_mut().local_host = local_ip.clone();
 
         let (response, sid) = {
             let mut ctx = HandlerContext::new(&mut self.session, protocol);
