@@ -193,6 +193,7 @@ fn tune_is_recorded_and_status_is_configurable() {
         bw: Some(8_000_000),
         plp: Some(0),
         pids: PidSet::all(),
+        ..TuneParams::default()
     };
 
     tuner.tune(&params).unwrap();

@@ -25,6 +25,8 @@ pub enum DeliverySystem {
     DvbC,
     /// DVB-C2.
     DvbC2,
+    /// Undefined delivery system (`SYS_UNDEFINED`).
+    Undefined,
     /// Any other `fe_delivery_system_t` value.
     Other(i32),
 }
@@ -41,6 +43,8 @@ pub enum Polarization {
     Left,
     /// Circular right.
     Right,
+    /// No polarisation specified.
+    None,
 }
 
 /// Tuning parameters passed from the RTSP layer; backend-specific fields are optional.
@@ -67,9 +71,31 @@ pub struct TuneParams {
     /// Bandwidth in Hz (DVB-T/C).
     pub bw: Option<u32>,
     /// PLP or ISI (DVB-T2/S2).
-    pub plp: Option<u8>,
+    pub plp: Option<i32>,
     /// PIDs requested together with the tune.
     pub pids: PidSet,
+    /// Frontend number (`fe`).
+    pub fe: Option<i32>,
+    /// Transmission mode (`fe_transmit_mode_t`).
+    pub tmode: Option<i32>,
+    /// Guard interval (`fe_guard_interval_t`).
+    pub gi: Option<i32>,
+    /// T2 transponder id (`t2id`).
+    pub t2id: Option<i32>,
+    /// Stream or input-stream id (`sm`).
+    pub sm: Option<i32>,
+    /// DVB-C2 tuner frequency (`c2tft`).
+    pub c2tft: Option<i32>,
+    /// DVB-C2 data slice (`ds`).
+    pub ds: Option<i32>,
+    /// Spectral inversion (`fe_spectral_inversion_t`).
+    pub specinv: Option<i32>,
+    /// PLS mode (`fe_pls_mode_t`).
+    pub plsm: Option<i32>,
+    /// PLS code (`plsc`).
+    pub plsc: Option<i32>,
+    /// External PMT PID (`x_pmt`).
+    pub x_pmt: Option<i32>,
 }
 
 /// Set of PIDs with the C++ `8192` sentinel meaning every PID.
