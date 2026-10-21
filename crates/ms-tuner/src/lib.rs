@@ -1,6 +1,7 @@
 //! `Tuner` trait and backends: linux-dvb, satipc, netceiver and file-replay.
 
 mod file;
+pub mod satipc;
 mod tuner;
 
 pub use file::{FileReplayConfig, FileReplayTuner, Pacing};

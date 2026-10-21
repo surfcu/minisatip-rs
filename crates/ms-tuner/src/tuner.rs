@@ -322,4 +322,6 @@ pub trait Tuner {
     fn status(&self) -> SignalStatus;
     /// Appends whole TS packets to `buf` and returns the bytes appended.
     fn read(&mut self, buf: &mut TsBuf) -> Result<usize>;
+    /// The last output stopped (`ad->standby`); the default does nothing.
+    fn standby(&mut self) {}
 }

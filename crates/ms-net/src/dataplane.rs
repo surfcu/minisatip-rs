@@ -331,6 +331,7 @@ impl DataPlane {
                     let stats = output.stats();
                     let _ = self.events.send(Event::OutputStopped(stream_id, stats));
                     self.update_tuner_pids();
+                    self.standby_if_idle();
                 }
             }
             Command::WritePriority { stream_id, data } => {
@@ -464,6 +465,13 @@ impl DataPlane {
         if self.outputs.remove(&stream_id).is_some() {
             let _ = self.events.send(Event::OutputClosed(stream_id));
             self.update_tuner_pids();
+            self.standby_if_idle();
+        }
+    }
+
+    fn standby_if_idle(&mut self) {
+        if self.outputs.is_empty() {
+            self.tuner.standby();
         }
     }
 }
