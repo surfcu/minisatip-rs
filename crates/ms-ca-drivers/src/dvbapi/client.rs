@@ -8,10 +8,13 @@ use std::collections::{HashMap, VecDeque};
 use ms_ca::{CaCaps, CaDriver, CaError, CaEvent, CaService, CapmtDiff, CapmtOp, CwAlgo, FilterId};
 
 use super::proto::{
-    self, CLM_ADD, CLM_ONLY, CLM_UPDATE, CMD_ID_NOT_SELECTED, CMD_ID_OK_DESCRAMBLING,
-    CW_ALGO_AES128, CW_ALGO_CSA, CW_ALGO_CSA_ALT, CW_ALGO_DES, CW_ALGO_MODE_ECB, Capmt, EcmInfo,
-    Parsed, ServerMsg,
+    self, CLM_ADD, CLM_FIRST, CLM_LAST, CLM_MORE, CLM_ONLY, CLM_UPDATE, CMD_ID_NOT_SELECTED,
+    CMD_ID_OK_DESCRAMBLING, CW_ALGO_AES128, CW_ALGO_CSA, CW_ALGO_CSA_ALT, CW_ALGO_DES,
+    CW_ALGO_MODE_ECB, Capmt, EcmInfo, Parsed, ServerMsg,
 };
+
+/// `DEFAULT_LOG` of `dvbapi.cpp` (`#define DEFAULT_LOG LOG_DVBAPI`).
+const DEFAULT_LOG: u32 = ms_log::LOG_DVBAPI;
 
 /// Key slots (`MAX_KEYS`).
 pub const MAX_KEYS: usize = 255;
@@ -237,6 +240,8 @@ pub struct DvbapiClient {
     events: VecDeque<CaEvent>,
     // Clock for the `CaDriver` methods; sans-IO callers pass time explicitly.
     now: i64,
+    // C++ `sock`: the descriptor of the open connection, -1 when closed.
+    sock_id: i32,
 }
 
 impl DvbapiClient {
@@ -259,7 +264,18 @@ impl DvbapiClient {
             out: VecDeque::new(),
             events: VecDeque::new(),
             now: 0,
+            sock_id: -1,
         }
+    }
+
+    /// Records the descriptor of the open connection (C++ `sock`).
+    pub fn set_socket_id(&mut self, fd: i32) {
+        self.sock_id = fd;
+    }
+
+    /// Descriptor of the open connection, -1 when closed.
+    pub fn socket_id(&self) -> i32 {
+        self.sock_id
     }
 
     /// Time used by the [`CaDriver`] methods (milliseconds).
@@ -385,6 +401,8 @@ impl DvbapiClient {
         }
         self.opaque.clear();
         self.registered = false;
+        self.sock_id = -1;
+        ms_log::log!("unregistering dvbapi as the socket is closed");
         self.events.push_back(CaEvent::Closed);
     }
 
@@ -395,8 +413,37 @@ impl DvbapiClient {
             self.rx.clear();
             return;
         }
-        while let Parsed::Message(msg, used) = proto::parse_message(&self.rx) {
+        // `dvbapi_reply` logs each operation before switching on it.
+        let rlen = self.rx.len();
+        let mut pos = 0;
+        while self.rx.len() >= 4 {
+            let op1 =
+                u32::from_be_bytes([self.rx[0], self.rx[1], self.rx[2], self.rx[3]]) & 0xFF_FFFF;
+            let (op, little_endian) = proto::decode_opcode(&self.rx);
+            if little_endian {
+                ms_log::log!("dvbapi: changing endianness from {:06X} to {:08X}", op1, op);
+            }
+            // In host order the key byte is moved to b[4] before the log.
+            let key = if little_endian {
+                self.rx[0]
+            } else {
+                // A partial message may not have reached the key byte yet; the
+                // C++ reads it from its zeroed receive buffer.
+                self.rx.get(4).copied().unwrap_or(0)
+            };
+            ms_log::log!(
+                "dvbapi read from socket {} the following data ({} bytes), pos = {}, op {:08X}, key {}",
+                self.sock_id,
+                rlen,
+                pos,
+                op,
+                key
+            );
+            let Parsed::Message(msg, used) = proto::parse_message(&self.rx) else {
+                break;
+            };
             self.rx.drain(..used);
+            pos += used;
             self.handle(msg, now);
         }
     }
@@ -418,29 +465,49 @@ impl DvbapiClient {
                 filter,
                 pid,
             } => self.dmx_stop(key, demux, filter, pid, now),
-            ServerMsg::CaSetPid { .. } | ServerMsg::Unknown(_) => {}
+            ServerMsg::CaSetPid { .. } => ms_log::log!("received DVBAPI_CA_SET_PID"),
             ServerMsg::CaSetDescr {
-                key, parity, cw, ..
-            } => self.set_descr(key, parity, cw),
-            ServerMsg::CaSetDescrAes => log_unknown_aes(),
+                key,
+                index,
+                parity,
+                cw,
+            } => self.set_descr(key, index, parity, cw),
+            ServerMsg::CaSetDescrAes { data } => log_unknown_operation(&data),
             ServerMsg::CaSetDescrMode {
                 key, algo, mode, ..
             } => {
+                ms_log::log!(
+                    "dvbapi: received DVBAPI_CA_SET_DESCR_MODE, key {}, algo {}, mode {}",
+                    key as i32 - self.cfg.offset,
+                    algo,
+                    mode
+                );
                 if let Some(i) = self.wire_key(key) {
                     set_algo(&mut self.keys[i], algo, mode);
                 }
             }
             ServerMsg::EcmInfo(info) => self.ecm_info(info),
+            ServerMsg::Unknown(data) => log_unknown_operation(&data),
         }
     }
 
     fn server_info(&mut self, version: u16, info: &[u8]) {
-        self.protocol_version = version.min(proto::DVBAPI_PROTOCOL_VERSION);
         if let Some(at) = find(info, b"build r") {
             self.oscam_version = parse_int(&info[at + 7..]);
         }
+        ms_log::log!(
+            "dvbapi: server version {}, build {}, found, name = {}",
+            version,
+            self.oscam_version,
+            cstr(info)
+        );
+        self.protocol_version = version.min(proto::DVBAPI_PROTOCOL_VERSION);
         self.enabled = true;
         if self.oscam_version > 0 && self.oscam_version < MIN_OSCAM_BUILD {
+            ms_log::log0!(
+                "Oscam build {} (< 11553) is not supported after minisatip version 1.0.1. Upgrade your oscam binary",
+                self.oscam_version
+            );
             self.events.push_back(CaEvent::Unsupported {
                 build: self.oscam_version,
             });
@@ -459,17 +526,49 @@ impl DvbapiClient {
         data: [u8; 16],
         mask: [u8; 16],
     ) {
+        let emm = (0x82..=0x8F).contains(&(data[0] & mask[0]));
+        let (demux, filter, pid) = (demux as i32, filter as i32, pid as i32);
+        let key_id = raw_key as i32 - self.cfg.offset;
+        let valid = self.wire_key(raw_key).is_some();
+        ms_log::log!(
+            "dvbapi set filter for pid {:04X} ({}), key {}, demux {}, filter {} {}{}",
+            pid,
+            pid,
+            key_id,
+            demux,
+            filter,
+            if valid { "" } else { "(KEY NOT VALID)" },
+            if emm { " EMM" } else { "" }
+        );
+        ms_log::logm!(
+            "filter: {:02X} {:02X} {:02X} {:02X} {:02X}, mask: {:02X} {:02X} {:02X} {:02X} {:02X}",
+            data[0],
+            data[1],
+            data[2],
+            data[3],
+            data[4],
+            mask[0],
+            mask[1],
+            mask[2],
+            mask[3],
+            mask[4]
+        );
         let Some(i) = self.wire_key(raw_key) else {
             return;
         };
-        let emm = (0x82..=0x8F).contains(&(data[0] & mask[0]));
-        let (demux, filter, pid) = (demux as i32, filter as i32, pid as i32);
-        let k = &mut self.keys[i];
+        let k = &self.keys[i];
         // A repeated request keeps the existing filter (C++ only updates flags).
-        if k.filters
+        if let Some(f) = k
+            .filters
             .iter()
-            .any(|f| f.id.is_some() && f.pid == pid && f.demux == demux && f.filter == filter)
+            .find(|f| f.id.is_some() && f.pid == pid && f.demux == demux && f.filter == filter)
         {
+            ms_log::log!(
+                "dvbapi: filter for pid {} and key {} already exists, fid {}",
+                pid,
+                k.id,
+                f.id.map_or(-1, |id| id.0 as i32)
+            );
             return;
         }
         let Some(slot) = k.filters.iter().position(|f| f.id.is_none()) else {
@@ -477,6 +576,7 @@ impl DvbapiClient {
         };
         let id = FilterId(self.next_filter);
         self.next_filter = self.next_filter.wrapping_add(1).max(1);
+        let k = &mut self.keys[i];
         k.filters[slot] = KeyFilter {
             id: Some(id),
             filter,
@@ -487,6 +587,7 @@ impl DvbapiClient {
         k.ecms += 1;
         let event = CaEvent::SetFilter {
             id,
+            slot,
             pmt_id: k.pmt_id,
             adapter: k.adapter.max(0) as usize,
             pid: pid as u16,
@@ -502,12 +603,23 @@ impl DvbapiClient {
             return;
         };
         let (demux, filter, pid) = (demux as i32, filter as i32, pid as i32);
-        let k = &mut self.keys[i];
-        if let Some(f) = k
+        let index = self.keys[i]
             .filters
-            .iter_mut()
-            .find(|f| f.filter == filter && f.demux == demux && f.pid == pid)
-        {
+            .iter()
+            .position(|f| f.filter == filter && f.demux == demux && f.pid == pid);
+        let k = &mut self.keys[i];
+        ms_log::log!(
+            "dvbapi: received DMX_STOP for key {}, index {}, adapter {}, demux {}, filter {}, pid {:X} ({})",
+            raw_key as i32 - self.cfg.offset,
+            index.map_or(MAX_KEY_FILTERS as i32, |i| i as i32),
+            k.adapter,
+            demux,
+            filter,
+            pid,
+            pid
+        );
+        if let Some(slot) = index {
+            let f = &mut k.filters[slot];
             if let Some(id) = f.id.take() {
                 self.events.push_back(CaEvent::StopFilter { id });
             }
@@ -519,17 +631,51 @@ impl DvbapiClient {
         k.last_dmx_stop = now;
     }
 
-    fn set_descr(&mut self, raw_key: u8, parity: i32, cw: [u8; 8]) {
-        let Some(i) = self.wire_key(raw_key) else {
-            return;
-        };
-        if !(0..2).contains(&parity) {
+    fn set_descr(&mut self, raw_key: u8, index: i32, parity: i32, cw: [u8; 8]) {
+        let key_id = raw_key as i32 - self.cfg.offset;
+        let i = self.wire_key(raw_key);
+        if i.is_none() || !(0..2).contains(&parity) {
+            // C++ `%p`: normalized to the slot id, 0 for a missing key.
+            ms_log::log!(
+                "dvbapi: invalid DVBAPI_CA_SET_DESCR, key {} parity {}, k 0x{:x}, index {}, CW: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                key_id,
+                parity,
+                i.unwrap_or(0),
+                index,
+                cw[0],
+                cw[1],
+                cw[2],
+                cw[3],
+                cw[4],
+                cw[5],
+                cw[6],
+                cw[7]
+            );
             return;
         }
+        let i = i.unwrap_or_default();
+        let correct = (((cw[0] as u32 + cw[1] as u32 + cw[2] as u32) & 0xFF) == cw[3] as u32)
+            && (((cw[4] as u32 + cw[5] as u32 + cw[6] as u32) & 0xFF) == cw[7] as u32);
         let k = &mut self.keys[i];
         // C++ stores 8 bytes for every CA_SET_DESCR, even in AES mode.
         k.key_len = 8;
         k.cw[parity as usize][..8].copy_from_slice(&cw);
+        ms_log::log!(
+            "dvbapi: received DVBAPI_CA_SET_DESCR, key {} parity {}, index {}, algo {}, CW {}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+            key_id,
+            parity,
+            index,
+            algo_code(k.algo),
+            if correct { "OK" } else { "NOK" },
+            cw[0],
+            cw[1],
+            cw[2],
+            cw[3],
+            cw[4],
+            cw[5],
+            cw[6],
+            cw[7]
+        );
         let algo = if k.is_icam { CwAlgo::CsaIcam } else { k.algo };
         self.events.push_back(CaEvent::ControlWord {
             pmt_id: k.pmt_id,
@@ -542,8 +688,38 @@ impl DvbapiClient {
 
     fn ecm_info(&mut self, info: EcmInfo) {
         let Some(i) = self.wire_key(info.key) else {
+            ms_log::log!(
+                "dvbapi: ECM_INFO: key {}, SID = {:04X}, CAID = {:04X} ({}), PID = {} ({:04X}), ProvID = {:06X}, ECM time = {} ms, reader = {}, from = {}, protocol = {}, hops = {}",
+                -1,
+                info.sid,
+                0,
+                cstr(&info.cardsystem),
+                0,
+                0,
+                0,
+                -1,
+                cstr(&info.reader),
+                cstr(&info.from),
+                cstr(&info.protocol),
+                0
+            );
             return;
         };
+        ms_log::log!(
+            "dvbapi: ECM_INFO: key {}, SID = {:04X}, CAID = {:04X} ({}), PID = {} ({:04X}), ProvID = {:06X}, ECM time = {} ms, reader = {}, from = {}, protocol = {}, hops = {}",
+            i,
+            info.sid,
+            info.caid,
+            cstr(&info.cardsystem),
+            info.pid,
+            info.pid,
+            info.prid,
+            info.ecm_time,
+            cstr(&info.reader),
+            cstr(&info.from),
+            cstr(&info.protocol),
+            info.hops
+        );
         let k = &mut self.keys[i];
         k.caid = info.caid;
         k.info_pid = info.pid;
@@ -558,7 +734,10 @@ impl DvbapiClient {
 
     /// `keys_add`: claims the lowest free slot for a known service.
     pub(crate) fn keys_add(&mut self, adapter: usize, pmt_id: usize, now: i64) -> Option<usize> {
-        let sid = self.services.get(&pmt_id)?.sid;
+        let Some(service) = self.services.get(&pmt_id) else {
+            ms_log::log_and_return!(None, "keys_add: PMT {} not found ", pmt_id);
+        };
+        let (sid, pmt_pid) = (service.sid, service.pmt_pid);
         let i = match self.keys.iter().position(|k| !k.enabled) {
             Some(i) => i,
             None if self.keys.len() < MAX_KEYS => {
@@ -568,7 +747,10 @@ impl DvbapiClient {
                 });
                 self.keys.len() - 1
             }
-            None => return None,
+            None => {
+                ms_log::log!("keys_add: no free key id");
+                return None;
+            }
         };
         let k = &mut self.keys[i];
         k.parity = -1;
@@ -594,6 +776,14 @@ impl DvbapiClient {
             f.demux = -1;
         }
         k.enabled = true;
+        ms_log::log!(
+            "returning new key {} for adapter {}, pmt {} pid {} sid {:04X}",
+            i,
+            adapter,
+            pmt_id,
+            pmt_pid,
+            sid
+        );
         Some(i)
     }
 
@@ -608,6 +798,14 @@ impl DvbapiClient {
         let (ek, ed) = others.fold((0, 0), |(ek, ed), o| {
             (ek + 1, ed + usize::from(o.demux_index == demux))
         });
+        let op = if ek == 0 {
+            "ALL"
+        } else if ed == 0 {
+            "DEMUX"
+        } else {
+            "PMT"
+        };
+        let (pmt_pid, sid) = (self.keys[i].pmt_pid, self.keys[i].sid);
         if ek == 0 {
             self.write(proto::ca_stop(0xFF).to_vec());
         } else if ed == 0 {
@@ -632,6 +830,15 @@ impl DvbapiClient {
         k.info_pid = 0;
         k.prid = 0;
         k.ecm_time = 0;
+        ms_log::log!(
+            "Stopped key {}, active keys {}, sock {}, pmt pid {}, sid {:04X}, op {}",
+            i,
+            ek,
+            self.sock_id,
+            pmt_pid,
+            sid,
+            op
+        );
     }
 
     /// `dvbapi_send_pmt`: builds the CAPMT and skips an unchanged update.
@@ -655,6 +862,7 @@ impl DvbapiClient {
         }
         // List management is framing, not content: compare with it zeroed.
         let mut bytes = proto::build_capmt(&Capmt {
+            key_id: k.id,
             list_management: 0,
             cmd_id,
             sid: k.sid,
@@ -664,13 +872,31 @@ impl DvbapiClient {
             ca: &service.ca,
             streams: &service.streams,
         });
+        let hash = ms_log::crc_32(&bytes);
         let k = &mut self.keys[i];
         k.demux_index = demux;
         k.adapter_index = adapter;
         if !force && k.capmt.as_deref() == Some(&bytes[..]) {
+            ms_log::log!(
+                "dvbapi key {}: PMT {} update, CAPMT unchanged ({:08X}), not re-sending",
+                k.id,
+                k.pmt_id,
+                hash
+            );
             return;
         }
         if self.connected {
+            ms_log::log!(
+                "Sending pmt {} to dvbapi server for pid {}, Channel ID {:04X}, key {}, adapter {}, demux {}, using socket {} ({})",
+                k.pmt_id,
+                k.pmt_pid,
+                k.sid,
+                k.id,
+                adapter,
+                demux,
+                self.sock_id,
+                listmgmt_str(listmgmt)
+            );
             k.capmt = Some(bytes.clone());
             bytes[6] = listmgmt;
             self.out.push_back(bytes);
@@ -684,8 +910,20 @@ impl DvbapiClient {
         update: bool,
         now: i64,
     ) -> Result<(), CaError> {
+        ms_log::log!(
+            "dvbapi_add_pmt: adapter {}, pmt {}, pid {}, update {}",
+            service.adapter,
+            service.pmt_id,
+            service.pmt_pid,
+            i32::from(update)
+        );
         if !self.connected {
-            return Err(CaError::NotConnected);
+            ms_log::log_and_return!(
+                Err(CaError::NotConnected),
+                "dvbapi_add_pmt: dvbapi socket is not open, adapter {}, pmt {}",
+                service.adapter,
+                service.pmt_id
+            );
         }
         let pmt_id = service.pmt_id;
         self.services.insert(pmt_id, service.clone());
@@ -700,9 +938,9 @@ impl DvbapiClient {
                 return Ok(());
             }
         }
-        let i = self
-            .keys_add(service.adapter, pmt_id, now)
-            .ok_or(CaError::NoSlot)?;
+        let Some(i) = self.keys_add(service.adapter, pmt_id, now) else {
+            ms_log::log_and_return!(Err(CaError::NoSlot), "Could not add key for pmt {}", pmt_id);
+        };
         self.opaque.insert(pmt_id, i);
         let k = &mut self.keys[i];
         k.sid = service.sid;
@@ -718,7 +956,19 @@ impl DvbapiClient {
     /// `dvbapi_del_pmt`.
     pub fn remove_service(&mut self, pmt_id: usize, now: i64) {
         if let Some(i) = self.opaque.remove(&pmt_id) {
+            let (pmt_pid, sid) = self
+                .services
+                .get(&pmt_id)
+                .map_or((0, 0), |service| (service.pmt_pid, service.sid));
             self.keys_del(i, now);
+            ms_log::log!(
+                "dvbapi_del_pmt: deleted key {}, PMT pid {}, sid {} ({:X}), PMT {}",
+                i,
+                pmt_pid,
+                sid,
+                sid,
+                pmt_id
+            );
         }
         self.services.remove(&pmt_id);
     }
@@ -738,11 +988,29 @@ impl DvbapiClient {
         }
         let Some((i, slot)) = self.keys.iter().enumerate().find_map(|(i, k)| {
             let slot = k.filters.iter().position(|f| f.id == Some(id))?;
-            k.enabled.then_some((i, slot))
+            Some((i, slot))
         }) else {
+            // C++ `LOG_AND_RETURN(0, ...)`; the function returns `()`.
+            ms_log::log!("send_ecm: filter {} not found", id.0);
             return;
         };
+        // C++ checks the key twice (before and after taking its lock).
+        if !self.keys[i].enabled {
+            // C++ `LOG_AND_RETURN(0, ...)`; the function returns `()`.
+            ms_log::log!(
+                "send_ecm: key is null pid {} and filter {}",
+                self.keys[i].filters[slot].pid,
+                id.0
+            );
+            return;
+        }
         if !self.services.contains_key(&self.keys[i].pmt_id) {
+            // C++ `LOG_AND_RETURN(0, ...)`; the function returns `()`.
+            ms_log::log!(
+                "send_ecm: PMT not found for pid {} and filter {}",
+                self.keys[i].filters[slot].pid,
+                id.0
+            );
             return;
         }
         let send_all = self.cfg.send_all_ecm;
@@ -755,6 +1023,7 @@ impl DvbapiClient {
         if !send_all && is_ecm && (b[0] & 1) as i32 == f.ecm_parity {
             return;
         }
+        let old_parity = f.ecm_parity;
         f.ecm_parity = (b[0] & 1) as i32;
         let (demux, filter) = (f.demux, f.filter);
         let len = ((((b[1] & 0x0F) as usize) << 8) | b[2] as usize) + 3;
@@ -769,6 +1038,22 @@ impl DvbapiClient {
                 k.is_icam = false;
             }
         }
+        ms_log::log!(
+            "dvbapi: sending ECM key {} for pid {:04X} ({}), ecm_parity = {}, previous parity {}, demux = {}, filter = {}, icam_ecm {}, len = {} [{:02X} {:02X} {:02X} {:02X}]",
+            k.id,
+            f.pid,
+            f.pid,
+            f.ecm_parity,
+            old_parity,
+            demux,
+            filter,
+            k.icam_ecm,
+            len,
+            b[0],
+            b[1],
+            b[2],
+            b.get(3).copied().unwrap_or(0)
+        );
         if demux < 0 || len > b.len() {
             return;
         }
@@ -790,6 +1075,7 @@ impl DvbapiClient {
                         && now - k.last_dmx_stop > NO_FILTER_CLOSE_MS
                     {
                         let pmt_id = k.pmt_id;
+                        ms_log::log!("Key {} active but no active filter, closing ", i);
                         self.keys_del(i, now);
                         self.restart_service(pmt_id, now);
                     }
@@ -844,6 +1130,12 @@ impl DvbapiClient {
                 continue;
             }
             w.restarts += 1;
+            let restarts = w.restarts;
+            ms_log::log!(
+                "Descramble watchdog: no CW for PMT {}, restarting it for OSCam, restart {}",
+                p.pmt_id,
+                restarts
+            );
             self.restart_service(p.pmt_id, now);
         }
     }
@@ -900,12 +1192,53 @@ fn set_algo(k: &mut Key, algo: i32, mode: i32) {
 }
 
 /// `CA_SET_DESCR_AES` has no C++ `case`; C++ logs the unknown operation and
-/// drops the rest of the read (plain `LOG`, level 0 and unconditional).
-fn log_unknown_aes() {
-    eprintln!(
-        "dvbapi: unknown operation: {:08X}",
-        proto::DVBAPI_CA_SET_DESCR_AES
+/// drops the rest of the read (plain `LOG`).
+fn log_unknown_operation(b: &[u8]) {
+    let byte = |i: usize| b.get(i).copied().unwrap_or(0);
+    ms_log::log!(
+        "dvbapi: unknown operation: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+        byte(0),
+        byte(1),
+        byte(2),
+        byte(3),
+        byte(4),
+        byte(5),
+        byte(6),
+        byte(7),
+        byte(8),
+        byte(9),
+        byte(10)
     );
+}
+
+/// C++ `CA_ALGO_*` (`pmt.h:11-15`) of a key algorithm.
+fn algo_code(algo: CwAlgo) -> i32 {
+    match algo {
+        CwAlgo::Csa => 0,
+        CwAlgo::Des => 1,
+        CwAlgo::Aes128Ecb => 2,
+        CwAlgo::Aes128Cbc => 3,
+        CwAlgo::CsaIcam => 4,
+    }
+}
+
+/// C++ `listmgmt_str[]` (`pmt.cpp:77-78`).
+fn listmgmt_str(listmgmt: u8) -> &'static str {
+    match listmgmt {
+        CLM_MORE => "CLM_MORE",
+        CLM_FIRST => "CLM_FIRST",
+        CLM_LAST => "CLM_LAST",
+        CLM_ONLY => "CLM_ONLY",
+        CLM_ADD => "CLM_ADD",
+        CLM_UPDATE => "CLM_UPDATE",
+        _ => "",
+    }
+}
+
+/// Bytes of a C string (the C++ `%s` stops at the first NUL).
+fn cstr(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end])
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

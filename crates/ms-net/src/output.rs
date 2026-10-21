@@ -1,20 +1,24 @@
 //! Stream outputs (RTP/UDP, RTP over RTSP TCP, HTTP TS), ported from `flush_stream`,
 //! `send_rtcp` and `stream_timeout`.
 
-use crate::handler::StreamType;
+use crate::handler::{StreamId, StreamType};
 use crate::rtcp::{RtcpInfo, build_rtcp};
-use crate::rtp::{Batch, Framing, RtpState, packetize};
+use crate::rtp::{Batch, Framing, RtpState, Segment, packetize_for_stream};
 use crate::socket::DEFAULT_FIFO_SIZE;
 #[cfg(feature = "srt")]
 use crate::srt::{SrtOps, send_ts_partial};
 use crate::writeq::WriteQueue;
 use ms_tuner::PidSet;
+use std::fmt;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 #[cfg(feature = "srt")]
 use std::sync::Arc;
 use std::time::SystemTime;
+
+/// The C++ `stream.cpp` uses `#define DEFAULT_LOG LOG_STREAM` for this module.
+const DEFAULT_LOG: u32 = ms_log::LOG_STREAM;
 
 /// Period of the per-stream timer (`sockets_timeout(st_sock, 200)`).
 pub const STREAM_TIMER_MS: i64 = 200;
@@ -81,6 +85,22 @@ enum Transport {
     },
 }
 
+/// `get_stream_rhost`: an address, or the empty string C++ returns without one.
+#[derive(Debug, Clone, Copy)]
+enum RemoteHost {
+    Addr(IpAddr),
+    Empty,
+}
+
+impl fmt::Display for RemoteHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Addr(ip) => write!(f, "{ip}"),
+            Self::Empty => Ok(()),
+        }
+    }
+}
+
 /// Counters and addresses exposed to the session layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputStats {
@@ -118,6 +138,8 @@ pub struct StreamOutput {
     transport: Transport,
     stream_type: StreamType,
     framing: Framing,
+    /// Stream id used by the C++ log lines (`sid->sid`); set by the data plane.
+    stream_id: StreamId,
     rtp: RtpState,
     queue: WriteQueue,
     udp_dropped: u64,
@@ -147,10 +169,32 @@ impl StreamOutput {
         bind_dev: Option<&str>,
         send_buffer: i32,
     ) -> io::Result<Self> {
-        let rtp = bind_connect(target.local, target.dest, target.ttl, bind_dev)?;
+        let rtp = match bind_connect(target.local, target.dest, target.ttl, bind_dev) {
+            Ok(socket) => socket,
+            Err(error) => {
+                // stream.cpp:560.
+                ms_log::log!(
+                    "decode_transport failed: UDP connection on rtp port to {}:{} failed",
+                    target.dest.ip(),
+                    target.dest.port()
+                );
+                return Err(error);
+            }
+        };
         let rtcp_local = with_port(target.local, target.local.port().wrapping_add(1));
         let rtcp_dest = with_port(target.dest, target.dest.port().wrapping_add(1));
-        let rtcp = bind_connect(rtcp_local, rtcp_dest, target.ttl, bind_dev)?;
+        let rtcp = match bind_connect(rtcp_local, rtcp_dest, target.ttl, bind_dev) {
+            Ok(socket) => socket,
+            Err(error) => {
+                // stream.cpp:577.
+                ms_log::log!(
+                    "decode_transport failed: UDP connection on rtcp port to {}:{} failed",
+                    target.dest.ip(),
+                    target.dest.port().wrapping_add(1)
+                );
+                return Err(error);
+            }
+        };
         let mut output = Self::udp_from_sockets(rtp, rtcp, config, now_ms);
         output.apply_udp_socket_options(send_buffer);
         Ok(output)
@@ -251,6 +295,7 @@ impl StreamOutput {
             transport,
             stream_type,
             framing,
+            stream_id: -1,
             rtp: RtpState::new(config.ssrc, config.seq),
             queue: WriteQueue::new(config.fifo_size),
             udp_dropped: 0,
@@ -267,6 +312,51 @@ impl StreamOutput {
     /// Output type.
     pub fn stream_type(&self) -> StreamType {
         self.stream_type
+    }
+
+    /// Records the stream index used by the C++ log lines (`sid->sid`).
+    pub fn set_stream_id(&mut self, stream_id: StreamId) {
+        self.stream_id = stream_id;
+    }
+
+    /// Remote destination, as `get_stream_rhost`/`get_stream_rport` report it.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        match &self.transport {
+            Transport::Udp { rtp, .. } => rtp.peer_addr().ok(),
+            Transport::Tcp { remote, .. } => *remote,
+            #[cfg(feature = "srt")]
+            Transport::Srt { remote, .. } => *remote,
+        }
+    }
+
+    /// `sid->rsock`: the RTP socket handle where one exists.
+    fn rtp_handle(&self) -> i32 {
+        match &self.transport {
+            Transport::Udp { rtp, .. } => rtp.as_raw_fd(),
+            // The TCP sink is type-erased (`Box<dyn Write>`), so no fd.
+            Transport::Tcp { .. } => -1,
+            #[cfg(feature = "srt")]
+            Transport::Srt { sock, .. } => *sock,
+        }
+    }
+
+    /// Logs the sockets C++ `close_stream` force-closes (stream.cpp:376,385).
+    ///
+    /// The C++ `rsock_id`/`rtcp_sock` socket-table indices have no Rust
+    /// counterpart and print -1.
+    pub fn log_closing_sockets(&self) {
+        if let Transport::Udp { rtp, rtcp } = &self.transport {
+            ms_log::log!("Closing RTP sock {} handle {}", -1, rtp.as_raw_fd());
+            ms_log::log!("Closing RTCP sock {} handle {}", -1, rtcp.as_raw_fd());
+        }
+    }
+
+    /// `get_stream_rhost`/`get_stream_rport` for the log lines below.
+    fn remote_parts(&self) -> (RemoteHost, u16) {
+        match self.remote_addr() {
+            Some(addr) => (RemoteHost::Addr(addr.ip()), addr.port()),
+            None => (RemoteHost::Empty, 0),
+        }
     }
 
     /// Follows the RTP session id (`set_session_id` assigns `sid->ssrc`;
@@ -333,13 +423,49 @@ impl StreamOutput {
         ctime_ms: i64,
         mono_us: i64,
     ) -> io::Result<()> {
-        let batches = packetize(
+        let batches = packetize_for_stream(
             &mut self.rtp,
             self.framing,
             buf,
             |pid| pids.contains(pid),
             mono_us,
+            self.stream_id,
         );
+        if let Some(last) = batches.last() {
+            // stream.cpp:1144 (`LOGM` under `#define DEFAULT_LOG LOG_DMX`).
+            let pos = last.segments.len();
+            let rtp_header = last
+                .segments
+                .iter()
+                .rposition(|segment| matches!(segment, Segment::Header { .. }))
+                .unwrap_or(0);
+            let total_len: usize = last
+                .segments
+                .iter()
+                .filter_map(|segment| match segment {
+                    Segment::Data { len, .. } => Some(*len),
+                    Segment::Header { .. } => None,
+                })
+                .sum();
+            let rtp_pos: usize = last
+                .segments
+                .iter()
+                .filter_map(|segment| match segment {
+                    Segment::Header { len, .. } => Some(*len),
+                    Segment::Data { .. } => None,
+                })
+                .sum();
+            ms_log::logl!(
+                ms_log::LOG_DMX,
+                "Processing done sid {} at pos {}, rtp header {}, rtp_pos {}, total_len {}, rlen {}",
+                self.stream_id,
+                pos,
+                rtp_header,
+                rtp_pos,
+                total_len,
+                buf.len()
+            );
+        }
         for batch in &batches {
             self.flush_stream(batch, buf, ctime_ms)?;
         }
@@ -387,6 +513,13 @@ impl StreamOutput {
                     let (count, failed) = send_ts_partial(ops.as_ref(), *sock, chunk);
                     sent += count;
                     if failed {
+                        // stream.cpp:817. `SrtOps` exposes no
+                        // `srt_getlasterror_str`; the stable text stands in.
+                        ms_log::log!(
+                            "SRT send failed for sid {}: {}",
+                            self.stream_id,
+                            crate::srt::SrtError::Send
+                        );
                         self.forced_close = true;
                         // stream.cpp:824-829: a partial flush is not a failed write.
                         if sent == 0 {
@@ -398,6 +531,29 @@ impl StreamOutput {
                 sent as i32
             }
         };
+        let (host, port) = self.remote_parts();
+        if rv > 0 && !self.started {
+            // stream.cpp:838.
+            ms_log::log!(
+                "Start streaming for stream sid {}, len {} to handle {} => {}:{}",
+                self.stream_id,
+                rv,
+                self.rtp_handle(),
+                host,
+                port
+            );
+        }
+        // stream.cpp:845 (`DEBUGM`; `sock_id` is the socket-table index).
+        ms_log::debugm!(
+            "flush_stream: sent {} bytes for sid {}, handle {}, sock_id {}, seq {} => {}:{}",
+            rv,
+            self.stream_id,
+            self.rtp_handle(),
+            -1,
+            self.rtp.seq,
+            host,
+            port
+        );
         if rv > 0 {
             self.started = true;
             self.sp = self.sp.wrapping_add(1);
@@ -419,6 +575,14 @@ impl StreamOutput {
             return Ok(());
         }
         if ctime_ms - self.wtime_ms > KEEPALIVE_MS {
+            let (host, port) = self.remote_parts();
+            // stream.cpp:1357 (`stream_timeout`).
+            ms_log::log!(
+                "no data sent for more than 1s sid: {} for {}:{}",
+                self.stream_id,
+                host,
+                port
+            );
             let mut batch = Batch::default();
             let start = batch.headers.len();
             let len = self
@@ -472,10 +636,19 @@ impl StreamOutput {
             Transport::Srt { .. } => {}
         }
         self.rtcp_wtime_ms = ctime_ms;
+        let (host, port) = self.remote_parts();
+        // stream.cpp:785 (`DEBUGM`; `handle` is `sid->rsock`).
+        ms_log::debugm!(
+            "send_rtcp: sent {} bytes for sid {}, handle {} seq {} => {}:{}",
+            packet.len(),
+            self.stream_id,
+            self.rtp_handle(),
+            i32::from(self.rtp.seq) - 1,
+            host,
+            port
+        );
         Ok(())
     }
-
-    /// Queues an RTSP reply on the high-priority lane (`sockets_writev_prio(.., 1)`).
     pub fn write_priority(&mut self, data: &[u8]) -> io::Result<i32> {
         match &mut self.transport {
             Transport::Tcp { sink, .. } => {

@@ -11,6 +11,9 @@ use ms_tuner::{DeliverySystem, PidSet, Polarization, TuneParams};
 
 pub mod pmt;
 
+/// `#define DEFAULT_LOG LOG_ADAPTER` (adapter.cpp:58).
+const DEFAULT_LOG: u32 = ms_log::LOG_ADAPTER;
+
 /// Maximum PMTs tracked per adapter (`MAX_PMT_FOR_ADAPTER`).
 pub const MAX_PMT_FOR_ADAPTER: usize = 255;
 /// Adapter kind (`ADAPTER_*`).
@@ -68,6 +71,56 @@ impl TuneError {
             Self::Pids => -503,
         }
     }
+}
+
+/// `iterable_to_string`: the PID set joined with `", "` in ascending order.
+fn pids_string(pids: &PidSet) -> String {
+    pids.iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `copy_dvb_param start` (dvb.cpp:395-403).
+fn log_copy_start(p: &TuneParams) {
+    ms_log::log!(
+        "copy_dvb_param start -> src={}, fe={}, freq={}, fec={}, sr={}, pol={}, ro={}, msys={}, mtype={}, plts={}, bw={}, inv={}, pids={} x_pmt={}",
+        p.src_value(),
+        p.fe_value(),
+        p.freq,
+        p.fec_value(),
+        p.sr_value(),
+        p.pol_number(),
+        p.ro.map_or(3, i32::from),
+        p.sys_number(),
+        p.mtype_value(),
+        p.plts_number(),
+        p.bw_value(),
+        p.inversion_value(),
+        pids_string(&p.pids),
+        p.x_pmt.unwrap_or(-1)
+    );
+}
+
+/// `copy_dvb_parameters` (dvb.cpp:463-470).
+fn log_copy_end(p: &TuneParams) {
+    ms_log::log!(
+        "copy_dvb_parameters -> src={}, fe={}, freq={}, fec={} sr={}, pol={}, ro={}, msys={}, mtype={}, plts={}, bw={}, inv={}, pids={} x_pmt={}",
+        p.src_value(),
+        p.fe_value(),
+        p.freq,
+        p.fec_value(),
+        p.sr_value(),
+        p.pol_number(),
+        p.ro.map_or(3, i32::from),
+        p.sys_number(),
+        p.mtype_value(),
+        p.plts_number(),
+        p.bw_value(),
+        p.inversion_value(),
+        pids_string(&p.pids),
+        p.x_pmt.unwrap_or(-1)
+    );
 }
 
 /// `set_adapter_parameters` failure, matching the C++ `-2`/`-1` returns.
@@ -518,6 +571,48 @@ impl Scheduler {
         } else {
             fe = -1;
         }
+        // C++ keeps a default adapter for the log even when the frontend pin
+        // does not resolve: `a[0]` unless another adapter is enabled.
+        let mut chosen = self
+            .adapters
+            .first()
+            .is_some_and(Option::is_some)
+            .then_some(0);
+        if let Some(index) = self
+            .adapters
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|adapter| adapter.config.enabled))
+        {
+            chosen = Some(index);
+        }
+        if fe >= 0 {
+            chosen = Some(fe as usize);
+        }
+        match chosen.and_then(|index| {
+            self.adapters[index]
+                .as_ref()
+                .map(|adapter| (index, adapter))
+        }) {
+            Some((index, adapter)) => ms_log::log!(
+                "get free adapter {} - a[{}] => e:{} m:{} sid_cnt:{} src:{} f:{} pol={} sys: {} {}",
+                tp.fe_value(),
+                index,
+                i32::from(adapter.config.enabled),
+                adapter.master_sid,
+                adapter.sid_cnt,
+                adapter.params.src_value(),
+                adapter.params.freq,
+                adapter.params.pol_number(),
+                adapter.config.sys[0].name(),
+                adapter.config.sys[1].name()
+            ),
+            None => ms_log::log!(
+                "get free adapter {} msys {} requested {}",
+                fe,
+                ms_tuner::delsys_name(fe),
+                ms_tuner::delsys_name(tp.sys_number())
+            ),
+        }
         if fe >= 0 {
             let index = fe as usize;
             let usable = self.adapters[index].as_ref().is_some_and(|adapter| {
@@ -577,9 +672,17 @@ impl Scheduler {
                 && self.source_enabled(index, tp)
                 && self.compare_slave_parameters(index as i32, tp)
             {
+                ms_log::logm!("get free adapter found slave adapter {}", index);
                 return Some(index);
             }
         }
+        ms_log::log!(
+            "no adapter found for src:{} f:{} pol:{} msys:{}",
+            tp.src_value(),
+            tp.freq,
+            tp.pol_number(),
+            tp.sys_number()
+        );
         None
     }
 
@@ -628,6 +731,24 @@ impl Scheduler {
         let Some(adapter) = self.enabled_adapter(aid) else {
             return true;
         };
+        ms_log::logm!(
+            "new parameters: f:{}, plp/isi:{}, diseqc:{}, pol:{}, sr:{}, mtype:{}",
+            tp.freq,
+            tp.plp.unwrap_or(-1),
+            tp.src_value(),
+            tp.pol_number(),
+            tp.sr_value(),
+            tp.mtype_value()
+        );
+        ms_log::logm!(
+            "old parameters: f:{}, plp/isi:{}, diseqc:{}, pol:{}, sr:{}, mtype:{}",
+            adapter.params.freq,
+            adapter.params.plp.unwrap_or(-1),
+            adapter.params.src_value(),
+            adapter.params.pol_number(),
+            adapter.params.sr_value(),
+            adapter.params.mtype_value()
+        );
         if (i64::from(tp.freq) - i64::from(adapter.params.freq)).abs() > 1_000 {
             return true;
         }
@@ -711,6 +832,21 @@ impl Scheduler {
         {
             return true;
         }
+        ms_log::logm!(
+            "compare_slave_parameters: adapter {} master {} (pol {}, band {}, diseqc {}) compatible with freq {}, pol {} band {} diseqc {}",
+            aid,
+            adapter
+                .config
+                .master_source
+                .map_or(-1, |master| master as i32),
+            adapter.old_pol,
+            adapter.old_hiband,
+            adapter.old_diseqc,
+            tp.freq,
+            pol,
+            hiband.unwrap_or(-1),
+            diseqc
+        );
         false
     }
 
@@ -737,7 +873,9 @@ impl Scheduler {
             return src;
         }
         self.adapters[aid].as_ref().map_or(-1, |adapter| {
-            i32::from(adapter.config.absolute_table[src as usize - 1])
+            let mapped = i32::from(adapter.config.absolute_table[src as usize - 1]);
+            ms_log::log!("Mapping adapter {} src {} to src {}", aid, src, mapped);
+            mapped
         })
     }
 
@@ -757,12 +895,20 @@ impl Scheduler {
         }
         adapter.sid_cnt += 1;
         adapter.attached.insert(sid);
+        let (master_sid, sid_cnt) = (adapter.master_sid, adapter.sid_cnt);
         let master_source = adapter.config.master_source;
         if let Some(master) = master_source
             && let Some(master) = self.adapters.get_mut(master).and_then(Option::as_mut)
         {
             master.used[index] = true;
         }
+        ms_log::log!(
+            "set adapter {} for sid {} m:{} s:{}",
+            aid,
+            sid,
+            master_sid,
+            sid_cnt
+        );
         true
     }
 
@@ -786,6 +932,16 @@ impl Scheduler {
         if needs_fix {
             self.fix_master_sid(index);
         }
+        let master_sid = self.adapters[index]
+            .as_ref()
+            .map_or(-1, |adapter| adapter.master_sid);
+        ms_log::log!(
+            "closed adapter {} for sid {} m:{} sid_cnt:{}",
+            aid,
+            sid,
+            master_sid,
+            count
+        );
         if count == 0 {
             if let Some(adapter) = self.adapters[index].as_mut() {
                 adapter.master_sid = -1;
@@ -795,10 +951,11 @@ impl Scheduler {
             let master_source = self.adapters[index]
                 .as_ref()
                 .and_then(|adapter| adapter.config.master_source);
-            if let Some(master) = master_source
-                && let Some(master) = self.adapters.get_mut(master).and_then(Option::as_mut)
-            {
-                master.used[index] = false;
+            if let Some(master) = master_source {
+                if let Some(master) = self.adapters.get_mut(master).and_then(Option::as_mut) {
+                    master.used[index] = false;
+                }
+                ms_log::logm!("adapter {} freed from slave adapter {}", master, index);
             }
         } else {
             self.mark_pid_deleted(index, sid, None);
@@ -831,12 +988,35 @@ impl Scheduler {
         let Some(adapter) = self.enabled_adapter_mut(aid) else {
             return Err(SetParamsError::MissingAdapter);
         };
+        ms_log::log!(
+            "setting DVB parameters for adapter {} - master_sid {} sid {} old f:{}",
+            aid,
+            adapter.master_sid,
+            sid,
+            adapter.params.freq
+        );
         if adapter.master_sid == -1 {
             adapter.master_sid = sid;
         }
         adapter.do_tune = false;
         if self.compare_tuning_parameters(aid, tp) {
             if self.enabled_adapter(aid).map(|a| a.master_sid) != Some(sid) {
+                let old = &self.enabled_adapter(aid).expect("adapter checked").params;
+                ms_log::log!(
+                    "secondary stream requested tune, not gonna happen ad: f:{} sr:{} pol:{} plp/isi:{} src:{} mod {} -> \t\t\tnew: f:{} sr:{} pol:{} plp/isi:{} src:{} mod {}",
+                    old.freq,
+                    old.sr_value(),
+                    old.pol_number(),
+                    old.plp.unwrap_or(0),
+                    old.src_value(),
+                    old.mtype_value(),
+                    tp.freq,
+                    tp.sr_value(),
+                    tp.pol_number(),
+                    tp.plp.unwrap_or(0),
+                    tp.src_value(),
+                    tp.mtype_value()
+                );
                 return Err(SetParamsError::SlaveConflict);
             }
             if let Some(adapter) = self.adapters[index].as_mut() {
@@ -850,7 +1030,26 @@ impl Scheduler {
         let Some(adapter) = self.adapters[index].as_mut() else {
             return Err(SetParamsError::MissingAdapter);
         };
+        // copy_dvb_parameters (dvb.cpp:393-471): the start line shows the
+        // destination before the copy, the end line the merged result.
+        log_copy_start(&adapter.params);
         adapter.params = tp.clone();
+        // The C++ copy forces switch position 1 and the DVB-S/S2 modulation
+        // defaults on the destination; from_params applies them later.
+        let mut logged = adapter.params.clone();
+        if logged.src_value() < 1 {
+            logged.src = 1;
+            logged.src_specified = true;
+        }
+        if logged.msys == DeliverySystem::DvbS2 && !logged.mtype_specified {
+            logged.mtype = 9;
+            logged.mtype_specified = true;
+        }
+        if logged.msys == DeliverySystem::DvbS && !logged.mtype_specified {
+            logged.mtype = 0;
+            logged.mtype_specified = true;
+        }
+        log_copy_end(&logged);
         let need_mapping = adapter.params.fe.unwrap_or(0) < 1;
         let (src, msys) = (adapter.params.src, adapter.params.msys);
         if need_mapping {
@@ -872,6 +1071,8 @@ impl Scheduler {
 
     /// Runs a pending tune for the master stream `sid`.
     pub fn tune(&mut self, aid: i32, sid: StreamId) -> TuneOutcome {
+        // ms-sched has no DVR socket; C++ prints `-1` when the adapter is absent.
+        ms_log::logm!("adapter tune: sid {} aid {} => sock: {} ", sid, aid, -1);
         let mut close_streams = Vec::new();
         let Ok(index) = usize::try_from(aid) else {
             return TuneOutcome {
@@ -931,6 +1132,13 @@ impl Scheduler {
             }
             close_streams = slaves;
             self.post_tune(index);
+        } else if let Some(adapter) = self.enabled_adapter(aid) {
+            ms_log::log!(
+                "not tuning for sid {} (do_tune={}, master_sid={})",
+                sid,
+                i32::from(adapter.do_tune),
+                adapter.master_sid
+            );
         }
         if result.is_err() {
             self.mark_pid_deleted(index, PID_STREAM_ID_UNDEFINED, None);
@@ -974,6 +1182,11 @@ impl Scheduler {
             .iter_mut()
             .find(|entry| entry.state != PidState::Inactive && entry.pid == pid)
         {
+            ms_log::log!(
+                "found already existing pid {} flags {}",
+                pid,
+                entry.state as i32
+            );
             if sid != PID_STREAM_ID_UNDEFINED {
                 let had_client = !entry.sids.is_empty();
                 entry.sids.insert(sid);
@@ -991,6 +1204,12 @@ impl Scheduler {
             .iter_mut()
             .find(|entry| entry.state == PidState::Inactive)
         else {
+            ms_log::log!(
+                "MAX_PIDS ({}) reached for adapter {} in adding PID: {}",
+                MAX_PIDS,
+                aid,
+                pid
+            );
             return -1;
         };
         entry.pid = pid;
@@ -1104,6 +1323,7 @@ impl Scheduler {
     }
 
     fn post_tune(&mut self, index: usize) {
+        ms_log::logm!("adapter post_tune: aid {}", index);
         let Some(adapter) = self.adapters[index].as_ref() else {
             return;
         };
@@ -1124,6 +1344,11 @@ impl Scheduler {
             // CI adapters only need pid 0, for the generated PAT (adapter.cpp:1046-1061).
             for pid in [0, 1, 16, 18] {
                 if !existing.contains(&pid) && (!ci || pid == 0) {
+                    ms_log::log!(
+                        "Adding pid {} to the list of pids as not explicitly added for adapter {}",
+                        pid,
+                        index
+                    );
                     let _ = self.mark_pid_add(index as i32, PID_STREAM_ID_UNDEFINED, pid);
                 }
             }
@@ -1165,6 +1390,7 @@ impl Scheduler {
     /// Applies pending DELETED/NEW entries and sorts the table
     /// (`update_pids`, adapter.cpp:928-1047). Returns 0 on success, 1 on error.
     fn update_pids(&mut self, index: usize) -> i32 {
+        ms_log::logm!("Updating pids for adapter {}", index);
         let mut rv = 0;
         // pids=all expansion must precede the NEW->ACTIVE pass below, so the
         // PMT/stream pids it adds can start the PMT in this same update.
@@ -1183,6 +1409,7 @@ impl Scheduler {
                     }
                     let (fd, pid) = (adapter.pids[slot].fd, adapter.pids[slot].pid);
                     if adapter.tuner.del_filters(fd, pid).is_err() {
+                        ms_log::log0!("failed to remove pid {}, reporting error", pid);
                         rv = 1;
                     }
                 }
@@ -1199,6 +1426,11 @@ impl Scheduler {
                     continue;
                 }
                 if adapter.max_pids != 0 && adapter.max_pids < adapter.active_pids {
+                    ms_log::log!(
+                        "maximum number of pids {} out of {} reached",
+                        adapter.active_pids,
+                        adapter.max_pids
+                    );
                     break;
                 }
                 if adapter.pids[slot].fd <= 0 {
@@ -1210,7 +1442,16 @@ impl Scheduler {
                             if adapter.max_pids < MIN_ADAPTER_PIDS {
                                 adapter.max_pids = MIN_ADAPTER_PIDS;
                             }
+                            ms_log::log0!(
+                                "Maximum pid filter reached, lowering the value to {}",
+                                adapter.max_pids
+                            );
                             if adapter.active_pids < MIN_ADAPTER_PIDS {
+                                ms_log::log0!(
+                                    "failed to add pid {} with only {} active pids, reporting error",
+                                    pid,
+                                    adapter.active_pids
+                                );
                                 rv = 1;
                             }
                             break;

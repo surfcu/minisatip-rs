@@ -5,18 +5,32 @@
 pub struct Fifo {
     data: Vec<u8>,
     pub write_index: u64,
+    /// `SFIFO::file`/`SFIFO::line`, reported by `fifo_pop_offset` (fifo.cpp:93).
+    origin_file: &'static str,
+    origin_line: u32,
 }
 
 impl Fifo {
+    /// `#[track_caller]` supplies the nearest Rust equivalent of the
+    /// `__FILE__`/`__LINE__` pair `create_fifo` stores in `SFIFO`.
+    #[track_caller]
     pub fn new(size: usize) -> Self {
+        let origin = std::panic::Location::caller();
         Self {
             data: vec![0; size],
             write_index: 0,
+            origin_file: origin.file(),
+            origin_line: origin.line(),
         }
     }
 
     pub fn capacity(&self) -> usize {
         self.data.len()
+    }
+
+    /// The backing ring buffer (`d->fifo.data`), for the debug packet dumps.
+    pub fn raw_data(&self) -> &[u8] {
+        &self.data
     }
 
     /// Appends, overwriting the oldest bytes when full (`fifo_push_force`).
@@ -36,6 +50,15 @@ impl Fifo {
     pub fn pop_offset(&self, dst: &mut [u8], read_index: &mut u64) -> usize {
         let cap = self.data.len() as u64;
         if *read_index + cap < self.write_index {
+            // fifo.cpp:91-97
+            if *read_index > 0 {
+                ms_log::log!(
+                    "Lost {} bytes in fifo created at {}:{}",
+                    self.write_index - cap - *read_index,
+                    self.origin_file,
+                    self.origin_line
+                );
+            }
             *read_index = self.write_index - cap;
         }
         let avail = self.write_index.saturating_sub(*read_index) as usize;

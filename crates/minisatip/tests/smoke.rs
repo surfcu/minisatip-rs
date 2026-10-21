@@ -946,6 +946,8 @@ fn daemonises_by_default_and_redirects_stdio_to_the_logfile() -> io::Result<()> 
             dir.to_str().unwrap_or("."),
             "-e",
             "0",
+            "-l",
+            "ca",
         ])
         .env("MINISATIP_REPLAY", &capture.0)
         .stdin(Stdio::null())
@@ -989,6 +991,33 @@ fn daemonises_by_default_and_redirects_stdio_to_the_logfile() -> io::Result<()> 
     }
     assert!(connected, "daemonised server did not listen");
     assert!(log_path.exists(), "stdio must go to the -F log file");
+    // Log lines reach the -F file, flushed per line, with the C++ prefix
+    // "[DD/MM HH:MM:SS.mmm main]: " (logging.cpp:64-65,115): the LOG0
+    // version banner (minisatip.cpp:280) and the LOGL module line
+    // (minisatip.cpp:1930).
+    let log = fs::read_to_string(&log_path)?;
+    let prefixed = |suffix: &str| {
+        log.lines().any(|line| {
+            line.len() > 26
+                && line.as_bytes()[0] == b'['
+                && line.as_bytes()[3] == b'/'
+                && line.as_bytes()[9] == b':'
+                && line.as_bytes()[15] == b'.'
+                && line[19..].starts_with(" main]: ")
+                && line.ends_with(suffix)
+        })
+    };
+    assert!(
+        log.lines()
+            .any(|line| line.contains(" main]: minisatip version ")),
+        "version banner missing from -F file:
+{log}"
+    );
+    assert!(
+        prefixed(" LOG  of the module enabled: ca"),
+        "module line missing from -F file:
+{log}"
+    );
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }

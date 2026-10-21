@@ -31,6 +31,33 @@ pub enum DeliverySystem {
     Other(i32),
 }
 
+/// `EnumMap::reverse_lookup` name of a `fe_delivery_system_t` number
+/// (dvb.cpp:100-120), used by log messages that print the C++ table value.
+pub fn delsys_name(number: i32) -> &'static str {
+    crate::names::fe_delsys(number)
+}
+
+impl DeliverySystem {
+    /// `fe_delivery_system_t` number (`SYS_*`).
+    pub fn number(self) -> i32 {
+        match self {
+            DeliverySystem::DvbS => 5,
+            DeliverySystem::DvbS2 => 6,
+            DeliverySystem::DvbT => 3,
+            DeliverySystem::DvbT2 => 16,
+            DeliverySystem::DvbC => 1,
+            DeliverySystem::DvbC2 => 19,
+            DeliverySystem::Undefined => 0,
+            DeliverySystem::Other(value) => value,
+        }
+    }
+
+    /// `fe_delsys_map.reverse_lookup`: the C++ name for this system.
+    pub fn name(self) -> &'static str {
+        delsys_name(self.number())
+    }
+}
+
 /// Satellite polarisation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Polarization {
@@ -110,6 +137,80 @@ pub struct TuneParams {
     pub plsc: Option<i32>,
     /// External PMT PID (`x_pmt`).
     pub x_pmt: Option<i32>,
+}
+
+impl TuneParams {
+    /// `fe_pol_map` number: 0 none, 1 v, 2 h, 3 r, 4 l.
+    pub fn pol_number(&self) -> i32 {
+        match self.pol {
+            Polarization::None => 0,
+            Polarization::Vertical => 1,
+            Polarization::Horizontal => 2,
+            Polarization::Right => 3,
+            Polarization::Left => 4,
+        }
+    }
+
+    /// `tp->diseqc.value_or(0)`.
+    pub fn src_value(&self) -> i32 {
+        if self.src_specified {
+            i32::from(self.src)
+        } else {
+            0
+        }
+    }
+
+    /// `tp->sys.value_or(SYS_UNDEFINED)` as a `fe_delivery_system_t`.
+    pub fn sys_number(&self) -> i32 {
+        self.msys.number()
+    }
+
+    /// `tp->fe.value_or(0)`.
+    pub fn fe_value(&self) -> i32 {
+        self.fe.unwrap_or(0)
+    }
+
+    /// `tp->fec.value_or(FEC_AUTO)`.
+    pub fn fec_value(&self) -> i32 {
+        if self.fec_specified {
+            i32::from(self.fec)
+        } else {
+            9
+        }
+    }
+
+    /// `tp->mtype.value_or(QAM_AUTO)`.
+    pub fn mtype_value(&self) -> i32 {
+        if self.mtype_specified {
+            self.mtype as i32
+        } else {
+            6
+        }
+    }
+
+    /// `tp->plts.value_or(PILOT_AUTO)`.
+    pub fn plts_number(&self) -> i32 {
+        match self.plts {
+            Some(true) => 0,
+            Some(false) => 1,
+            None => 2,
+        }
+    }
+
+    /// `tp->bw.value_or(8000000)`.
+    pub fn bw_value(&self) -> i32 {
+        self.bw.map_or(8_000_000, |bw| bw as i32)
+    }
+
+    /// `tp->inversion.value_or(INVERSION_AUTO)`.
+    pub fn inversion_value(&self) -> i32 {
+        self.specinv.unwrap_or(2)
+    }
+
+    /// `tp->sr.value_or(0)`.
+    pub fn sr_value(&self) -> i32 {
+        self.sr as i32
+    }
 }
 
 /// Set of PIDs with the C++ `8192` sentinel meaning every PID.

@@ -11,6 +11,7 @@ default = []
 srt = []
 
 [dependencies]
+ms-log = { path = "../ms-log" }
 libc = "0.2"
 
 [lints]

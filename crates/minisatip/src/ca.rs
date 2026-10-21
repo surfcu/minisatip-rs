@@ -30,6 +30,9 @@ use ms_ts::{SectionAssembler, TsStage, crc32_mpeg2};
 use ms_tuner::PidSet;
 use std::collections::BTreeSet;
 
+/// `DEFAULT_LOG` of the `pmt.cpp` sites ported in this module.
+const DEFAULT_LOG: u32 = ms_log::LOG_PMT;
+
 /// `connect_dvbapi` runs from a 1 s timer (dvbapi.cpp).
 const DVBAPI_POLL_MS: i64 = 1000;
 /// `dvbapi_ts` runs the watchdog at most every 100 ms per adapter.
@@ -158,6 +161,7 @@ impl CaRuntime {
     pub fn attach_ddci(&mut self, sched: &mut Scheduler, hub: DdciHub) {
         let sink = DdciSink { hub: hub.clone() };
         let ca_id = sched.add_ca(Box::new(Offering::new(sink, &self.offered)));
+        ms_log::log!("Registered DDCI CA {}", ca_id);
         // ddci_init_dev accepts every adapter.
         for aid in 0..MAX_ADAPTERS {
             sched.init_ca_for_adapter(aid, ca_id);
@@ -303,11 +307,29 @@ impl CaRuntime {
                     self.ddci_cam(aid, |cam, _| cam.enabled = true);
                 }
                 Notice::Caids(aid, caids) => {
+                    // `tables.cpp add_caid_mask` for every supported CAID.
+                    let adapter_known = sched.adapter(aid).is_some();
+                    if !adapter_known {
+                        ms_log::log!("add_caid_mask: No adapter {} found ", aid);
+                    }
                     state.caids.borrow_mut().insert(aid, caids.clone());
                     self.ddci_cam(aid, |cam, masks| {
                         cam.initialized = true;
                         *masks = caids.iter().map(|c| (*c, 0xFFFF)).collect();
                     });
+                    if adapter_known {
+                        for (i, caid) in caids.iter().enumerate() {
+                            ms_log::logl!(
+                                ms_log::LOG_TABLES,
+                                "CA {} can handle CAID {:04X} mask {:04X} on adapter {} at position {}",
+                                state.ca_id,
+                                caid,
+                                0xFFFF,
+                                aid,
+                                i
+                            );
+                        }
+                    }
                 }
                 Notice::Released(ids) => {
                     for pmt_id in ids {
@@ -501,11 +523,11 @@ impl CaRuntime {
                     sched.del_ca(id);
                 }
             }
-            CaEvent::Unsupported { build } => crate::sys::log_error(format_args!(
-                "minisatip: dvbapi: OSCam build {build} is too old, not registering"
-            )),
+            // The C++ `LOG0` is emitted in `dvbapi.cpp`'s SERVER_INFO case.
+            CaEvent::Unsupported { .. } => {}
             CaEvent::SetFilter {
                 id,
+                slot,
                 adapter,
                 pid,
                 filter,
@@ -532,6 +554,14 @@ impl CaRuntime {
                         .insert(fid, (adapter as i32, i32::from(pid)));
                     dvbapi.by_id.insert(id, fid);
                     sched.update_adapter_pids(adapter);
+                } else {
+                    // `dvbapi.cpp` (`#define DEFAULT_LOG LOG_DVBAPI`).
+                    ms_log::logl!(
+                        ms_log::LOG_DVBAPI,
+                        "dvbapi: DMX_SET_FILTER failed, fid {}, index {}",
+                        fid,
+                        slot
+                    );
                 }
             }
             CaEvent::StopFilter { id } => {
@@ -774,6 +804,7 @@ impl EmmAssembler {
         if b[4] == 0 && (0x82..=0x8F).contains(&b[5]) {
             self.data.clear();
         } else if self.data.len() + 183 > Self::MAX {
+            ms_log::log!("assemble_emm: data too large {}", self.data.len() + 184);
             self.data.clear();
             return None;
         }
@@ -786,9 +817,18 @@ impl EmmAssembler {
 /// `getEMMlen`: bytes covered by consecutive 0x80-0x8F sections.
 fn emm_len(b: &[u8]) -> usize {
     let mut i = 0;
+    let mut emms = 0;
     while i + 3 <= b.len() && (0x80..=0x8F).contains(&b[i]) {
         i += ((usize::from(b[i + 1] & 0xF) << 8) | usize::from(b[i + 2])) + 3;
+        emms += 1;
     }
+    ms_log::debugm!(
+        "returning EMM len {} ({:X}) from {}, found {} emms",
+        i,
+        i,
+        b.len(),
+        emms
+    );
     i
 }
 
@@ -813,7 +853,16 @@ impl SectionRouter {
             }
             let emm = f.flags & FILTER_EMM != 0;
             if b[1] & 0x40 != 0 {
-                state.matched = !emm && match_filter(&f.filter, &f.mask, f.flags, &b[5..]);
+                state.matched =
+                    !emm && match_filter(id, f.pid, &f.filter, &f.mask, f.flags, &b[5..]);
+                ms_log::debugm!(
+                    "matching pid {}, filter {}, match {}, flags {}, isEMM {}",
+                    pid,
+                    id,
+                    u8::from(state.matched),
+                    f.flags,
+                    u8::from(emm)
+                );
             }
             if !state.matched && !emm {
                 continue;
@@ -823,6 +872,11 @@ impl SectionRouter {
             } else {
                 state.assembler.assemble_packet(b)
             };
+            ms_log::debugm!(
+                "assemble_packet returned {} for pid {}",
+                assembled.map_or(0, |section| section.len()),
+                pid
+            );
             let Some(section) = assembled else {
                 continue;
             };
@@ -842,7 +896,20 @@ impl SectionRouter {
                 let len =
                     (usize::from(section[i + 1] & 0xF) << 8) + usize::from(section[i + 2]) + 3;
                 let end = (i + len).min(section.len());
-                if match_filter(&f.filter, &f.mask, f.flags, &section[i..end]) {
+                let matched =
+                    match_filter(id, f.pid, &f.filter, &f.mask, f.flags, &section[i..end]);
+                ms_log::debugm!(
+                    "EMM: match {} id: {} len: {}: {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    u8::from(matched),
+                    id,
+                    len,
+                    section.get(i).copied().unwrap_or(0),
+                    section.get(i + 1).copied().unwrap_or(0),
+                    section.get(i + 2).copied().unwrap_or(0),
+                    section.get(i + 3).copied().unwrap_or(0),
+                    section.get(i + 4).copied().unwrap_or(0)
+                );
+                if matched {
                     out.push((id, section[i..end].to_vec()));
                 }
                 i += len;
@@ -866,22 +933,63 @@ impl SectionRouter {
 }
 
 /// `match_filter`: byte 0 is the table id, the rest skips the length field.
-fn match_filter(filter: &[u8; 16], mask: &[u8; 16], flags: i32, b: &[u8]) -> bool {
+fn match_filter(
+    id: i32,
+    pid: i32,
+    filter: &[u8; 16],
+    mask: &[u8; 16],
+    flags: i32,
+    b: &[u8],
+) -> bool {
     let mask_len = mask.iter().rposition(|&m| m != 0).map_or(0, |i| i + 1);
     let mut matched = true;
     for i in 0..mask_len {
         let idx = if i == 0 { 0 } else { i + 2 };
         let want = filter[i] & mask[i];
         if b.get(idx).is_none_or(|&byte| byte & mask[i] != want) {
+            ms_log::debugm!(
+                "filter {}, pid {}, index {} did not match: {:02X} & {:02X} != {:02X} inital filter: {:02X}",
+                id,
+                pid,
+                i,
+                b.get(i + 5).copied().unwrap_or(0),
+                mask[i],
+                want,
+                filter[i]
+            );
             matched = false;
             break;
         }
     }
     if flags & FILTER_REVERSE != 0 {
-        !matched
-    } else {
-        matched
+        matched = !matched;
     }
+    ms_log::debugm!(
+        "filter {}match: id {}: pid {}, flags {}, mask_len {}, filter -> {:02X} {:02X} {:02X} {:02X} {:02X}, mask ->{:02X} {:02X} {:02X} {:02X} {:02X} -> data {:02X} [{:02x} {:02x}] {:02X} {:02X} {:02X} {:02X}",
+        if matched { "" } else { "not " },
+        id,
+        pid,
+        flags,
+        mask_len,
+        filter[0],
+        filter[1],
+        filter[2],
+        filter[3],
+        filter[4],
+        mask[0],
+        mask[1],
+        mask[2],
+        mask[3],
+        mask[4],
+        b.first().copied().unwrap_or(0),
+        b.get(1).copied().unwrap_or(0),
+        b.get(2).copied().unwrap_or(0),
+        b.get(3).copied().unwrap_or(0),
+        b.get(4).copied().unwrap_or(0),
+        b.get(5).copied().unwrap_or(0),
+        b.get(6).copied().unwrap_or(0)
+    );
+    matched
 }
 
 type HwRegistryFactory = Box<dyn Fn(usize, i32, i32) -> CipherRegistry>;
@@ -947,6 +1055,7 @@ impl Dvbapi {
             let spawned = thread::Builder::new()
                 .name("dvbapi-connect".to_owned())
                 .spawn(move || {
+                    ms_log::set_thread_name("dvbapi-connect");
                     let _ = tx.send(transport::connect(&cfg, CONNECT_TIMEOUT));
                 });
             if spawned.is_ok() {
@@ -962,13 +1071,16 @@ impl Dvbapi {
                 Ok(Ok(stream)) => {
                     self.connecting = None;
                     if stream.set_nonblocking(true).is_ok() {
+                        let sock = stream.raw_fd();
                         self.conn = Some(stream);
-                        self.shared.borrow_mut().client.on_connected(now);
+                        let mut shared = self.shared.borrow_mut();
+                        shared.client.set_socket_id(sock);
+                        shared.client.on_connected(now);
                     }
                 }
-                Ok(Err(error)) => {
+                Ok(Err(_)) => {
                     self.connecting = None;
-                    crate::sys::log_error(format_args!("minisatip: dvbapi connect: {error}"));
+                    ms_log::log!("connect_dvbapi: connect to {} failed", self.cfg.host);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.connecting = None,
@@ -1009,7 +1121,16 @@ impl Dvbapi {
             let Some(conn) = self.conn.as_mut() else {
                 break;
             };
-            if write_all(conn, &message).is_err() {
+            if let Err(failure) = write_all(conn, &message) {
+                let sock = self.shared.borrow().client.socket_id();
+                ms_log::log!(
+                    "write to dvbapi socket failed ({} out of {}), closing socket {}, errno {}, error: {}",
+                    failure.written,
+                    failure.total,
+                    sock,
+                    ms_log::errno(&failure.error),
+                    ms_log::strerror(&failure.error)
+                );
                 self.close(now);
                 return;
             }
@@ -1025,20 +1146,42 @@ impl Dvbapi {
     }
 }
 
-fn write_all(conn: &mut Stream, mut data: &[u8]) -> io::Result<()> {
+/// A short or failed write: how much went out (`TEST_WRITE`'s `x`) and why.
+struct WriteFailure {
+    written: usize,
+    total: usize,
+    error: io::Error,
+}
+
+fn write_all(conn: &mut Stream, data: &[u8]) -> Result<(), WriteFailure> {
+    let total = data.len();
+    let mut written = 0;
     let deadline = Instant::now() + WRITE_TIMEOUT;
-    while !data.is_empty() {
-        match conn.write(data) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => data = &data[n..],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+    while written < total {
+        let outcome = conn.write(&data[written..]);
+        let error = match outcome {
+            Ok(0) => Some(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                written += n;
+                None
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => None,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() > deadline {
-                    return Err(io::ErrorKind::TimedOut.into());
+                    Some(io::ErrorKind::TimedOut.into())
+                } else {
+                    thread::sleep(Duration::from_millis(1));
+                    None
                 }
-                thread::sleep(Duration::from_millis(1));
             }
-            Err(e) => return Err(e),
+            Err(e) => Some(e),
+        };
+        if let Some(error) = error {
+            return Err(WriteFailure {
+                written,
+                total,
+                error,
+            });
         }
     }
     Ok(())
@@ -1123,11 +1266,18 @@ mod tests {
         mask[1] = 0xFF;
         mask[2] = 0xFF;
         let section = [0x02, 0xB0, 0x20, 0x00, 0x64, 0xC1];
-        assert!(match_filter(&filter, &mask, 0, &section));
-        assert!(!match_filter(&filter, &mask, FILTER_REVERSE, &section));
+        assert!(match_filter(0, 100, &filter, &mask, 0, &section));
+        assert!(!match_filter(
+            0,
+            100,
+            &filter,
+            &mask,
+            FILTER_REVERSE,
+            &section
+        ));
         let other = [0x02, 0xB0, 0x20, 0x00, 0x65, 0xC1];
-        assert!(!match_filter(&filter, &mask, 0, &other));
-        assert!(match_filter(&[0; 16], &[0; 16], 0, &other));
+        assert!(!match_filter(0, 100, &filter, &mask, 0, &other));
+        assert!(match_filter(0, 100, &[0; 16], &[0; 16], 0, &other));
     }
 }
 

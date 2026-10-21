@@ -20,7 +20,10 @@ pub fn udp_bind_reuse(addr: SocketAddr, bind_dev: Option<&str>) -> io::Result<Ud
     // SAFETY: socket(2) is called with valid constants and the result checked.
     let fd = unsafe { libc::socket(family_of(addr), libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // socketworks.cpp:262-265.
+        ms_log::log!("udp_bind failed: socket(): {}", ms_log::strerror(&error));
+        return Err(error);
     }
     let result = (|| {
         // C++ closes the socket when set_socket_bind_dev returns -1
@@ -33,16 +36,36 @@ pub fn udp_bind_reuse(addr: SocketAddr, bind_dev: Option<&str>) -> io::Result<Ud
                 format!("cannot bind UDP socket to {dev}"),
             ));
         }
-        set_socket_int(fd, libc::SO_REUSEADDR, 1)?;
-        // C++ only logs a failure here (socketworks.cpp:299-304).
-        let _ = set_socket_int(fd, libc::SO_REUSEPORT, 1);
+        if let Err(error) = set_socket_int(fd, libc::SO_REUSEADDR, 1) {
+            // socketworks.cpp:293-298.
+            ms_log::log!(
+                "udp_bind failed: setsockopt(SO_REUSEADDR): {}",
+                ms_log::strerror(&error)
+            );
+            return Err(error);
+        }
+        // C++ only logs a failure here (socketworks.cpp:300-302).
+        if let Err(error) = set_socket_int(fd, libc::SO_REUSEPORT, 1) {
+            ms_log::log!(
+                "setsockopt failed to set SO_REUSEPORT {}",
+                ms_log::strerror(&error)
+            );
+        }
         // SAFETY: the storage is filled by `sockaddr_storage_of` and passed
         // with its matching length.
         let (storage, length) = sockaddr_storage_of(addr);
         let bound =
             unsafe { libc::bind(fd, (&raw const storage).cast::<libc::sockaddr>(), length) };
         if bound < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            // socketworks.cpp:316-321.
+            ms_log::log!(
+                "udp_bind: failed: bind() on host {} port {}: error {}",
+                addr.ip(),
+                addr.port(),
+                ms_log::strerror(&error)
+            );
+            return Err(error);
         }
         Ok(())
     })();
@@ -51,6 +74,17 @@ pub fn udp_bind_reuse(addr: SocketAddr, bind_dev: Option<&str>) -> io::Result<Ud
         unsafe { libc::close(fd) };
         return Err(error);
     }
+    // socketworks.cpp:326-329. The Rust helper never joins a multicast group,
+    // so the three multicast suffixes are always empty.
+    ms_log::log!(
+        "New UDP socket {} bound to {}:{} {}{}{}",
+        fd,
+        addr.ip(),
+        addr.port(),
+        "",
+        "",
+        ""
+    );
     // SAFETY: the descriptor was created above and is transferred to the socket.
     Ok(unsafe { UdpSocket::from_raw_fd(fd) })
 }
@@ -63,7 +97,10 @@ pub fn tcp_listen(addr: SocketAddr, bind_dev: Option<&str>) -> io::Result<TcpLis
     // SAFETY: socket(2) is called with valid constants and the result checked.
     let fd = unsafe { libc::socket(family_of(addr), libc::SOCK_STREAM, libc::IPPROTO_IP) };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // socketworks.cpp:475-478.
+        ms_log::log!("tcp_listen failed: socket(): {}", ms_log::strerror(&error));
+        return Err(error);
     }
     let result = (|| {
         if let Some(dev) = bind_dev
@@ -74,18 +111,38 @@ pub fn tcp_listen(addr: SocketAddr, bind_dev: Option<&str>) -> io::Result<TcpLis
                 format!("cannot bind TCP socket to {dev}"),
             ));
         }
-        set_socket_int(fd, libc::SO_REUSEADDR, 1)?;
+        if let Err(error) = set_socket_int(fd, libc::SO_REUSEADDR, 1) {
+            // socketworks.cpp:483-488.
+            ms_log::log!(
+                "tcp_listen failed: setsockopt(SO_REUSEADDR): {}",
+                ms_log::strerror(&error)
+            );
+            return Err(error);
+        }
         // SAFETY: the storage is filled by `sockaddr_storage_of` and passed
         // with its matching length.
         let (storage, length) = sockaddr_storage_of(addr);
         let bound =
             unsafe { libc::bind(fd, (&raw const storage).cast::<libc::sockaddr>(), length) };
         if bound < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            // socketworks.cpp:490-497. With no original host string the Rust
+            // helper prints the concrete address twice.
+            ms_log::log!(
+                "tcp_listen: failed: bind() on address: {} [{}], port {} : error {}",
+                addr.ip(),
+                addr.ip(),
+                addr.port(),
+                ms_log::strerror(&error)
+            );
+            return Err(error);
         }
         // SAFETY: a successfully bound stream socket accepts a listen call.
         if unsafe { libc::listen(fd, 10) } < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            // socketworks.cpp:498-501.
+            ms_log::log!("tcp_listen: listen() error: {}", ms_log::strerror(&error));
+            return Err(error);
         }
         Ok(())
     })();
@@ -94,6 +151,14 @@ pub fn tcp_listen(addr: SocketAddr, bind_dev: Option<&str>) -> io::Result<TcpLis
         unsafe { libc::close(fd) };
         return Err(error);
     }
+    // socketworks.cpp:503-504.
+    ms_log::log!(
+        "New TCP listening socket {} at {}:{}, family {}",
+        fd,
+        addr.ip(),
+        addr.port(),
+        family_of(addr)
+    );
     // SAFETY: the descriptor was created above and is transferred to the listener.
     Ok(unsafe { TcpListener::from_raw_fd(fd) })
 }
@@ -123,16 +188,30 @@ pub fn set_socket_send_buffer(fd: RawFd, len: libc::c_int) {
         )
     };
     if forced != 0 {
+        // socketworks.cpp:1145-1147.
+        ms_log::log!("unable to set output socket buffer (force) size to {}", len);
         // SAFETY: same as above; the return value is only checked for fallback.
-        unsafe {
+        let result = unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
                 (&raw const len).cast(),
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+            )
+        };
+        if result != 0 {
+            // socketworks.cpp:1148-1149.
+            ms_log::log!("unable to set output socket buffer size to {}", len);
         }
+    }
+    // socketworks.cpp:1150-1152.
+    if let Ok(size) = socket_send_buffer(fd) {
+        ms_log::log!(
+            "output socket buffer size for socket {} is {} bytes",
+            fd,
+            size
+        );
     }
 }
 
@@ -141,21 +220,32 @@ pub fn set_socket_send_buffer(fd: RawFd, len: libc::c_int) {
 pub fn set_socket_dscp(fd: RawFd, dscp: libc::c_int, priority: libc::c_int) {
     let tos = dscp & IPTOS_DSCP_MASK_VALUE;
     // SAFETY: `tos` is a valid c_int of the given size.
-    unsafe {
+    let tos_result = unsafe {
         libc::setsockopt(
             fd,
             libc::IPPROTO_IP,
             libc::IP_TOS,
             (&raw const tos).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+        )
+    };
+    if tos_result != 0 {
+        // socketworks.cpp:1622-1623, __FUNCTION__ is `set_socket_dscp`.
+        ms_log::log!("set_socket_dscp: setsockopt IP_TOS failed");
+    }
+    // SAFETY: `priority` is a valid c_int of the given size.
+    let priority_result = unsafe {
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_PRIORITY,
             (&raw const priority).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+        )
+    };
+    if priority_result != 0 {
+        // socketworks.cpp:1627-1628.
+        ms_log::log!("set_socket_dscp: setsockopt SO_PRIORITY failed");
     }
 }
 
@@ -186,6 +276,8 @@ pub fn join_multicast_v4(fd: RawFd, group: Ipv4Addr, interface: Ipv4Addr) -> io:
         imr_multiaddr: in_addr(group),
         imr_interface: in_addr(interface),
     };
+    // socketworks.cpp:280.
+    ms_log::log!("setting multicast for {group}");
     // SAFETY: `request` is a valid ip_mreq of exactly the given size.
     let result = unsafe {
         libc::setsockopt(
@@ -197,7 +289,10 @@ pub fn join_multicast_v4(fd: RawFd, group: Ipv4Addr, interface: Ipv4Addr) -> io:
         )
     };
     if result < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // socketworks.cpp:282-284.
+        ms_log::log!("membership error: {}", ms_log::strerror(&error));
+        return Err(error);
     }
     Ok(())
 }
@@ -216,7 +311,10 @@ pub fn set_multicast_if(fd: RawFd, interface: Ipv4Addr) -> io::Result<()> {
         )
     };
     if result < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // socketworks.cpp:288-291.
+        ms_log::log!("multicast if error: {}", ms_log::strerror(&error));
+        return Err(error);
     }
     Ok(())
 }
@@ -386,10 +484,24 @@ impl BindDevOps for RawBindDev {
         if result == 0 {
             return BindDevStatus::Applied;
         }
-        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let error = io::Error::last_os_error();
+        let errno = ms_log::errno(&error);
         if errno == libc::EPERM || errno == libc::EACCES {
+            // socketworks.cpp:190-193.
+            ms_log::log!(
+                "No permission to bind socket {} to {}, using IP binding",
+                self.fd,
+                dev
+            );
             BindDevStatus::Degraded
         } else {
+            // socketworks.cpp:195-196.
+            ms_log::log!(
+                "Failed to bind socket {} to device {}: {}",
+                self.fd,
+                dev,
+                ms_log::strerror(&error)
+            );
             BindDevStatus::Failed
         }
     }

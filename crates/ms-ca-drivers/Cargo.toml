@@ -13,6 +13,7 @@ dvbcsa = []
 dvbcsa-icam = ["dvbcsa"]
 
 [dependencies]
+ms-log = { path = "../ms-log" }
 ms-ca = { path = "../ms-ca" }
 ms-config = { path = "../ms-config" }
 ms-tuner = { path = "../ms-tuner" }

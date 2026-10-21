@@ -12,6 +12,7 @@ srt = ["dep:ms-srt", "ms-srt/srt"]
 
 [dependencies]
 libc = "0.2"
+ms-log = { path = "../ms-log" }
 ms-sched = { path = "../ms-sched" }
 ms-srt = { path = "../ms-srt", optional = true }
 ms-tuner = { path = "../ms-tuner" }

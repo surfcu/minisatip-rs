@@ -1,6 +1,7 @@
 //! TCP/UDP address selection helpers, testable without kernel sockets.
 
 use std::fmt;
+use std::io;
 use std::net::IpAddr;
 
 /// Address family used for a socket.
@@ -116,8 +117,15 @@ pub fn udp_bind_connect<O: SocketOps + ?Sized>(
     let dest_family = parse_family(dest).ok_or(TransportError::Unresolved)?;
     let sock = udp_bind(ops, src, sport, dest_family == IpFamily::V4)?;
     if !ops.connect(sock, dest, dport) {
+        // socketworks.cpp:342-346.
+        ms_log::log!(
+            "udp_bind_connect: failed: bind(): {}",
+            ms_log::strerror(&io::Error::last_os_error())
+        );
         return Err(TransportError::Connect);
     }
+    // socketworks.cpp:347-349.
+    ms_log::log!("New UDP socket {} connected to {}:{}", sock, dest, dport);
     Ok(sock)
 }
 
@@ -130,20 +138,76 @@ pub fn tcp_connect_src<O: SocketOps + ?Sized>(
     ipv4_only: bool,
 ) -> Result<u32, TransportError> {
     let (family, _) = bind_address(Some(dest), ipv4_only)?;
-    let sock = ops.socket(family).ok_or(TransportError::Socket)?;
+    let sock = match ops.socket(family) {
+        Some(sock) => sock,
+        None => {
+            // socketworks.cpp:402-405.
+            ms_log::log!(
+                "tcp_connect failed: socket() {}",
+                ms_log::strerror(&io::Error::last_os_error())
+            );
+            return Err(TransportError::Socket);
+        }
+    };
     if !ops.set_reuseaddr(sock) {
+        // socketworks.cpp:411-416.
+        ms_log::log!(
+            "tcp_connect: setsockopt(SO_REUSEADDR): {}",
+            ms_log::strerror(&io::Error::last_os_error())
+        );
         return Err(TransportError::Options);
     }
     if let Some(src) = src.filter(|value| !value.is_empty()) {
         let src_family = parse_family(src).ok_or(TransportError::Unresolved)?;
-        if src_family == family && !ops.bind(sock, src, 0) {
-            return Err(TransportError::Source);
+        if src_family == family {
+            if !ops.bind(sock, src, 0) {
+                // socketworks.cpp:439-444.
+                ms_log::log!(
+                    "tcp_connect_src: failed: bind() on address: {}: error {}",
+                    src,
+                    ms_log::strerror(&io::Error::last_os_error())
+                );
+                return Err(TransportError::Source);
+            }
+        } else {
+            // socketworks.cpp:436-438.
+            ms_log::log!(
+                "tcp_connect_src: ignoring source {} (family {}) for family {} socket",
+                src,
+                family_code(src_family),
+                family_code(family)
+            );
         }
     }
     if !ops.connect(sock, dest, port) {
+        // socketworks.cpp:447-456.
+        let error = io::Error::last_os_error();
+        let errno = ms_log::errno(&error);
+        let message = if errno == 11 {
+            "connect timed out".to_owned()
+        } else {
+            ms_log::strerror(&error)
+        };
+        ms_log::log!(
+            "tcp_connect: failed: connect to {}:{} failed with errno {}: {}",
+            dest,
+            port,
+            errno,
+            message
+        );
         return Err(TransportError::Connect);
     }
+    // socketworks.cpp:458.
+    ms_log::log!("New TCP socket {} connected to {}:{}", sock, dest, port);
     Ok(sock)
+}
+
+/// Numeric address family used by the C++ `%d` family logs.
+fn family_code(family: IpFamily) -> i32 {
+    match family {
+        IpFamily::V4 => libc::AF_INET,
+        IpFamily::V6 => libc::AF_INET6,
+    }
 }
 
 /// Connects a TCP socket without a source address.

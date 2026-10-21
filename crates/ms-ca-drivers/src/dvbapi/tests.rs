@@ -729,6 +729,7 @@ fn filter_events_stop_and_emm_flag() {
         filter,
         mask,
         emm,
+        ..
     }) = client.next_event()
     else {
         panic!("no filter event");

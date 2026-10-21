@@ -25,6 +25,22 @@ impl Stream {
             Self::Unix(s) => s.set_nonblocking(nonblocking),
         }
     }
+
+    /// Descriptor of the connection (the C++ `sock`), -1 where unavailable.
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> i32 {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            Self::Tcp(s) => s.as_raw_fd(),
+            Self::Unix(s) => s.as_raw_fd(),
+        }
+    }
+
+    /// Descriptor of the connection (the C++ `sock`), -1 where unavailable.
+    #[cfg(not(unix))]
+    pub fn raw_fd(&self) -> i32 {
+        -1
+    }
 }
 
 impl Read for Stream {

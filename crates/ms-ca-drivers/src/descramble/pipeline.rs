@@ -7,6 +7,9 @@ use ms_config::DropEncrypted;
 
 use super::cipher::{Cipher, CipherRegistry, KeyMaterial};
 
+/// `DEFAULT_LOG` of `pmt.cpp` (`#define DEFAULT_LOG LOG_PMT`).
+const DEFAULT_LOG: u32 = ms_log::LOG_PMT;
+
 /// TS packet size (`DVB_FRAME`).
 pub const DVB_FRAME: usize = 188;
 /// CW slots per descrambler (`MAX_CW`).
@@ -125,7 +128,13 @@ pub fn test_decrypt_packets(
 ) -> bool {
     let mut copy = packets.concat();
     let offsets: Vec<usize> = (0..packets.len()).map(|i| i * DVB_FRAME).collect();
+    for packet in packets {
+        ms_log::hexdump!("test_decrypt_packet before: ", packet);
+    }
     cipher.decrypt(key, &mut payloads(&mut copy, &offsets));
+    for packet in copy.as_chunks::<DVB_FRAME>().0 {
+        ms_log::hexdump!("test_decrypt_packet after: ", packet);
+    }
     copy.as_chunks::<DVB_FRAME>().0.iter().any(|b| {
         let p = &b[adaptation_len(b)..];
         p.len() >= 3 && p[..3] == [0, 0, 1]
@@ -172,6 +181,45 @@ fn mark_pcr_only(b: &mut [u8]) {
     b[3] &= 0x2F;
     b[5] |= 0x80;
     b[5] &= 0x9F;
+}
+
+/// `cw_to_string`: the human-readable form of one CW slot.
+fn cw_to_string(id: usize, cw: &CwSlot, now: i64) -> String {
+    let mut out = format!(
+        "id {}, parity {}, pmt {},{} time {} ms ago, expiry in {} ms, CW: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+        id,
+        cw.parity,
+        cw.pmt,
+        if cw.algo == CwAlgo::CsaIcam {
+            " ICAM,"
+        } else {
+            ""
+        },
+        now - cw.time,
+        cw.expiry - now,
+        cw.key.cw[0],
+        cw.key.cw[1],
+        cw.key.cw[2],
+        cw.key.cw[3],
+        cw.key.cw[4],
+        cw.key.cw[5],
+        cw.key.cw[6],
+        cw.key.cw[7]
+    );
+    if cw.key.iv[0] != 0 {
+        out.push_str(&format!(
+            ", IV: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+            cw.key.iv[0],
+            cw.key.iv[1],
+            cw.key.iv[2],
+            cw.key.iv[3],
+            cw.key.iv[4],
+            cw.key.iv[5],
+            cw.key.iv[6],
+            cw.key.iv[7]
+        ));
+    }
+    out
 }
 
 impl Descrambler {
@@ -328,6 +376,22 @@ impl Descrambler {
         }
     }
 
+    /// `dump_cws`: logs every live CW slot.
+    fn dump_cws(&self, now: i64) {
+        if !ms_log::enabled(ms_log::LOG_GENERAL) {
+            return;
+        }
+        ms_log::log!("List of CWs:");
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(s) = slot
+                && s.enabled
+                && s.expiry > now
+            {
+                ms_log::log!("* CW {}: {}", i, cw_to_string(i, s, now));
+            }
+        }
+    }
+
     fn cw_in_use(&self, slot: usize, pmt: usize) -> bool {
         self.services.get(&pmt).is_some_and(|s| s.cw == Some(slot))
     }
@@ -346,21 +410,43 @@ impl Descrambler {
         now: i64,
     ) -> Result<usize, SendCwError> {
         if !self.services.contains_key(&pmt_id) {
-            return Err(SendCwError::PmtNotFound);
+            ms_log::log_and_return!(
+                Err(SendCwError::PmtNotFound),
+                "send_cw: pmt not found {}",
+                pmt_id
+            );
         }
-        let factory = self.registry.get(algo).ok_or(SendCwError::NoAlgo)?;
+        let Some(factory) = self.registry.get(algo) else {
+            ms_log::log_and_return!(
+                Err(SendCwError::NoAlgo),
+                "op not found for algo {}",
+                crate::algo::Algo::from(algo).raw()
+            );
+        };
         let mut bytes = [0u8; 32];
         let n = cw.len().min(32);
         bytes[..n].copy_from_slice(&cw[..n]);
-        let duplicate = self.slots.iter().flatten().any(|s| {
-            s.enabled
+        let mut duplicate = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(s) = slot
+                && s.enabled
                 && s.pmt == pmt_id
                 && s.parity == parity
                 && now < s.expiry
                 && bytes[..s.key.cw_len] == s.key.cw[..s.key.cw_len]
-        });
-        if duplicate {
-            return Err(SendCwError::Duplicate);
+            {
+                duplicate = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = duplicate {
+            let desc = cw_to_string(i, self.slots[i].as_ref().expect("matched slot"), now);
+            ms_log::log_and_return!(
+                Err(SendCwError::Duplicate),
+                "cw already exist at position {}: {} ",
+                i,
+                desc
+            );
         }
 
         let free = (0..MAX_CW).find(|&i| match self.slots.get(i) {
@@ -370,6 +456,8 @@ impl Descrambler {
             }
         });
         let Some(id) = free else {
+            ms_log::log!("CWS is full {}", MAX_CW);
+            self.dump_cws(now);
             return Err(SendCwError::Full);
         };
         if id >= self.slots.len() {
@@ -479,21 +567,39 @@ impl Descrambler {
             }
             if validated {
                 if test_decrypt_packets(s.cipher.as_mut(), &s.key, &starts) {
+                    ms_log::logm!(
+                        "correct CW found (len {}): {}",
+                        starts.len(),
+                        cw_to_string(i, s, now)
+                    );
                     found = Some((i, s.time));
                     break;
                 }
                 continue;
             }
             // Unverifiable (parity change without PUSI): the newest CW wins.
-            if found.is_none_or(|(_, t)| t < s.time) {
-                found = Some((i, s.time));
+            match found {
+                None => {
+                    ms_log::logm!("candidate CW {}", cw_to_string(i, s, now));
+                    found = Some((i, s.time));
+                }
+                Some((_, time)) if time < s.time => {
+                    ms_log::logm!("New candidate found: {}", cw_to_string(i, s, now));
+                    found = Some((i, s.time));
+                }
+                _ => {}
             }
         }
 
-        let service = self.services.get_mut(&pmt_id).expect("present");
-        service.update_cw = !validated;
-        let Some((id, _)) = found else { return };
-        service.cw = Some(id);
+        self.services.get_mut(&pmt_id).expect("present").update_cw = !validated;
+        let Some((id, _)) = found else {
+            // `if (opts.debug & LOG_PMT) dump_cws();`
+            if ms_log::debug_enabled(DEFAULT_LOG) {
+                self.dump_cws(now);
+            }
+            return;
+        };
+        self.services.get_mut(&pmt_id).expect("present").cw = Some(id);
         let active = self.slots[id].as_mut().expect("found slot");
         if active.set_time == 0 {
             active.set_time = now;
@@ -510,8 +616,16 @@ impl Descrambler {
                     && s.set_time > 0
                 {
                     s.expiry = now + REPLACED_CW_EXPIRY;
+                    ms_log::log!(
+                        "Expiring CW {} for pmt {}: {}",
+                        i,
+                        pmt_id,
+                        cw_to_string(i, s, now)
+                    );
                 }
             }
+        } else if ms_log::debug_enabled(DEFAULT_LOG) {
+            self.dump_cws(now);
         }
     }
 
@@ -551,8 +665,18 @@ impl Descrambler {
             if b[0] != 0x47 || b[3] & 0x80 == 0 {
                 continue;
             }
-            let pmt = self.pid_pmt[pid_of(b) as usize];
+            let pid = pid_of(b);
+            let pmt = self.pid_pmt[pid as usize];
             if pmt == NO_PMT {
+                // `p ? p->pmt : -3`: `pid_pmt` keeps no entry for untracked
+                // pids, so the C++ default is what remains.
+                ms_log::debugm!(
+                    "PMT not found for pid {}, id {}, packet {}, pos {}",
+                    pid,
+                    -3,
+                    off / DVB_FRAME,
+                    off
+                );
                 continue;
             }
             let pmt = pmt as usize;
@@ -585,10 +709,24 @@ impl Descrambler {
     /// Handles packets still scrambled after decrypting (`mark_pids_null`).
     pub fn mark_pids_null(&mut self, buf: &mut [u8], drop: DropEncrypted, pids_all: bool) {
         let len = buf.len() / DVB_FRAME * DVB_FRAME;
-        for b in buf[..len].as_chunks_mut::<DVB_FRAME>().0 {
+        for (packet, b) in buf[..len]
+            .as_chunks_mut::<DVB_FRAME>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
             let pid = pid_of(b);
             if pid == 0x1FFF || pids_all || b[3] & 0x80 == 0 {
                 continue;
+            }
+            // `opts.debug & (DEFAULT_LOG | LOG_DMX)`.
+            if ms_log::debug_enabled(DEFAULT_LOG | ms_log::LOG_DMX) {
+                ms_log::log!(
+                    "Marking PID {} packet {} pos {} as NULL",
+                    pid,
+                    packet,
+                    packet * DVB_FRAME
+                );
             }
             match drop {
                 DropEncrypted::Drop if has_pcr(b) => mark_pcr_only(b),

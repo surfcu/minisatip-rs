@@ -15,6 +15,9 @@ use ms_psi::{CrcCheck, Pmt as ParsedPmt};
 
 use crate::{AdapterType, PidEntry, PidState, Scheduler, StreamId};
 
+/// `DEFAULT_LOG` of `pmt.cpp` (`#define DEFAULT_LOG LOG_PMT`).
+const DEFAULT_LOG: u32 = ms_log::LOG_PMT;
+
 /// PMT slots (`MAX_PMT`).
 pub const MAX_PMT: usize = 25_600;
 /// CA descriptors kept per PMT (`MAX_CAID`).
@@ -325,7 +328,7 @@ impl Scheduler {
     /// Allocates a PMT slot (`pmt_add`).
     pub fn pmt_add(&mut self, adapter: i32, sid: i32, pmt_pid: i32) -> i32 {
         let Some(slot) = self.pmt.pmts.iter().position(|pmt| !pmt.allocated) else {
-            return -1;
+            ms_log::log_and_return!(-1, "PMT buffer is full, could not add new pmts");
         };
         let id = slot as i32;
         let pmt = &mut self.pmt.pmts[slot];
@@ -348,6 +351,14 @@ impl Scheduler {
         pmt.ca.clear();
         pmt.descriptors.clear();
         pmt.stream_pids.clear();
+        ms_log::log!(
+            "returning new pmt {} for adapter {}, pmt pid {}, sid {} {:04X}",
+            id,
+            adapter,
+            pmt_pid,
+            sid,
+            sid
+        );
         id
     }
 
@@ -356,6 +367,7 @@ impl Scheduler {
         let Some(pmt) = self.pmt(id) else {
             return;
         };
+        ms_log::log!("deleting PMT {}, name {} ", pmt.id, pmt.name);
         let adapter = pmt.adapter;
         self.close_pmt_for_cas(adapter, id);
         let (allocated, filter) = {
@@ -402,6 +414,11 @@ impl Scheduler {
             return;
         }
         if adapter.active_pmts >= crate::MAX_PMT_FOR_ADAPTER {
+            ms_log::log!(
+                "adapter {} active PMT list full, dropping PMT {}",
+                aid,
+                pmt_id
+            );
             return;
         }
         adapter.active_pmt[adapter.active_pmts] = pmt_id;
@@ -448,11 +465,27 @@ impl Scheduler {
             .iter()
             .any(|ca| ca.id == caid && ca.pid == capid)
         {
+            ms_log::logm!(
+                "pmt_add_caid: CAID {:04X} CAPID {} already exists in PMT {}",
+                caid,
+                capid,
+                pmt_id
+            );
             return;
         }
         if pmt.caids >= MAX_CAID {
+            ms_log::log!("Too many CAIDs for pmt {}, discarding {:04X}", pmt_id, caid);
             return;
         }
+        ms_log::log!(
+            "PMT {} PI pos {} caid {:04X} => pid {:04X} ({}), index {}",
+            pmt_id,
+            pmt.caids + 1,
+            caid,
+            capid,
+            capid,
+            pmt.caids
+        );
         if pmt.ca.len() <= pmt.caids {
             pmt.ca.push(PmtCa::default());
         }
@@ -503,6 +536,12 @@ impl Scheduler {
                 .pmt_slot(pmt_id)
                 .is_some_and(|pmt| pmt.descriptors.contains(&entry));
             if duplicate {
+                ms_log::logm!(
+                    "PMT {} already has descriptor with type {}, len {}",
+                    pmt_id,
+                    entry.tag,
+                    entry.data.len()
+                );
                 continue;
             }
             if let Some(pmt) = self.pmt_slot_mut(pmt_id) {
@@ -524,6 +563,13 @@ impl Scheduler {
                 .and_then(|pmt| pmt.stream_pids.iter().find(|stream| stream.pid == pid))
                 .is_some_and(|stream| stream.descriptors.contains(&entry));
             if duplicate {
+                ms_log::logm!(
+                    "PMT {} pid {} already has descriptor with type {}, len {}",
+                    pmt_id,
+                    pid,
+                    entry.tag,
+                    entry.data.len()
+                );
                 continue;
             }
             if let Some(stream) = self
@@ -750,6 +796,11 @@ impl Scheduler {
             if !matches!(old.state, PmtState::Running | PmtState::Starting) {
                 continue;
             }
+            ms_log::log!(
+                "PMT {} takes over from lower-priority PMT {}",
+                pmt_id,
+                old_id
+            );
             self.stop_pmt(old_id);
             self.release_pmt_claims(aid, old_id);
         }
@@ -817,6 +868,7 @@ impl Scheduler {
                 continue;
             }
             if !pmt.best {
+                ms_log::log!("Stopping started PMT {}: {}", id, pmt.name);
                 self.stop_pmt(id);
                 self.release_pmt_claims(aid, id);
             }
@@ -842,6 +894,7 @@ impl Scheduler {
                     continue;
                 }
                 if entry.pmt >= 0 {
+                    let holder_id = entry.pmt;
                     let holder_order = self
                         .pmt(entry.pmt)
                         .and_then(|holder| self.find_pid(aid, holder.pid))
@@ -850,11 +903,13 @@ impl Scheduler {
                     if order >= holder_order {
                         continue;
                     }
+                    ms_log::logm!("PMT {} steals pid {} from PMT {}", id, pid, holder_id);
                 }
                 if let Some(entry) = self.find_pid_mut(aid, pid) {
                     entry.pmt = id;
                     entry.is_decrypted = false;
                 }
+                ms_log::logm!("PMT {} claimed pid {}", id, pid);
                 if state != PmtState::Stopped {
                     self.tables_add_pid(id, pid);
                 }
@@ -906,7 +961,17 @@ impl Scheduler {
     /// Starts a PMT and arms its section filter (`start_pmt`).
     pub fn start_pmt(&mut self, id: i32) {
         let (filter, adapter) = match self.pmt(id) {
-            Some(pmt) => (pmt.filter, pmt.adapter),
+            Some(pmt) => {
+                ms_log::logm!(
+                    "starting PMT {}, pid {}, sid {}, filter {} for channel: {}",
+                    pmt.id,
+                    pmt.pid,
+                    pmt.sid,
+                    pmt.filter,
+                    pmt.name
+                );
+                (pmt.filter, pmt.adapter)
+            }
             None => return,
         };
         if let Some(pmt) = self.pmt_slot_mut(id) {
@@ -920,13 +985,23 @@ impl Scheduler {
 
     /// Stops a PMT and closes its CA registrations (`stop_pmt`).
     pub fn stop_pmt(&mut self, id: i32) {
-        let (state, filter, adapter) = match self.pmt(id) {
-            Some(pmt) => (pmt.state, pmt.filter, pmt.adapter),
+        let (filter, adapter) = match self.pmt(id) {
+            Some(pmt) => {
+                if pmt.state == PmtState::Stopped {
+                    return;
+                }
+                ms_log::logm!(
+                    "stopping PMT {} pid {} sid {} filter {} for channel {}",
+                    pmt.id,
+                    pmt.pid,
+                    pmt.sid,
+                    pmt.filter,
+                    pmt.name
+                );
+                (pmt.filter, pmt.adapter)
+            }
             None => return,
         };
-        if state == PmtState::Stopped {
-            return;
-        }
         if let Some(pmt) = self.pmt_slot_mut(id) {
             pmt.state = PmtState::Stopping;
         }
@@ -957,6 +1032,7 @@ impl Scheduler {
                 continue;
             }
             if self.live_av(id) {
+                ms_log::log!("PMT {} keeps running without pid {}", id, pid);
                 continue;
             }
             self.stop_pmt(id);
@@ -969,17 +1045,39 @@ impl Scheduler {
         if pmt_id < 0 {
             return;
         }
-        self.tables_del_pid(pmt_id, pid);
-        let streams: Vec<i32> = match self.pmt(pmt_id) {
-            Some(pmt) => pmt.stream_pids.iter().map(|stream| stream.pid).collect(),
+        let (pmt_pid, streams): (i32, Vec<i32>) = match self.pmt(pmt_id) {
+            Some(pmt) => {
+                ms_log::logm!(
+                    "pmt_pid_del: pid {} adapter {} pmt {}, channel {}",
+                    pid,
+                    aid,
+                    pmt_id,
+                    pmt.name
+                );
+                (
+                    pmt.pid,
+                    pmt.stream_pids.iter().map(|stream| stream.pid).collect(),
+                )
+            }
             None => return,
         };
-        let other_live = streams.into_iter().any(|stream_pid| {
-            stream_pid != pid
+        self.tables_del_pid(pmt_id, pid);
+        let mut other_live = false;
+        for stream_pid in streams {
+            if stream_pid != pid
                 && self
                     .find_pid(aid, stream_pid)
                     .is_some_and(|entry| matches!(entry.state, PidState::Active | PidState::New))
-        });
+            {
+                ms_log::logm!(
+                    "found active pid {} for pmt id {}, pid {}",
+                    stream_pid,
+                    pmt_id,
+                    pmt_pid
+                );
+                other_live = true;
+            }
+        }
         if !other_live {
             self.stop_pmt(pmt_id);
             self.release_pmt_claims(aid, pmt_id);
@@ -1025,15 +1123,26 @@ impl Scheduler {
                     if existing.contains(&(stream, sid)) {
                         continue;
                     }
+                    ms_log::log!(
+                        "emulate_add_all_pids: adding pid {} sid {} to emulate all pids",
+                        stream,
+                        sid
+                    );
                     self.mark_pid_add(aid, sid, stream);
                 }
             }
             for enforced in [0, 1, 16, 17, 18, 20, 21] {
                 if !existing.contains(&(enforced, sid)) {
+                    ms_log::log!(
+                        "emulate_add_all_pids: adding (enforced) pid {} sid {} to emulate all pids",
+                        enforced,
+                        sid
+                    );
                     self.mark_pid_add(aid, sid, enforced);
                 }
             }
             if !existing.contains(&(8191, sid)) {
+                ms_log::log!("emulate_add_all_pids: adding (enforced) pid 8191 (NULL) too");
                 self.mark_pid_add(aid, sid, 8191);
             }
         }
@@ -1080,7 +1189,9 @@ impl Scheduler {
             .is_some_and(Option::is_some);
         if let Some(adapter) = self.adapter_mut(aid)
             && registered
+            && adapter.ca_mask & (1u64 << ca) == 0
         {
+            ms_log::logl!(ms_log::LOG_TABLES, "CA {} will handle adapter {}", ca, aid);
             adapter.ca_mask |= 1u64 << ca;
         }
     }
@@ -1178,6 +1289,18 @@ impl Scheduler {
         if pmt.caids == 0 {
             return;
         }
+        let (sent, disabled) = (pmt.ca_mask, pmt.disabled_ca_mask);
+        let ad_ca = self
+            .adapter_index(aid)
+            .and_then(|index| self.adapters[index].as_ref())
+            .map_or(u32::MAX - 1, |adapter| adapter.ca_mask as u32);
+        ms_log::log!(
+            "Sending PMT {} to all CAs: ad_ca_mask {:X}, pmt_ca_mask {:X}, disabled_ca_mask {:X}",
+            pmt_id,
+            ad_ca,
+            sent,
+            disabled
+        );
         for slot in 0..self.pmt.ca.len() {
             self.send_pmt_to_ca(slot as i32, aid, pmt_id);
         }
@@ -1212,7 +1335,17 @@ impl Scheduler {
             return;
         };
         let update = registered & mask != 0;
-        let result = if sink.accepts_service(&service) {
+        let accepted = sink.accepts_service(&service);
+        if accepted {
+            ms_log::logl!(
+                ms_log::LOG_TABLES,
+                "PMT {} -> CA {}: {}",
+                pmt_id,
+                slot,
+                if update { "update" } else { "add" }
+            );
+        }
+        let result = if accepted {
             sink.add_pmt(&service, update)
         } else {
             TablesResult::NoRetry
@@ -1238,6 +1371,26 @@ impl Scheduler {
         if stale {
             self.close_pmt_for_ca(slot, aid, pmt_id);
         }
+        if accepted {
+            let result_code = match result {
+                TablesResult::Ok => 0,
+                TablesResult::Retry => 1,
+                TablesResult::NoRetry => 2,
+            };
+            if let Some(pmt) = self.pmt(pmt_id) {
+                ms_log::logl!(
+                    ms_log::LOG_TABLES,
+                    "In processing PMT {}, ca {}, CA matched {}, update {}, ca_pmt_add returned {}, new ca_mask {} new disabled_ca_mask {}",
+                    pmt_id,
+                    slot,
+                    1,
+                    u8::from(update),
+                    result_code,
+                    pmt.ca_mask,
+                    pmt.disabled_ca_mask
+                );
+            }
+        }
     }
 
     fn close_pmt_for_ca(&mut self, slot: i32, aid: i32, pmt_id: i32) {
@@ -1257,6 +1410,13 @@ impl Scheduler {
         if adapter.ca_mask & mask == 0 || !registered {
             return;
         }
+        ms_log::logl!(
+            ms_log::LOG_TABLES,
+            "Closing pmt {} for ca {} and adapter {}",
+            pmt_id,
+            slot,
+            aid
+        );
         let Some(Some(sink)) = self.pmt.ca.get_mut(slot as usize) else {
             return;
         };
@@ -1276,6 +1436,12 @@ impl Scheduler {
         if !registered {
             return;
         }
+        ms_log::logl!(
+            ms_log::LOG_TABLES,
+            "Closing pmt {} for adapter {}",
+            pmt_id,
+            aid
+        );
         for slot in 0..self.pmt.ca.len() {
             self.close_pmt_for_ca(slot as i32, aid, pmt_id);
         }
@@ -1365,10 +1531,10 @@ impl Scheduler {
         mask: &[u8; 16],
     ) -> i32 {
         if !(0..=8191).contains(&pid) {
-            return -1;
+            ms_log::log_and_return!(-1, "add_filter_mask failed, pid {}", pid);
         }
         let Some(slot) = self.pmt.filters.iter().position(|filter| !filter.allocated) else {
-            return -1;
+            ms_log::log_and_return!(-1, "add_filter_mask failed");
         };
         let id = slot as i32;
         {
@@ -1385,14 +1551,33 @@ impl Scheduler {
         if flags & FILTER_ADD_REMOVE != 0 && self.find_pid(aid, pid).is_none() {
             let _ = self.mark_pid_add(aid, crate::PID_STREAM_ID_UNDEFINED, pid);
         }
+        let master_filter =
+            self.find_pid(aid, pid).map_or(
+                id,
+                |entry| if entry.filter >= 0 { entry.filter } else { id },
+            );
         if let Some(pid_entry) = self.find_pid_mut(aid, pid) {
             pid_entry.filter = id;
         }
+        let mask_len = mask
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map_or(0, |index| index + 1);
+        ms_log::log!(
+            "new filter {} added for adapter {}, pid {}, flags {}, mask_len {}, master_filter {}",
+            id,
+            aid,
+            pid,
+            flags,
+            mask_len,
+            master_filter
+        );
         id
     }
 
     /// Removes a filter (`del_filter`).
     pub fn del_filter(&mut self, id: i32) {
+        ms_log::log!("deleting filter {}", id);
         let Ok(slot) = usize::try_from(id) else {
             return;
         };
@@ -1415,6 +1600,19 @@ impl Scheduler {
         {
             entry.filter = -1;
         }
+        let max_filters = self
+            .pmt
+            .filters
+            .iter()
+            .rposition(|filter| filter.enabled)
+            .map_or(0, |index| index + 1) as i32;
+        ms_log::log!(
+            "deleted filter {}, ad {}, pid {}, max filters {}",
+            id,
+            aid,
+            pid,
+            max_filters
+        );
     }
 
     fn active_add_remove_filters(&self, aid: i32, pid: i32) -> usize {
@@ -1434,12 +1632,18 @@ impl Scheduler {
     /// PID add/delete side effects of `set_filter_flags_locked`.
     pub fn set_filter_flags(&mut self, id: i32, flags: i32) {
         let Ok(slot) = usize::try_from(id) else {
+            // C++ `LOG_AND_RETURN(0, ...)`; the function returns `()`.
+            ms_log::log!("set_filter_flags: filter {} not found", id);
             return;
         };
         let Some(entry) = self.pmt.filters.get_mut(slot) else {
+            // C++ `LOG_AND_RETURN(0, ...)`; the function returns `()`.
+            ms_log::log!("set_filter_flags: filter {} not found", id);
             return;
         };
         if !entry.enabled {
+            // C++ `LOG_AND_RETURN(0, ...)`; the function returns `()`.
+            ms_log::log!("set_filter_flags: filter {} not found", id);
             return;
         }
         entry.flags = flags;
@@ -1458,6 +1662,11 @@ impl Scheduler {
                 };
                 self.mark_pid_deleted(index, crate::PID_STREAM_ID_UNDEFINED, Some(pid));
                 self.update_pids(index);
+            } else {
+                let streams = self
+                    .find_pid(aid, pid)
+                    .map_or(u64::MAX, |entry| entry.sids.len() as u64);
+                ms_log::logm!("pid not found or pid in use by {} streams", streams);
             }
         }
     }
@@ -1465,12 +1674,20 @@ impl Scheduler {
     /// Replaces a filter's match bytes (`set_filter_mask`).
     pub fn set_filter_mask(&mut self, id: i32, filter: &[u8; 16], mask: &[u8; 16]) {
         let Ok(slot) = usize::try_from(id) else {
+            // C++ `LOG_AND_RETURN(0, ...)`; the function returns `()`.
+            ms_log::log!("set_filter_mask: filter {} not found", id);
             return;
         };
-        if let Some(entry) = self.pmt.filters.get_mut(slot) {
-            entry.filter = *filter;
-            entry.mask = *mask;
+        let Some(entry) = self.pmt.filters.get_mut(slot) else {
+            // C++ `LOG_AND_RETURN(0, ...)`; the function returns `()`.
+            ms_log::log!("set_filter_mask: filter {} not found", id);
+            return;
+        };
+        if !entry.enabled {
+            ms_log::logm!("set_filter_mask: filter {} not found", id);
         }
+        entry.filter = *filter;
+        entry.mask = *mask;
     }
 
     /// Caches a PMT and releases its CA/claims (`cache_pmt_for_adapter`).
@@ -1579,13 +1796,28 @@ impl Scheduler {
             return 0;
         };
         if !adapter.config.enabled {
-            return 0;
+            ms_log::log_and_return!(0, "Adapter {} no longer enabled, not processing PAT", aid);
         }
         if adapter.transponder_id == tid && adapter.pat_ver == ver {
-            return 0;
+            ms_log::log_and_return!(0, "PAT AD {}: tsid {} version {}", aid, tid, ver);
+        }
+        if adapter.pat_processed && adapter.transponder_id == tid && adapter.pat_ver != ver {
+            ms_log::log!(
+                "PAT AD {} new version for transponder {}, version {}",
+                aid,
+                adapter.transponder_id,
+                ver
+            );
         }
         let new_transponder = adapter.pat_processed && adapter.transponder_id != tid;
         if new_transponder {
+            ms_log::log!(
+                "PAT AD {} new transponder {} (old {}), version {}",
+                aid,
+                tid,
+                adapter.transponder_id,
+                adapter.pat_ver
+            );
             self.clear_pmt_for_adapter(aid);
         }
         if let Some(adapter) = self.adapters[index].as_mut() {
@@ -1603,6 +1835,15 @@ impl Scheduler {
         self.set_filter_mask(filter, &match_bytes, &match_mask);
         self.set_filter_flags(filter, FILTER_PERMANENT | FILTER_REVERSE | FILTER_CRC);
 
+        let pat_len = section.len() as i32 - 13;
+        ms_log::log!(
+            "PAT Adapter {}, Transponder ID {}, version {}, len {}",
+            aid,
+            tid,
+            ver,
+            pat_len
+        );
+
         if let Some(adapter) = self.adapters[index].as_mut() {
             adapter.active_pmts = 0;
         }
@@ -1615,6 +1856,14 @@ impl Scheduler {
                 (((section[offset + 2] & 0x1F) as u16) << 8) | u16::from(section[offset + 3]),
             );
             let existing = self.get_pmt_for_sid_pid(aid, sid, pid).map(|pmt| pmt.id);
+            ms_log::log!(
+                "Adapter {}, PMT {} sid {} ({:04X}), pid {}",
+                aid,
+                existing.map_or(-1, |id| id as i32),
+                sid,
+                sid,
+                pid
+            );
             if let Some(existing) = existing {
                 seen.insert(existing);
             }
@@ -1669,6 +1918,15 @@ impl Scheduler {
             .map(|pmt| pmt.id as i32)
             .collect();
         for id in retire {
+            let Some(pmt) = self.pmt(id) else {
+                continue;
+            };
+            ms_log::log!(
+                "Caching PMT {} ({}) and filter {} as it is not present in the new PAT",
+                pmt.id,
+                pmt.name,
+                pmt.filter
+            );
             if self.adapter_type(aid) == AdapterType::Ci {
                 self.pmt_del(id);
             } else {
@@ -1688,13 +1946,13 @@ impl Scheduler {
             return 0;
         }
         let Ok(slot) = usize::try_from(filter) else {
-            return 0;
+            ms_log::log_and_return!(0, "process_pmt: filter {} not found", filter);
         };
         let Some(entry) = self.pmt.filters.get(slot) else {
-            return 0;
+            ms_log::log_and_return!(0, "process_pmt: filter {} not found", filter);
         };
         if !entry.enabled {
-            return 0;
+            ms_log::log_and_return!(0, "process_pmt: filter {} not found", filter);
         }
         let (aid, pid, target) = (entry.adapter, entry.pid, entry.target);
         let sid = i32::from(u16::from_be_bytes([section[3], section[4]]));
@@ -1702,6 +1960,7 @@ impl Scheduler {
         let pmt_id = match target {
             FilterTarget::Pmt(Some(id)) => {
                 if self.pmt(id as i32).is_none() {
+                    ms_log::log!("PMT {} does not exist", id);
                     return 0;
                 }
                 id as i32
@@ -1709,6 +1968,7 @@ impl Scheduler {
             _ => {
                 let id = self.pmt_add(aid, sid, pid);
                 if id < 0 {
+                    ms_log::log!("PMT {} does not exist", -1);
                     return 0;
                 }
                 if let Some(entry) = self.pmt.filters.get_mut(slot) {
@@ -1718,6 +1978,7 @@ impl Scheduler {
             }
         };
         if self.pmt(pmt_id).is_none() {
+            ms_log::log!("PMT {} does not exist", pmt_id);
             return 0;
         }
         if let Some(pmt) = self.pmt_slot_mut(pmt_id) {
@@ -1746,12 +2007,44 @@ impl Scheduler {
             Ok(parsed) => parsed,
             Err(_) => return 0,
         };
+        let pmt_len = section.len() as i32 - 3;
+        let pi_len = (i32::from(section[10] & 0x0F) << 8) | i32::from(section[11]);
+        let old_ver = self.pmt(pmt_id).map_or(-1, |pmt| pmt.version);
         if let Some(pmt) = self.pmt_slot_mut(pmt_id) {
             pmt.sid = sid;
             pmt.version = version;
             pmt.pcr_pid = i32::from(parsed.pcr_pid_header);
             pmt.descriptors.clear();
             pmt.stream_pids.clear();
+        }
+        if let Some(pmt) = self.pmt(pmt_id) {
+            let channel = if pmt.name.is_empty() {
+                ""
+            } else {
+                " channel: "
+            };
+            let update = if old_ver != -1 && old_ver != version {
+                " UPDATE"
+            } else {
+                ""
+            };
+            ms_log::log!(
+                "new PMT {} AD {}, pid: {:04X} ({}), filter {}, len {}, pi_len {}, ver {}, pcr {}, sid {:04X} ({}){}{}{}",
+                pmt_id,
+                aid,
+                pid,
+                pid,
+                filter,
+                pmt_len,
+                pi_len,
+                version,
+                i32::from(parsed.pcr_pid_header),
+                pmt.sid,
+                pmt.sid,
+                channel,
+                pmt.name,
+                update
+            );
         }
         for descriptor in &parsed.program_info {
             self.add_ca_from_descriptor(

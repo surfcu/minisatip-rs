@@ -42,6 +42,8 @@ pub(super) fn register(registry: &mut CipherRegistry) {
     registry.register(CwAlgo::Csa, Arc::new(|| Box::new(Csa::new(false))));
     #[cfg(feature = "dvbcsa-icam")]
     registry.register(CwAlgo::CsaIcam, Arc::new(|| Box::new(Csa::new(true))));
+    #[cfg(not(feature = "dvbcsa-icam"))]
+    ms_log::log!("libdvbcsa does not support ICAM (dvbcsa_bs_key_set_ecm missing)");
 }
 
 /// One bitslice CSA key (`dvbcsa_create_key`).

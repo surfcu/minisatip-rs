@@ -3,6 +3,19 @@
 use crate::program::{Program, ProgramTable};
 use ms_ts::crc::crc32_mpeg2;
 
+/// `#define DEFAULT_LOG LOG_DVBCA` (ca.cpp:52).
+const DEFAULT_LOG: u32 = ms_log::LOG_DVBCA;
+
+/// `listmgmt_str[]` (pmt.cpp:77), indexed by `CLM_*`.
+pub const LISTMGMT_STR: [&str; 6] = [
+    "CLM_MORE",
+    "CLM_FIRST",
+    "CLM_LAST",
+    "CLM_ONLY",
+    "CLM_ADD",
+    "CLM_UPDATE",
+];
+
 pub const CLM_MORE: u8 = 0x00;
 pub const CLM_FIRST: u8 = 0x01;
 pub const CLM_LAST: u8 = 0x02;
@@ -162,12 +175,19 @@ pub fn pmt_add_ca_descriptor(
     filter: &[(u16, u16)],
 ) -> usize {
     let mut len = 0;
-    for ca in &pmt.caids {
+    for (i, ca) in pmt.caids.iter().enumerate() {
         if !match_ca_caid(filter, ca.caid) {
             continue;
         }
         let private = ca.private_data.len();
         if len + 6 + private > buf_len {
+            // `pmt.cpp` (`DEFAULT_LOG` is LOG_PMT there).
+            ms_log::log!(
+                "PMT {} CA descriptor {} does not fit, truncating at {}",
+                pmt.id,
+                i,
+                len
+            );
             break;
         }
         out.push(0x09);
@@ -176,6 +196,14 @@ pub fn pmt_add_ca_descriptor(
         out.extend_from_slice(&ca.pid.to_be_bytes());
         out.extend_from_slice(&ca.private_data);
         len += 6 + private;
+        ms_log::logl!(
+            ms_log::LOG_PMT,
+            "PMT {} added caid {:04X}, pid {:04X}, pos {}",
+            pmt.id,
+            ca.caid,
+            ca.pid,
+            len
+        );
     }
     len
 }
@@ -200,6 +228,12 @@ pub fn capmt_add_pmt(
     let start = out.len();
     for es in &pmt.streams {
         if added_only && !ctx.programs.pid_requested(pmt.adapter, es.pid) {
+            ms_log::logm!(
+                "CAPMT_add_PMT: skipping pmt {} (ad {}) pid {} from CAPMT",
+                pmt.id,
+                pmt.adapter,
+                es.pid
+            );
             continue;
         }
         if !es.is_audio && !es.is_video {
@@ -207,6 +241,11 @@ pub fn capmt_add_pmt(
         }
         let pos = out.len() - start;
         if pos + 6 > len {
+            ms_log::log!(
+                "CAPMT_add_PMT: truncating PMT {} stream list at {} bytes",
+                pmt.id,
+                pos
+            );
             break;
         }
         out.push(es.stream_type);
@@ -250,6 +289,7 @@ pub fn create_capmt(
 ) -> Result<BuiltCapmt, CapmtError> {
     let first = ca.first_pmt_id();
     if ctx.programs.get(first).is_none() {
+        ms_log::log!("create_capmt: PMT {} not found", first);
         return Err(CapmtError::PmtNotFound(first));
     }
     let mut out = Vec::with_capacity(256);

@@ -164,6 +164,18 @@ pub fn packetize<F: Fn(u16) -> bool>(
     selected: F,
     mono_us: i64,
 ) -> Vec<Batch> {
+    packetize_for_stream(rtp, framing, buf, selected, mono_us, -1)
+}
+
+/// [`packetize`] for a known stream; `stream_id` feeds the C++ log lines.
+pub fn packetize_for_stream<F: Fn(u16) -> bool>(
+    rtp: &mut RtpState,
+    framing: Framing,
+    buf: &[u8],
+    selected: F,
+    mono_us: i64,
+    stream_id: i32,
+) -> Vec<Batch> {
     let max_pack = framing.max_pack();
     let mut batches = Vec::new();
     let mut batch = Batch::default();
@@ -175,6 +187,8 @@ pub fn packetize<F: Fn(u16) -> bool>(
 
     for (index, packet) in buf.as_chunks::<DVB_FRAME>().0.iter().enumerate() {
         if packet[0] != 0x47 {
+            // stream.cpp:1096 (`LOG`, general module).
+            ms_log::log!("Non TS packet found {:02X}, pos {}", packet[0], index);
             continue;
         }
         let pid = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
@@ -189,6 +203,14 @@ pub fn packetize<F: Fn(u16) -> bool>(
             rtp_added = true;
         }
         if (rtp_added || max_pack == 0) && batch.segments.len() >= TCP_MAX_IOV {
+            // stream.cpp:1114 (`LOG`, general module).
+            ms_log::log!(
+                "stream sid {}, flushing intermediary stream iiov {} max_iiov {}, total_len {}",
+                stream_id,
+                batch.segments.len().saturating_sub(1),
+                TCP_MAX_IOV,
+                total_len
+            );
             let mut flushed = std::mem::take(&mut batch);
             if max_pack > 0 {
                 flushed.segments.pop();

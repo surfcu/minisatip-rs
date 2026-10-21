@@ -263,6 +263,11 @@ pub struct SsdpAction {
 pub trait SsdpIo {
     /// Sends `data` to `host:port`.
     fn send_to(&mut self, data: &[u8], host: &str, port: u16) -> io::Result<usize>;
+
+    /// Descriptor used in the C++ `handle`/`fd` log fields; fakes report 0.
+    fn fd(&self) -> i32 {
+        0
+    }
 }
 
 /// The two SSDP sockets C++ creates in `main` (minisatip.cpp:1943-1947).
@@ -349,6 +354,27 @@ impl SsdpIo for UdpSsdpIo {
     fn send_to(&mut self, data: &[u8], host: &str, port: u16) -> io::Result<usize> {
         self.socket.send_to(data, (host, port))
     }
+
+    /// The announcing socket, used for every C++ `sendto` and log field
+    /// (minisatip.cpp:1739, 1803, 1855).
+    fn fd(&self) -> i32 {
+        self.socket.as_raw_fd()
+    }
+}
+
+/// Logs a short/failed `sendto` exactly like the three C++ checks
+/// (minisatip.cpp:1741-1743, 1819-1822, 1862-1864).
+fn log_send_result(prefix: &str, result: &io::Result<usize>, len: usize) {
+    let (written, code, text) = match result {
+        Ok(written) if *written == len => return,
+        // A short write leaves the C++ errno untouched; report 0/Success.
+        Ok(written) => {
+            let success = io::Error::from_raw_os_error(0);
+            (*written as i64, 0, ms_log::strerror(&success))
+        }
+        Err(error) => (-1, ms_log::errno(error), ms_log::strerror(error)),
+    };
+    ms_log::log!("{prefix}: wrote {written} out of {len}: error {code}: {text}");
 }
 
 /// `fill_sockaddr` with `getaddrinfo`: hostnames resolved with the requested
@@ -452,8 +478,25 @@ impl<I: SsdpIo> SsdpServer<I> {
                 .trim_start()
                 .starts_with(&self.config.uuid)
         }) {
+            // minisatip.cpp:1794-1796
+            ms_log::logl!(
+                ms_log::LOG_SSDP,
+                "Dropping packet from the same UUID as mine (from {}:{})",
+                peer_host,
+                peer_port
+            );
             return Ok(action);
         }
+
+        // minisatip.cpp:1802-1805 (`LOGM`, DEFAULT_LOG is LOG_SSDP here).
+        ms_log::logl!(
+            ms_log::LOG_SSDP,
+            "Received SSDP packet (handle {}) from {}:{} \n{}",
+            self.io.fd(),
+            peer_host,
+            peer_port,
+            String::from_utf8_lossy(message)
+        );
 
         if starts_with_ignoring_case(message, "NOTIFY") {
             // C++ uses strcasestr, so the header need not start a line.
@@ -463,7 +506,14 @@ impl<I: SsdpIo> SsdpServer<I> {
             let device_id = String::from_utf8_lossy(&message[start + 17..]);
             if parse_int_prefix(device_id.trim_start(), 0) == self.config.device_id {
                 let conflict = device_id_conflict(&self.config);
-                self.io.send_to(&conflict, peer_host, peer_port)?;
+                // minisatip.cpp:1814-1816 (note the double space after ':').
+                ms_log::log!(
+                    "A new device joined the network with the same Device ID:  {}, asking to change DEVICEID.SES.COM",
+                    peer_host
+                );
+                let result = self.io.send_to(&conflict, peer_host, peer_port);
+                log_send_result("incomplete ssdp_reply notify", &result, conflict.len());
+                result?;
                 action.device_id_conflict = true;
             }
             return Ok(action);
@@ -489,6 +539,13 @@ impl<I: SsdpIo> SsdpServer<I> {
         if man && discover && didsescom.is_some() && in_window && did == self.config.device_id {
             self.config.device_id += 1;
             self.config.bootid += 1;
+            // minisatip.cpp:1840-1843: logged after the increment and before
+            // readBootID().
+            ms_log::log!(
+                "Device ID conflict, changing our device id to {}, destination SAT>IP server {}",
+                self.config.device_id,
+                peer_host
+            );
             // C++ calls readBootID() here (minisatip.cpp:1844).
             if let Some(cache_dir) = self.config.cache_dir.clone() {
                 let mut uuid = self.config.uuid.clone();
@@ -513,23 +570,58 @@ impl<I: SsdpIo> SsdpServer<I> {
             did = self.config.device_id;
         }
 
-        // minisatip.cpp:1851: strncmp is case-sensitive here.
+        // minisatip.cpp:1848-1849: strncmp is case-sensitive here.
         if message.starts_with(b"HTTP/1") {
-            return Ok(action);
+            ms_log::log_and_return!(
+                Ok(action),
+                "ssdp_reply: the message is a reply, ignoring...."
+            );
         }
 
         // C++ replies to every remaining datagram without looking at `ST`
         // (minisatip.cpp:1848-1865).
         let reply = search_reply(&self.config, date, did);
-        self.io.send_to(&reply, peer_host, peer_port)?;
+        // minisatip.cpp:1855-1858
+        ms_log::logl!(
+            ms_log::LOG_SSDP,
+            "Send Reply SSDP packet (fd: {}) {}:{}, bootid: {} deviceid: {} http: {}\n{}",
+            self.io.fd(),
+            peer_host,
+            peer_port,
+            self.config.bootid,
+            did,
+            self.config.http_host,
+            String::from_utf8_lossy(&reply)
+        );
+        let result = self.io.send_to(&reply, peer_host, peer_port);
+        log_send_result("incomplete ssdp_reply", &result, reply.len());
+        result?;
         action.replied = true;
         Ok(action)
     }
 
     fn send_notify(&mut self, alive: bool) -> io::Result<()> {
-        for message in notify_messages(&self.config, alive) {
-            self.io
-                .send_to(&message, &self.config.disc_host, SSDP_PORT)?;
+        // minisatip.cpp:1716-1717 (`__FUNCTION__` is "ssdp_notify").
+        ms_log::logl!(
+            ms_log::LOG_SSDP,
+            "ssdp_notify: bootid: {} deviceid: {} http: {}",
+            self.config.bootid,
+            self.config.device_id,
+            self.config.http_host
+        );
+        let op = if alive { "Discovery" } else { "ByeBye" };
+        for (index, message) in notify_messages(&self.config, alive).into_iter().enumerate() {
+            // minisatip.cpp:1738
+            ms_log::logl!(
+                ms_log::LOG_SSDP,
+                "{} packet {}:\n{}",
+                op,
+                index + 1,
+                String::from_utf8_lossy(&message)
+            );
+            let result = self.io.send_to(&message, &self.config.disc_host, SSDP_PORT);
+            log_send_result("incomplete ssdp_discovery", &result, message.len());
+            result?;
         }
         Ok(())
     }
@@ -551,6 +643,14 @@ pub fn read_boot_id(
     let path = cache_dir.join("bootid");
     let mut bootid = 0;
     let mut local_device_id = 0;
+    // minisatip.cpp:2047-2048
+    ms_log::log!(
+        "Initial values bootid {}, device_id {}, UUID {} (reading new from {})",
+        bootid,
+        device_id,
+        uuid.as_str(),
+        path.display()
+    );
     if let Ok(contents) = fs::read_to_string(&path) {
         let mut fields = contents.split_whitespace();
         bootid = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -569,7 +669,15 @@ pub fn read_boot_id(
     if device_id < local_device_id {
         device_id = local_device_id;
     }
-    fs::write(&path, format!("{bootid} {device_id} {uuid}"))?;
+    let written = fs::write(&path, format!("{bootid} {device_id} {uuid}"));
+    // minisatip.cpp:2075-2076 is emitted even when the file cannot be written.
+    ms_log::log!(
+        "Running with bootid {}, device_id {}, UUID {}",
+        bootid,
+        device_id,
+        uuid.as_str()
+    );
+    written?;
     Ok((bootid, device_id))
 }
 

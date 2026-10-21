@@ -2,6 +2,11 @@
 
 use std::io;
 
+/// `errno` and `strerror(errno)` of a failed syscall.
+pub(crate) fn error_parts(error: &io::Error) -> (i32, String) {
+    (ms_log::errno(error), ms_log::strerror(error))
+}
+
 /// `fe_sec_voltage_t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Voltage {
@@ -122,6 +127,10 @@ pub trait SecDevice {
     fn sleep_ms(&mut self, ms: i32);
     /// `ad->wakeup` hook; Linux DVB adapters have none.
     fn wakeup(&mut self, _voltage: Voltage) {}
+    /// Frontend fd used in log messages (`ad->fe` in C++).
+    fn log_fd(&self) -> i32 {
+        -1
+    }
 }
 
 /// Frontend, demux and dvr operations of one Linux DVB adapter.

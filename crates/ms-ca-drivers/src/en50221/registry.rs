@@ -117,8 +117,21 @@ impl CaRegistry {
         }
         let mut link = match opener.open(&ad.ca_path(self.enigma)) {
             Ok(l) => l,
-            Err(_) if self.enigma && self.has_ci => return InitResult::Ok,
-            Err(_) => return InitResult::NoRetry,
+            Err(_) if self.enigma && self.has_ci => {
+                ms_log::log!(
+                    "No CA device detected on adapter {}: enabling already registered CAs",
+                    ad.id
+                );
+                return InitResult::Ok;
+            }
+            Err(_) => {
+                ms_log::log!(
+                    "No CA device detected on adapter {}: file {}",
+                    ad.id,
+                    ad.ca_path(self.enigma)
+                );
+                return InitResult::NoRetry;
+            }
         };
         link.flush_input();
         let enigma = self.enigma;
@@ -142,6 +155,7 @@ impl CaRegistry {
             c.force_ci = true;
         }
         if !enigma && !c.slot_present() {
+            ms_log::log!("CA {}: no module in slot, deferring init", c.id);
             c.init_failed();
             return InitResult::Retry;
         }
@@ -186,6 +200,7 @@ impl CaRegistry {
             let Some(ad) = adapter(i).filter(|a| a.enabled) else {
                 continue;
             };
+            ms_log::log!("Trying to reconnect to CA {}", i);
             let r = self.init_dev(&ad, opener);
             let next = match r {
                 InitResult::Ok => 0,

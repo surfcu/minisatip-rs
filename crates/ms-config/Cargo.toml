@@ -10,5 +10,8 @@ default = []
 # Reflects whether the binary was built with SRT support.
 srt = []
 
+[dependencies]
+ms-log = { path = "../ms-log" }
+
 [lints]
 workspace = true

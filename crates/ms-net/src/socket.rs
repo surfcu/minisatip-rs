@@ -39,6 +39,20 @@ impl SocketType {
     pub fn is_server(self) -> bool {
         matches!(self, Self::Server)
     }
+
+    /// C++ `TYPE_*` value used by the `sockets_add` log.
+    fn type_code(self) -> u8 {
+        match self {
+            Self::Udp => 0,
+            Self::Tcp => 1,
+            Self::Server => 2,
+            Self::Http => 3,
+            Self::Rtsp => 4,
+            Self::Dvr => 5,
+            Self::Rtcp => 6,
+            Self::Rtp => 7,
+        }
+    }
 }
 
 /// Read hook: fills the buffer and reports bytes read or an I/O error.
@@ -96,6 +110,9 @@ pub struct Socket {
 
 impl Socket {
     fn new(id: SocketId, handle: i32, kind: SocketType, sid: i32, fifo_size: usize) -> Self {
+        let mut queue = WriteQueue::new(fifo_size);
+        // The queue's C++ write logs mention `s->sock`, `s->id` and `s->sid`.
+        queue.set_log_ids(i32::try_from(id).unwrap_or(-1), handle, sid);
         Self {
             id,
             enabled: true,
@@ -103,7 +120,7 @@ impl Socket {
             kind,
             sid,
             master: None,
-            queue: WriteQueue::new(fifo_size),
+            queue,
             read_buf: vec![0; READ_BUFFER_LEN],
             read_len: 0,
             read: None,
@@ -211,6 +228,10 @@ impl Socket {
     /// Routes this socket's reads through `master`'s buffer and action.
     pub fn set_master(&mut self, master: Option<SocketId>) {
         self.master = master;
+        if let Some(master) = master {
+            // socketworks.cpp:1664.
+            ms_log::log!("sock {} is master for sock {}", master, self.id);
+        }
     }
 
     /// Marks the socket for closing after queued data drains.
@@ -237,7 +258,20 @@ impl Socket {
     /// Flushes queued data and arms the close timeout once it is empty.
     pub fn flush<W: Write + ?Sized>(&mut self, sink: &mut W) -> i32 {
         let written = self.queue.flush(sink);
-        if self.force_close && self.queue.fifo().used() == 0 {
+        // `flush_socket_prio` reaches this point only after a positive, fully
+        // flushed priority write (socketworks.cpp:1568-1580).
+        if self.force_close
+            && written > 0
+            && self.queue.prio_len() == 0
+            && self.queue.fifo().used() == 0
+        {
+            // socketworks.cpp:1579-1582 (LOGM under LOG_SOCKET).
+            ms_log::logl!(
+                ms_log::LOG_SOCKET,
+                "SOCK {}: set timeout_ms to 1 from {}",
+                self.id,
+                self.timeout_ms
+            );
             self.timeout_ms = 1;
         }
         written
@@ -323,16 +357,28 @@ impl SocketTable {
 
     /// Registers a socket with an OS handle and returns its id.
     pub fn add_handle(&mut self, handle: i32, kind: SocketType, sid: i32) -> Option<SocketId> {
-        if let Some(id) = self.sockets.iter().position(Option::is_none) {
-            self.sockets[id] = Some(Socket::new(id, handle, kind, sid, self.fifo_size));
-            return Some(id);
-        }
-        if self.sockets.len() >= MAX_SOCKS {
-            return None;
-        }
-        let id = self.sockets.len();
-        self.sockets
-            .push(Some(Socket::new(id, handle, kind, sid, self.fifo_size)));
+        let id = if let Some(id) = self.sockets.iter().position(Option::is_none) {
+            id
+        } else {
+            if self.sockets.len() >= MAX_SOCKS {
+                // socketworks.cpp:598-599.
+                ms_log::log_and_return!(None, "sockets_add failed for socks {}", handle);
+            }
+            self.sockets.push(None);
+            self.sockets.len() - 1
+        };
+        self.sockets[id] = Some(Socket::new(id, handle, kind, sid, self.fifo_size));
+        // socketworks.cpp:643-647. `read` is a function pointer in C++; the
+        // normalized stable value is `0x0`, and the Rust table has no sockaddr.
+        ms_log::log!(
+            "sockets_add: handle {} (type {}) returning socket sock {} [{}:{}] read: {}",
+            handle,
+            kind.type_code(),
+            id,
+            "",
+            0,
+            "0x0"
+        );
         Some(id)
     }
 
@@ -386,6 +432,23 @@ impl SocketTable {
         if let Some(mut close) = socket.close.take() {
             close();
         }
+        // socketworks.cpp:667-669.
+        ms_log::log!(
+            "sockets_del: sock {} -> handle {}, sid {}, overflow bytes {}, total buffered bytes {}",
+            id,
+            socket.handle,
+            socket.sid,
+            socket.queue.overflow(),
+            socket.queue.buffered_bytes()
+        );
+        // socketworks.cpp:689-691: `max_sock` is the table's high-water mark,
+        // which the never-shrinking `Vec` length tracks.
+        ms_log::log!(
+            "sockets_del: sock {} Last open socket is at index {} current_handle {}",
+            id,
+            self.sockets.len(),
+            socket.handle
+        );
         let slaves: Vec<SocketId> = self
             .sockets
             .iter()
@@ -397,6 +460,8 @@ impl SocketTable {
             })
             .collect();
         for slave in slaves {
+            // socketworks.cpp:699-700.
+            ms_log::log!("Closing slave socket index {} (master sock {})", slave, id);
             self.remove(slave);
         }
         true

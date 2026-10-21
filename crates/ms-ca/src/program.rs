@@ -140,7 +140,22 @@ impl Program {
 
     /// `match_caid`: any CAID of the program matches `caid` under `mask`.
     pub fn match_caid(&self, caid: u16, mask: u16) -> bool {
-        self.caids.iter().any(|c| c.caid & mask == caid)
+        for (i, c) in self.caids.iter().enumerate() {
+            if c.caid & mask == caid {
+                // `tables.cpp` (`#define DEFAULT_LOG LOG_TABLES`).
+                ms_log::logl!(
+                    ms_log::LOG_TABLES,
+                    "match_caid: match caid {:04X} ({}/{}) with CA caid {:04X} and mask {:04X}",
+                    c.caid,
+                    i,
+                    self.caids.len(),
+                    caid,
+                    mask
+                );
+                return true;
+            }
+        }
+        false
     }
 }
 

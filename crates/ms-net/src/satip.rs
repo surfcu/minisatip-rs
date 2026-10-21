@@ -29,7 +29,10 @@ pub fn merge_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
 }
 
 fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
+    // dvb.cpp:274: captured before the `freq=` reset, like the C++ local.
+    let old_pids = pids_string(&params.pids);
     let Some((_, query)) = url.split_once('?') else {
+        ms_log::log!("no ? found in URL");
         return ParseReport::default();
     };
 
@@ -41,6 +44,7 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
         params.pids.clear();
         report.reset_pids = true;
     }
+    ms_log::log!("detect_dvb_parameters (S)-> {}", query);
 
     for token in split_tokens(query, '&') {
         let (key, value) = token.split_once('=').unwrap_or((token, ""));
@@ -115,10 +119,44 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
         }
     }
 
+    if report.pids_specified {
+        ms_log::log!(
+            "detect_dvb_parameters: PIDs changed: old = {}, new = {}",
+            old_pids,
+            pids_string(&params.pids)
+        );
+    }
+
     if params.plsm == Some(0) {
         params.plsc = Some(pls_scrambling_index(params.plsc));
     }
+
+    ms_log::log!(
+        "detect_dvb_parameters (E) -> src={}, fe={}, freq={}, fec={}, sr={}, pol={}, ro={}, msys={}, mtype={}, plts={}, bw={}, inv={}, pids={} x_pmt={}",
+        params.src_value(),
+        params.fe_value(),
+        params.freq,
+        params.fec_value(),
+        params.sr_value(),
+        params.pol_number(),
+        params.ro.map_or(3, i32::from),
+        params.sys_number(),
+        params.mtype_value(),
+        params.plts_number(),
+        params.bw_value(),
+        params.inversion_value(),
+        pids_string(&params.pids),
+        params.x_pmt.unwrap_or(-1)
+    );
     report
+}
+
+/// `iterable_to_string`: the PID set joined with `", "` in ascending order.
+fn pids_string(pids: &PidSet) -> String {
+    pids.iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Parses a URL into fresh parameters.
@@ -346,8 +384,18 @@ fn pls_scrambling_index(code: Option<i32>) -> i32 {
 /// Parses a C-style decimal float prefix and multiplies it, as `parse_float` does.
 fn parse_float(text: &str, multiplier: f64) -> i32 {
     let bytes = text.as_bytes();
-    if bytes.is_empty() || !(bytes[0] == b'+' || bytes[0] == b'-' || bytes[0].is_ascii_digit()) {
-        return 0;
+    if bytes.is_empty() {
+        // utils.cpp:179 (`%d` for the integer multiplier)
+        ms_log::log_and_return!(0, "parse_float: s is empty, mul={}", multiplier as i64);
+    }
+    if !(bytes[0] == b'+' || bytes[0] == b'-' || bytes[0].is_ascii_digit()) {
+        // utils.cpp:181 (`%.*s` is the whole view; `%d` the integer multiplier)
+        ms_log::log_and_return!(
+            0,
+            "parse_float: s not a number: {}, mul={}",
+            text,
+            multiplier as i64
+        );
     }
     let mut end = usize::from(bytes[0] == b'+' || bytes[0] == b'-');
     let digits = end;

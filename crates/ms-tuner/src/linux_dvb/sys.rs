@@ -7,7 +7,7 @@ use std::time::Instant;
 use super::consts::*;
 use super::device::{
     DemuxFd, DiseqcMessage, DtvProperty, DtvStat, DvbDevice, FrontendInfo, MiniCmd, PesOutput,
-    SecDevice, Tone, Voltage,
+    SecDevice, Tone, Voltage, error_parts,
 };
 use super::enumerate::{DeviceTree, FrontendProbe, ProbedFrontend, probe_device};
 use super::ioc::NATIVE_IOCTLS;
@@ -180,8 +180,12 @@ pub struct LinuxFrontendProbe;
 
 impl FrontendProbe for LinuxFrontendProbe {
     fn probe(&self, adapter: u32, frontend: u32) -> Option<ProbedFrontend> {
+        self.probe_with_id(adapter, frontend, adapter as i32)
+    }
+
+    fn probe_with_id(&self, adapter: u32, frontend: u32, aid: i32) -> Option<ProbedFrontend> {
         let mut dev = LinuxDvbDevice::open(adapter, frontend).ok()?;
-        Some(probe_device(&mut dev))
+        Some(probe_device(&mut dev, aid))
     }
 }
 
@@ -227,10 +231,33 @@ impl LinuxDvbDevice {
     pub fn open(adapter: u32, frontend: u32) -> io::Result<Self> {
         let fe_path = path(DEV_FRONTEND, adapter, frontend);
         let dvr_path = path(DEV_DVR, adapter, frontend);
-        let fe = open_path(&fe_path, libc::O_RDWR | libc::O_NONBLOCK)?;
+        let fe = match open_path(&fe_path, libc::O_RDWR | libc::O_NONBLOCK) {
+            Ok(fd) => fd,
+            Err(error) => {
+                let (errno, text) = error_parts(&error);
+                ms_log::log!(
+                    "Could not open {} in RW mode (fe: {}, dvr: {}) error {}: {}",
+                    fe_path,
+                    -1,
+                    -1,
+                    errno,
+                    text
+                );
+                return Err(error);
+            }
+        };
         let dvr = match open_path(&dvr_path, libc::O_RDONLY | libc::O_NONBLOCK) {
             Ok(fd) => fd,
             Err(error) => {
+                let (errno, text) = error_parts(&error);
+                ms_log::log!(
+                    "Could not open {} in RW mode (fe: {}, dvr: {}) error {}: {}",
+                    fe_path,
+                    fe,
+                    -1,
+                    errno,
+                    text
+                );
                 close_fd(fe);
                 return Err(error);
             }
@@ -305,6 +332,10 @@ impl SecDevice for LinuxDvbDevice {
         if ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(ms as u64));
         }
+    }
+
+    fn log_fd(&self) -> i32 {
+        self.fe
     }
 }
 

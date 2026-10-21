@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -21,7 +22,7 @@ use ms_net::dataplane::{AdapterHandle, Command, DataPlaneConfig, DataPlaneTuner}
 use ms_net::handler::{HandlerContext, StreamBackend, StreamType, handle_http, handle_rtsp};
 use ms_net::output::{OutputConfig, StreamOutput, UdpTarget};
 use ms_net::response::format_http_date;
-use ms_net::rtsp::{ParseOutcome, Protocol, Request, parse_request_with};
+use ms_net::rtsp::{ParseOutcome, Protocol, Request, parse_request_logged};
 use ms_net::session::{DescribeOptions, SessionManager};
 use ms_net::socket::DEFAULT_FIFO_SIZE;
 use ms_net::ssdp::{
@@ -162,13 +163,21 @@ struct ConnectionRequest {
     request: Request,
     /// Read events on the connection so far (`sockets::iteration`).
     reads: u64,
+    /// File descriptor of the connection socket (`s->sock` in the read logs).
+    fd: i32,
+    /// Bytes parsed for this request (`rlen` in the read logs).
+    len: usize,
+    /// The request bytes, captured only when `LOG_HTTP` is enabled
+    /// (minisatip.cpp:1227-1232, 1555-1559).
+    raw: Vec<u8>,
 }
 
 enum Inbound {
     Request(Box<ConnectionRequest>),
     /// An interleaved RTP/RTCP frame was received (minisatip.cpp:1187-1189).
     Interleaved(u64),
-    Closed(u64),
+    /// The connection socket closed; the descriptor is logged as `s->sock`.
+    Closed(u64, i32),
 }
 
 /// Outputs started by PLAY/GET, tracked so they can be stopped or re-targeted.
@@ -208,6 +217,8 @@ struct Runtime {
     satip_adapters: Vec<SatipAdapter>,
     xml_poll: Option<SatipXmlPoll>,
     ca: CaRuntime,
+    /// Close timeout armed on HTTP connections (`s->timeout_ms`).
+    close_timeouts: HashMap<u64, i32>,
 }
 
 impl Runtime {
@@ -265,12 +276,18 @@ impl Runtime {
             if opts.hw_descrambler {
                 let hw = crate::hw::Hw::new(ms_ca_drivers::hw_descrambler::LinuxCaDevice);
                 ca.attach_hw(&mut scheduler, hw);
+            } else {
+                // hw_descrambler.cpp:532-533 (`init_hw_descrambler` when disabled).
+                ms_log::log!(
+                    "hw_descrambler: --hw-descrambler not enabled, hardware descrambler disabled"
+                );
             }
         }
         #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
         if !replay_enabled {
             // find_ddci_adapter: DDCI registers before the tuners get their stages.
             let nodes = if opts.disable_dvb {
+                ms_log::log!("DVBCI device detection disabled");
                 Vec::new()
             } else {
                 crate::ddci::linux::find()
@@ -306,7 +323,8 @@ impl Runtime {
             let Some(aid) = (0..MAX_ADAPTERS)
                 .find(|aid| handles[*aid].is_none() && !satip.adapter_disabled(*aid))
             else {
-                eprintln!("minisatip: MAX_ADAPTERS reached");
+                // satipc.cpp:2009-2010 (LOG_AND_RETURN in add_satip_server).
+                ms_log::log!("MAX_ADAPTERS reached");
                 break;
             };
             let handle = spawn_satip(
@@ -413,6 +431,7 @@ impl Runtime {
             satip_adapters,
             xml_poll,
             ca,
+            close_timeouts: HashMap::new(),
         })
     }
 
@@ -425,7 +444,7 @@ impl Runtime {
                         self.session.touch_stream(id);
                     }
                 }
-                Ok(Inbound::Closed(conn_id)) => self.close_connection(conn_id),
+                Ok(Inbound::Closed(conn_id, fd)) => self.close_connection(conn_id, fd),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -434,6 +453,8 @@ impl Runtime {
             self.poll_satip_xml();
             self.ca.tick(self.session.scheduler_mut(), &self.handles);
         }
+        // socketworks.cpp:1009-1010: `run_loop` is 0 once the loop exits.
+        ms_log::log!("The main loop ended, run_loop = {}", 0);
     }
 
     /// `add_satip_server`: installs one satipc adapter in the first free slot.
@@ -441,8 +462,8 @@ impl Runtime {
         let Some(aid) = (0..MAX_ADAPTERS)
             .find(|aid| self.handles[*aid].is_none() && !self.satip.adapter_disabled(*aid))
         else {
-            eprintln!("minisatip: MAX_ADAPTERS reached");
-            return Ok(());
+            // satipc.cpp:2009-2010.
+            ms_log::log_and_return!(Ok(()), "MAX_ADAPTERS reached");
         };
         let stages = self.ca.stages(aid);
         let handle = spawn_satip(
@@ -533,12 +554,12 @@ impl Runtime {
     /// `satip_getxml_data`: compares the advertised tuners with the configured
     /// adapters and replaces them when the counts differ.
     fn reconcile_satip_xml(&mut self, url: &str, over_tcp: bool) {
+        // Fetch failures and unparsable XML are logged at their source
+        // (httpc.cpp:88-144, satipc.cpp:2223).
         let Ok((host, xml)) = fetch_satip_xml(url) else {
-            eprintln!("minisatip: cannot read satip xml from {url}");
             return;
         };
         let Some(description) = parse_satip_xml(&xml, &host) else {
-            eprintln!("minisatip: no satipcap found for {url}");
             return;
         };
         // detect_tuners_satip counts the adapters already configured for host:port.
@@ -553,8 +574,17 @@ impl Runtime {
             }
         }
         if detected == description.tuners {
+            // satipc.cpp:2278-2279.
+            ms_log::log!("No change for satip xml: {}", url);
             return;
         }
+        // satipc.cpp:2265-2266.
+        ms_log::log!(
+            "updating tuners for {}, host: {}, satip port {}",
+            url,
+            description.host,
+            description.port
+        );
         self.remove_satip_server(&description.host, description.port);
         for server in description.servers(over_tcp) {
             if let Err(error) = self.add_satip_adapter(server) {
@@ -586,8 +616,45 @@ impl Runtime {
             mut writer,
             request,
             reads,
+            fd,
+            len,
+            raw,
         } = message;
         let before = self.conn_streams.get(&conn_id).copied();
+        // read_http forwards `GET /?` to read_rtsp before logging
+        // (minisatip.cpp:1520-1523), so those requests produce the RTSP line.
+        let rtsp_read =
+            protocol.is_rtsp() || (request.is_method("GET") && request.uri.contains("/?"));
+        if rtsp_read {
+            // minisatip.cpp:1229-1232: `LOG` is the general module; the
+            // buffer is appended only when LOG_HTTP is enabled.
+            ms_log::log!(
+                "Read RTSP (sock {}, handle {}) [{}:{}] sid {}, len: {} {}{}",
+                conn_id,
+                fd,
+                peer.ip(),
+                peer.port(),
+                before.unwrap_or(-1),
+                len,
+                if raw.is_empty() { "" } else { "\n" },
+                String::from_utf8_lossy(&raw)
+            );
+        } else {
+            // minisatip.cpp:1556-1559: C++ passes `s->sid` for "handle" too.
+            ms_log::log!(
+                "Read HTTP (handle {}) [{}:{}] sid {}, sock {} {}{}",
+                before.unwrap_or(-1),
+                peer.ip(),
+                peer.port(),
+                before.unwrap_or(-1),
+                fd,
+                if raw.is_empty() { "" } else { "\n" },
+                String::from_utf8_lossy(&raw)
+            );
+            // read_http arms a 1 ms close timeout on every connection that is
+            // not a `GET /?` stream (minisatip.cpp:1525).
+            self.close_timeouts.insert(conn_id, 1);
+        }
         if request.is_method("PLAY")
             && let Some(id) = before
         {
@@ -637,11 +704,54 @@ impl Runtime {
             && response
                 .as_ref()
                 .is_some_and(|response| response.status == 200);
+        if hidden {
+            // minisatip.cpp:2097-2100 (`LOG`, i.e. the general module)
+            ms_log::log!(
+                "Reply hidden because another GET while streaming (handle {}) [{}:{}] iteration:{}, sock {}",
+                fd,
+                peer.ip(),
+                peer.port(),
+                reads,
+                conn_id
+            );
+        }
         // Queued before prune_outputs stops a torn-down output, whose flush
         // still sends it (TEARDOWN, minisatip.cpp:1424-1429).
         let mut write_failed = false;
         if let Some(response) = response.filter(|_| !hidden) {
             let bytes = response.to_bytes();
+            // minisatip.cpp:2165-2168: `resp` is the header block. For
+            // process_file the body goes out separately with `lr` 0
+            // (utils.cpp:398-403). The "(message truncated) " marker is
+            // always empty: strlcatf is given sizeof(resp) - 1 and clamps
+            // lresp to sizeof(resp) - 2 on overflow (utils.h:176-185), so
+            // `lresp == sizeof(resp) - 1` never holds.
+            let (content_len, logged) = if response.streamed {
+                (
+                    0,
+                    &bytes[..bytes.len().saturating_sub(response.body.len() + 4)],
+                )
+            } else {
+                (response.body.len(), &bytes[..])
+            };
+            // `LOG` is the general module; DEFAULT_LOG (LOG_HTTP) only gates
+            // the appended response buffer (minisatip.cpp:2164-2168).
+            let log_buf = ms_log::enabled(ms_log::LOG_HTTP);
+            ms_log::log!(
+                "Reply {}(handle {}) [{}:{}] content_len:{}, sock {} {}{}",
+                "",
+                fd,
+                peer.ip(),
+                peer.port(),
+                content_len,
+                conn_id,
+                if log_buf { "\n" } else { "" },
+                if log_buf {
+                    String::from_utf8_lossy(logged)
+                } else {
+                    std::borrow::Cow::Borrowed("")
+                }
+            );
             let queued = priority.is_some_and(|(stream_id, adapter)| {
                 self.handles
                     .get(adapter as usize)
@@ -939,7 +1049,33 @@ impl Runtime {
         }
     }
 
-    fn close_connection(&mut self, conn_id: u64) {
+    fn close_connection(&mut self, conn_id: u64, fd: i32) {
+        let sid = self.conn_streams.get(&conn_id).copied();
+        // C++ `sid->timeout` is in seconds, with 1 as the forced-close marker;
+        // Rust stores milliseconds (session.rs:137-138).
+        let (timeout, kind) = sid
+            .and_then(|id| self.session.stream(id))
+            .map(|stream| {
+                let timeout = if stream.timeout_ms <= 1 {
+                    stream.timeout_ms as i32
+                } else {
+                    (stream.timeout_ms / 1000) as i32
+                };
+                (timeout, stream.stream_type as i32)
+            })
+            .unwrap_or((-1, -1));
+        // Removed before the log so its mask never decides bookkeeping.
+        let socket_timeout = self.close_timeouts.remove(&conn_id).unwrap_or(0);
+        // minisatip.cpp:1680-1684
+        ms_log::log!(
+            "Requested sid close {} timeout {} type {}, sock {}, handle {}, timeout {}",
+            sid.unwrap_or(-1),
+            timeout,
+            kind,
+            conn_id,
+            fd,
+            socket_timeout
+        );
         let streams: Vec<i32> = self
             .outputs
             .iter()
@@ -1066,16 +1202,25 @@ impl Runtime {
 }
 
 /// Resolves `--bind`/`--bind-http` like `getaddrinfo` (socketworks.cpp:55-98).
-fn resolve_bind_address(host: Option<&str>) -> Result<Option<IpAddr>, String> {
+fn resolve_bind_address(host: Option<&str>, port: u16) -> Result<Option<IpAddr>, String> {
     let Some(host) = host.filter(|host| !host.is_empty()) else {
         return Ok(None);
     };
     if let Ok(address) = host.parse() {
         return Ok(Some(address));
     }
-    (host, 0)
+    (host, port)
         .to_socket_addrs()
-        .map_err(|error| format!("cannot resolve {host}: {error}"))?
+        .map_err(|error| {
+            // socketworks.cpp:75-78
+            ms_log::log!(
+                "getaddrinfo failed: host {}, port {}, {}",
+                host,
+                port,
+                ms_log::strerror(&error)
+            );
+            format!("cannot resolve {host}: {error}")
+        })?
         .next()
         .map(|address| Some(address.ip()))
         .ok_or_else(|| format!("cannot resolve {host}"))
@@ -1099,8 +1244,10 @@ pub fn run(opts: &Options) -> Result<(), String> {
         opts.bind_http.as_deref(),
         opts.bind_dev.as_deref(),
     );
+    // minisatip.cpp:1122-1123: a failing resolve_bind_opts is a FAIL; the
+    // specific reason is logged by resolve_bind_opts itself.
     resolve_bind_opts(&mut binds, &ms_net::sys::SystemDevices)
-        .map_err(|error| format!("bind options: {error}"))?;
+        .map_err(|_| "Invalid bind configuration".to_owned())?;
     // fill_sockaddr binds the IPv6 wildcard unless `-4`/--ipv4-only is in
     // effect (socketworks.cpp:96-102).
     let wildcard = if opts.use_ipv4_only != 0 {
@@ -1108,8 +1255,9 @@ pub fn run(opts: &Options) -> Result<(), String> {
     } else {
         IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
     };
-    let bind_ip = resolve_bind_address(binds.bind.as_deref())?.unwrap_or(wildcard);
-    let http_bind_ip = resolve_bind_address(binds.bind_http.as_deref())?.unwrap_or(bind_ip);
+    let bind_ip = resolve_bind_address(binds.bind.as_deref(), rtsp_port)?.unwrap_or(wildcard);
+    let http_bind_ip =
+        resolve_bind_address(binds.bind_http.as_deref(), http_port)?.unwrap_or(bind_ip);
     // set_options: `lip` is the resolved `--bind` or getlocalip()
     // (minisatip.cpp:1125-1128).
     let advertised_host = if binds.bind.is_some() {
@@ -1117,6 +1265,21 @@ pub fn run(opts: &Options) -> Result<(), String> {
     } else {
         local_ip(&opts.disc_host, opts.use_ipv4_only != 0)
     };
+    // minisatip.cpp:1130-1147: `-w` overrides http_host; rtsp_host always has
+    // the port, printed from the configured (pre-htons) value.
+    let http_host = opts
+        .http_host
+        .clone()
+        .unwrap_or_else(|| format!("{advertised_host}:{}", opts.http_port));
+    ms_log::log!(
+        "Listening configuration RTSP:{} (bind address: {}, bind device: {}), HTTP:{} (bind address: {}, bind device: {})",
+        format!("{advertised_host}:{}", opts.rtsp_port),
+        binds.bind.as_deref().unwrap_or("(null)"),
+        binds.bind_dev.as_deref().unwrap_or("(null)"),
+        http_host,
+        binds.bind_http.as_deref().unwrap_or("(null)"),
+        binds.bind_dev.as_deref().unwrap_or("(null)")
+    );
 
     // tcp_listen applies SO_BINDTODEVICE before bind and fails hard when the
     // device cannot be selected (socketworks.cpp:469-505).
@@ -1150,12 +1313,6 @@ pub fn run(opts: &Options) -> Result<(), String> {
         device_id = 1;
     }
 
-    // minisatip.cpp:1130-1136: `-w` overrides http_host; rtsp_host always has
-    // the port, printed from the configured (pre-htons) value.
-    let http_host = opts
-        .http_host
-        .clone()
-        .unwrap_or_else(|| format!("{advertised_host}:{}", opts.http_port));
     let config = ServerConfig {
         bind_ip,
         advertised_host: advertised_host.clone(),
@@ -1224,7 +1381,8 @@ pub fn run(opts: &Options) -> Result<(), String> {
         };
         // Both SSDP sockets must bind or C++ exits (minisatip.cpp:1943-1947).
         let bind_dev_ip = if opts.bind_dev.is_some() {
-            match resolve_bind_address(binds.bind.as_deref())? {
+            // ssdp.cpp binds its own sockets on UDP port 1900.
+            match resolve_bind_address(binds.bind.as_deref(), 1900)? {
                 Some(IpAddr::V4(address)) => Some(address),
                 Some(IpAddr::V6(_)) => {
                     return Err("SSDP: --bind-dev requires an IPv4 address".to_owned());
@@ -1278,13 +1436,31 @@ fn local_ip(disc_host: &str, ipv4_only: bool) -> String {
     } else {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     };
-    UdpSocket::bind(any)
-        .and_then(|socket| {
-            socket.connect(target)?;
-            socket.local_addr()
-        })
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_default()
+    let socket = match UdpSocket::bind(any) {
+        Ok(socket) => socket,
+        Err(error) => {
+            // socketworks.cpp:233-236
+            ms_log::log!(
+                "getlocalip: Cannot create socket: {}",
+                ms_log::strerror(&error)
+            );
+            return String::new();
+        }
+    };
+    match socket.connect(target) {
+        Ok(()) => socket
+            .local_addr()
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_default(),
+        Err(error) => {
+            // socketworks.cpp:239-242 (the doubled quote is in C++).
+            ms_log::log!(
+                "getlocalip: Error '{}'' during connect",
+                ms_log::strerror(&error)
+            );
+            String::new()
+        }
+    }
 }
 
 fn udp_destination(stream: &ms_net::session::Stream) -> Option<SocketAddr> {
@@ -1415,12 +1591,8 @@ fn spawn_satip(
         bind_dev_ip: settings.bind_dev_ip,
         receive_buffer: settings.receive_buffer,
     };
-    if !server.source_ip.is_empty() && settings.bind_dev_ip.is_some() {
-        eprintln!(
-            "minisatip: AD{aid}: per-server source {} overrides --bind-dev source {:?}",
-            server.source_ip, settings.bind_dev_ip
-        );
-    }
+    // The per-server source override is logged when the RTSP socket opens
+    // (satipc.cpp:396, crates/ms-tuner/src/satipc/driver.rs).
     let tuner = SatipcTuner::new(&config)
         .map_err(|error| format!("cannot start satip adapter {aid}: {error}"))?;
     let buffer = usize::try_from(settings.adapter_buffer)
@@ -1462,12 +1634,12 @@ fn satip_servers(opts: &Options) -> Result<Vec<SatipServer>, String> {
         .split(|c: char| c == ',' || (c as u32) < 33)
         .filter(|url| !url.is_empty())
     {
+        // Fetch failures and unparsable XML are logged at their source
+        // (httpc.cpp:88-144, satipc.cpp:2223).
         let Ok((host, xml)) = fetch_satip_xml(url) else {
-            eprintln!("minisatip: cannot read satip xml from {url}");
             continue;
         };
         let Some(description) = parse_satip_xml(&xml, &host) else {
-            eprintln!("minisatip: no satipcap found for {url}");
             continue;
         };
         // detect_tuners_satip counts the adapters already configured for host:port.
@@ -1500,6 +1672,7 @@ fn spawn_dvb_adapters(
     ca: &mut CaRuntime,
 ) -> Result<(), String> {
     if opts.disable_dvb {
+        ms_log::log!("DVB device detection disabled");
         return Ok(());
     }
     let frontends = linux_dvb::enumerate(&LinuxDeviceTree, &LinuxFrontendProbe);
@@ -1523,12 +1696,15 @@ fn spawn_dvb_adapters(
         let mut config = dvb_adapter_config(opts, aid, &frontend.systems, &diseqc);
         config.enabled = selected;
         let bridge: Box<dyn AdapterTuner> = if selected {
-            match LinuxDvbTuner::open_with_buffer(
+            match LinuxDvbTuner::open_for_adapter(
+                aid as i32,
                 frontend.path_adapter,
                 frontend.path_frontend,
                 opts.dvr_buffer,
             ) {
                 Ok(mut tuner) => {
+                    tuner.state_mut().pa = frontend.path_adapter as i32;
+                    tuner.state_mut().fn_num = frontend.path_frontend as i32;
                     apply_tuner_options(opts, aid, &diseqc, &mut tuner);
                     ca.set_hw_node(
                         aid,
@@ -1551,13 +1727,19 @@ fn spawn_dvb_adapters(
                         frontend.path_adapter,
                         frontend.path_frontend,
                     ));
+                    // adapter.cpp:360: end of the C++ init_hw for this device.
+                    ms_log::log!(
+                        "done opening adapter {} delivery systems: {} {} {} {}",
+                        aid,
+                        config.sys[0].name(),
+                        config.sys[1].name(),
+                        config.sys[2].name(),
+                        config.sys[3].name()
+                    );
                     Box::new(bridge)
                 }
-                Err(error) => {
-                    eprintln!(
-                        "minisatip: adapter {aid} (adapter{}/frontend{}): {error}",
-                        frontend.path_adapter, frontend.path_frontend
-                    );
+                Err(_) => {
+                    // `dvb_open_device` logs the open failure itself (dvb.cpp:911).
                     config.enabled = false;
                     Box::new(UnavailableTuner)
                 }
@@ -1586,14 +1768,29 @@ fn spawn_ddci_adapters(
     bandwidth: Option<Arc<Bandwidth>>,
     ca: &mut CaRuntime,
 ) -> Result<(), String> {
+    // `find_ddci_adapter` logs the index it starts allocating from.
+    let next = (0..MAX_ADAPTERS)
+        .find(|aid| handles[*aid].is_none())
+        .unwrap_or(MAX_ADAPTERS);
+    ms_log::logl!(
+        ms_log::LOG_DDCI,
+        "Starting find_ddci_adapter with index {}",
+        next
+    );
     for node in nodes {
         let Some(aid) = (0..MAX_ADAPTERS).find(|aid| handles[*aid].is_none()) else {
             break;
         };
-        let (reader, writer) = match crate::ddci::linux::open(node) {
+        ms_log::logl!(
+            ms_log::LOG_DDCI,
+            "find_ddci_adapter: adding {} {} to the list of devices",
+            node.pa,
+            node.fe
+        );
+        let (reader, writer) = match crate::ddci::linux::open(aid, node) {
             Ok(pair) => pair,
-            Err(error) => {
-                eprintln!("minisatip: DDCI adapter{}/sec{}: {error}", node.pa, node.fe);
+            Err(_) => {
+                // ddci_open_device logged the failure.
                 continue;
             }
         };
@@ -1893,6 +2090,13 @@ fn spawn_listener(
         .map_err(|error| format!("cannot start {name} listener: {error}"))
 }
 
+/// Gives the logger the standard thread name (`thread_info[].thread_name`).
+fn adopt_thread_name() {
+    if let Some(name) = thread::current().name() {
+        ms_log::set_thread_name(name);
+    }
+}
+
 fn accept_loop(
     listener: TcpListener,
     protocol: Protocol,
@@ -1900,6 +2104,7 @@ fn accept_loop(
     shutdown: Arc<AtomicBool>,
     next_id: Arc<Mutex<u64>>,
 ) {
+    adopt_thread_name();
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
@@ -1911,17 +2116,28 @@ fn accept_loop(
                 };
                 let requests = requests.clone();
                 let shutdown = Arc::clone(&shutdown);
+                let fd = stream.as_raw_fd();
                 let spawn = thread::Builder::new()
                     .name(format!("conn{conn_id}"))
                     .spawn(move || serve_connection(stream, protocol, conn_id, requests, shutdown));
                 if spawn.is_err() {
-                    crate::sys::log_error(format_args!(
-                        "minisatip: cannot start a connection thread"
-                    ));
+                    // socketworks.cpp:556-558.
+                    ms_log::log!(
+                        "ERROR on accept: could not add new socket {} to the list",
+                        fd
+                    );
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
-            Err(_) => break,
+            Err(error) => {
+                // socketworks.cpp:551-553.
+                ms_log::log!(
+                    "sockets_accept: failed {}: {}",
+                    ms_log::errno(&error),
+                    ms_log::strerror(&error)
+                );
+                break;
+            }
         }
     }
 }
@@ -1933,6 +2149,9 @@ fn serve_connection(
     requests: Sender<Inbound>,
     shutdown: Arc<AtomicBool>,
 ) {
+    adopt_thread_name();
+    // The logged `s->sock`; the number stays meaningful after the close.
+    let fd = stream.as_raw_fd();
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let local_ip = stream
@@ -1953,8 +2172,22 @@ fn serve_connection(
                 reads += 1;
                 buffer.extend_from_slice(&chunk[..read]);
                 loop {
-                    match parse_request_with(&buffer, protocol == Protocol::Http) {
+                    match parse_request_logged(
+                        &buffer,
+                        protocol == Protocol::Http,
+                        i32::try_from(conn_id).unwrap_or(-1),
+                        // `s->sid` lives in the runtime thread's connection
+                        // map, not in this reader thread.
+                        -1,
+                    ) {
                         ParseOutcome::Complete { request, consumed } => {
+                            // Only the enabled mask pays for the copy
+                            // (minisatip.cpp:1227-1232, 1555-1559).
+                            let raw = if ms_log::enabled(ms_log::LOG_HTTP) {
+                                buffer[..consumed].to_vec()
+                            } else {
+                                Vec::new()
+                            };
                             buffer.drain(..consumed);
                             let Ok(writer) = stream.try_clone() else {
                                 return;
@@ -1967,6 +2200,9 @@ fn serve_connection(
                                 writer,
                                 request,
                                 reads,
+                                fd,
+                                len: consumed,
+                                raw,
                             };
                             if requests.send(Inbound::Request(Box::new(message))).is_err() {
                                 return;
@@ -2000,7 +2236,7 @@ fn serve_connection(
             Err(_) => break,
         }
     }
-    let _ = requests.send(Inbound::Closed(conn_id));
+    let _ = requests.send(Inbound::Closed(conn_id, fd));
 }
 
 fn spawn_ssdp(
@@ -2021,6 +2257,7 @@ fn ssdp_loop(
     io: UdpSsdpIo,
     shutdown: Arc<AtomicBool>,
 ) {
+    adopt_thread_name();
     let _ = io.set_read_timeout(Some(SSDP_READ_TIMEOUT));
     let mut server = SsdpServer::new(io, config).with_identity(identity);
     let origin = Instant::now();
@@ -2076,12 +2313,15 @@ fn start_srt_listener(
         config.bind_dev.as_deref(),
     ) {
         Ok(socket) => socket,
-        Err(error) => {
-            crate::sys::log_error(format_args!(
-                "minisatip: SRT disabled: UDP bind failed: {error}"
-            ));
+        Err(_error) => {
+            // srt.cpp:145-147: LOG_AND_RETURN(-1, ...); the caller reports
+            // the failed listener like a failed sockets_add (minisatip.cpp:1971).
             ms_net::srt::LibSrtOps::cleanup();
-            return None;
+            ms_log::log_and_return!(
+                None,
+                "SRT listener: UDP bind failed on port {}",
+                config.rtsp_port
+            );
         }
     };
     let mut listener = ms_net::srt::SrtListener::new(Arc::new(ms_net::srt::LibSrtOps));
@@ -2090,6 +2330,13 @@ fn start_srt_listener(
         ms_net::srt::LibSrtOps::cleanup();
         return None;
     }
+    // srt.cpp:195-196
+    ms_log::log!(
+        "SRT listener started on port {}, srt_sock={}, udp_fd={}",
+        config.rtsp_port,
+        listener.listener_socket(),
+        listener.udp_fd()
+    );
     Some(listener)
 }
 

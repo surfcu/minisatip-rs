@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io;
 
 use super::consts::{DVR_BUFFER, FE_HAS_LOCK};
-use super::device::{DemuxFd, DvbDevice, PesOutput};
+use super::device::{DemuxFd, DvbDevice, PesOutput, error_parts};
 use super::state::AdapterState;
 use super::sys::LinuxDvbDevice;
 use super::transponder::DvbTransponder;
@@ -30,7 +30,43 @@ impl LinuxDvbTuner<LinuxDvbDevice> {
 
     /// Opens a frontend with an explicit DVR buffer size (`-b`).
     pub fn open_with_buffer(adapter: u32, frontend: u32, dvr_buffer: i32) -> io::Result<Self> {
+        Self::open_target(None, adapter, frontend, dvr_buffer)
+    }
+
+    /// Opens a runtime adapter and logs the `dvb_open_device` lines, including
+    /// the logical adapter id (`ad->id`).
+    pub fn open_for_adapter(
+        aid: i32,
+        adapter: u32,
+        frontend: u32,
+        dvr_buffer: i32,
+    ) -> io::Result<Self> {
+        Self::open_target(Some(aid), adapter, frontend, dvr_buffer)
+    }
+
+    fn open_target(
+        aid: Option<i32>,
+        adapter: u32,
+        frontend: u32,
+        dvr_buffer: i32,
+    ) -> io::Result<Self> {
+        if let Some(aid) = aid {
+            ms_log::log!(
+                "trying to open [{}] adapter {} and frontend {}",
+                aid,
+                adapter,
+                frontend
+            );
+        }
         let dev = LinuxDvbDevice::open(adapter, frontend)?;
+        if let Some(aid) = aid {
+            ms_log::log!(
+                "opened DVB adapter {} fe:{} dvr:{}",
+                aid,
+                dev.frontend_fd(),
+                dev.dvr_fd()
+            );
+        }
         Ok(Self::with_dvr_buffer(
             dev,
             AdapterState::alloc(),
@@ -49,7 +85,12 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
     /// (`-b`, dvb.cpp:926).
     pub fn with_dvr_buffer(mut dev: D, mut state: AdapterState, dvr_buffer: i32) -> Self {
         state.fe = 1;
-        let _ = dev.set_buffer_size(dev.stream_fd(), dvr_buffer);
+        if let Err(error) = dev.set_buffer_size(dev.stream_fd(), dvr_buffer) {
+            let (errno, text) = error_parts(&error);
+            ms_log::log!("couldn't set DVR buffer size error {}: {}", errno, text);
+        } else {
+            ms_log::log!("DVR buffer set to {} bytes", dvr_buffer);
+        }
         Self {
             dev,
             state,
@@ -110,6 +151,12 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
     fn set_pids(&mut self, pids: &PidSet) -> Result<()> {
         for pid in pids.iter() {
             if pid > PID_ALL {
+                ms_log::log!(
+                    "pid {} > 8192 for /dev/dvb/adapter{}/demux{}",
+                    pid,
+                    self.state.pa,
+                    self.state.fn_num
+                );
                 return Err(TunerError::Backend(-1));
             }
         }
@@ -121,8 +168,25 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
             .collect();
         for pid in remove {
             if let Some(fd) = self.pids.remove(&pid) {
+                let ctime = self.dev.now_ms();
                 // Best effort, like dvb_del_filters (dvb.cpp:1601).
-                let _ = self.dev.demux_stop(fd);
+                if let Err(error) = self.dev.demux_stop(fd) {
+                    let (errno, text) = error_parts(&error);
+                    ms_log::log0!(
+                        "DMX_STOP failed on PID {} FD {}: error {} {}",
+                        pid,
+                        fd.0,
+                        errno,
+                        text
+                    );
+                } else {
+                    ms_log::log!(
+                        "clearing filter on PID {} FD {} [{} ms]",
+                        pid,
+                        fd.0,
+                        self.dev.now_ms() - ctime
+                    );
+                }
                 self.dev.close_demux(fd);
             }
         }
@@ -130,11 +194,43 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
             if self.pids.contains_key(&pid) {
                 continue;
             }
-            let fd = self.dev.open_demux()?;
+            let ctime = self.dev.now_ms();
+            let fd = match self.dev.open_demux() {
+                Ok(fd) => fd,
+                Err(error) => {
+                    let (_, text) = error_parts(&error);
+                    ms_log::log!(
+                        "Could not open demux device /dev/dvb/adapter{}/demux{}: {} ",
+                        self.state.pa,
+                        self.state.fn_num,
+                        text
+                    );
+                    return Err(TunerError::from(error));
+                }
+            };
             if let Err(error) = self.dev.set_pes_filter(fd, pid, PesOutput::TsTap) {
+                let (errno, text) = error_parts(&error);
+                ms_log::log0!(
+                    "failed setting filter on /dev/dvb/adapter{}/demux{} pid {}, errno {} ({}), enabled pids {}",
+                    self.state.pa,
+                    self.state.fn_num,
+                    pid,
+                    errno,
+                    text,
+                    self.pids.len()
+                );
                 self.dev.close_demux(fd);
                 return Err(TunerError::from(error));
             }
+            ms_log::log!(
+                "AD {} [dvr {} {}], setting filter on PID {} for fd {} [{} ms]",
+                self.state.id,
+                self.state.pa,
+                self.state.fn_num,
+                pid,
+                fd.0,
+                self.dev.now_ms() - ctime
+            );
             self.pids.insert(pid, fd);
         }
         Ok(())

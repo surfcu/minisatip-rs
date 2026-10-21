@@ -172,6 +172,7 @@ pub mod linux {
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
     use std::path::Path;
 
     use ms_ca_drivers::ddci::CiWriter;
@@ -201,7 +202,13 @@ pub mod linux {
     }
 
     /// `ddci_open_device`: the write and read handles of the CAM TS interface.
-    pub fn open(node: &DdciNode) -> io::Result<(DdciReader, DdciWriter)> {
+    pub fn open(aid: usize, node: &DdciNode) -> io::Result<(DdciReader, DdciWriter)> {
+        ms_log::log!(
+            "DDCI opening [{}] adapter {} and frontend {}",
+            aid,
+            node.pa,
+            node.fe
+        );
         let open = |path: &str, write: bool| {
             OpenOptions::new()
                 .read(!write)
@@ -213,10 +220,39 @@ pub mod linux {
         let ci = format!("/dev/dvb/adapter{}/ci{}", node.pa, node.fe);
         let (writer, path) = match open(&sec, true) {
             Ok(file) => (file, sec),
-            Err(_) => (open(&ci, true)?, ci),
+            Err(_) => match open(&ci, true) {
+                Ok(file) => (file, ci),
+                Err(error) => {
+                    ms_log::log!(
+                        "ddci_open_device: could not open {} in WRONLY mode error {}: {}",
+                        ci,
+                        ms_log::errno(&error),
+                        ms_log::strerror(&error)
+                    );
+                    return Err(error);
+                }
+            },
         };
-        let reader = open(&path, false)?;
-        Ok((DdciReader(reader), DdciWriter(writer)))
+        let reader = match open(&path, false) {
+            Ok(file) => file,
+            Err(error) => {
+                ms_log::log!(
+                    "ddci_open_device: could not open {} in RDONLY mode error {}: {}",
+                    path,
+                    ms_log::errno(&error),
+                    ms_log::strerror(&error)
+                );
+                return Err(error);
+            }
+        };
+        let writer = DdciWriter::new(writer);
+        ms_log::log!(
+            "opened DDCI adapter {} fe:{} dvr:{}",
+            aid,
+            CiWriter::fd(&writer),
+            reader.as_raw_fd()
+        );
+        Ok((DdciReader(reader), writer))
     }
 
     /// The CAM output as the CI adapter's tuner (`ad->dvr`).
@@ -246,12 +282,47 @@ pub mod linux {
     }
 
     /// `writev` on `ad->fe` of the CI adapter.
-    pub struct DdciWriter(File);
+    pub struct DdciWriter {
+        file: File,
+        /// `errno` after a failed write, for the incomplete-write log.
+        errno: i32,
+        error: String,
+    }
+
+    impl DdciWriter {
+        fn new(file: File) -> Self {
+            Self {
+                file,
+                errno: 0,
+                error: String::new(),
+            }
+        }
+    }
 
     impl CiWriter for DdciWriter {
         fn writev(&mut self, iov: &[&[u8]]) -> isize {
             let slices: Vec<io::IoSlice<'_>> = iov.iter().map(|s| io::IoSlice::new(s)).collect();
-            self.0.write_vectored(&slices).map_or(-1, |n| n as isize)
+            match self.file.write_vectored(&slices) {
+                Ok(n) => n as isize,
+                Err(error) => {
+                    self.errno = ms_log::errno(&error);
+                    self.error = ms_log::strerror(&error);
+                    -1
+                }
+            }
+        }
+
+        fn last_errno(&self) -> i32 {
+            self.errno
+        }
+
+        fn last_error(&self) -> &str {
+            &self.error
+        }
+
+        fn fd(&self) -> i32 {
+            use std::os::unix::io::AsRawFd;
+            self.file.as_raw_fd()
         }
     }
 }

@@ -23,16 +23,16 @@ pub const MCLI_QPSK_S2: i32 = 9;
 pub const MCLI_PSK8: i32 = 10;
 
 const FEC_NONE: i32 = 0;
-const FEC_AUTO: i32 = 9;
+pub(crate) const FEC_AUTO: i32 = 9;
 const FEC_3_5: i32 = 10;
 const FEC_9_10: i32 = 11;
 const QPSK: i32 = 0;
 const QAM_32: i32 = 2;
 const QAM_256: i32 = 5;
-const QAM_AUTO: i32 = 6;
-const INVERSION_AUTO: i32 = 2;
-const TRANSMISSION_MODE_AUTO: i32 = 2;
-const GUARD_INTERVAL_AUTO: i32 = 4;
+pub(crate) const QAM_AUTO: i32 = 6;
+pub(crate) const INVERSION_AUTO: i32 = 2;
+pub(crate) const TRANSMISSION_MODE_AUTO: i32 = 2;
+pub(crate) const GUARD_INTERVAL_AUTO: i32 = 4;
 const HIERARCHY_NONE: i32 = 0;
 
 /// `fe_bandwidth_t`.
@@ -150,8 +150,42 @@ fn bandwidth(bw: i32) -> i32 {
     }
 }
 
-/// The `want_tune` branch of `netcv_commit` (netceiver.cpp:163-344).
-pub fn mcli_tune(tp: &TuneParams) -> McliTune {
+/// Values `netcv_commit` reads from `ad->tp` before choosing a delivery system
+/// (netceiver.cpp:164-184). Shared by [`mcli_tune`] and the tuning log lines so
+/// both use the same defaults and clamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TuneInputs {
+    /// Switch position, clamped to 0..=4.
+    pub diseqc: i32,
+    /// `fe_pol_map` number, clamped to 0..=3.
+    pub pol: i32,
+    /// Transponder frequency in kHz.
+    pub freq: i32,
+    /// Symbol rate in sym/s.
+    pub sr: u32,
+    /// `fe_code_rate_t`.
+    pub fec: i32,
+    /// `fe_modulation_t`.
+    pub mtype: i32,
+    /// Bandwidth in Hz.
+    pub bw: i32,
+    /// `fe_transmit_mode_t`.
+    pub tmode: i32,
+    /// `fe_guard_interval_t`.
+    pub gi: i32,
+    /// `fe_spectral_inversion_t`.
+    pub inversion: i32,
+    /// `hprate` as `tp->hprate.value_or(FEC_AUTO)`. `detect_dvb_parameters`
+    /// never sets `hprate`, so this is always `FEC_AUTO`.
+    pub hprate: i32,
+    /// Stream/ISI id.
+    pub sm: i32,
+    /// T2 transponder id.
+    pub t2id: i32,
+}
+
+/// Reads the `netcv_commit` tuning values with the C++ defaults.
+pub(crate) fn tune_inputs(tp: &TuneParams) -> TuneInputs {
     let diseqc = if tp.src_specified {
         i32::from(tp.src)
     } else {
@@ -160,18 +194,46 @@ pub fn mcli_tune(tp: &TuneParams) -> McliTune {
     let diseqc = if (0..=4).contains(&diseqc) { diseqc } else { 0 };
     let pol = pol_number(tp);
     let pol = if (0..=3).contains(&pol) { pol } else { 0 };
-    let freq = tp.freq;
-    let sr = tp.sr;
-    let fec = if tp.fec_specified {
-        i32::from(tp.fec)
-    } else {
-        FEC_AUTO
-    };
-    let mtype = if tp.mtype_specified {
-        tp.mtype as i32
-    } else {
-        QAM_AUTO
-    };
+    TuneInputs {
+        diseqc,
+        pol,
+        freq: tp.freq,
+        sr: tp.sr,
+        fec: if tp.fec_specified {
+            i32::from(tp.fec)
+        } else {
+            FEC_AUTO
+        },
+        mtype: if tp.mtype_specified {
+            tp.mtype as i32
+        } else {
+            QAM_AUTO
+        },
+        bw: tp.bw.map_or(8_000_000, |b| b as i32),
+        tmode: tp.tmode.unwrap_or(TRANSMISSION_MODE_AUTO),
+        gi: tp.gi.unwrap_or(GUARD_INTERVAL_AUTO),
+        inversion: tp.specinv.unwrap_or(INVERSION_AUTO),
+        hprate: FEC_AUTO,
+        sm: tp.sm.unwrap_or(0),
+        t2id: tp.t2id.unwrap_or(0),
+    }
+}
+
+/// The `want_tune` branch of `netcv_commit` (netceiver.cpp:163-344).
+pub fn mcli_tune(tp: &TuneParams) -> McliTune {
+    let inputs = tune_inputs(tp);
+    let TuneInputs {
+        diseqc,
+        pol,
+        freq,
+        sr,
+        fec,
+        mtype,
+        bw,
+        tmode,
+        gi,
+        ..
+    } = inputs;
     let mut out = McliTune::default();
     match tp.msys {
         DeliverySystem::DvbS | DeliverySystem::DvbS2 => {
@@ -214,7 +276,6 @@ pub fn mcli_tune(tp: &TuneParams) -> McliTune {
         }
         DeliverySystem::DvbT => {
             out.fe_type = FE_OFDM;
-            let bw = tp.bw.map_or(8_000_000, |b| b as i32);
             out.fep = FrontendParams {
                 frequency: freq.wrapping_mul(1000) as u32,
                 inversion: INVERSION_AUTO,
@@ -227,8 +288,8 @@ pub fn mcli_tune(tp: &TuneParams) -> McliTune {
                         6 => QAM_32,
                         other => other,
                     },
-                    transmission_mode: tp.tmode.unwrap_or(TRANSMISSION_MODE_AUTO),
-                    guard_interval: tp.gi.unwrap_or(GUARD_INTERVAL_AUTO),
+                    transmission_mode: tmode,
+                    guard_interval: gi,
                     hierarchy: HIERARCHY_NONE,
                 },
             };

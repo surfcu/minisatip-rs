@@ -4,6 +4,7 @@ use crate::getopt::{
     OptError, c_atoi, parse_f32_prefix, parse_int, scan_int_pair, scan_int_triple, split_terms,
 };
 use crate::options::*;
+use ms_log::{ALL_LOG_MODULES, LOG_LEVELS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArgKind {
@@ -438,29 +439,6 @@ const OPTIONS: &[OptSpec] = &[
     },
 ];
 
-const LOG_LEVELS: [&str; 18] = [
-    "general",
-    "http",
-    "socketworks",
-    "stream",
-    "adapter",
-    "satipc",
-    "pmt",
-    "tables",
-    "dvbapi",
-    "lock",
-    "netceiver",
-    "ca",
-    "socket",
-    "utils",
-    "dmx",
-    "ssdp",
-    "dvb",
-    "ddci",
-];
-
-/// Bit mask selecting every log module (`-l all`).
-pub const ALL_LOG_MODULES: u32 = (1 << LOG_LEVELS.len()) - 1;
 const PLAYLIST_PREFIX: &str = "<satip:X_SATIPM3U xmlns:satip=\"urn:ses-com:satip\">";
 const PLAYLIST_SUFFIX: &str = "</satip:X_SATIPM3U>\r\n";
 
@@ -726,9 +704,18 @@ impl Parser<'_> {
                 } else {
                     for term in split_terms(value, ',') {
                         let level = if term == "-l" {
+                            // minisatip.cpp:769-772.
+                            ms_log::log!("The LOG option has changed, please run ./minisatip -h");
                             Some(1)
                         } else {
-                            log_level(term)
+                            match log_level(term) {
+                                Some(level) => Some(level),
+                                None => {
+                                    // minisatip.cpp:773-776.
+                                    ms_log::log!("module {} not recognised", term);
+                                    None
+                                }
+                            }
                         };
                         if let Some(level) = level {
                             let bit = 1u32 << level;
@@ -746,7 +733,13 @@ impl Parser<'_> {
             OptId::Version => self.opts.version = true,
             OptId::HttpPort => self.opts.http_port = c_atoi(value) as u32,
             OptId::UdpPort => self.opts.start_rtp = c_atoi(value) as u32,
-            OptId::Ipv6 => self.opts.use_ipv4_only = 1 - self.opts.use_ipv4_only,
+            OptId::Ipv6 => {
+                self.opts.use_ipv4_only = 1 - self.opts.use_ipv4_only;
+                if self.opts.use_ipv4_only == 0 {
+                    // minisatip.cpp:819-820.
+                    ms_log::log0!("IPv6 mode is enabled");
+                }
+            }
             OptId::Buffer => {
                 let (adapter, dvr) = scan_int_pair(value);
                 if let Some(adapter) = adapter {
@@ -795,6 +788,9 @@ impl Parser<'_> {
             OptId::Playlist => {
                 if value.len() < 1000 {
                     self.opts.playlist = Some(format!("{PLAYLIST_PREFIX}{value}{PLAYLIST_SUFFIX}"));
+                } else {
+                    // minisatip.cpp:887.
+                    ms_log::log!("playlist length is too big {} bytes", value.len());
                 }
             }
             OptId::EnableAdapters => self.parse_enable_adapters(value),
@@ -832,12 +828,18 @@ impl Parser<'_> {
                 let stripped = value.trim_start_matches('/');
                 if !stripped.is_empty() {
                     self.opts.xml_path = stripped.into();
+                } else {
+                    // minisatip.cpp:1070.
+                    ms_log::log!("Not a valid path for the xml file");
                 }
             }
             OptId::DemuxDev => {
                 let mode = c_atoi(value);
                 if (0..4).contains(&mode) {
                     self.opts.use_demux_device = mode;
+                } else {
+                    // minisatip.cpp:1078.
+                    ms_log::log!("Demux device can be 0-3 and not {}", mode);
                 }
             }
             OptId::AbsoluteSrc => self.parse_absolute_sources(value),
@@ -932,6 +934,17 @@ impl Parser<'_> {
                 },
                 |entry| entry.adapter,
             );
+            ms_log::log!(
+                "Setting {} adapter {} slot {} freq {} pin {}",
+                match kind {
+                    UnicableKind::Unicable => "unicable",
+                    UnicableKind::Jess => "jess",
+                },
+                adapter,
+                slot,
+                freq,
+                pin
+            );
         }
     }
 
@@ -996,6 +1009,14 @@ impl Parser<'_> {
                     entry.uncommitted_no = uncommitted_no;
                 }
             }
+            ms_log::log!(
+                "Setting diseqc adapter {} fast {} addr 0x{:02x} committed_no {} uncommitted_no {}",
+                adapter.map_or(-1, i32::from),
+                i32::from(fast),
+                addr,
+                committed_no,
+                uncommitted_no
+            );
         }
     }
 
@@ -1069,6 +1090,16 @@ impl Parser<'_> {
                     entry.after_tone = after_tone;
                 }
             }
+            ms_log::log!(
+                "Setting diseqc timing for adapter {} before cmd {} after cmd {} after repeated cmd {} after switch {} after burst {} after tone {}",
+                adapter.map_or(-1, i32::from),
+                before_cmd,
+                after_cmd,
+                after_repeated_cmd,
+                after_switch,
+                after_burst,
+                after_tone
+            );
         }
     }
 
@@ -1105,6 +1136,11 @@ impl Parser<'_> {
                     entry.position = position;
                 }
             }
+            ms_log::log!(
+                "Setting diseqc multi adapter {} position {}",
+                adapter.map_or(-1, i32::from),
+                position
+            );
         }
     }
 
@@ -1121,13 +1157,14 @@ impl Parser<'_> {
                 self.mark_allocated(adapter);
                 Some(adapter as u8)
             };
-            let Some(colon) = token.find(':') else {
-                continue;
-            };
-            let Some(dash1) = token.find('-') else {
-                continue;
-            };
-            let Some(dash2) = token[dash1 + 1..].find('-').map(|p| dash1 + 1 + p) else {
+            let dash1 = token.find('-');
+            let dash2 = dash1.and_then(|first| {
+                token[first + 1..]
+                    .find('-')
+                    .map(|position| first + 1 + position)
+            });
+            let (Some(colon), Some(dash1), Some(dash2)) = (token.find(':'), dash1, dash2) else {
+                ms_log::log!("LNB parameters not correctly specified: {}", token);
                 continue;
             };
             let low = parse_int(&token[colon + 1..], -1).saturating_mul(1000);
@@ -1161,6 +1198,13 @@ impl Parser<'_> {
                     entry.circular = 0;
                 }
             }
+            ms_log::log!(
+                "Setting diseqc adapter {} lnb_low {} lnb_high {} lnb_switch {}",
+                adapter.map_or(-1, i32::from),
+                low,
+                high,
+                switch
+            );
         }
     }
 
@@ -1196,6 +1240,7 @@ impl Parser<'_> {
                         adapter: current as u8,
                         master,
                     });
+                    ms_log::log!("Setting master adapter {} for adapter {}", master, current);
                 }
             }
         }
@@ -1206,6 +1251,8 @@ impl Parser<'_> {
             let (start, end) = adapter_range(token);
             for adapter in range_bounds(start, end) {
                 if !self.opts.disable_cat.contains(&(adapter as u8)) {
+                    // `ddci.cpp` `disable_cat_adapters`.
+                    ms_log::log!("Disable passing the CAT to DDCI {}", adapter);
                     self.opts.disable_cat.push(adapter as u8);
                 }
             }
@@ -1224,6 +1271,7 @@ impl Parser<'_> {
             for entry in &mut self.opts.adapter_timeouts {
                 entry.timeout_ms = timeout_ms;
             }
+            ms_log::log!("Set default timeout to {}", timeout_ms);
             return;
         }
         for token in terms {
@@ -1237,6 +1285,7 @@ impl Parser<'_> {
             if !adapter_in_range(adapter_end) {
                 continue;
             }
+            let timeout_ms = timeout.saturating_mul(1000);
             for current in adapter..=adapter_end {
                 self.mark_allocated(current);
                 upsert_by(
@@ -1244,10 +1293,11 @@ impl Parser<'_> {
                     current as u8,
                     AdapterTimeout {
                         adapter: current as u8,
-                        timeout_ms: timeout.saturating_mul(1000),
+                        timeout_ms,
                     },
                     |entry| entry.adapter,
                 );
+                ms_log::log!("Set timeout for adapter {} to {}", current, timeout_ms);
             }
         }
     }
@@ -1259,6 +1309,9 @@ impl Parser<'_> {
                 continue;
             }
             let Some(colon) = token.find(':') else {
+                ms_log::log!(
+                    "Delivery system is missing, the format is adapter_number:delivery_system\n example: 2:dvbs2"
+                );
                 return;
             };
             self.mark_allocated(adapter);
@@ -1272,6 +1325,12 @@ impl Parser<'_> {
                     secondary: system.secondary(),
                 },
                 |entry| entry.adapter,
+            );
+            ms_log::log!(
+                "Setting delivery system for adapter {} to {} and {}",
+                adapter,
+                system.as_str(),
+                system.secondary().as_str()
             );
         }
     }
@@ -1343,6 +1402,34 @@ impl Parser<'_> {
                     entry.snr = snr;
                 }
             }
+            let mut force_text = String::new();
+            if force.strength_percent
+                || force.strength_decibel
+                || force.snr_percent
+                || force.snr_decibel
+            {
+                force_text.push_str(" (forcing driver:");
+                if force.strength_percent {
+                    force_text.push_str(" strength_in_percentage");
+                }
+                if force.strength_decibel {
+                    force_text.push_str(" strength_in_decibels");
+                }
+                if force.snr_percent {
+                    force_text.push_str(" snr_in_percentage");
+                }
+                if force.snr_decibel {
+                    force_text.push_str(" snr_in_decibels");
+                }
+                force_text.push(')');
+            }
+            ms_log::log!(
+                "Setting signal multipler for adapter {}{} strength_multiplier {:.2} snr_multiplier {:.2}",
+                adapter.map_or(-1, i32::from),
+                force_text,
+                strength,
+                snr
+            );
         }
     }
 
@@ -1377,6 +1464,15 @@ impl Parser<'_> {
                 position: (position + 1) as u8,
             });
             if src <= src_end {
+                for value in src..=src_end {
+                    ms_log::log!(
+                        "Setting source {} (src={}) to adapter {} position {}",
+                        value,
+                        value + 1,
+                        adapter,
+                        position + (value - src)
+                    );
+                }
                 self.mark_allocated(adapter);
             }
         }
@@ -1425,6 +1521,8 @@ impl Parser<'_> {
                     },
                     |entry| entry.adapter,
                 );
+                // C++ logs the untruncated option value, not the stored PIN.
+                ms_log::log!("Setting CA {} pin to {}", adapter, &token[colon + 1..]);
             }
         }
     }
@@ -1436,6 +1534,7 @@ impl Parser<'_> {
                 if !self.opts.force_ci.contains(&(adapter as u8)) {
                     self.opts.force_ci.push(adapter as u8);
                 }
+                ms_log::log!("Forcing CA {} to CI", adapter);
             }
         }
     }
@@ -1457,14 +1556,30 @@ impl Parser<'_> {
             if !adapter_in_range(adapter) {
                 continue;
             }
+            ms_log::log!(
+                "Forcing CA {} to use maximum {} CAPMTs with {} PMTs each",
+                adapter,
+                max_ca_pmt,
+                multiple_pmt + 1
+            );
             let mut caids = Vec::new();
             let mut search = 0;
             while let Some(offset) = rem[search..].find('-') {
                 let segment = &rem[search + offset + 1..];
-                if let Some(caid) = parse_hex_prefix(segment)
-                    && caids.len() < MAX_CAID
-                {
-                    caids.push(caid);
+                if let Some(caid) = parse_hex_prefix(segment) {
+                    if caids.len() < MAX_CAID {
+                        caids.push(caid);
+                        if caid > 0 {
+                            ms_log::log!("Forcing CA {} to use CAID {:04X}", adapter, caid);
+                        }
+                    } else if caid > 0 {
+                        ms_log::log!(
+                            "CA {}: reached maximum CAID limit ({}), ignoring CAID {:04X}",
+                            adapter,
+                            MAX_CAID,
+                            caid
+                        );
+                    }
                 }
                 search += offset + 1;
             }
@@ -1489,11 +1604,13 @@ impl Parser<'_> {
         let bind = self.opts.bind.take().filter(|value| !value.is_empty());
         let bind_http = self.opts.bind_http.take().filter(|value| !value.is_empty());
         if self.opts.bind_dev.is_some() && (bind.is_some() || bind_http.is_some()) {
-            // C++ resolve_bind_opts() returns non-zero and set_options calls
-            // FAIL("Invalid bind configuration"): exits 1 without usage.
+            // C++ resolve_bind_opts() returns non-zero (socketworks.cpp:153)
+            // and set_options calls FAIL("Invalid bind configuration"):
+            // exits 1 without usage (minisatip.cpp:1122-1123).
+            ms_log::log!("--bind-dev cannot be combined with --bind or --bind-http");
             return Err(OptError::InvalidValue {
                 option: "--bind-dev".into(),
-                message: "--bind-dev cannot be combined with --bind or --bind-http".into(),
+                message: "Invalid bind configuration".into(),
                 show_usage: false,
             });
         }
@@ -1519,6 +1636,8 @@ fn split_name(text: &str) -> (&str, Option<&str>) {
 fn log_level(term: &str) -> Option<usize> {
     let term = term.trim_start_matches([' ', '\t', '\r', '\n', '\x0b', '\x0c']);
     if term.is_empty() {
+        // utils.cpp:136 (check_strs, driven by minisatip.cpp:767)
+        ms_log::log!("check_strs: s is empty");
         return None;
     }
     let mut found = None;
@@ -1606,6 +1725,24 @@ pub fn parse_dvbapi_opt(optarg: &str, opts: &mut Options) {
     } else {
         opts.dvbapi_host = buf;
         opts.dvbapi_port = 9000;
+    }
+
+    if opts.dvbapi_host.starts_with('/') {
+        // opts.cpp:56
+        ms_log::log!("Using DVBAPI socket at {}", opts.dvbapi_host);
+    } else {
+        // opts.cpp:58
+        ms_log::log!(
+            "Using DVBAPI server at {}:{}, offset {}",
+            opts.dvbapi_host,
+            opts.dvbapi_port,
+            opts.dvbapi_offset
+        );
+    }
+
+    if opts.pids_all_no_dec != 0 {
+        // opts.cpp:63
+        ms_log::log!("Not filtering out encrypted packets from pids=all streams");
     }
 }
 

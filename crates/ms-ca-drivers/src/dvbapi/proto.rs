@@ -2,6 +2,9 @@
 
 use ms_ca::{CaDescriptor, StreamPid};
 
+/// `DEFAULT_LOG` of `dvbapi.cpp` (`#define DEFAULT_LOG LOG_DVBAPI`).
+const DEFAULT_LOG: u32 = ms_log::LOG_DVBAPI;
+
 /// Protocol version this client speaks (`DVBAPI_PROTOCOL_VERSION`).
 pub const DVBAPI_PROTOCOL_VERSION: u16 = 2;
 
@@ -106,6 +109,8 @@ pub fn filter_data(demux: u8, filter: u8, section: &[u8]) -> Option<Vec<u8>> {
 /// Fields of one CAPMT object as `dvbapi_send_pmt` fills them.
 #[derive(Clone, Copy, Debug)]
 pub struct Capmt<'a> {
+    /// Key slot id, only used by the C++ log lines.
+    pub key_id: usize,
     /// `ca_pmt_list_management`.
     pub list_management: u8,
     /// `ca_pmt_cmd_id`.
@@ -156,11 +161,23 @@ pub fn build_capmt(c: &Capmt<'_>) -> Vec<u8> {
 
     for s in c.streams {
         if b.len() + 5 > MAX_CAPMT_LEN {
+            ms_log::log!(
+                "Key {} truncating stream list, dvbapi buffer full",
+                c.key_id
+            );
             break;
         }
         b.push(s.stream_type);
         b.extend_from_slice(&s.pid.to_be_bytes());
         b.extend_from_slice(&[0, 0]);
+        ms_log::logm!(
+            "Key {} adding stream pid {} ({:X}) type {} ({:x})",
+            c.key_id,
+            s.pid,
+            s.pid,
+            s.stream_type,
+            s.stream_type
+        );
     }
     let length = (b.len() - 6) as u16;
     b[4..6].copy_from_slice(&length.to_be_bytes());
@@ -246,8 +263,12 @@ pub enum ServerMsg {
         /// Control word.
         cw: [u8; 8],
     },
-    /// 16-byte AES control word; carried only so the frame can be skipped.
-    CaSetDescrAes,
+    /// 16-byte AES control word; carried only so the frame can be skipped and
+    /// the unknown-operation log can print its first bytes.
+    CaSetDescrAes {
+        /// First 11 message bytes (`b[0..11]` in the C++ default case).
+        data: [u8; 11],
+    },
     /// Algorithm and cipher mode for the next control words.
     CaSetDescrMode {
         /// Raw key byte.
@@ -398,7 +419,7 @@ pub fn parse_message(b: &[u8]) -> Parsed {
             if !need(AES_LEN) {
                 return Parsed::Incomplete;
             }
-            (ServerMsg::CaSetDescrAes, AES_LEN)
+            (ServerMsg::CaSetDescrAes { data: array(b, 0) }, AES_LEN)
         }
         DVBAPI_CA_SET_DESCR_MODE => {
             if !need(17) {
@@ -504,7 +525,12 @@ mod tests {
         be.extend_from_slice(&[0xAA; 16]);
         assert_eq!(
             parse_message(&be),
-            Parsed::Message(ServerMsg::CaSetDescrAes, 29)
+            Parsed::Message(
+                ServerMsg::CaSetDescrAes {
+                    data: be[..11].try_into().unwrap()
+                },
+                29
+            )
         );
         assert_eq!(parse_message(&be[..28]), Parsed::Incomplete);
 
@@ -516,7 +542,12 @@ mod tests {
         assert_eq!(host.len(), 29);
         assert_eq!(
             parse_message(&host),
-            Parsed::Message(ServerMsg::CaSetDescrAes, 29)
+            Parsed::Message(
+                ServerMsg::CaSetDescrAes {
+                    data: host[..11].try_into().unwrap()
+                },
+                29
+            )
         );
         assert_eq!(parse_message(&host[..28]), Parsed::Incomplete);
     }

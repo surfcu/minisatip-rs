@@ -9,15 +9,25 @@ pub struct Fifo {
     data: Vec<u8>,
     read_index: u64,
     write_index: u64,
+    /// Creation site, logged by the C++ `SFIFO` diagnostics (`fifo.h:42`).
+    origin_file: &'static str,
+    origin_line: u32,
 }
 
 impl Fifo {
     /// Allocates a zeroed buffer of `size` bytes.
+    ///
+    /// `#[track_caller]` supplies the nearest Rust equivalent of the
+    /// `__FILE__`/`__LINE__` pair `create_fifo` stores in `SFIFO`.
+    #[track_caller]
     pub fn new(size: usize) -> Self {
+        let origin = std::panic::Location::caller();
         Self {
             data: vec![0; size],
             read_index: 0,
             write_index: 0,
+            origin_file: origin.file(),
+            origin_line: origin.line(),
         }
     }
 
@@ -74,7 +84,24 @@ impl Fifo {
             return 0;
         }
         if !force && src.len() > self.available() {
+            // fifo.cpp:64
+            ms_log::log!(
+                "Not enough space in FIFO created at {}:{}: need {}, available {}",
+                self.origin_file,
+                self.origin_line,
+                src.len(),
+                self.available()
+            );
             return 0;
+        }
+        if self.read_index > 0 && src.len() > self.available() {
+            // fifo.cpp:70 (`%d` is the unsigned `len - available`)
+            ms_log::log!(
+                "Overwriting {} bytes in the FIFO created at {}:{}",
+                src.len() - self.available(),
+                self.origin_file,
+                self.origin_line
+            );
         }
         let offset = (self.write_index % self.size() as u64) as usize;
         let first = src.len().min(self.size() - offset);

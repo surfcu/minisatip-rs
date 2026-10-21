@@ -133,8 +133,47 @@ pub fn parse_request(buf: &[u8]) -> ParseOutcome {
 /// minisatip.cpp:1561-1564) after `is_http_request` matched the method prefix
 /// (utils.cpp:861-864).
 pub fn parse_request_with(buf: &[u8], http: bool) -> ParseOutcome {
+    parse_request_inner(buf, http, None)
+}
+
+/// [`parse_request_with`] plus the `read_rtsp`/`read_http` diagnostics that
+/// need the C++ socket and stream ids (minisatip.cpp:1187-1248, 1495-1506).
+pub fn parse_request_logged(
+    buf: &[u8],
+    http: bool,
+    socket_id: i32,
+    stream_id: i32,
+) -> ParseOutcome {
+    parse_request_inner(buf, http, Some((socket_id, stream_id)))
+}
+
+fn parse_request_inner(buf: &[u8], http: bool, log_ids: Option<(i32, i32)>) -> ParseOutcome {
     if buf.is_empty() {
         return ParseOutcome::Incomplete { consumed: 0 };
+    }
+
+    if let Some((id, sid)) = log_ids
+        && !http
+        && buf.len() > 3
+        && buf[0] == b'$'
+        && buf[1] < 2
+    {
+        let frame_len = (usize::from(buf[2]) << 8) | usize::from(buf[3]);
+        // minisatip.cpp:1192-1196 (C++ reads the first frame of the buffer).
+        ms_log::log!(
+            "Received RTSP over tcp packet (sock_id {}) sid {}, rlen {}, packet len: {}, type {:02X} {:02X} discarding {}...",
+            id,
+            sid,
+            buf.len(),
+            frame_len,
+            buf.get(4).copied().unwrap_or(0),
+            buf.get(5).copied().unwrap_or(0),
+            if buf.len() == frame_len + 4 {
+                "complete"
+            } else {
+                "fragment"
+            }
+        );
     }
 
     let mut offset = 0;
@@ -152,6 +191,21 @@ pub fn parse_request_with(buf: &[u8], http: bool) -> ParseOutcome {
 
     let rest = &buf[offset..];
     let Some(terminator) = find_terminator(rest) else {
+        if let Some((id, _)) = log_ids {
+            // minisatip.cpp:1213-1222 (RTSP) and 1496-1503 (HTTP).
+            if rest.len() > DISCARD_THRESHOLD {
+                ms_log::log!(
+                    "Discarding {} bytes from the socket buffer, request > {}, consider increasing  RBUF",
+                    rest.len(),
+                    MAX_REQUEST_LEN
+                );
+            }
+            if http {
+                ms_log::log!("HTTP header not complete: {}\n{}", id, c_string_lossy(rest));
+            } else {
+                ms_log::log!("RTSP header not complete: {}\n{}", id, c_string_lossy(rest));
+            }
+        }
         if rest.len() > DISCARD_THRESHOLD {
             return ParseOutcome::Discarded;
         }
@@ -169,13 +223,19 @@ pub fn parse_request_with(buf: &[u8], http: bool) -> ParseOutcome {
     };
     let mut parts = request_line.split_whitespace();
     let Some(method) = parts.next() else {
+        // minisatip.cpp:1243-1248.
+        log_short_rtsp_request(log_ids, http, rest.len());
         return ParseOutcome::Malformed;
     };
     let uri = match parts.next() {
         Some(uri) => uri,
         // `GET \r\n\r\n` reaches the inline 503 path (minisatip.cpp:1561-1564).
         None if http && matches!(method, "GET" | "HEAD" | "POST") => "",
-        None => return ParseOutcome::Malformed,
+        None => {
+            // minisatip.cpp:1243-1248.
+            log_short_rtsp_request(log_ids, http, rest.len());
+            return ParseOutcome::Malformed;
+        }
     };
     let version = parts.next().unwrap_or("");
     if method.is_empty() {
@@ -232,6 +292,27 @@ pub fn parse_request_with(buf: &[u8], http: bool) -> ParseOutcome {
 
 fn find_terminator(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// `read_rtsp`'s `split(...).size() < 2` path (minisatip.cpp:1243-1248).
+fn log_short_rtsp_request(log_ids: Option<(i32, i32)>, http: bool, rlen: usize) {
+    if http {
+        return;
+    }
+    if let Some((id, sid)) = log_ids {
+        ms_log::log!(
+            "Most likely not an RTSP packet sock_id: {} sid: {} rlen: {}, dropping ....",
+            id,
+            sid,
+            rlen
+        );
+    }
+}
+
+/// C++ `%s` on the NUL-terminated socket buffer.
+fn c_string_lossy(buf: &[u8]) -> std::borrow::Cow<'_, str> {
+    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end])
 }
 
 /// Parses a signed decimal prefix, returning `default` without any digits.

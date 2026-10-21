@@ -29,6 +29,10 @@ impl<D: CaDevice + Send> Clone for Hw<D> {
 
 impl<D: CaDevice + Send + 'static> Hw<D> {
     pub fn new(dev: D) -> Self {
+        // hw_descrambler.cpp:517-518 (`init_hw_descrambler` when enabled).
+        ms_log::log!(
+            "hw_descrambler: Initializing Hardware Descrambler (--hw-descrambler enabled)"
+        );
         Self {
             hw: Arc::new(Mutex::new(HwDescrambler::new(true, dev))),
             adapters: Arc::default(),
