@@ -230,6 +230,8 @@ impl Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_minisatip"))
             .args([
                 "--disable-ssdp",
+                // `-N`: ignore the host's /dev/dvb adapters so only the test's adapters count.
+                "-N",
                 // `-f`: stay in the foreground; the binary daemonises by
                 // default (minisatip.cpp:1916, DEV-170), and the harness owns
                 // the child process.
