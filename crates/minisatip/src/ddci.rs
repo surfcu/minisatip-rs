@@ -87,6 +87,13 @@ impl DdciStage {
 
 impl TsStage for DdciStage {
     fn process(&mut self, buf: &mut [u8]) {
+        let mut data = buf.to_vec();
+        let capacity = data.len();
+        self.process_buf(&mut data, capacity);
+        buf.copy_from_slice(&data[..buf.len()]);
+    }
+
+    fn process_buf(&mut self, buf: &mut Vec<u8>, capacity: usize) {
         let mut guard = self.hub.lock();
         let state = &mut *guard;
         if state.ddci.devices.contains_key(&usize::from(self.aid)) {
@@ -103,11 +110,16 @@ impl TsStage for DdciStage {
             return;
         }
         state.ddci.now_ms = state.origin.elapsed().as_millis() as u64;
-        // DEV-215: CAM output only fills null slots inside the read batch.
+        // CAM output fills null slots and may grow the batch up to the adapter
+        // buffer (`ad->rlen` up to `ad->lbuf`, ddci.cpp:1105). The zeroed tail
+        // (about 376 KB) reuses the batch allocation.
+        let rlen = buf.len();
+        let mut data = std::mem::take(buf);
+        data.resize(capacity.max(rlen), 0);
         let mut ts = TsBuffer {
             id: self.aid,
-            buf: buf.to_vec(),
-            rlen: buf.len(),
+            buf: data,
+            rlen,
         };
         for dev in devices {
             if let Some(writer) = state.writers.get_mut(&dev) {
@@ -116,7 +128,9 @@ impl TsStage for DdciStage {
                     .process_ts(&mut ts, dev, &mut state.programs, writer.as_mut());
             }
         }
-        buf.copy_from_slice(&ts.buf[..buf.len()]);
+        let mut data = ts.buf;
+        data.truncate(ts.rlen);
+        *buf = data;
     }
 }
 
@@ -680,5 +694,68 @@ mod tests {
         assert!(clear >= 100, "only {clear} descrambled packets came back");
         assert_eq!(scrambled_after_clear, 0);
         assert!(cam.lock().unwrap().ts_stats().descrambled > 0);
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+    use ms_ca_drivers::ddci::{pid_from_ts, set_pid_ts};
+
+    /// The CI side: records what the stage writes, for the CAM to send back later.
+    struct Loopback(Arc<Mutex<Vec<u8>>>);
+
+    impl CiWriter for Loopback {
+        fn writev(&mut self, iov: &[&[u8]]) -> isize {
+            let mut sent = self.0.lock().unwrap();
+            for part in iov {
+                sent.extend_from_slice(part);
+            }
+            iov.iter().map(|part| part.len()).sum::<usize>() as isize
+        }
+    }
+
+    // ddci.cpp:1105: CAM output may grow the batch up to the adapter buffer, so
+    // a stream fully routed through the CAM loses nothing and builds no backlog.
+    #[test]
+    fn cam_output_grows_the_batch_instead_of_backing_up() {
+        const BATCH: usize = 50;
+        const BATCHES: usize = 200;
+        let hub = DdciHub::new();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        hub.open_device(1, Box::new(Loopback(Arc::clone(&sent))));
+        let mut stage = DdciStage::new(hub.clone(), 0);
+        hub.lock().ddci.add_pid_mapping_table(0, 1000, 0, 1, false);
+        let mut delivered = 0;
+        for _ in 0..BATCHES {
+            // The CAM returns the previous batch's packets, PSI and null tail excluded.
+            let echoed: Vec<u8> = std::mem::take(&mut *sent.lock().unwrap())
+                .chunks(188)
+                .filter(|p| pid_from_ts(p) == 1000)
+                .flatten()
+                .copied()
+                .collect();
+            hub.lock().ddci.push_from_cam(1, &echoed);
+            let mut batch = vec![0u8; BATCH * 188];
+            for p in batch.chunks_mut(188) {
+                p[0] = 0x47;
+                p[3] = 0x10;
+                set_pid_ts(p, 1000);
+            }
+            stage.process_buf(&mut batch, 2000 * 188);
+            assert_eq!(batch.len() % 188, 0);
+            delivered += batch.chunks(188).filter(|p| pid_from_ts(p) == 1000).count();
+        }
+        let state = hub.lock();
+        let d = &state.ddci.devices[&1];
+        assert_eq!(
+            d.fifo.write_index - d.read_index[0],
+            0,
+            "CAM output left in the FIFO"
+        );
+        // All but two batches came back: the first reply predates the adapter's
+        // first read, which starts at the write index (ddci.cpp:1179), and the
+        // last batch is still at the CAM.
+        assert_eq!(delivered, BATCH * (BATCHES - 2));
     }
 }

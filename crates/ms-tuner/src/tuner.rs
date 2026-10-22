@@ -424,6 +424,20 @@ impl TsBuf {
         &mut self.data
     }
 
+    /// Lends the packets to a stage that may append up to the capacity
+    /// (`ad->rlen` growing to `ad->lbuf`), then keeps whole packets only.
+    pub fn with_vec(&mut self, f: impl FnOnce(&mut Vec<u8>, usize)) {
+        f(&mut self.data, self.capacity);
+        debug_assert!(
+            self.data.len() <= self.capacity && self.data.len().is_multiple_of(TS_PACKET_SIZE),
+            "stage left {} bytes in a {} byte buffer",
+            self.data.len(),
+            self.capacity
+        );
+        let len = self.data.len().min(self.capacity) / TS_PACKET_SIZE * TS_PACKET_SIZE;
+        self.data.truncate(len);
+    }
+
     /// Iterates over whole buffered packets.
     pub fn packets(&self) -> impl Iterator<Item = &[u8]> {
         self.data
