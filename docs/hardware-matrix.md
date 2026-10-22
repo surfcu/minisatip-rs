@@ -12,4 +12,4 @@ hardware must be called out in release notes.
 | Unicable/JESS | — | tests + external testers | Needs external hardware to validate. |
 | CI+ | — | external testers | Feature-gated and experimental until validated. |
 | SAT>IP client | TBD | real server if available | Backend lands in M8. |
-| Netceiver, hw descrambler, Enigma2 | — | tests only | Unvalidated; must be flagged in release notes. |
+| Netceiver, hw descrambler, Enigma2 | — | tests only | Unvalidated; must be flagged in release notes. Netceiver is parked (PLAN §3) and not part of the binary. |

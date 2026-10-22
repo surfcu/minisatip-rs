@@ -41,6 +41,8 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   are covered by tests only, so there are no alternative CA policies yet.
 - SAT>IP client adapters report `ad_type` 1 on the status page, which scales
   their SNR as DVB (DEV-053).
+- Netceiver is parked (PLAN §3): the `ms-tuner` backend exists but the binary does
+  not use it, and `-n` is an unknown option, as in a C++ build without NETCVCLIENT.
 - The demux-device modes are not supported; the DVR device is always used (DEV-072).
 
 ## Layout
@@ -88,7 +90,6 @@ Cargo features of the `minisatip` crate:
 | `linux-dvb` | yes | Linux DVB tuner backend and `/dev/dvb` enumeration |
 | `dvbcsa` | no | software DVB-CSA descrambling; links `libdvbcsa` |
 | `dvbcsa-icam` | no | iCAM CSA (implies `dvbcsa`); needs a `libdvbcsa` with `dvbcsa_bs_key_set_ecm` |
-| `netceiver` | no | netceiver adapters (`-n if:count`); links `libnetceiver`. Without it `-n` is an unknown option, as in a C++ build without NETCVCLIENT |
 | `srt` | no | SRT output; links `libsrt` |
 
 ```sh

@@ -10,6 +10,7 @@ default = []
 # Reflects whether the binary was built with SRT support.
 srt = []
 # Netceiver client (C++ NETCVCLIENT): without it `-n`/`--netceiver` are unknown options.
+# Netceiver is parked (PLAN §3), so the binary never enables it.
 netceiver = []
 
 [dependencies]

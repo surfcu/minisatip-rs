@@ -35,10 +35,7 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
-      # libnetceiver and an iCAM libdvbcsa are not on the runners: check without linking.
-      - name: Check netceiver feature
-        run: cargo check -p minisatip --features netceiver
-
+      # An iCAM-capable libdvbcsa is not on the runners: check without linking.
       - name: Check iCAM CSA feature
         run: cargo check -p minisatip --features dvbcsa-icam
 

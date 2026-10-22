@@ -690,20 +690,14 @@ fn usage_and_build_lines_follow_the_netceiver_feature() {
     let lines = ms_config::built_info();
     if cfg!(feature = "netceiver") {
         assert!(text.contains("* -n --netceiver if:count:"));
-        assert!(text.contains(
-            "Built with netceiver
-"
-        ));
+        assert!(text.contains("Built with netceiver\n"));
         assert!(lines.contains(&"Built with netceiver"));
     } else {
         assert!(
             !text.contains("-n --netceiver"),
             "the -n paragraph is left out"
         );
-        assert!(text.contains(
-            "Built without netceiver
-"
-        ));
+        assert!(text.contains("Built without netceiver\n"));
         assert!(lines.contains(&"Built without netceiver"));
     }
 }
