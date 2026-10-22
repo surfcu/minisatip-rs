@@ -6,7 +6,7 @@ Server: minisatip/<VER>
 Content-Type: application/json; charset=utf-8
 Connection: close
 Access-Control-Allow-Origin: *
-Content-Length: 35239
+Content-Length: 35188
 --
 {
 "ad_enabled":[<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>],
@@ -124,7 +124,7 @@ Server: minisatip/<VER>
 Content-Type: application/json; charset=utf-8
 Connection: close
 Access-Control-Allow-Origin: *
-Content-Length: 35298
+Content-Length: 35247
 --
 {
 "ad_enabled":[<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>],
@@ -244,7 +244,7 @@ Server: minisatip/<VER>
 Content-Type: application/json; charset=utf-8
 Connection: close
 Access-Control-Allow-Origin: *
-Content-Length: 35240
+Content-Length: 35189
 --
 {
 "ad_enabled":[<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>],
