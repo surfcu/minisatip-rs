@@ -139,56 +139,56 @@ Output: per-scenario pass/fail, plus a readable diff. CI runs every scenario.
 Each milestone lists exit criteria. Tick only when all criteria hold.
 
 ### M0 — Groundwork
-- [ ] Cargo workspace, CI (x86_64 + cross-build armv7/aarch64/mipsel musl)
-- [ ] Decide replay mechanism for the C++ side; build C++ reference binary in CI
+- [x] Cargo workspace, CI (x86_64 + cross-build armv7/aarch64/mipsel musl)
+- [x] Decide replay mechanism for the C++ side; build C++ reference binary in CI
 - [ ] Record initial TS captures on the box (FTA, scrambled, multi-service)
-- [ ] `docs/deviations.md`, `docs/hardware-matrix.md` created
+- [x] `docs/deviations.md`, `docs/hardware-matrix.md` created
 - **Exit:** CI green on all targets with an empty binary; C++ reference builds in CI
 
 ### M1 — Harness + fake CAM
-- [ ] `ms-harness` drives the C++ binary through scenarios, captures all outputs
-- [ ] `ms-fakecam` EN50221 + DDCI, records APDUs
-- [ ] 10+ scenarios recorded as golden output from C++
+- [x] `ms-harness` drives the C++ binary through scenarios, captures all outputs
+- [x] `ms-fakecam` EN50221 + DDCI, records APDUs
+- [x] 10+ scenarios recorded as golden output from C++
 - **Exit:** harness runs C++ against itself deterministically (zero diffs, 10 runs)
 
 ### M2 — TS + PSI
-- [ ] Port `test_pmt.cpp` (PSI parts), `test_dvb_charset.cpp`
-- [ ] `ms-ts`, `ms-psi` incl. charset tables (generate, don't hand-port)
-- [ ] Fuzz targets for section parsing
+- [x] Port `test_pmt.cpp` (PSI parts), `test_dvb_charset.cpp`
+- [x] `ms-ts`, `ms-psi` incl. charset tables (generate, don't hand-port)
+- [x] Fuzz targets for section parsing
 - **Exit:** ported tests pass; fuzzers run 1 h clean
 
 ### M3 — Networking + streaming (file-replay tuner)
-- [ ] Port `test_socketworks.cpp`, `test_stream.cpp`, `test_srt.cpp`
-- [ ] RTSP, HTTP, RTP/UDP, RTP-over-TCP, SRT, SSDP; reuse `html/`
-- [ ] CLI compat parser; port `test_opts.cpp`
+- [x] Port `test_socketworks.cpp`, `test_stream.cpp`, `test_srt.cpp`
+- [x] RTSP, HTTP, RTP/UDP, RTP-over-TCP, SRT, SSDP; reuse `html/`
+- [x] CLI compat parser; port `test_opts.cpp`
 - **Exit:** harness FTA scenarios match C++; tvheadend plays from the Rust build via replay
 
 ### M4 — Linux DVB + scheduler
-- [ ] Port `test_dvb.cpp`, `test_adapter.cpp`
-- [ ] Linux DVB backend, DiSEqC, unicable/JESS, LNB sharing
-- [ ] Scheduler incl. same-mux reuse (#1509 behaviour)
+- [x] Port `test_dvb.cpp`, `test_adapter.cpp`
+- [x] Linux DVB backend, DiSEqC, unicable/JESS, LNB sharing
+- [x] Scheduler incl. same-mux reuse (#1509 behaviour)
 - **Exit:** FTA on real tuners on the box, all 8 adapters; zapping scenarios match C++
 
 ### M5 — DVBAPI + software descrambling
-- [ ] Port `test_dvbapi.cpp`
+- [x] Port `test_dvbapi.cpp`
 - [ ] DVBAPI protocol against fake oscam and real oscam; CSA (libdvbcsa FFI) + AES
 - **Exit:** scrambled channels play via oscam on the box; DVBAPI message diff clean
 
 ### M6 — CA reconciler + DDCI
-- [ ] Port `test_ddci.cpp` and DDCI-related parts of `test_ca.cpp`
-- [ ] `ms-ca` reconciler with a "C++-compatible" policy set reproducing current sequences
-- [ ] DDCI driver: virtual adapter, PID remapping, generated PAT/SDT (#1511 behaviour)
+- [x] Port `test_ddci.cpp` and DDCI-related parts of `test_ca.cpp`
+- [x] `ms-ca` reconciler with a "C++-compatible" policy set reproducing current sequences
+- [x] DDCI driver: virtual adapter, PID remapping, generated PAT/SDT (#1511 behaviour)
 - **Exit:** CAPMT sequences identical to C++ in all scenarios; real CAM on the box
   descrambles with no new glitches on join/leave/rejoin
 
 ### M7 — EN50221 CI stack
-- [ ] Port remaining `test_ca.cpp`
-- [ ] Resources: resource manager, application info, CA support, date-time, MMI
+- [x] Port remaining `test_ca.cpp`
+- [x] Resources: resource manager, application info, CA support, date-time, MMI
 - **Exit:** APDU diff clean with fake CAM; real CAM works through the CI path
 
 ### M8 — Remaining backends
-- [ ] SAT>IP client (port `test_satipc.cpp`, `test_satipc_rtsp.cpp`, `fake_satip_server.h`)
-- [ ] Netceiver, hardware descrambler (port `test_hw_descrambler.cpp`)
+- [x] SAT>IP client (port `test_satipc.cpp`, `test_satipc_rtsp.cpp`, `fake_satip_server.h`)
+- [x] Netceiver, hardware descrambler (port `test_hw_descrambler.cpp`)
 - [ ] Status/variables API parity
 - **Exit:** ported tests pass; satipc against at least one real SAT>IP server
 
@@ -207,10 +207,10 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 
 | Feature | Validated on | How |
 |---|---|---|
-| Linux DVB, 8 tuners | user's box | real |
-| DDCI, 1 CAM | user's box | real |
+| Linux DVB, 8 tuners | user's box | real: FTA through tvheadend (2026-10-22) |
+| DDCI, 1 CAM | user's box | real: Irdeto CAM on a DuoFlex CI, `-c 8:**2`, 3 channels through tvheadend without glitches (2026-10-22) |
 | Multi-CAM | — | fake CAM only |
-| DVBAPI / oscam | user's box | real |
+| DVBAPI / oscam | — | fake oscam only; no oscam on the box |
 | Unicable/JESS | — | tests + external testers |
 | CI+ | — | external testers |
 | SAT>IP client | TBD | real server if available |
@@ -258,8 +258,39 @@ Unvalidated rows must be called out in release notes.
 
 ## Status
 
-- **Current milestone:** M0
-- **Last session:** — (plan created 2026-10-21)
-- **Next:** set up cargo workspace + CI; decide C++ replay mechanism (`tools/replay.py`,
-  `tests/test_play`)
-- **Blockers:** none
+- **Current milestone:** M9 (parity hardening). M0–M8 items are in place except the
+  M0 box captures, the M5 real-oscam item and the M8 status API item; the open exit
+  criteria are listed below.
+- **Last session:** 2026-10-22 — hardware bring-up behind tvheadend on the user's box
+  (8 DVB-S2 tuners, DuoFlex CI with an Irdeto CAM). Fixed and merged:
+  - #21 hermetic tests (`-N`); #22 `DTV_ENUM_DELSYS` byte layout; #23 LNB kHz units.
+  - #24 DDCI multi-PMT (`-c N:**M`) PID filter; #26 DDCI CAM output may grow the batch
+    (plus harness date masking); #27 blocking RTP socket with the C++ 1.1 s timeout
+    (lost RTP datagrams).
+  - #25 C++ logging port (`-l`, `-v`, `-F`, `-g`).
+  - #28 and #30 port upstream #1518 (no forced CAPMT on a kept-place rejoin) and
+    3d42bee (retry a failed CAPMT write). Upstream baseline is now `28dfd78`.
+  - #29 status page: SDT names, CI adapter type, CA info (DEV-212 withdrawn).
+  - Verified on the box: FTA, DDCI descrambling of 3 channels with MTD, rejoin
+    without partner glitches.
+- **Open exit criteria:**
+  - M0: TS captures recorded on the box (the harness uses synthetic captures).
+  - M1: C++-against-itself determinism run (10 runs) not recorded.
+  - M2: 1 h fuzz run not recorded.
+  - M3: tvheadend via the replay tuner not tried (tvheadend works on real tuners).
+  - M4: all 8 adapters exercised and zapping compared with C++.
+  - M5: real oscam (none on the box): DVBAPI item and exit stay open.
+  - M6: no CA scenarios in the harness yet, so CAPMT sequences are only diffed by
+    the ported tests; the real-CAM join/leave/rejoin check passed. The runtime drives
+    `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
+  - M7: APDU diff with the fake CAM needs the same CA harness scenarios; the real CAM
+    works through the CI path.
+  - M8: satipc against a real SAT>IP server. Status API: SAT>IP/netceiver adapters
+    report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
+    instead of /0.15).
+  - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak; resource comparison.
+- **Next:** status page check on the box (#29); report the SAT>IP/netceiver adapter
+  types; port `test_utils.cpp`; CA scenarios in the harness; second CI (adapter 9) once
+  a CAM is in; start the 7-day soak.
+- **Blockers:** no oscam on the box (M5 exit; whether to reword it is the user's call);
+  no SAT>IP server (M8 exit).
