@@ -76,6 +76,26 @@ pub struct ServiceStats {
     pub cw: Option<usize>,
 }
 
+/// One pid of the adapter pid table as the descrambler counts it (`SPid`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PidCounters {
+    /// The pid is in the adapter pid table (`find_pid` finds it).
+    pub tracked: bool,
+    /// `PID_STATE_ACTIVE`; only active slots count for `ad_decerr`.
+    pub active: bool,
+    /// Claiming PMT (`p->pmt`), -1 when none.
+    pub claim: i32,
+    /// `p->packets` since the pid became active.
+    pub packets: u64,
+    /// `p->dec_err`: scrambled packets since the last reset.
+    pub dec_err: u64,
+    /// `p->is_decrypted`: a clear packet was seen.
+    pub decrypted: bool,
+}
+
+/// One entry of [`Descrambler::set_adapter_pids`]: pid, active, claiming PMT.
+pub type AdapterPid = (u16, bool, i32);
+
 /// Owns the CW slots and per-service batches of one adapter.
 pub struct Descrambler {
     registry: CipherRegistry,
@@ -84,6 +104,7 @@ pub struct Descrambler {
     pid_pmt: Box<[u32; 8192]>,
     order: Vec<usize>,
     dec_err: u64,
+    pids: Box<[PidCounters; 8192]>,
 }
 
 /// Header length up to the payload (`get_adaptation_len`).
@@ -232,7 +253,75 @@ impl Descrambler {
             pid_pmt: Box::new([NO_PMT; 8192]),
             order: Vec::new(),
             dec_err: 0,
+            pids: vec![PidCounters::default(); 8192]
+                .into_boxed_slice()
+                .try_into()
+                .expect("8192 pid entries"),
         }
+    }
+
+    /// Mirrors the adapter pid table: a new pid starts at zero (slot init in
+    /// update_pids), a changed claim clears `decrypted` (pmt.cpp:1264).
+    pub fn set_adapter_pids(&mut self, table: &[AdapterPid]) {
+        let mut seen = [false; 8192];
+        for &(pid, active, claim) in table {
+            let Some(entry) = self.pids.get_mut(usize::from(pid)) else {
+                continue;
+            };
+            seen[usize::from(pid)] = true;
+            if !entry.tracked {
+                *entry = PidCounters {
+                    tracked: true,
+                    claim,
+                    ..PidCounters::default()
+                };
+            } else if entry.claim != claim {
+                entry.claim = claim;
+                entry.decrypted = false;
+            }
+            // NEW -> ACTIVE re-initialises the slot counters (adapter.cpp:1015-1028).
+            if active && !entry.active {
+                entry.packets = 0;
+                entry.dec_err = 0;
+            }
+            entry.active = active;
+        }
+        for (pid, entry) in self.pids.iter_mut().enumerate() {
+            if entry.tracked && !seen[pid] {
+                *entry = PidCounters::default();
+            }
+        }
+    }
+
+    /// `p->packets++` for tracked pids (check_cc, stream.cpp:899-923): nothing
+    /// is counted while pid 8192 is requested, and TEI packets are skipped.
+    pub fn count_packets(&mut self, buf: &[u8], pid_all_requested: bool) {
+        if pid_all_requested {
+            return;
+        }
+        for b in buf.as_chunks::<DVB_FRAME>().0 {
+            if b[1] & 0x80 != 0 {
+                continue;
+            }
+            let entry = &mut self.pids[usize::from(pid_of(b))];
+            if entry.tracked {
+                entry.packets += 1;
+            }
+        }
+    }
+
+    /// `get_adapter_decerrs` (adapter.cpp:2363): the dec errors of the first
+    /// two active slots, which sort_pids orders by packets.
+    pub fn adapter_decerr(&self) -> u64 {
+        let mut active: Vec<&PidCounters> =
+            self.pids.iter().filter(|p| p.tracked && p.active).collect();
+        active.sort_by_key(|p| std::cmp::Reverse(p.packets));
+        active.iter().take(2).map(|p| p.dec_err).sum()
+    }
+
+    /// Counters of one pid, for tests and diagnostics.
+    pub fn pid_counters(&self, pid: u16) -> PidCounters {
+        self.pids[usize::from(pid & 0x1FFF)]
     }
 
     /// Starts tracking a service and maps its PIDs to it (`pmt_add` + `p->pmt`).
@@ -716,7 +805,16 @@ impl Descrambler {
             .enumerate()
         {
             let pid = pid_of(b);
-            if pid == 0x1FFF || pids_all || b[3] & 0x80 == 0 {
+            if pid == 0x1FFF || pids_all {
+                continue;
+            }
+            if b[3] & 0x80 == 0 {
+                // The first clear packet resets the pid's errors (pmt.cpp:1366-1372).
+                let entry = &mut self.pids[usize::from(pid)];
+                if pid > 0x001F && entry.tracked && !entry.decrypted {
+                    entry.decrypted = true;
+                    entry.dec_err = 0;
+                }
                 continue;
             }
             // `opts.debug & (DEFAULT_LOG | LOG_DMX)`.
@@ -735,6 +833,10 @@ impl Descrambler {
                 DropEncrypted::Send => {}
             }
             self.dec_err += 1;
+            let entry = &mut self.pids[usize::from(pid)];
+            if entry.tracked {
+                entry.dec_err += 1;
+            }
         }
     }
 }

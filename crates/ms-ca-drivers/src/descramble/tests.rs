@@ -771,3 +771,138 @@ fn updating_service_pids_keeps_the_control_words() {
     d.set_service_pids(2, &[0x200]);
     assert!(d.has_service(2));
 }
+
+/// A TS packet on `pid` with payload, scrambled (TSC 10) or clear.
+fn ts(pid: u16, scrambled: bool) -> [u8; 188] {
+    let mut b = [0xAAu8; 188];
+    b[0] = 0x47;
+    b[1] = (pid >> 8) as u8 & 0x1F;
+    b[2] = pid as u8;
+    b[3] = if scrambled { 0x90 } else { 0x10 };
+    b
+}
+
+fn batch(packets: &[(u16, bool)]) -> Vec<u8> {
+    packets.iter().flat_map(|&(pid, s)| ts(pid, s)).collect()
+}
+
+/// count_packets then mark_pids_null, as one data-plane batch with a CA active.
+fn pass(d: &mut Descrambler, packets: &[(u16, bool)]) {
+    let mut buf = batch(packets);
+    d.count_packets(&buf, false);
+    d.mark_pids_null(&mut buf, DropEncrypted::Send, false);
+}
+
+// get_adapter_decerrs (adapter.cpp:2363): the errors of the two busiest active
+// pids; mark_pids_null (pmt.cpp:1324-1374) counts per pid and resets on decrypt.
+#[test]
+fn ad_decerr_sums_the_two_busiest_active_pids() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    d.set_adapter_pids(&[
+        (0x100, true, 1),
+        (0x101, true, 1),
+        (0x102, true, 1),
+        (0x103, false, 1),
+    ]);
+    let mut packets = vec![(0x100, true); 10];
+    packets.extend([(0x101, true); 6]);
+    packets.extend([(0x102, true); 2]);
+    packets.extend([(0x103, true); 20]);
+    pass(&mut d, &packets);
+    assert_eq!(d.dec_err(), 38, "ad->dec_err counts every scrambled packet");
+    assert_eq!(d.pid_counters(0x102).dec_err, 2);
+    assert_eq!(
+        d.adapter_decerr(),
+        16,
+        "0x100 and 0x101; 0x103 is not active yet"
+    );
+
+    // The first clear packet of a pid resets its errors, once.
+    pass(&mut d, &[(0x100, false)]);
+    assert_eq!(d.pid_counters(0x100).dec_err, 0);
+    assert!(d.pid_counters(0x100).decrypted);
+    pass(&mut d, &[(0x100, true), (0x100, false)]);
+    assert_eq!(d.pid_counters(0x100).dec_err, 1, "no second reset");
+    assert_eq!(d.adapter_decerr(), 7);
+}
+
+#[test]
+fn a_claim_change_rearms_the_reset_and_removed_pids_are_forgotten() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    d.set_adapter_pids(&[(0x100, true, 1)]);
+    pass(&mut d, &[(0x100, false), (0x100, true), (0x100, true)]);
+    assert_eq!(d.pid_counters(0x100).dec_err, 2);
+    // pmt.cpp:1264: a PMT claiming the pid clears is_decrypted.
+    d.set_adapter_pids(&[(0x100, true, 2)]);
+    assert!(!d.pid_counters(0x100).decrypted);
+    pass(&mut d, &[(0x100, false)]);
+    assert_eq!(
+        d.pid_counters(0x100).dec_err,
+        0,
+        "reset again after the claim change"
+    );
+
+    d.set_adapter_pids(&[]);
+    assert_eq!(d.pid_counters(0x100), PidCounters::default());
+    pass(&mut d, &[(0x100, true)]);
+    assert_eq!(
+        d.pid_counters(0x100).dec_err,
+        0,
+        "untracked pids have no counters"
+    );
+    assert_eq!(d.adapter_decerr(), 0);
+}
+
+#[test]
+fn no_packets_are_counted_while_pid_8192_is_requested() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    d.set_adapter_pids(&[(0x100, true, 1)]);
+    d.count_packets(&batch(&[(0x100, true); 5]), true);
+    assert_eq!(d.pid_counters(0x100).packets, 0);
+    d.count_packets(&batch(&[(0x100, true); 5]), false);
+    assert_eq!(d.pid_counters(0x100).packets, 5);
+}
+
+// The stage counts scrambled packets left after decrypting and reports them
+// as ad_decerr; the first clear packet clears them.
+#[test]
+fn stage_reports_ad_decerr_and_clears_it_once_decrypted() {
+    let (tx, mut stage) = DescramblerStage::new(
+        CipherRegistry::software(),
+        StageConfig {
+            drop_encrypted: DropEncrypted::Send,
+            pids_all_no_dec: false,
+        },
+        std::time::Instant::now(),
+    );
+    tx.send(DescramblerCommand::SetCaActive(true)).unwrap();
+    tx.send(DescramblerCommand::SetAdapterPids(vec![(0x100, true, 1)]))
+        .unwrap();
+    let query = |tx: &mpsc::Sender<DescramblerCommand>, stage: &mut DescramblerStage| {
+        let (reply, rx) = mpsc::channel();
+        tx.send(DescramblerCommand::Query(reply)).unwrap();
+        stage.drain_commands();
+        rx.recv().unwrap().ad_decerr
+    };
+    stage.process(&mut batch(&[(0x100, true); 4]));
+    assert_eq!(query(&tx, &mut stage), 4);
+    stage.process(&mut batch(&[(0x100, false)]));
+    assert_eq!(query(&tx, &mut stage), 0);
+}
+
+// adapter.cpp:1015-1028: a pid turning NEW -> ACTIVE starts its counters at zero.
+#[test]
+fn a_new_pid_becoming_active_starts_from_zero() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    d.set_adapter_pids(&[(0x100, false, 1)]);
+    pass(&mut d, &[(0x100, true), (0x100, true)]);
+    assert_eq!(d.pid_counters(0x100).packets, 2);
+    assert_eq!(d.adapter_decerr(), 0, "a NEW pid is not summed");
+    d.set_adapter_pids(&[(0x100, true, 1)]);
+    assert_eq!(
+        (d.pid_counters(0x100).packets, d.pid_counters(0x100).dec_err),
+        (0, 0)
+    );
+    pass(&mut d, &[(0x100, true)]);
+    assert_eq!(d.adapter_decerr(), 1);
+}

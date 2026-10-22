@@ -70,3 +70,18 @@ fn ca_slots_pushed_by_the_runtime_reach_the_snapshot() {
     session.set_web_ca(ca.clone(), Vec::new());
     assert_eq!(session.web_snapshot().ca, ca);
 }
+
+// adapter.cpp:2459 `ad_decerr`: the runtime pushes the descramblers' counts.
+#[test]
+fn decrypt_errors_reach_ad_decerr() {
+    let mut session = manager();
+    let mut decerr = vec![0; 32];
+    decerr[0] = 7;
+    session.set_web_decerr(decerr);
+    let snapshot = session.web_snapshot();
+    assert_eq!(snapshot.adapters[0].decerr, 7);
+    assert_eq!(snapshot.adapters[8].decerr, 0);
+    let json =
+        ms_net::web::WebService::new(ms_net::web::WebConfig::default()).state_json(&snapshot);
+    assert!(json.contains("\"ad_decerr\":[7,"), "{json}");
+}
