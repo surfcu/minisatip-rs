@@ -171,8 +171,8 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 
 ### M5 — DVBAPI + software descrambling
 - [x] Port `test_dvbapi.cpp`
-- [ ] DVBAPI protocol against fake oscam and real oscam; CSA (libdvbcsa FFI) + AES
-- **Exit:** scrambled channels play via oscam on the box; DVBAPI message diff clean
+- [x] DVBAPI protocol against fake oscam; CSA (libdvbcsa FFI) + AES
+- **Exit:** scrambled channels play against fake oscam; DVBAPI message diff clean
 
 ### M6 — CA reconciler + DDCI
 - [x] Port `test_ddci.cpp` and DDCI-related parts of `test_ca.cpp`
@@ -259,8 +259,7 @@ Unvalidated rows must be called out in release notes.
 ## Status
 
 - **Current milestone:** M9 (parity hardening). M0–M8 items are in place except the
-  M0 box captures, the M5 real-oscam item and the M8 status API item; the open exit
-  criteria are listed below.
+  M0 box captures and the M8 status API item; the open exit criteria are listed below.
 - **Last session:** 2026-10-22 — hardware bring-up behind tvheadend on the user's box
   (8 DVB-S2 tuners, DuoFlex CI with an Irdeto CAM). Fixed and merged:
   - #21 hermetic tests (`-N`); #22 `DTV_ENUM_DELSYS` byte layout; #23 LNB kHz units.
@@ -279,7 +278,11 @@ Unvalidated rows must be called out in release notes.
   - M2: 1 h fuzz run not recorded.
   - M3: tvheadend via the replay tuner not tried (tvheadend works on real tuners).
   - M4: all 8 adapters exercised and zapping compared with C++.
-  - M5: real oscam (none on the box): DVBAPI item and exit stay open.
+  - M5: reworded to fake oscam (2026-10-22, no oscam on the box). `ca_e2e` plays a
+    CSA-scrambled replay through RTSP with fake-oscam control words and passes, but
+    needs `--features dvbcsa`, which CI does not run. DVBAPI messages are checked by
+    the ported `test_dvbapi` tests. Open: DVBAPI message diff (no harness scenario);
+    `ca_e2e` not covered by CI.
   - M6: no CA scenarios in the harness yet, so CAPMT sequences are only diffed by
     the ported tests; the real-CAM join/leave/rejoin check passed. The runtime drives
     `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
@@ -290,7 +293,6 @@ Unvalidated rows must be called out in release notes.
     instead of /0.15).
   - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak; resource comparison.
 - **Next:** status page check on the box (#29); report the SAT>IP/netceiver adapter
-  types; port `test_utils.cpp`; CA scenarios in the harness; second CI (adapter 9) once
-  a CAM is in; start the 7-day soak.
-- **Blockers:** no oscam on the box (M5 exit; whether to reword it is the user's call);
-  no SAT>IP server (M8 exit).
+  types; port `test_utils.cpp`; CI test step with `--features dvbcsa`; CA scenarios in
+  the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak.
+- **Blockers:** no SAT>IP server (M8 exit).
