@@ -176,7 +176,8 @@ impl<P: CaPolicy> Reconciler<P> {
         self.rejected.keys().copied().collect()
     }
 
-    /// Programs waiting for a retry (CAM busy or initializing).
+    /// Programs waiting for a retry (CAM busy or initializing, no CA session,
+    /// or a failed CAPMT write).
     pub fn pending(&self) -> Vec<i32> {
         self.pending.keys().copied().collect()
     }

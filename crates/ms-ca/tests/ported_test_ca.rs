@@ -896,6 +896,40 @@ fn test_capmt_changed_rejoin_still_sends() {
     );
 }
 
+// Ported from tests/test_ca.cpp:2316 (minisatip 3d42bee)
+// A failed CAPMT write is reported as a retry and keeps no place, so the
+// next PMT pass registers the program from scratch.
+#[test]
+fn test_capmt_write_failure_retries() {
+    let mut cam = PackingCam::open();
+    let p1 = cam.program(0x2b01);
+    cam.drv.fail_writes = true;
+    assert_eq!(
+        cam.join(p1, false),
+        TablesResult::Retry,
+        "a failed write asks to retry"
+    );
+    assert_eq!(cam.dev.capmt[0].pmt_count(), 0, "no place is kept");
+
+    cam.drv.fail_writes = false;
+    assert_eq!(cam.join(p1, false), TablesResult::Ok, "the retry");
+    assert_eq!(cam.read_capmts().0, 1, "sends the CAPMT");
+    assert!(cam.dev.capmt[0].has_pmt(p1), "and registers it");
+
+    // A failed update keeps its place; it is retried as an update.
+    cam.drv.fail_writes = true;
+    cam.dev.capmt[0].sid = 0x2b0f;
+    assert_eq!(cam.join(p1, true), TablesResult::Retry);
+    assert!(cam.dev.capmt[0].has_pmt(p1), "an update keeps its place");
+    cam.drv.fail_writes = false;
+
+    // Without a CA session the add is retried too and keeps no place.
+    let p2 = cam.program(0x2b02);
+    cam.drv.no_session = true;
+    assert_eq!(cam.join(p2, false), TablesResult::Retry);
+    assert!(cam.dev.slot_of(p2).is_none(), "no place is kept");
+}
+
 // Ported from tests/test_ca.cpp:2292
 #[test]
 fn test_capmt_zap_back_keeps_places() {
