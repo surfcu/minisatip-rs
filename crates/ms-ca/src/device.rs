@@ -26,18 +26,27 @@ pub enum SendOutcome {
     Sent,
     /// Content hash unchanged and not forced: nothing written.
     Unchanged,
-    /// The write failed; C++ still reports success (returns 0).
+    /// The write failed (C++ `TABLES_RESULT_ERROR_RETRY`).
     WriteFailed,
-    /// No CA session (C++ returns 1).
+    /// No CA session (C++ returns 1, `TABLES_RESULT_ERROR_RETRY`).
     NoSession,
     /// `create_capmt` failed (C++ NORETRY).
     BuildFailed,
 }
 
 impl SendOutcome {
+    /// The C++ `send_capmt` return value (tables.h:13-15).
+    pub fn result(self) -> TablesResult {
+        match self {
+            Self::Sent | Self::Unchanged => TablesResult::Ok,
+            Self::WriteFailed | Self::NoSession => TablesResult::Retry,
+            Self::BuildFailed => TablesResult::NoRetry,
+        }
+    }
+
     /// The C++ return value treated as failure by callers.
     pub fn is_error(self) -> bool {
-        matches!(self, Self::NoSession | Self::BuildFailed)
+        self.result() != TablesResult::Ok
     }
 }
 
@@ -271,6 +280,7 @@ impl CaDevice {
         ms_log::hexdump!("CAPMT: ", &built.bytes);
         if !driver.send_ca_pmt(&built.bytes) {
             c.forget_sent();
+            ms_log::log!("CA {}: CAPMT write failed", self.id);
             return SendOutcome::WriteFailed;
         }
         c.capmt_hash = capmt_content_hash(&built.bytes);
@@ -365,7 +375,7 @@ impl CaDevice {
         }
         // Only a new join forces the send; an update or a kept-place rejoin
         // sends only when the built CAPMT changed, decided in send_capmt.
-        if self
+        let rc = self
             .send_capmt(
                 slot,
                 listmgmt,
@@ -374,10 +384,15 @@ impl CaDevice {
                 programs,
                 driver,
             )
-            .is_error()
-        {
+            .result();
+        if rc != TablesResult::Ok {
+            // A failed add keeps no place, so a channel closed before the
+            // retry leaves nothing behind; a write failure is retried.
+            if !update {
+                self.remove_pmt_from_device(pmt_id);
+            }
             ms_log::log!("send_capmt failed");
-            return TablesResult::NoRetry;
+            return rc;
         }
         TablesResult::Ok
     }
