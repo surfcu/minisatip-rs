@@ -96,6 +96,37 @@ fn udp_outputs_set_dscp_ef_and_the_send_buffer() {
     drop((rx_rtp, rx_rtcp));
 }
 
+#[test]
+fn udp_rtp_socket_blocks_with_the_cpp_timeout() {
+    // udp_bind never sets O_NONBLOCK and set_linux_socket_timeout gives
+    // SO_SNDTIMEO/SO_RCVTIMEO of 1.1 s (socketworks.cpp:250-386), so a send
+    // burst waits for buffer space. RTCP is polled, so it stays non-blocking.
+    let (rx_rtp, rx_rtcp) = udp_pair();
+    let target = UdpTarget {
+        local: free_local_pair(),
+        dest: rx_rtp.local_addr().unwrap(),
+        ttl: None,
+    };
+    let output = StreamOutput::udp_with_options(target, config(7), 0, None, 0).unwrap();
+    let (rtp, rtcp) = output.udp_sockets().expect("UDP output");
+    use std::os::fd::AsRawFd;
+    assert!(
+        !ms_net::sys::socket_nonblocking(rtp.as_raw_fd()).unwrap(),
+        "RTP sends must wait for buffer space"
+    );
+    assert!(ms_net::sys::socket_nonblocking(rtcp.as_raw_fd()).unwrap());
+    let timeout = Some(std::time::Duration::from_millis(1100));
+    assert_eq!(rtp.write_timeout().unwrap(), timeout);
+    assert_eq!(rtp.read_timeout().unwrap(), timeout);
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        rtcp.recv(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "RTCP reads must not block"
+    );
+    drop((rx_rtp, rx_rtcp));
+}
+
 fn recv(socket: &UdpSocket) -> Vec<u8> {
     let mut buf = [0u8; 2048];
     let len = socket.recv(&mut buf).expect("datagram");
