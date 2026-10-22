@@ -5,9 +5,45 @@ a drop-in replacement: the same RTSP/HTTP streaming, SAT>IP behaviour, CLI flags
 web UI and hardware support, with CA, adapter allocation and PSI processing each
 owned by one component.
 
-The architecture, milestones and conventions are in [PLAN.md](PLAN.md). Current
-status: **M0 (groundwork)** — the workspace and CI exist; all crates are
-placeholders.
+The architecture, milestones and conventions are in [PLAN.md](PLAN.md).
+
+## Status
+
+**Pre-release, M9 (parity hardening).** All modules of the C++ reference are
+ported. The binary runs as a tvheadend SAT>IP backend on real hardware, but it
+has not yet passed the 7-day soak test, so it is not a recommended replacement yet.
+
+- Upstream baseline: `catalinii/minisatip` `28dfd78`.
+- The C++ test suites are ported, except `test_utils.cpp`.
+- The differential harness matches the C++ binary on 12 RTSP/HTTP/RTP scenarios.
+- Intentional differences from C++ are listed in [docs/deviations.md](docs/deviations.md).
+
+### Hardware validation
+
+| Feature | State |
+|---|---|
+| Linux DVB (8 DVB-S2 tuners) | verified: FTA through tvheadend |
+| DDCI (DuoFlex CI, Irdeto CAM, `-c 8:**2`) | verified: 3 channels descrambled without glitches, including rejoin |
+| DVBAPI / oscam | fake oscam only |
+| Multi-CAM | fake CAM only |
+| SAT>IP client, netceiver, unicable/JESS, hardware descrambler | unit tests only |
+| Enigma2 paths | deferred |
+
+Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
+
+### Known limitations
+
+- **CI+ is not implemented.** The content-control resources are advertised, but
+  their APDUs are ignored (DEV-151), so CI+ CAMs will not authenticate.
+- The CA harness scenarios are still missing. CAPMT sequences are compared with
+  C++ only by the ported unit tests and by the real-CAM check.
+- The runtime drives `ms_ca::CaDevice` directly; the `Reconciler` and its policies
+  are covered by tests only, so there are no alternative CA policies yet.
+- SAT>IP and netceiver adapters report `ad_type` 1 on the status page, which
+  scales their SNR as DVB (DEV-053).
+- The demux-device modes are not supported; the DVR device is always used (DEV-072).
+- The `minisatip` crate has no feature for the netceiver backend (`ms-tuner/netceiver`)
+  or for iCAM CSA (`ms-ca-drivers/dvbcsa-icam`), so the binary cannot be built with them yet.
 
 ## Layout
 
@@ -16,16 +52,20 @@ Cargo workspace (Rust 2024) with these members:
 | Crate | Role |
 |---|---|
 | `ms-ts` | TS packet/section handling, CRC, PID router |
-| `ms-psi` | PAT/PMT/CAT/SDT parsing and charset tables |
-| `ms-tuner` | `Tuner` trait and backends |
-| `ms-sched` | adapter allocation and DiSEqC/unicable constraints |
-| `ms-ca` | CA state reconciler and CAPMT policies |
-| `ms-ca-drivers` | EN50221, DDCI, DVBAPI and descramblers |
-| `ms-net` | RTSP, HTTP, RTP, SRT and SSDP |
-| `ms-config` | CLI/config compatibility and status API |
+| `ms-psi` | PAT/PMT/CAT/SDT parsing and generated charset tables |
+| `ms-tuner` | `Tuner` trait and backends: Linux DVB, SAT>IP client, netceiver, file replay |
+| `ms-sched` | adapter allocation, PMT/PID state, DiSEqC/unicable constraints |
+| `ms-ca` | CAPMT building, CA device slots, reconciler and policies |
+| `ms-ca-drivers` | EN50221, DDCI, DVBAPI, CSA/AES and hardware descramblers |
+| `ms-net` | RTSP, HTTP, RTP, SSDP, the adapter data plane and the web/status pages |
+| `ms-srt` | SRT bindings |
+| `ms-log` | logging compatible with the C++ `-l`/`-v` modules |
+| `ms-config` | CLI compatibility and options |
 | `ms-harness` | differential test runner |
 | `ms-fakecam` | EN50221/DDCI CAM simulator |
-| `minisatip` | binary: wiring, logging, signals |
+| `minisatip` | binary: wiring, CA runtime, signals |
+
+Fuzz targets for the PSI parsers and the section assembler are in `fuzz/`.
 
 ## Build and test
 
@@ -43,9 +83,24 @@ cargo build --release -p minisatip
 ./target/release/minisatip --version
 ```
 
+Cargo features of the `minisatip` crate:
+
+| Feature | Default | Effect |
+|---|---|---|
+| `linux-dvb` | yes | Linux DVB tuner backend and `/dev/dvb` enumeration |
+| `dvbcsa` | no | software DVB-CSA descrambling; links `libdvbcsa` |
+| `srt` | no | SRT output; links `libsrt` |
+
+```sh
+cargo build --release -p minisatip --features dvbcsa,srt
+```
+
+The release binary is about 1.5 MB stripped (x86_64).
+
 Cross builds use [`cross`](https://github.com/cross-rs/cross); see
-`.github/workflows/ci.yml` for the musl target matrix. The C++ reference build is
-also produced there.
+`.github/workflows/ci.yml` for the musl target matrix (x86_64, armv7, aarch64 and
+mipsel). `scripts/check-cross.sh` type-checks the same targets locally. The C++
+reference build is also produced there (`scripts/build-cpp-reference.sh`).
 
 The differential harness runs both binaries over the YAML scenarios in
 `harness/scenarios/` and diffs normalised RTSP/HTTP/RTP output. See
