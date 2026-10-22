@@ -35,7 +35,7 @@ allocation and PSI processing are each owned by one component.
 - RTSP/SAT>IP server, HTTP streaming, RTP/UDP, RTP-over-TCP, SRT output
 - SSDP/UPnP discovery, web UI (reuse `html/` as-is), status/variables API
 - Linux DVB frontends: DiSEqC 1.0/1.1, unicable/JESS, LNB sharing, adapter allocation
-- SAT>IP client backend (satipc), netceiver backend
+- SAT>IP client backend (satipc)
 - PSI: PAT/PMT/CAT/SDT, section assembly, charset decoding
 - CA: EN50221 CI stack incl. CI+, DDCI, DVBAPI (oscam), software CSA/AES,
   hardware descrambler
@@ -45,6 +45,19 @@ allocation and PSI processing are each owned by one component.
 - Enigma2-specific paths: until after M9, only if someone can test them
 - CI+ crypto: ported last, behind a cargo feature, marked experimental until
   validated on real CI+ CAMs
+
+### Supported / parked / dropped
+
+Decisions that override the lists above. Do not port or wire parked or dropped
+items back in without the user's explicit go-ahead.
+
+- **Supported:** everything under "In scope" above, plus iCAM CSA (`dvbcsa-icam`
+  feature, needs a libdvbcsa with `dvbcsa_bs_key_set_ecm`).
+- **Parked (2026-10-22):** netceiver backend. The `ms-tuner` netceiver module and
+  its tests stay (DEV-132–139), but nothing wires it into the binary; `-n` is an
+  unknown option, as in a C++ build without NETCVCLIENT.
+- **Dropped:** DVBAPI AES key delivery (`CA_SET_DESCR_AES`): the message is skipped
+  cleanly and never applied (DEV-080).
 
 ### Non-goals
 - New features before parity (exception: anything needed by the harness)
@@ -214,7 +227,7 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 | Unicable/JESS | — | tests + external testers |
 | CI+ | — | external testers |
 | SAT>IP client | TBD | real server if available |
-| Netceiver, hw descrambler, Enigma2 | — | tests only |
+| Netceiver (parked), hw descrambler, Enigma2 | — | tests only |
 
 Unvalidated rows must be called out in release notes.
 
@@ -288,11 +301,14 @@ Unvalidated rows must be called out in release notes.
     `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
   - M7: APDU diff with the fake CAM needs the same CA harness scenarios; the real CAM
     works through the CI path.
-  - M8: satipc against a real SAT>IP server. Status API: SAT>IP/netceiver adapters
+  - M8: satipc against a real SAT>IP server. Status API: SAT>IP client adapters
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).
   - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak; resource comparison.
-- **Next:** status page check on the box (#29); report the SAT>IP/netceiver adapter
-  types; port `test_utils.cpp`; CI test step with `--features dvbcsa`; CA scenarios in
+- **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
+  path already matched C++); CI checks it without linking. Netceiver is parked
+  (§3): the binary is built without it, so `-n` is unknown as in C++.
+- **Next:** status page check on the box (#29); report the SAT>IP adapter type;
+  port `test_utils.cpp`; CI test step with `--features dvbcsa`; CA scenarios in
   the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak.
 - **Blockers:** no SAT>IP server (M8 exit).

@@ -15,4 +15,4 @@ pub use options::{
     UnicableConfig, UnicableKind,
 };
 pub use parse::{ParseOutcome, parse_args, parse_dvbapi_opt, parse_sdt_charset_opt};
-pub use usage::{BUILT_INFO, USAGE, VERSION_BANNER, usage_text};
+pub use usage::{BUILT_INFO, USAGE, VERSION_BANNER, built_info, usage_text};

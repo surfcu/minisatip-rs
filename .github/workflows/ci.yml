@@ -35,6 +35,10 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # An iCAM-capable libdvbcsa is not on the runners: check without linking.
+      - name: Check iCAM CSA feature
+        run: cargo check -p minisatip --features dvbcsa-icam
+
   harness:
     name: Differential harness (Rust vs Rust)
     runs-on: ubuntu-latest

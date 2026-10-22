@@ -285,12 +285,33 @@ By default every CAM supports 1 channels
 "#
 );
 
-/// Returns the help text printed for `--help`, including the C++
-/// `DISABLE_SRT` build line when the feature is off.
+/// The `-n` help paragraph, printed only by NETCVCLIENT builds.
+const NETCEIVER_HELP: &str = "* -n --netceiver if:count: use network interface <if> (default vlan4) and look for <count> netceivers\n\t* eg: -n vlan4:2\n\n";
+
+/// Build lines for this binary (`built_info`), with the C++ "Built without"
+/// text for the SRT and netceiver features that are off.
+pub fn built_info() -> Vec<&'static str> {
+    BUILT_INFO
+        .iter()
+        .map(|line| match *line {
+            "Built with srt" if !cfg!(feature = "srt") => "Built without srt",
+            "Built with netceiver" if !cfg!(feature = "netceiver") => "Built without netceiver",
+            line => line,
+        })
+        .collect()
+}
+
+/// Returns the help text printed for `--help`, with the build lines and the
+/// `-n` paragraph of this build (`DISABLE_SRT`, `DISABLE_NETCVCLIENT`).
 pub fn usage_text() -> String {
-    if cfg!(feature = "srt") {
-        USAGE.to_owned()
-    } else {
-        USAGE.replace("Built with srt\n", "Built without srt\n")
+    let mut text = USAGE.to_owned();
+    if !cfg!(feature = "srt") {
+        text = text.replace("Built with srt\n", "Built without srt\n");
     }
+    if !cfg!(feature = "netceiver") {
+        text = text
+            .replace("Built with netceiver\n", "Built without netceiver\n")
+            .replace(NETCEIVER_HELP, "");
+    }
+    text
 }

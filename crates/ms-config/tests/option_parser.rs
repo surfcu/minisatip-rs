@@ -148,10 +148,6 @@ fn short_options_table() {
         (&["-s", "192.168.1.2"], |o| {
             assert_eq!(o.satip_servers.as_deref(), Some("192.168.1.2"))
         }),
-        (&["-n", "vlan4:2"], |o| {
-            assert_eq!(o.netcv_if.as_deref(), Some("vlan4"));
-            assert_eq!(o.netcv_count, 2);
-        }),
         (&["-I", "living-room"], |o| {
             assert_eq!(o.name_app, "living-room")
         }),
@@ -305,7 +301,6 @@ fn every_long_option_is_recognized() {
         &["--satip-tcp"],
         &["--satip-xml", "http://localhost/desc.xml"],
         &["--satip-receive-buffer", "350"],
-        &["--netceiver", "vlan4:2"],
         &["--ca-pin", "0:1234"],
         &["--ci", "0"],
         &["--ca-channels", "0:1"],
@@ -655,4 +650,54 @@ fn defaults_match_set_options() {
     assert!(!opts.enigma);
     assert_eq!(opts.satip_servers, None);
     assert_eq!(opts.enabled_adapters, None);
+}
+
+#[cfg(feature = "netceiver")]
+#[test]
+fn netceiver_option_parses_interface_and_count() {
+    let o = parse(&["-n", "vlan4:2"]);
+    assert_eq!((o.netcv_if.as_deref(), o.netcv_count), (Some("vlan4"), 2));
+    let o = parse(&["--netceiver", "3"]);
+    assert_eq!((o.netcv_if.as_deref(), o.netcv_count), (Some("vlan4"), 3));
+}
+
+// Without NETCVCLIENT the C++ option table has no netceiver entry, so getopt
+// reports -n/--netceiver as unknown and the server keeps running.
+#[cfg(not(feature = "netceiver"))]
+#[test]
+fn netceiver_option_is_unknown_without_the_feature() {
+    for values in [&["-n", "vlan4:2"][..], &["--netceiver", "vlan4:2"]] {
+        let outcome = parse_outcome(values);
+        assert!(outcome.error.is_none(), "{values:?}: {:?}", outcome.error);
+        assert!(outcome.options.netcv_if.is_none());
+        assert_eq!(outcome.options.netcv_count, 0);
+    }
+    // getopt_long_only tries -n as a long prefix first (glibc): it is ambiguous.
+    assert_eq!(
+        parse_outcome(&["-n", "1"]).warnings,
+        ["option '-n' is ambiguous; possibilities: '-name-app' '-no-all-pids'"]
+    );
+    assert_eq!(
+        parse_outcome(&["--netceiver", "1"]).warnings,
+        ["unrecognized option '--netceiver'"]
+    );
+}
+
+// minisatip.cpp:254-258,441-447: the build line and the -n paragraph follow NETCVCLIENT.
+#[test]
+fn usage_and_build_lines_follow_the_netceiver_feature() {
+    let text = ms_config::usage_text();
+    let lines = ms_config::built_info();
+    if cfg!(feature = "netceiver") {
+        assert!(text.contains("* -n --netceiver if:count:"));
+        assert!(text.contains("Built with netceiver\n"));
+        assert!(lines.contains(&"Built with netceiver"));
+    } else {
+        assert!(
+            !text.contains("-n --netceiver"),
+            "the -n paragraph is left out"
+        );
+        assert!(text.contains("Built without netceiver\n"));
+        assert!(lines.contains(&"Built without netceiver"));
+    }
 }

@@ -22,7 +22,7 @@ message (`log_buf`); it does not change the logging module.
 | 887 | LOG | `playlist length is too big %zd bytes` | `crates/ms-config/src/parse.rs:793` |
 | 953 | LOG | `%s was not compiled with DVBAPI support, please install ...` | n/a: `DISABLE_DVBAPI` build only |
 | 975 | LOG | `%s was not compiled with satip client support, please change ...` | n/a: `DISABLE_SATIPCLIENT` build only |
-| 1025 | LOG | `%s was not compiled with netceiver client support, please change ...` | n/a: `DISABLE_NETCVCLIENT` build only |
+| 1025 | LOG | `%s was not compiled with netceiver client support, please change ...` | n/a: unreachable; without NETCVCLIENT `-n` is not in the option table (DEV-019) |
 | 1070 | LOG | `Not a valid path for the xml file` | `crates/ms-config/src/parse.rs:833` |
 | 1078 | LOG | `Demux device can be 0-3 and not %d` | `crates/ms-config/src/parse.rs:842` |
 | 1110 | LOG | `Invalid --sdt-charset value, expected auto or latin1` | already ported: `crates/ms-config/src/parse.rs:856-857`, logged by `main.rs:44` |
