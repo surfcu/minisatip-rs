@@ -244,8 +244,11 @@ pub trait CaSink {
     fn del_pmt(&mut self, _service: &CaService) -> TablesResult {
         TablesResult::Ok
     }
-    /// Announces a claimed elementary/data PID.
-    fn add_pid(&mut self, _service: &CaService, _pid: i32) {}
+    /// Announces a claimed elementary/data PID; `true` invalidates the PMT so
+    /// its next section is sent again as an update (`dvbca_add_pid`).
+    fn add_pid(&mut self, _service: &CaService, _pid: i32) -> bool {
+        false
+    }
     /// Removes a PID from the CA.
     fn del_pid(&mut self, _service: &CaService, _pid: i32) {}
     /// Whether this CA accepts the service's CAIDs (no filter means yes).
@@ -1465,12 +1468,16 @@ impl Scheduler {
             return;
         };
         let mask = self.pmt(pmt_id).map_or(0, |pmt| pmt.ca_mask);
+        let mut invalidate = false;
         for (slot, sink) in self.pmt.ca.iter_mut().enumerate() {
             if mask & (1u64 << slot) != 0
                 && let Some(sink) = sink
             {
-                sink.add_pid(&service, pid);
+                invalidate |= sink.add_pid(&service, pid);
             }
+        }
+        if invalidate && let Some(pmt) = self.pmt_slot_mut(pmt_id) {
+            pmt.version = -1;
         }
     }
 

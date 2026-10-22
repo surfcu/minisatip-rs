@@ -545,18 +545,217 @@ mod tests {
         }
     }
 
+    // `-c 1:*1` on the DDCI CA: the CAPMT for the CI-side PMT lists the pids DDCI
+    // mapped onto the CI adapter, which sync_ddci mirrors into its pid table.
     #[test]
-    fn ddci_cam_descrambles_the_tuner_service() {
+    fn ddci_multiple_pmt_capmt_lists_the_mapped_pids() {
+        let opts = ms_config::parse_args(&["-c".to_owned(), "1:*1".to_owned()])
+            .into_options()
+            .unwrap();
+        let run = run_ddci(opts, "multi");
+        let streams: Vec<u16> = {
+            let cam = run.cam.lock().unwrap();
+            let program = cam
+                .programs()
+                .programs()
+                .iter()
+                .find(|p| p.number() == SID)
+                .expect("the CAM got no CAPMT");
+            program.capmt.streams.iter().map(|s| s.pid).collect()
+        };
+        assert_eq!(streams, [VIDEO_PID], "the mapped video pid is listed");
+        assert!(
+            run.clear >= 100,
+            "only {} descrambled packets came back",
+            run.clear
+        );
+        assert_eq!(run.scrambled_after_clear, 0);
+        for handle in run.handles.into_iter().flatten() {
+            handle.stop();
+        }
+    }
+
+    const AUDIO_PID: u16 = 0x102;
+    const AUDIO2_PID: u16 = 0x103;
+
+    /// PAT and a scrambled PMT with video and two audio streams, repeated.
+    fn three_stream_mux(path: &std::path::Path) {
+        let pat = [0, 0, 0, 0, 1, 0xC1, 0, 0, 0, SID as u8, 0xE1, PMT_PID as u8];
+        let pmt = [
+            2,
+            0,
+            0,
+            0,
+            SID as u8,
+            0xC1,
+            0,
+            0,
+            0xE1,
+            VIDEO_PID as u8,
+            0xF0,
+            6, //
+            9,
+            4,
+            0x0B,
+            0x00,
+            0xE5,
+            0x00, //
+            2,
+            0xE1,
+            VIDEO_PID as u8,
+            0xF0,
+            0, //
+            3,
+            0xE1,
+            AUDIO_PID as u8,
+            0xF0,
+            0, //
+            3,
+            0xE1,
+            AUDIO2_PID as u8,
+            0xF0,
+            0,
+        ];
+        let mut data = Vec::new();
+        for cycle in 0..200u8 {
+            data.extend_from_slice(&section_packet(0, &pat, cycle & 0xF));
+            data.extend_from_slice(&section_packet(PMT_PID, &pmt, cycle & 0xF));
+        }
+        std::fs::write(path, data).unwrap();
+    }
+
+    /// Stream PIDs of the CAPMT the fake CAM holds for `SID`.
+    fn capmt_pids(cam: &Cam) -> Option<Vec<u16>> {
+        let cam = cam.lock().unwrap();
+        let program = cam
+            .programs()
+            .programs()
+            .iter()
+            .find(|p| p.number() == SID)?;
+        Some(program.capmt.streams.iter().map(|s| s.pid).collect())
+    }
+
+    // ca.cpp CAPMT_add_PMT: with multiple PMTs per CAPMT (`-c 0:*1`) only the ES
+    // pids in the adapter's pid table are listed (`added_only`); a pid added later
+    // invalidates the PMT (dvbca_add_pid), so the CAPMT is sent again with it.
+    #[test]
+    fn ci_slot_capmt_lists_only_requested_pids() {
         let cam: Cam = Arc::new(Mutex::new(FakeCam::new(
             CamConfig::default(),
             Arc::new(ms_fakecam::ManualClock::new(0)),
         )));
-        let dir = std::env::temp_dir().join(format!("ms-ddci-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ms-capmt-req-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let capture = dir.join("mux.ts");
+        three_stream_mux(&capture);
+
+        let opts = ms_config::parse_args(&["-c".to_owned(), "0:*1".to_owned()])
+            .into_options()
+            .unwrap();
+        let mut sched = Scheduler::new();
+        let mut ca = CaRuntime::new(&opts);
+        let dvbca = Dvbca::spawn(
+            DvbcaSettings::from_options(&opts),
+            Box::new(SlotOpener(Arc::clone(&cam))),
+            Arc::new(SystemClock::default()),
+        )
+        .unwrap();
+        ca.attach_dvbca(&mut sched, dvbca);
+        let tuner = FileReplayTuner::open(
+            &capture,
+            FileReplayConfig {
+                looping: true,
+                pacing: Pacing::FixedBitrate(2_000_000),
+            },
+        )
+        .unwrap();
+        let source = AdapterHandle::spawn_with_stages(
+            Box::new(tuner),
+            DataPlaneConfig::default(),
+            None,
+            ca.stages(0),
+        )
+        .unwrap();
+        source.send(Command::KeepReading(true));
+        sched.add_adapter(
+            0,
+            AdapterConfig::new(DeliverySystem::DvbS2),
+            Box::new(DataPlaneTuner::new(source.command_sender())),
+        );
+        ca.adapter_added(&mut sched, 0);
+        ca.dvbca_init_dev(AdapterInfo::dvb(0, 0, 0));
+        let handles = vec![Some(source)];
+
+        // The client asks for video and the first audio only.
+        for pid in [0, PMT_PID, VIDEO_PID, AUDIO_PID] {
+            sched.mark_pid_add(0, 0, i32::from(pid));
+        }
+        sched.post_tune_adapter(0);
+        ca.after_scheduler(&mut sched, &handles);
+
+        let mut pump = |sched: &mut Scheduler, until: &dyn Fn(&[u16]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                while let Ok(event) = handles[0].as_ref().unwrap().events().try_recv() {
+                    if let Event::TablePackets {
+                        generation,
+                        packets,
+                    } = event
+                    {
+                        ca.on_table_packets(sched, &handles, 0, generation, &packets);
+                    }
+                }
+                ca.tick(sched, &handles);
+                if capmt_pids(&cam).is_some_and(|pids| until(&pids)) {
+                    return capmt_pids(&cam);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            capmt_pids(&cam)
+        };
+        let pids = pump(&mut sched, &|pids| !pids.is_empty()).expect("the CAM got no CAPMT");
+        assert_eq!(
+            pids,
+            [VIDEO_PID, AUDIO_PID],
+            "the unrequested audio is left out"
+        );
+
+        sched.mark_pid_add(0, 0, i32::from(AUDIO2_PID));
+        sched.update_adapter_pids(0);
+        let pids = pump(&mut sched, &|pids| pids.contains(&AUDIO2_PID)).unwrap();
+        assert_eq!(
+            pids,
+            [VIDEO_PID, AUDIO_PID, AUDIO2_PID],
+            "a requested pid is sent again"
+        );
+        for handle in handles.into_iter().flatten() {
+            handle.stop();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Result of [`run_ddci`]: the CAM and the runtime after the loop.
+    struct DdciRun {
+        cam: Cam,
+        sched: Scheduler,
+        ca: CaRuntime,
+        hub: DdciHub,
+        handles: Vec<Option<AdapterHandle>>,
+        clear: usize,
+        scrambled_after_clear: usize,
+    }
+
+    /// A tuner (adapter 0) streaming a scrambled service through DDCI (adapter 1).
+    fn run_ddci(opts: Options, tag: &str) -> DdciRun {
+        let cam: Cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let dir = std::env::temp_dir().join(format!("ms-ddci-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let capture = dir.join("mux.ts");
         scrambled_mux(&capture);
 
-        let opts = Options::default();
         let mut sched = Scheduler::new();
         let mut ca = CaRuntime::new(&opts);
         let dvbca = Dvbca::spawn(
@@ -681,6 +880,29 @@ mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+        DdciRun {
+            cam,
+            sched,
+            ca,
+            hub,
+            handles,
+            clear,
+            scrambled_after_clear,
+        }
+    }
+
+    #[test]
+    fn ddci_cam_descrambles_the_tuner_service() {
+        let DdciRun {
+            cam,
+            mut sched,
+            mut ca,
+            hub,
+            handles,
+            clear,
+            scrambled_after_clear,
+        } = run_ddci(Options::default(), "plain");
         let programs: Vec<u16> = cam
             .lock()
             .unwrap()
@@ -689,7 +911,6 @@ mod tests {
             .iter()
             .map(|p| p.number())
             .collect();
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(!programs.is_empty(), "the CAM got no CAPMT");
         assert!(clear >= 100, "only {clear} descrambled packets came back");
         assert_eq!(scrambled_after_clear, 0);

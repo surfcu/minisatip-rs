@@ -240,6 +240,11 @@ impl ProgramTable {
         self.slots.iter().flatten()
     }
 
+    /// Replaces the requested pids with the adapters' pid tables (`find_pid`).
+    pub fn set_requested_pids(&mut self, pids: BTreeSet<(u16, u16)>) {
+        self.requested = Some(pids);
+    }
+
     /// Tracks requested pids from now on (adapter pid table, `find_pid`).
     pub fn track_requested_pids(&mut self) {
         self.requested.get_or_insert_with(BTreeSet::new);
