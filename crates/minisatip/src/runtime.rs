@@ -23,7 +23,7 @@ use ms_net::handler::{HandlerContext, StreamBackend, StreamType, handle_http, ha
 use ms_net::output::{OutputConfig, StreamOutput, UdpTarget};
 use ms_net::response::format_http_date;
 use ms_net::rtsp::{ParseOutcome, Protocol, Request, parse_request_logged};
-use ms_net::session::{DescribeOptions, SessionManager};
+use ms_net::session::{DescribeOptions, SessionManager, UdpBinder};
 use ms_net::socket::DEFAULT_FIFO_SIZE;
 use ms_net::ssdp::{
     ANNOUNCE_INTERVAL_MS, SharedIdentity, SsdpConfig, SsdpServer, UdpSsdpIo, read_boot_id, uuid4,
@@ -372,6 +372,7 @@ impl Runtime {
         session.set_bandwidth(Arc::clone(&bandwidth));
         session.set_start_rtp(config.start_rtp);
         session.set_transport_defaults(config.rrtp.clone(), &opts.disc_host);
+        session.set_udp_binder(udp_binder(&config));
         session.set_server_timeout_ms(config.timeout_ms);
         session.set_describe_options(DescribeOptions {
             local_host: config.advertised_host.clone(),
@@ -855,14 +856,29 @@ impl Runtime {
             }
             return;
         }
+        let moved = dest.is_some() && active_dest != dest;
+        let sockets = if moved {
+            self.session.udp_sockets(id)
+        } else {
+            None
+        };
+        if moved && sockets.is_none() {
+            // decode_transport closed the old socket before its bind failed
+            // (stream.cpp:525-560), so nothing streams until a new SETUP.
+            self.stop_output(id);
+            return;
+        }
         if let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref) {
-            if let Some(dest) = dest
-                && active_dest != Some(dest)
-            {
-                handle.send(Command::SetDestination {
+            if let Some((rtp, rtcp)) = sockets {
+                handle.send(Command::ReplaceUdpSockets {
                     stream_id: id,
-                    dest,
+                    rtp,
+                    rtcp,
+                    send_buffer: self.config.output_buffer,
                 });
+                if let Some(active) = self.outputs.get_mut(&id) {
+                    active.dest = dest;
+                }
             }
             // A re-SETUP Session header changes the SSRC of the live output
             // (stream.cpp:1409-1416).
@@ -883,12 +899,11 @@ impl Runtime {
         let Some(stream) = self.session.stream(id) else {
             return;
         };
-        let (stream_type, adapter, ssrc, seq, server_port, remote_host, remote_port, srt_sock) = (
+        let (stream_type, adapter, ssrc, seq, remote_host, remote_port, srt_sock) = (
             stream.stream_type,
             stream.adapter,
             stream.session_id as u32,
             stream.rtp_seq,
-            stream.server_port,
             stream.remote_host.clone(),
             stream.remote_port,
             stream.srt_sock,
@@ -921,29 +936,12 @@ impl Runtime {
         };
         let output = match stream_type {
             StreamType::RtspUdp => {
-                let dest = dest.expect("parsed above");
-                // decode_transport binds `bind_dev_ip()` or the wildcard of
-                // the destination family, not `--bind`
-                // (stream.cpp:556-561, socketworks.cpp:333-341).
-                let local_ip = if self.config.bind_dev.is_some() {
-                    self.config.bind_ip
-                } else if dest.is_ipv4() {
-                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-                } else {
-                    IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                // decode_transport opened them at SETUP (stream.cpp:556-584); a
+                // failed bind leaves `rsock < 0` and the stream never sends.
+                let Some((rtp, rtcp)) = self.session.udp_sockets(id) else {
+                    return;
                 };
-                let target = UdpTarget {
-                    local: SocketAddr::new(local_ip, server_port),
-                    dest,
-                    ttl: None,
-                };
-                StreamOutput::udp_with_options(
-                    target,
-                    config,
-                    now_ms,
-                    self.config.bind_dev.as_deref(),
-                    self.config.output_buffer,
-                )
+                StreamOutput::udp_from_bound(rtp, rtcp, config, now_ms, self.config.output_buffer)
             }
             StreamType::RtspTcp => Ok(StreamOutput::rtsp_tcp(
                 Box::new(writer),
@@ -1463,6 +1461,37 @@ fn local_ip(disc_host: &str, ipv4_only: bool) -> String {
             String::new()
         }
     }
+}
+
+/// decode_transport binds `bind_dev_ip()` or the wildcard of the destination
+/// family, not `--bind` (stream.cpp:556-561, socketworks.cpp:333-341).
+fn udp_target(dev_ip: Option<IpAddr>, server_port: u16, dest: SocketAddr) -> UdpTarget {
+    let local_ip = if let Some(ip) = dev_ip {
+        ip
+    } else if dest.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    };
+    UdpTarget {
+        local: SocketAddr::new(local_ip, server_port),
+        dest,
+        ttl: None,
+    }
+}
+
+/// The SETUP-time `udp_bind_connect` of decode_transport (stream.cpp:556-584).
+fn udp_binder(config: &ServerConfig) -> UdpBinder {
+    let bind_dev = config.bind_dev.clone();
+    let dev_ip = bind_dev.as_ref().map(|_| config.bind_ip);
+    Box::new(move |server_port, host, port| {
+        let ip = host.parse::<IpAddr>().map_err(|_| {
+            crate::sys::log_error(format_args!("minisatip: invalid RTP destination {host}"));
+            io::Error::from(io::ErrorKind::InvalidInput)
+        })?;
+        let target = udp_target(dev_ip, server_port, SocketAddr::new(ip, port));
+        ms_net::output::bind_udp_pair(&target, bind_dev.as_deref())
+    })
 }
 
 fn udp_destination(stream: &ms_net::session::Stream) -> Option<SocketAddr> {

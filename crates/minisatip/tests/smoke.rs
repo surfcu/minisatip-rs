@@ -31,6 +31,7 @@ struct Server {
     child: Child,
     rtsp_port: u16,
     http_port: u16,
+    start_rtp: u16,
     dir: PathBuf,
 }
 
@@ -109,6 +110,7 @@ impl Server {
             child,
             rtsp_port,
             http_port,
+            start_rtp,
             dir,
         })
     }
@@ -371,6 +373,51 @@ fn setup_after_play_redirects_rtp() -> io::Result<()> {
     let (length, _) = second.recv_from(&mut buffer)?;
     assert!(length > 12, "RTP packet after redirect");
 
+    // Going back to the first port is another transport change.
+    first.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let drain_until = Instant::now() + TIMEOUT;
+    while Instant::now() < drain_until && first.recv_from(&mut buffer).is_ok() {}
+    assert!(
+        Instant::now() < drain_until,
+        "the first port still receives after the redirect"
+    );
+    first.set_read_timeout(Some(TIMEOUT))?;
+    let (status, _, _) = request(
+        &mut rtsp,
+        &format!(
+            "SETUP {url} RTSP/1.0\r\nCSeq: 4\r\nSession: {session}\r\nTransport: RTP/AVP;unicast;client_port={first_port}-{}\r\n\r\n",
+            first_port.wrapping_add(1)
+        ),
+    )?;
+    assert_eq!(status, 200, "third SETUP");
+    let (length, _) = first.recv_from(&mut buffer)?;
+    assert!(length > 12, "RTP packet after redirecting back");
+    Ok(())
+}
+
+#[test]
+fn setup_fails_when_the_rtp_port_is_taken() -> io::Result<()> {
+    let capture = generate_ts()?;
+    let server = start_server(&capture)?;
+    let _taken = UdpSocket::bind(("127.0.0.1", server.start_rtp))?;
+    let mut rtsp = TcpStream::connect(("127.0.0.1", server.rtsp_port))?;
+    rtsp.set_read_timeout(Some(TIMEOUT))?;
+    let url = format!(
+        "rtsp://127.0.0.1:{}/?freq=11500&msys=dvbs2&sr=27500&pids=0",
+        server.rtsp_port
+    );
+    let client = UdpSocket::bind(("127.0.0.1", 0))?;
+    let port = client.local_addr()?.port();
+    // decode_transport binds the RTP socket at SETUP and a failure answers
+    // 400 (stream.cpp:556-560, minisatip.cpp:1286-1289).
+    let (status, _, _) = request(
+        &mut rtsp,
+        &format!(
+            "SETUP {url} RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP;unicast;client_port={port}-{}\r\n\r\n",
+            port.wrapping_add(1)
+        ),
+    )?;
+    assert_eq!(status, 400, "SETUP with the server RTP port taken");
     Ok(())
 }
 

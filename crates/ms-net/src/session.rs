@@ -6,6 +6,9 @@
 use ms_sched::pmt::PmtState as SchedPmtState;
 use ms_sched::{AdapterType, MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
 use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
+use std::collections::HashMap;
+use std::io;
+use std::net::UdpSocket;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime};
 
@@ -212,9 +215,16 @@ impl Default for DescribeOptions {
     }
 }
 
+/// Opens the RTP/RTCP sockets of a UDP transport: server port, client host and port.
+pub type UdpBinder = Box<dyn FnMut(u16, &str, u16) -> io::Result<(UdpSocket, UdpSocket)> + Send>;
+
 /// Stream table plus adapter scheduler.
 pub struct SessionManager {
     streams: Vec<Option<Stream>>,
+    /// Binds at SETUP like `decode_transport`; unset, no UDP sockets are opened.
+    udp_binder: Option<UdpBinder>,
+    /// RTP/RTCP sockets of each UDP stream (`sid->rsock`/`sid->rtcp`).
+    udp_sockets: HashMap<StreamId, (UdpSocket, UdpSocket)>,
     sched: Scheduler,
     sock: i32,
     next_session_id: i64,
@@ -259,6 +269,8 @@ impl SessionManager {
         streams.resize_with(STREAM_SLOTS, || None);
         Self {
             streams,
+            udp_binder: None,
+            udp_sockets: HashMap::new(),
             sched,
             sock: -1,
             next_session_id: 1000,
@@ -276,6 +288,23 @@ impl SessionManager {
             bandwidth: Arc::new(Bandwidth::new()),
             #[cfg(feature = "srt")]
             srt: None,
+        }
+    }
+
+    /// Makes `decode_transport` open the UDP sockets at SETUP (stream.cpp:556-584).
+    pub fn set_udp_binder(&mut self, binder: UdpBinder) {
+        self.udp_binder = Some(binder);
+    }
+
+    /// Handles to the RTP/RTCP sockets of `id`; `None` stands for C++ `rsock < 0`.
+    pub fn udp_sockets(&self, id: StreamId) -> Option<(UdpSocket, UdpSocket)> {
+        let (rtp, rtcp) = self.udp_sockets.get(&id)?;
+        match (rtp.try_clone(), rtcp.try_clone()) {
+            (Ok(rtp), Ok(rtcp)) => Some((rtp, rtcp)),
+            (Err(error), _) | (_, Err(error)) => {
+                ms_log::log!("cannot share the RTP sockets of sid {}: {}", id, error);
+                None
+            }
         }
     }
 
@@ -781,6 +810,7 @@ impl SessionManager {
         if adapter >= 0 {
             self.sched.close_adapter_for_stream(id, adapter);
         }
+        self.udp_sockets.remove(&id);
         // C++ returns a connected SRT socket to the pending pool (stream.cpp:379).
         #[cfg(feature = "srt")]
         if let (Some((sock, streamid)), Some(listener)) = (srt_socket, self.srt.as_ref()) {
@@ -833,6 +863,7 @@ impl SessionManager {
                 stream.stream_type = StreamType::RtspTcp;
                 stream.remote_host = peer_host.to_owned();
                 stream.remote_port = peer_port;
+                self.udp_sockets.remove(&id);
                 return Ok(());
             }
             TransportKind::Udp => {
@@ -950,6 +981,14 @@ impl SessionManager {
         match stream.stream_type {
             // A stream with another transport keeps it (stream.cpp:513-547).
             StreamType::RtspTcp | StreamType::RtspSrt | StreamType::Http => return Ok(()),
+            // `sid->rsock < 0` after a failed bind skips both branches (stream.cpp:513-550).
+            StreamType::RtspUdp
+                if self.udp_binder.is_some() && !self.udp_sockets.contains_key(&stream.id) =>
+            {
+                if stream.remote_port == port && stream.remote_host == dest {
+                    return Ok(());
+                }
+            }
             StreamType::RtspUdp if stream.remote_port == port && stream.remote_host == dest => {
                 // stream.cpp:519: `handle` (`sid->rsock`) is not modelled here.
                 ms_log::log!(
@@ -978,6 +1017,14 @@ impl SessionManager {
         stream.remote_host = dest.clone();
         stream.remote_port = port;
         let id = stream.id;
+        let server_port = stream.server_port;
+        // The previous transport's sockets close first (stream.cpp:533-541).
+        self.udp_sockets.remove(&id);
+        if let Some(binder) = self.udp_binder.as_mut() {
+            // udp_bind_connect failures answer 400 (stream.cpp:556-584).
+            let sockets = binder(server_port, &dest, port).map_err(|_| TransportError)?;
+            self.udp_sockets.insert(id, sockets);
+        }
 
         // A new UDP target closes other streams sending to it (stream.cpp:591-605).
         let duplicates: Vec<(StreamId, i32)> = self

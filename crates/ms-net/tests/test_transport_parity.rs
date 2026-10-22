@@ -5,6 +5,9 @@ use ms_net::rtsp::{ParseOutcome, Protocol, parse_request};
 use ms_net::session::SessionManager;
 use ms_sched::{AdapterConfig, AdapterTuner, Scheduler, TuneError};
 use ms_tuner::{DeliverySystem, TuneParams};
+use std::io;
+use std::net::UdpSocket;
+use std::sync::{Arc, Mutex};
 
 struct FakeTuner;
 
@@ -166,6 +169,92 @@ fn same_udp_destination_closes_older_stream() {
     assert!(manager.stream(first).is_none(), "same host:port is closed");
     assert!(manager.stream(second).is_some());
     assert!(manager.stream(third).is_some());
+}
+
+// stream.cpp:556-591: udp_bind_connect runs before the duplicate check, and
+// a failure returns -1 (a 400) without closing the other stream.
+#[test]
+fn failed_udp_bind_rejects_the_transport() {
+    let mut manager = manager();
+    let first = setup(&mut manager);
+    manager
+        .decode_transport_from(first, "RTP/AVP;unicast;client_port=5000", "10.0.0.7", 1)
+        .unwrap();
+    let binds = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&binds);
+    manager.set_udp_binder(Box::new(move |server_port, host, port| {
+        seen.lock()
+            .unwrap()
+            .push((server_port, host.to_owned(), port));
+        Err(io::Error::from(io::ErrorKind::AddrInUse))
+    }));
+    let second = setup(&mut manager);
+    assert!(
+        manager
+            .decode_transport_from(second, "RTP/AVP;unicast;client_port=5000", "10.0.0.7", 1)
+            .is_err()
+    );
+    assert!(manager.stream(first).is_some(), "duplicate kept on failure");
+    assert!(manager.udp_sockets(second).is_none());
+    let server_port = manager.stream(second).expect("enabled").server_port;
+    assert_eq!(
+        *binds.lock().unwrap(),
+        [(server_port, "10.0.0.7".to_owned(), 5000)]
+    );
+}
+
+// stream.cpp:513-550: after a failed bind `rsock < 0`, so a SETUP to the same
+// destination neither rebinds nor fails.
+#[test]
+fn same_destination_after_failed_bind_is_left_alone() {
+    let mut manager = manager();
+    let calls = Arc::new(Mutex::new(0));
+    let seen = Arc::clone(&calls);
+    manager.set_udp_binder(Box::new(move |_, _, _| {
+        *seen.lock().unwrap() += 1;
+        Err(io::Error::from(io::ErrorKind::AddrInUse))
+    }));
+    let id = setup(&mut manager);
+    let transport = "RTP/AVP;unicast;client_port=5000";
+    assert!(
+        manager
+            .decode_transport_from(id, transport, "10.0.0.7", 1)
+            .is_err()
+    );
+    manager
+        .decode_transport_from(id, transport, "10.0.0.7", 1)
+        .unwrap();
+    assert_eq!(*calls.lock().unwrap(), 1, "no second bind");
+    assert!(manager.udp_sockets(id).is_none());
+}
+
+// stream.cpp:513-541: a new client port replaces the stream's sockets.
+#[test]
+fn udp_bind_runs_at_setup_and_on_port_change() {
+    let mut manager = manager();
+    manager.set_udp_binder(Box::new(|_, host, port| {
+        let rtp = UdpSocket::bind("127.0.0.1:0")?;
+        rtp.connect((host, port))?;
+        let rtcp = UdpSocket::bind("127.0.0.1:0")?;
+        rtcp.connect((host, port + 1))?;
+        Ok((rtp, rtcp))
+    }));
+    let id = setup(&mut manager);
+    let peer = |manager: &SessionManager| {
+        manager
+            .udp_sockets(id)
+            .map(|(rtp, _)| rtp.peer_addr().unwrap().port())
+    };
+    manager
+        .decode_transport_from(id, "RTP/AVP;unicast;client_port=5000", "127.0.0.1", 1)
+        .unwrap();
+    assert_eq!(peer(&manager), Some(5000));
+    manager
+        .decode_transport_from(id, "RTP/AVP;unicast;client_port=5002", "127.0.0.1", 1)
+        .unwrap();
+    assert_eq!(peer(&manager), Some(5002));
+    manager.close_stream(id);
+    assert!(manager.udp_sockets(id).is_none(), "closed with the stream");
 }
 
 // stream.cpp:236-241: an HTTP stream records the client as its remote address.
