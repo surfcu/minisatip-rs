@@ -292,10 +292,9 @@ Unvalidated rows must be called out in release notes.
   - M3: tvheadend via the replay tuner not tried (tvheadend works on real tuners).
   - M4: all 8 adapters exercised and zapping compared with C++.
   - M5: reworded to fake oscam (2026-10-22, no oscam on the box). `ca_e2e` plays a
-    CSA-scrambled replay through RTSP with fake-oscam control words and passes, but
-    needs `--features dvbcsa`, which CI does not run. DVBAPI messages are checked by
-    the ported `test_dvbapi` tests. Open: DVBAPI message diff (no harness scenario);
-    `ca_e2e` not covered by CI.
+    CSA-scrambled replay through RTSP with fake-oscam control words; the CI `dvbcsa`
+    job runs it and the CSA tests with libdvbcsa. DVBAPI messages are checked by the
+    ported `test_dvbapi` tests. Open: DVBAPI message diff (no harness scenario).
   - M6: no CA scenarios in the harness yet, so CAPMT sequences are only diffed by
     the ported tests; the real-CAM join/leave/rejoin check passed. The runtime drives
     `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
@@ -309,6 +308,5 @@ Unvalidated rows must be called out in release notes.
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:** status page check on the box (#29); report the SAT>IP adapter type;
-  port `test_utils.cpp`; CI test step with `--features dvbcsa`; CA scenarios in
-  the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak.
+  port `test_utils.cpp`; CA scenarios in the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak.
 - **Blockers:** no SAT>IP server (M8 exit).

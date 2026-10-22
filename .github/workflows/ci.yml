@@ -39,6 +39,30 @@ jobs:
       - name: Check iCAM CSA feature
         run: cargo check -p minisatip --features dvbcsa-icam
 
+  dvbcsa:
+    name: Tests with dvbcsa (CSA descrambling, ca_e2e)
+    # libdvbcsa-dev has this name on Ubuntu 24.04 and 26.04.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libdvbcsa
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdvbcsa-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features ms-ca-drivers/dvbcsa,minisatip/dvbcsa -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --features ms-ca-drivers/dvbcsa,minisatip/dvbcsa
+
   harness:
     name: Differential harness (Rust vs Rust)
     runs-on: ubuntu-latest
