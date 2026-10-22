@@ -19,9 +19,10 @@ use ms_ca_drivers::en50221::AdapterInfo;
 use ms_config::Options;
 
 use crate::ddci::{DdciCapture, DdciHub, DdciSink, DdciStage};
-use crate::dvbca::{Dvbca, DvbcaSettings, DvbcaSink, Notice, PendingOffers};
+use crate::dvbca::{DeviceView, Dvbca, DvbcaSettings, DvbcaSink, Notice, PendingOffers};
 use ms_ca_drivers::ddci::{CamInfo, DDCI_SID};
 use ms_net::dataplane::{AdapterHandle, Command};
+use ms_net::web::{CaDeviceState, KeyChannel, KeyState};
 use ms_sched::pmt::{
     CaSink, FILTER_ADD_REMOVE, FILTER_CRC, FILTER_EMM, FILTER_REVERSE, FilterTarget, PmtState,
 };
@@ -70,6 +71,8 @@ pub struct CaRuntime {
     hw_nodes: BTreeMap<usize, (i32, i32)>,
     /// PMTs offered to a CA since the last drain (`disable_cw` in `send_pmt_to_ca`).
     offered: Rc<RefCell<Vec<(usize, usize)>>>,
+    /// EN 50221 device fields for the status page, by adapter id.
+    ca_views: BTreeMap<usize, DeviceView>,
     next_poll: i64,
     next_watchdog: i64,
 }
@@ -97,6 +100,7 @@ impl CaRuntime {
             hw: None,
             hw_nodes: BTreeMap::new(),
             offered,
+            ca_views: BTreeMap::new(),
             next_poll: 0,
             next_watchdog: 0,
         }
@@ -192,6 +196,37 @@ impl CaRuntime {
             let mut state = link.hub.lock();
             for (aid, adapter) in state.ddci.adapters.iter_mut() {
                 adapter.transponder_id = sched.adapter_transponder_id(usize::from(*aid));
+            }
+        }
+        {
+            // The SDT often arrives after the PMT was offered to DDCI: refresh its
+            // copies, then name the CI-side PMTs (ddci_update_pmt_name, ddci.cpp:1020).
+            let mut guard = link.hub.lock();
+            let state = &mut *guard;
+            for (dev, device) in &state.ddci.devices {
+                for slot in device.pmt.iter().filter(|slot| slot.id >= 0) {
+                    let Some(source) = sched.pmt(slot.id) else {
+                        continue;
+                    };
+                    let (sid, sdt) = (source.sid, source.sdt);
+                    let (name, provider) = (source.name.clone(), source.provider.clone());
+                    if let Some(program) = state.programs.get_mut(slot.id) {
+                        if program.name.is_empty() && !name.is_empty() {
+                            program.name = name.clone();
+                            program.provider = provider.clone();
+                        }
+                        // ddci_create_sdt reads the live SDT fields (ddci.cpp:741).
+                        if sdt.is_some() && program.sdt != sdt {
+                            program.sdt = sdt;
+                        }
+                    }
+                    if !name.is_empty()
+                        && let Some(id) =
+                            sched.name_pmt_for_sid(*dev as i32, sid, slot.id, &name, &provider)
+                    {
+                        ms_log::log!("DD {}: naming PMT {} (sid {}) {}", dev, id, sid, name);
+                    }
+                }
             }
         }
         let wanted: BTreeSet<(usize, u16)> = link.hub.ddci_pids().into_iter().collect();
@@ -310,6 +345,9 @@ impl CaRuntime {
         });
         while let Some(notice) = state.dvbca.try_notice() {
             match notice {
+                Notice::State(aid, view) => {
+                    self.ca_views.insert(aid, view);
+                }
                 Notice::Usable(aid) => {
                     sched.init_ca_for_adapter(aid, state.ca_id);
                     self.ddci_cam(aid, |cam, _| cam.enabled = true);
@@ -374,6 +412,7 @@ impl CaRuntime {
         self.adapters.remove(&aid);
         self.section_pids.remove(&aid);
         self.hw_nodes.remove(&aid);
+        self.ca_views.remove(&aid);
         self.router.forget_adapter(aid as i32);
     }
 
@@ -416,8 +455,9 @@ impl CaRuntime {
             FilterTarget::Pmt(_) => {
                 sched.process_pmt(filter, section);
             }
-            // DEV-212: SDT names are not parsed yet.
-            FilterTarget::Sdt => {}
+            FilterTarget::Sdt => {
+                sched.process_sdt(filter, section);
+            }
             FilterTarget::Other => {
                 if let Some(link) = self.ddci.as_ref()
                     && let Some(&(id, _)) = link.cat_filters.get(&filter)
@@ -450,6 +490,35 @@ impl CaRuntime {
                 .iter()
                 .any(|s| s.pmt_id == pmt_id && s.cw.is_some())
         })
+    }
+
+    /// `ca_sym` and `dvbapi_sym` values for `/state.json`.
+    pub fn web_state(
+        &self,
+        sched: &Scheduler,
+    ) -> (Vec<Option<CaDeviceState>>, Vec<Option<KeyState>>) {
+        let mut ca = vec![None; MAX_ADAPTERS];
+        for (&aid, view) in &self.ca_views {
+            if let Some(slot) = ca.get_mut(aid) {
+                *slot = Some(CaDeviceState {
+                    enabled: i32::from(view.enabled),
+                    state: view.state,
+                    caids: view.caids.clone(),
+                    ci_name: view.ci_name.clone(),
+                });
+            }
+        }
+        let mut keys = Vec::new();
+        if let Some(dvbapi) = self.dvbapi.as_ref() {
+            let shared = dvbapi.shared.borrow();
+            for key in shared.client.keys() {
+                if keys.len() <= key.id {
+                    keys.resize(key.id + 1, None);
+                }
+                keys[key.id] = Some(key_state(key, sched));
+            }
+        }
+        (ca, keys)
     }
 
     /// One control-loop pass: DVBAPI socket, timers, events and data-plane sync.
@@ -1289,6 +1358,36 @@ mod tests {
     }
 }
 
+/// One `dvbapi_sym` key slot (dvbapi.cpp:1122-1201); the channel follows
+/// `get_channel_for_key` (dvbapi.cpp:1079-1111).
+fn key_state(key: &ms_ca_drivers::dvbapi::Key, sched: &Scheduler) -> KeyState {
+    let text = |bytes: &[u8]| {
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    };
+    let channel = key
+        .enabled
+        .then(|| sched.pmt(key.pmt_id as i32))
+        .flatten()
+        .filter(|pmt| pmt.enabled)
+        .map(|pmt| KeyChannel {
+            name: pmt.name.clone(),
+            sid: pmt.sid,
+        });
+    KeyState {
+        enabled: i32::from(key.enabled),
+        hops: i32::from(key.hops),
+        ecmtime: key.ecm_time,
+        pmt_pid: i32::from(key.pmt_pid),
+        adapter: key.adapter,
+        cardsystem: text(&key.cardsystem),
+        reader: text(&key.reader),
+        from: text(&key.from),
+        protocol: text(&key.protocol),
+        channel,
+    }
+}
+
 #[cfg(test)]
 mod wiring_tests {
     use super::*;
@@ -1340,6 +1439,73 @@ mod wiring_tests {
             9, 4, 0x0B, 0x00, 0xE5, 0x00, //
             2, 0xE1, 0x01, 0xF0, 0,
         ])
+    }
+
+    // ca_sym: the CI row shows the CAM name, state and CAIDs of its adapter only.
+    #[test]
+    fn web_state_reports_the_cam_on_its_adapter() {
+        let mut ca = CaRuntime::new(&Options::default());
+        let view = DeviceView {
+            enabled: true,
+            state: 2,
+            caids: vec![0x0664],
+            ci_name: "Irdeto Access".to_owned(),
+        };
+        ca.ca_views.insert(8, view);
+        let (slots, keys) = ca.web_state(&sched());
+        assert_eq!(slots.len(), MAX_ADAPTERS);
+        assert_eq!(
+            slots[8],
+            Some(CaDeviceState {
+                enabled: 1,
+                state: 2,
+                caids: vec![0x0664],
+                ci_name: "Irdeto Access".to_owned(),
+            })
+        );
+        assert!(slots.iter().enumerate().all(|(i, s)| i == 8 || s.is_none()));
+        assert!(keys.is_empty(), "no DVBAPI client");
+        ca.adapter_removed(8);
+        assert!(ca.web_state(&sched()).0[8].is_none());
+    }
+
+    // dvbapi_sym and get_channel_for_key: a named PMT, an unnamed one and a disabled key.
+    #[test]
+    fn key_state_resolves_the_channel_like_get_channel_for_key() {
+        let mut sched = sched();
+        let named = sched.pmt_add(0, 0x409E, 67);
+        sched.name_pmt_for_sid(0, 0x409E, -1, "beIN SPORTS 1", "beIN");
+        let unnamed = sched.pmt_add(0, 0x2000, 100);
+        let key = |pmt_id: i32, enabled: bool| ms_ca_drivers::dvbapi::Key {
+            enabled,
+            pmt_id: pmt_id as usize,
+            adapter: 0,
+            pmt_pid: 67,
+            hops: 1,
+            ecm_time: 250,
+            cardsystem: b"Irdeto\0\0".to_vec(),
+            reader: b"local".to_vec(),
+            ..Default::default()
+        };
+        let state = key_state(&key(named, true), &sched);
+        assert_eq!(
+            (state.enabled, state.hops, state.ecmtime, state.pmt_pid),
+            (1, 1, 250, 67)
+        );
+        assert_eq!(
+            (state.cardsystem.as_str(), state.reader.as_str()),
+            ("Irdeto", "local")
+        );
+        assert_eq!(
+            state.channel,
+            Some(KeyChannel {
+                name: "beIN SPORTS 1".to_owned(),
+                sid: 0x409E
+            })
+        );
+        let state = key_state(&key(unnamed, true), &sched);
+        assert_eq!(state.channel.unwrap().name, "", "rendered as SID n");
+        assert!(key_state(&key(named, false), &sched).channel.is_none());
     }
 
     #[test]

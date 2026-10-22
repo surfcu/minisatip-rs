@@ -3,7 +3,8 @@
 //! The manager owns all mutable state; adapter decisions are delegated to
 //! [`ms_sched::Scheduler`].
 
-use ms_sched::{MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
+use ms_sched::pmt::PmtState as SchedPmtState;
+use ms_sched::{AdapterType, MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
 use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime};
@@ -21,8 +22,9 @@ use crate::satip::{merge_satip_url, parse_satip_url_new};
 #[cfg(feature = "srt")]
 use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener};
 use crate::web::{
-    ADAPTER_DVB, AdapterState, GUARD_INTERVAL_AUTO, QAM_AUTO, RuntimeState, StreamState,
-    WebService, WebSnapshot,
+    ADAPTER_CI, ADAPTER_DVB, ADAPTER_NETCV, ADAPTER_SATIP, AdapterState, CaDeviceState,
+    GUARD_INTERVAL_AUTO, KeyState, PmtState, QAM_AUTO, RuntimeState, StreamState, WebService,
+    WebSnapshot,
 };
 
 const STREAM_SLOTS: usize = MAX_STREAMS as usize;
@@ -225,6 +227,10 @@ pub struct SessionManager {
     adapter_ccerr: Vec<u64>,
     web: Option<WebService>,
     web_runtime: RuntimeState,
+    /// `ca_sym` slots, pushed by the CA runtime.
+    web_ca: Vec<Option<CaDeviceState>>,
+    /// `dvbapi_sym` slots, pushed by the CA runtime.
+    web_keys: Vec<Option<KeyState>>,
     bandwidth: Arc<Bandwidth>,
     #[cfg(feature = "srt")]
     srt: Option<SrtListener<LibSrtOps>>,
@@ -265,6 +271,8 @@ impl SessionManager {
             adapter_ccerr: vec![0; MAX_ADAPTERS],
             web: None,
             web_runtime: RuntimeState::default(),
+            web_ca: Vec::new(),
+            web_keys: Vec::new(),
             bandwidth: Arc::new(Bandwidth::new()),
             #[cfg(feature = "srt")]
             srt: None,
@@ -279,6 +287,12 @@ impl SessionManager {
     /// Sets the runtime values reported by `state.json`.
     pub fn set_web_runtime(&mut self, runtime: RuntimeState) {
         self.web_runtime = runtime;
+    }
+
+    /// Installs the CA device and DVBAPI key slots shown by `/state.json`.
+    pub fn set_web_ca(&mut self, ca: Vec<Option<CaDeviceState>>, keys: Vec<Option<KeyState>>) {
+        self.web_ca = ca;
+        self.web_keys = keys;
     }
 
     /// Installs the process-wide counters reported by `/bandwidth.json`.
@@ -1259,7 +1273,7 @@ impl SessionManager {
                 present: true,
                 enabled: adapter.config.enabled,
                 disabled: self.sched.is_disabled(aid),
-                kind: ADAPTER_DVB,
+                kind: adapter_kind(adapter.config.adapter_type),
                 systems: adapter
                     .config
                     .sys
@@ -1298,6 +1312,17 @@ impl SessionManager {
                     .copied()
                     .unwrap_or(0)
                     .min(i32::MAX as u64) as i32,
+                pmts: self
+                    .sched
+                    .active_pmt_ids(aid)
+                    .iter()
+                    .filter_map(|&id| self.sched.pmt(id))
+                    .map(|pmt| PmtState {
+                        running: pmt.state == SchedPmtState::Running,
+                        name: pmt.name.clone(),
+                        pid: pmt.pid,
+                    })
+                    .collect(),
                 ..AdapterState::default()
             };
         }
@@ -1318,6 +1343,8 @@ impl SessionManager {
                 ..StreamState::default()
             };
         }
+        snapshot.ca = self.web_ca.clone();
+        snapshot.keys = self.web_keys.clone();
         snapshot.runtime = self.web_runtime.at(SystemTime::now());
         self.bandwidth.calculate();
         snapshot.bandwidth = self.bandwidth.snapshot();
@@ -1685,6 +1712,17 @@ fn positive_or_empty(value: Option<i32>) -> String {
     value
         .filter(|value| *value >= 0)
         .map_or_else(String::new, |value| value.to_string())
+}
+
+/// `adapter::type` for `ad_type`. An unset type reports `ADAPTER_DVB`, so the
+/// status page does not skip the adapter.
+fn adapter_kind(kind: AdapterType) -> i32 {
+    match kind {
+        AdapterType::Satip => ADAPTER_SATIP,
+        AdapterType::NetCv => ADAPTER_NETCV,
+        AdapterType::Ci => ADAPTER_CI,
+        AdapterType::Dvb | AdapterType::Unknown => ADAPTER_DVB,
+    }
 }
 
 #[cfg(test)]
