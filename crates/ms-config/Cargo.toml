@@ -9,6 +9,8 @@ repository.workspace = true
 default = []
 # Reflects whether the binary was built with SRT support.
 srt = []
+# Netceiver client (C++ NETCVCLIENT): without it `-n`/`--netceiver` are unknown options.
+netceiver = []
 
 [dependencies]
 ms-log = { path = "../ms-log" }

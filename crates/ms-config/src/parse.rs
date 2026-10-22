@@ -452,6 +452,14 @@ struct Parser<'a> {
     slave_master: [i32; MAX_ADAPTERS],
 }
 
+/// The options of this build: without NETCVCLIENT the C++ `long_options` table,
+/// and the short options built from it, have no `netceiver` (minisatip.cpp:206).
+fn compiled_options() -> impl Iterator<Item = &'static OptSpec> {
+    OPTIONS
+        .iter()
+        .filter(|spec| cfg!(feature = "netceiver") || !matches!(spec.id, OptId::Netceiver))
+}
+
 /// Result of [`parse_args`]: the parsed options, the getopt diagnostics that
 /// glibc would print to stderr, and a fatal error when the C++ binary exits.
 #[derive(Debug, Clone, PartialEq)]
@@ -579,11 +587,10 @@ impl Parser<'_> {
     /// written (`-` or `--`), used by diagnostic messages.
     fn lookup_long<'a>(&self, text: &'a str, dash: &str) -> LongMatch<'a> {
         let (name, inline) = split_name(text);
-        if let Some(spec) = OPTIONS.iter().find(|spec| spec.long == name) {
+        if let Some(spec) = compiled_options().find(|spec| spec.long == name) {
             return LongMatch::Found(spec, inline);
         }
-        let candidates: Vec<&'static OptSpec> = OPTIONS
-            .iter()
+        let candidates: Vec<&'static OptSpec> = compiled_options()
             .filter(|spec| spec.long.starts_with(name))
             .collect();
         match candidates.len() {
@@ -600,7 +607,7 @@ impl Parser<'_> {
     }
 
     fn lookup_short(&self, c: char) -> Option<&'static OptSpec> {
-        OPTIONS.iter().find(|spec| spec.short == Some(c))
+        compiled_options().find(|spec| spec.short == Some(c))
     }
 
     fn apply_spec(

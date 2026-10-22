@@ -84,7 +84,7 @@ fn main() {
     );
     // print_version(1, 1): the banner through LOG0, the build lines through LOG.
     ms_log::log0!("{}", ms_config::VERSION_BANNER);
-    for line in ms_config::BUILT_INFO {
+    for line in ms_config::built_info() {
         ms_log::log!("{line}");
     }
     ms_log::log!("Command line: {}", opts.command_line);

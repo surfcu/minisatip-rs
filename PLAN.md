@@ -288,11 +288,16 @@ Unvalidated rows must be called out in release notes.
     `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
   - M7: APDU diff with the fake CAM needs the same CA harness scenarios; the real CAM
     works through the CI path.
-  - M8: satipc against a real SAT>IP server. Status API: SAT>IP/netceiver adapters
+  - M8: satipc against a real SAT>IP server. Status API: SAT>IP client adapters
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).
   - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak; resource comparison.
-- **Next:** status page check on the box (#29); report the SAT>IP/netceiver adapter
-  types; port `test_utils.cpp`; CI test step with `--features dvbcsa`; CA scenarios in
+- **Binary features (rs/binary-features):** `netceiver` starts netceiver adapters
+  after the SAT>IP ones (`ADAPTER_NETCV`, exit 0 when the interface is down) and
+  without it `-n` is unknown as in C++; `dvbcsa-icam` exposes iCAM CSA (the CW path
+  already matched C++). CI checks both features without linking. Netceiver stays
+  unvalidated on hardware.
+- **Next:** status page check on the box (#29); report the SAT>IP adapter type;
+  port `test_utils.cpp`; CI test step with `--features dvbcsa`; CA scenarios in
   the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak.
 - **Blockers:** no SAT>IP server (M8 exit).

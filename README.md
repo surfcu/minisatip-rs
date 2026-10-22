@@ -39,11 +39,9 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   C++ only by the ported unit tests and by the real-CAM check.
 - The runtime drives `ms_ca::CaDevice` directly; the `Reconciler` and its policies
   are covered by tests only, so there are no alternative CA policies yet.
-- SAT>IP and netceiver adapters report `ad_type` 1 on the status page, which
-  scales their SNR as DVB (DEV-053).
+- SAT>IP client adapters report `ad_type` 1 on the status page, which scales
+  their SNR as DVB (DEV-053).
 - The demux-device modes are not supported; the DVR device is always used (DEV-072).
-- The `minisatip` crate has no feature for the netceiver backend (`ms-tuner/netceiver`)
-  or for iCAM CSA (`ms-ca-drivers/dvbcsa-icam`), so the binary cannot be built with them yet.
 
 ## Layout
 
@@ -89,6 +87,8 @@ Cargo features of the `minisatip` crate:
 |---|---|---|
 | `linux-dvb` | yes | Linux DVB tuner backend and `/dev/dvb` enumeration |
 | `dvbcsa` | no | software DVB-CSA descrambling; links `libdvbcsa` |
+| `dvbcsa-icam` | no | iCAM CSA (implies `dvbcsa`); needs a `libdvbcsa` with `dvbcsa_bs_key_set_ecm` |
+| `netceiver` | no | netceiver adapters (`-n if:count`); links `libnetceiver`. Without it `-n` is an unknown option, as in a C++ build without NETCVCLIENT |
 | `srt` | no | SRT output; links `libsrt` |
 
 ```sh

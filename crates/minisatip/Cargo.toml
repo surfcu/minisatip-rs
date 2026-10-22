@@ -13,6 +13,10 @@ srt = ["ms-config/srt", "ms-net/srt", "ms-tuner/srt"]
 linux-dvb = ["ms-tuner/linux-dvb"]
 # DVB-CSA software descrambling through libdvbcsa.
 dvbcsa = ["ms-ca-drivers/dvbcsa"]
+# iCAM CSA: needs a libdvbcsa that exports dvbcsa_bs_key_set_ecm.
+dvbcsa-icam = ["dvbcsa", "ms-ca-drivers/dvbcsa-icam"]
+# Netceiver adapters (`-n`) through libnetceiver (C++ NETCVCLIENT).
+netceiver = ["ms-tuner/netceiver", "ms-config/netceiver"]
 
 [dependencies]
 libc = "0.2"
