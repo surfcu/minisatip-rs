@@ -847,7 +847,11 @@ fn test_capmt_rejoin_takes_kept_place() {
         !cam.dev.capmt[1].has_pmt(p[2]),
         "not in the least loaded one"
     );
-    assert_eq!(cam.read_capmts().0, 1, "the rejoin is sent at once");
+    assert_eq!(
+        cam.read_capmts().0,
+        0,
+        "the CAPMT is unchanged, nothing sent"
+    );
     assert_eq!(cam.join(p[5], false), TablesResult::Ok, "new program");
     assert!(
         cam.dev.capmt[1].has_pmt(p[5]),
@@ -858,6 +862,37 @@ fn test_capmt_rejoin_takes_kept_place() {
     assert!(
         !capmt_lists_pid(&last.unwrap(), cam.first_pid(p[3])),
         "dropping the left program it replaced"
+    );
+}
+
+// Ported from tests/test_ca.cpp:2291 (minisatip PR #1518)
+// Guards against over-suppression: a kept-place rejoin whose CAPMT changed
+// (renumbered here) must still send once.
+#[test]
+fn test_capmt_changed_rejoin_still_sends() {
+    let mut cam = PackingCam::open();
+    let p1 = cam.program(0x2a01);
+    let p2 = cam.program(0x2a02);
+    cam.join(p1, false);
+    cam.join(p2, false);
+    cam.read_capmts();
+    cam.leave(p2);
+    assert_eq!(cam.read_capmts().0, 0, "the partner leaves lazily");
+
+    cam.dev.capmt[0].sid = 0x2a0f;
+    assert_eq!(cam.join(p2, false), TablesResult::Ok, "rejoin");
+    assert_eq!(cam.dev.capmt[0].other_id[0], p2, "back in its kept place");
+    let (n, last) = cam.read_capmts();
+    assert_eq!(n, 1, "the changed CAPMT is sent once");
+    let last = last.unwrap();
+    assert_eq!(
+        u16::from(last[1]) << 8 | u16::from(last[2]),
+        0x2a0f,
+        "with the new number"
+    );
+    assert!(
+        capmt_lists_pid(&last, cam.first_pid(p1)) && capmt_lists_pid(&last, cam.first_pid(p2)),
+        "both programs listed"
     );
 }
 
@@ -899,7 +934,7 @@ fn test_capmt_zap_back_keeps_places() {
         cam.leave(ch3);
         cam.join(ch4, false);
         assert!(cam.dev.capmt[1].has_pmt(ch4), "channel 4 back in CAPMT 1");
-        assert_eq!(cam.read_capmts().0, 2, "each rejoin sends at once");
+        assert_eq!(cam.read_capmts().0, 0, "zapping back sends nothing");
     }
 }
 
