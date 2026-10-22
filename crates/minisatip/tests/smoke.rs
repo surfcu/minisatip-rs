@@ -53,7 +53,7 @@ impl Server {
         let dir = unique_dir();
         fs::create_dir_all(&dir)?;
         let (rtsp_port, http_port) = free_tcp_ports()?;
-        let start_rtp = free_udp_pair()?;
+        let start_rtp = free_rtp_block()?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_minisatip"));
         if let Some(bind) = bind {
             command.args(["-V", bind]);
@@ -370,6 +370,7 @@ fn setup_after_play_redirects_rtp() -> io::Result<()> {
     // process_dmx keeps flushing every enabled stream (stream.cpp:1189-1193).
     let (length, _) = second.recv_from(&mut buffer)?;
     assert!(length > 12, "RTP packet after redirect");
+
     Ok(())
 }
 
@@ -694,15 +695,24 @@ fn duplicate_destination_stops_the_old_output() -> io::Result<()> {
     )?;
     assert_eq!(status, 200, "second PLAY");
 
-    // Drain anything the closed stream already sent, then sample the SSRCs.
+    // Drain anything the closed stream already sent, then sample the SSRCs
+    // from the first new packet on; a loaded host may start it late.
     client.set_read_timeout(Some(Duration::from_millis(100)))?;
     let drain_until = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < drain_until && client.recv_from(&mut packet).is_ok() {}
+    while Instant::now() < drain_until {
+        let _ = client.recv_from(&mut packet);
+    }
+    client.set_read_timeout(Some(TIMEOUT))?;
+    let (length, _) = client.recv_from(&mut packet)?;
     let mut ssrcs = Vec::new();
+    if length >= 12 {
+        ssrcs.push(packet[8..12].to_vec());
+    }
+    client.set_read_timeout(Some(Duration::from_millis(100)))?;
     let sample_until = Instant::now() + Duration::from_millis(500);
     while Instant::now() < sample_until {
         let Ok((length, _)) = client.recv_from(&mut packet) else {
-            break;
+            continue;
         };
         if length >= 12 && !ssrcs.contains(&packet[8..12].to_vec()) {
             ssrcs.push(packet[8..12].to_vec());
@@ -829,22 +839,53 @@ fn free_tcp_ports() -> io::Result<(u16, u16)> {
     ))
 }
 
-fn free_udp_pair() -> io::Result<u16> {
-    for _ in 0..100 {
-        let first = UdpSocket::bind(("127.0.0.1", 0))?;
-        let port = first.local_addr()?.port();
-        if port == 0 || port == u16::MAX {
+/// `-P` bases handed out in this process; each server uses `RTP_BLOCK` ports.
+static RTP_LEASES: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+const RTP_BLOCK: u16 = 8;
+const RTP_RANGE_START: u16 = 10_000;
+
+/// Picks a free `-P` block below the ephemeral range: the server binds it only
+/// at SETUP, and client sockets bound meanwhile (port 0) never land there.
+fn free_rtp_block() -> io::Result<u16> {
+    let low = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| range.split_whitespace().next()?.parse::<u16>().ok())
+        .unwrap_or(32_768);
+    // A low ephemeral bound falls back to the first unprivileged ports.
+    let start = if low >= RTP_RANGE_START + RTP_BLOCK {
+        RTP_RANGE_START
+    } else {
+        1024
+    };
+    let blocks = u64::from(low.saturating_sub(start) / RTP_BLOCK);
+    if blocks == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no ports below the ephemeral range",
+        ));
+    }
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ u64::from(std::process::id());
+    let mut leases = RTP_LEASES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    for attempt in 0..500u64 {
+        let block = seed.wrapping_add(attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15)) % blocks;
+        let base = start + block as u16 * RTP_BLOCK;
+        if leases.contains(&base) {
             continue;
         }
-        if let Ok(second) = UdpSocket::bind(("127.0.0.1", port + 1)) {
-            drop(second);
-            drop(first);
-            return Ok(port);
+        if (base..base + RTP_BLOCK).all(|port| UdpSocket::bind(("0.0.0.0", port)).is_ok()) {
+            leases.push(base);
+            return Ok(base);
         }
     }
     Err(io::Error::new(
         io::ErrorKind::AddrNotAvailable,
-        "no free consecutive UDP ports",
+        "no free RTP port block",
     ))
 }
 
@@ -930,7 +971,7 @@ fn daemonises_by_default_and_redirects_stdio_to_the_logfile() -> io::Result<()> 
     fs::create_dir_all(&dir)?;
     let log_path = dir.join("daemon.log");
     let (rtsp_port, http_port) = free_tcp_ports()?;
-    let start_rtp = free_udp_pair()?;
+    let start_rtp = free_rtp_block()?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_minisatip"))
         .args([
             "--disable-ssdp",
