@@ -259,6 +259,16 @@ pub fn socket_send_buffer(fd: RawFd) -> io::Result<libc::c_int> {
     socket_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF)
 }
 
+/// Whether `O_NONBLOCK` is set on `fd`.
+pub fn socket_nonblocking(fd: RawFd) -> io::Result<bool> {
+    // SAFETY: F_GETFL only reads the flags of the descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & libc::O_NONBLOCK != 0)
+}
+
 fn socket_int(fd: RawFd, level: libc::c_int, option: libc::c_int) -> io::Result<libc::c_int> {
     let mut value: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;

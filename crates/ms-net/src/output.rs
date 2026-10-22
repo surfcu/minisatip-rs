@@ -15,7 +15,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 #[cfg(feature = "srt")]
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// The C++ `stream.cpp` uses `#define DEFAULT_LOG LOG_STREAM` for this module.
 const DEFAULT_LOG: u32 = ms_log::LOG_STREAM;
@@ -195,6 +195,12 @@ impl StreamOutput {
                 return Err(error);
             }
         };
+        // udp_bind leaves RTP blocking with a 1.1 s timeout (set_linux_socket_timeout,
+        // socketworks.cpp:374-386): a burst waits for send-buffer space instead of
+        // being dropped. RTCP stays non-blocking for the `poll_rtcp` reads.
+        rtp.set_nonblocking(false)?;
+        rtp.set_write_timeout(Some(RTP_SOCKET_TIMEOUT))?;
+        rtp.set_read_timeout(Some(RTP_SOCKET_TIMEOUT))?;
         let mut output = Self::udp_from_sockets(rtp, rtcp, config, now_ms);
         output.apply_udp_socket_options(send_buffer);
         Ok(output)
@@ -223,7 +229,7 @@ impl StreamOutput {
         }
     }
 
-    /// Wraps already connected, non-blocking RTP and RTCP sockets.
+    /// Wraps already connected RTP and RTCP sockets.
     pub fn udp_from_sockets(
         rtp: UdpSocket,
         rtcp: UdpSocket,
@@ -477,13 +483,21 @@ impl StreamOutput {
         let rv = match &mut self.transport {
             Transport::Udp { rtp, .. } => {
                 let mut sent = 0i32;
+                let mut timed_out = false;
                 for datagram in batch.datagrams(buf) {
+                    // One sendmmsg per batch in C++ (socketworks.cpp:1280): after a
+                    // send timeout the rest of the batch is dropped, not retried.
+                    if timed_out {
+                        self.udp_dropped += datagram.len() as u64;
+                        continue;
+                    }
                     match rtp.send(&datagram) {
                         Ok(count) => sent += count as i32,
                         Err(error) => {
                             self.failed_writes = self.failed_writes.wrapping_add(1);
                             if error.kind() == io::ErrorKind::WouldBlock {
                                 self.udp_dropped += datagram.len() as u64;
+                                timed_out = true;
                             } else if matches!(
                                 error.kind(),
                                 io::ErrorKind::ConnectionRefused | io::ErrorKind::BrokenPipe
@@ -704,6 +718,9 @@ impl StreamOutput {
         seen
     }
 }
+
+/// `SO_SNDTIMEO`/`SO_RCVTIMEO` of `set_linux_socket_timeout` (socketworks.cpp:374-386).
+const RTP_SOCKET_TIMEOUT: Duration = Duration::from_millis(1100);
 
 fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
     SocketAddr::new(addr.ip(), port)
