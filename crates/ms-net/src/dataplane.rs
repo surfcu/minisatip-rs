@@ -1016,7 +1016,8 @@ impl DataPlane {
         self.last_send_ms = now_ms;
         self.tap_sections();
         for stage in &mut self.stages {
-            stage.process(self.buf.as_bytes_mut());
+            self.buf
+                .with_vec(|buf, capacity| stage.process_buf(buf, capacity));
         }
         let mono = self.mono_us();
         let mut closed = Vec::new();

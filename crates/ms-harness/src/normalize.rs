@@ -79,6 +79,11 @@ impl Normalizer {
         });
         out = replace_after(&out, "<modelNumber>", "<VER>", |c| c != '<');
         out = replace_after(&out, "\"version\":\"", "<VER>", |c| c != '"');
+        // Wall-clock dates of /state.json, like the Date headers above.
+        for key in ["datetime_compile", "datetime_start", "datetime_current"] {
+            let marker = format!("\"{key}\":\"");
+            out = replace_after(&out, &marker, "<DATETIME>", |c| c != '"');
+        }
         out = replace_after(&out, "ssrc=", "<SSRC>", |c| c.is_ascii_hexdigit());
         out = replace_after(&out, "seq=", "<SEQ>", |c| c.is_ascii_digit());
         out = replace_after(&out, "rtptime=", "<RTPTIME>", |c| c.is_ascii_digit());
@@ -238,6 +243,19 @@ mod tests {
         let mut norm = Normalizer::default();
         let out = norm.text("o=- 534863118 534863118 IN IP4 127.0.0.1\nuuid:2fac1234-31f8-11b4-a222-08002b34c003::x");
         assert_eq!(out, "o=- <SDPID> <SDPVER> IN IP4 127.0.0.1\nuuid:<UUID>::x");
+    }
+
+    #[test]
+    fn normalises_state_json_dates() {
+        let n = Normalizer::default();
+        assert_eq!(
+            n.line(r#""datetime_start":"Thu Oct 22 00:04:05 2026 ","run_pid":1"#),
+            r#""datetime_start":"<DATETIME>","run_pid":1"#
+        );
+        assert_eq!(
+            n.line(r#""datetime_compile":"Oct 21 2026 | 23:10:00","#),
+            r#""datetime_compile":"<DATETIME>","#
+        );
     }
 
     #[test]

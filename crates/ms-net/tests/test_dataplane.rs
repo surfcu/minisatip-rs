@@ -737,3 +737,83 @@ fn section_pids_are_tapped_and_stages_rewrite_the_batch() {
     handle.stop();
     let _ = std::fs::remove_file(path);
 }
+
+/// Appends one marked packet on PID 0x101 per batch, like DDCI growing `ad->rlen`.
+struct AppendStage;
+
+impl ms_ts::TsStage for AppendStage {
+    fn process(&mut self, _buf: &mut [u8]) {
+        unreachable!("the data plane lends the growable buffer");
+    }
+
+    fn process_buf(&mut self, buf: &mut Vec<u8>, capacity: usize) {
+        if buf.len() + 188 <= capacity {
+            let mut packet = ts_packet(0x101, 0);
+            packet[100] = 0x5A;
+            buf.extend_from_slice(&packet);
+        }
+    }
+}
+
+/// Counts the appended packets a later stage sees.
+struct SeenStage(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl ms_ts::TsStage for SeenStage {
+    fn process(&mut self, buf: &mut [u8]) {
+        let appended = buf.chunks(188).filter(|p| p[100] == 0x5A).count();
+        self.0
+            .fetch_add(appended as u64, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_stage_may_grow_the_batch_for_later_stages_and_outputs() {
+    let path = write_capture("grow");
+    let tuner = FileReplayTuner::open(
+        &path,
+        FileReplayConfig {
+            looping: true,
+            pacing: ms_tuner::Pacing::FixedBitrate(4_000_000),
+        },
+    )
+    .unwrap();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let handle = AdapterHandle::spawn_with_stages(
+        Box::new(tuner),
+        DataPlaneConfig::default(),
+        None,
+        vec![
+            Box::new(AppendStage),
+            Box::new(SeenStage(std::sync::Arc::clone(&seen))),
+        ],
+    )
+    .unwrap();
+    handle
+        .tune_wait(TuneParams::default(), Duration::from_secs(2))
+        .unwrap();
+    let (socket, _) = udp_pair();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    handle.start_output(
+        1,
+        output_to(socket.local_addr().unwrap(), 7),
+        PidSet::from_pids([0x101]),
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut appended_out = false;
+    let mut buf = [0u8; 2048];
+    while !appended_out && std::time::Instant::now() < deadline {
+        if let Ok(len) = socket.recv(&mut buf) {
+            appended_out = buf[12..len].chunks(188).any(|p| p[100] == 0x5A);
+        }
+    }
+    assert!(appended_out, "outputs see the packets a stage appended");
+    assert!(
+        seen.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "later stages see the appended packets"
+    );
+    handle.stop();
+    let _ = std::fs::remove_file(path);
+}

@@ -217,3 +217,16 @@ fn tune_is_recorded_and_status_is_configurable() {
     tuner.set_status(unlocked);
     assert_eq!(tuner.status(), unlocked);
 }
+
+#[test]
+fn ts_buf_with_vec_lends_room_up_to_the_capacity() {
+    let mut buf = TsBuf::with_packets(4);
+    assert_eq!(buf.push_data(&[0x47; TS_PACKET_SIZE]), TS_PACKET_SIZE);
+    buf.with_vec(|data, capacity| {
+        assert_eq!(capacity, 4 * TS_PACKET_SIZE);
+        assert_eq!(data.len(), TS_PACKET_SIZE);
+        data.extend_from_slice(&[0x47; 2 * TS_PACKET_SIZE]);
+    });
+    assert_eq!(buf.len(), 3 * TS_PACKET_SIZE);
+    assert_eq!(buf.remaining_bytes(), TS_PACKET_SIZE);
+}

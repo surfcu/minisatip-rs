@@ -6,7 +6,7 @@ Server: minisatip/<VER>
 Content-Type: application/json; charset=utf-8
 Connection: close
 Access-Control-Allow-Origin: *
-Content-Length: 35239
+Content-Length: 35188
 --
 {
 "ad_enabled":[<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>],
@@ -65,9 +65,9 @@ Content-Length: 35239
 "deviceid":<N>,
 "http_port":<HTTP>,
 "rtsp_host":"<N>.<N>.<N>.<N>:<RTSP>",
-"datetime_compile":"Oct <N> <N> | <N>:<N>:<N>",
-"datetime_start":"Wed Oct <N> <N>:<N>:<N> <N> ",
-"datetime_current":"Wed Oct <N> <N>:<N>:<N> <N> ",
+"datetime_compile":"<DATETIME>",
+"datetime_start":"<DATETIME>",
+"datetime_current":"<DATETIME>",
 "time_running":"<N>:<N>:<N>",
 "run_user":<N>,
 "run_pid":<N>,
@@ -124,7 +124,7 @@ Server: minisatip/<VER>
 Content-Type: application/json; charset=utf-8
 Connection: close
 Access-Control-Allow-Origin: *
-Content-Length: 35298
+Content-Length: 35247
 --
 {
 "ad_enabled":[<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>],
@@ -183,9 +183,9 @@ Content-Length: 35298
 "deviceid":<N>,
 "http_port":<HTTP>,
 "rtsp_host":"<N>.<N>.<N>.<N>:<RTSP>",
-"datetime_compile":"Oct <N> <N> | <N>:<N>:<N>",
-"datetime_start":"Wed Oct <N> <N>:<N>:<N> <N> ",
-"datetime_current":"Wed Oct <N> <N>:<N>:<N> <N> ",
+"datetime_compile":"<DATETIME>",
+"datetime_start":"<DATETIME>",
+"datetime_current":"<DATETIME>",
 "time_running":"<N>:<N>:<N>",
 "run_user":<N>,
 "run_pid":<N>,
@@ -244,7 +244,7 @@ Server: minisatip/<VER>
 Content-Type: application/json; charset=utf-8
 Connection: close
 Access-Control-Allow-Origin: *
-Content-Length: 35240
+Content-Length: 35189
 --
 {
 "ad_enabled":[<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>,<N>],
@@ -303,9 +303,9 @@ Content-Length: 35240
 "deviceid":<N>,
 "http_port":<HTTP>,
 "rtsp_host":"<N>.<N>.<N>.<N>:<RTSP>",
-"datetime_compile":"Oct <N> <N> | <N>:<N>:<N>",
-"datetime_start":"Wed Oct <N> <N>:<N>:<N> <N> ",
-"datetime_current":"Wed Oct <N> <N>:<N>:<N> <N> ",
+"datetime_compile":"<DATETIME>",
+"datetime_start":"<DATETIME>",
+"datetime_current":"<DATETIME>",
 "time_running":"<N>:<N>:<N>",
 "run_user":<N>,
 "run_pid":<N>,
