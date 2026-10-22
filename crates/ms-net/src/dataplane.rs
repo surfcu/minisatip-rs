@@ -11,7 +11,7 @@ use ms_ts::TsStage;
 use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner, TunerError};
 use std::collections::BTreeMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -341,12 +341,16 @@ pub enum Command {
         /// Reply bytes.
         data: Vec<u8>,
     },
-    /// Moves a UDP output to a new client address.
-    SetDestination {
+    /// Moves a UDP output onto the sockets of a new transport (re-SETUP).
+    ReplaceUdpSockets {
         /// Target stream.
         stream_id: StreamId,
-        /// New RTP destination.
-        dest: SocketAddr,
+        /// New RTP socket, connected to the new client port.
+        rtp: UdpSocket,
+        /// New RTCP socket.
+        rtcp: UdpSocket,
+        /// `--output-buffer` for the new sockets.
+        send_buffer: i32,
     },
     /// Replaces the send threshold (see [`adapter_threshold`]).
     SetThreshold(i64),
@@ -827,9 +831,23 @@ impl DataPlane {
                     self.close(stream_id);
                 }
             }
-            Command::SetDestination { stream_id, dest } => {
-                if let Some(subscriber) = self.outputs.get_mut(&stream_id) {
-                    let _ = subscriber.output.set_udp_destination(dest);
+            Command::ReplaceUdpSockets {
+                stream_id,
+                rtp,
+                rtcp,
+                send_buffer,
+            } => {
+                if let Some(subscriber) = self.outputs.get_mut(&stream_id)
+                    && let Err(error) =
+                        subscriber
+                            .output
+                            .replace_udp_sockets(rtp, rtcp, send_buffer)
+                {
+                    ms_log::log!(
+                        "cannot change the transport of sid {}: {}",
+                        stream_id,
+                        error
+                    );
                 }
             }
             Command::SetThreshold(threshold) => self.threshold_ms = threshold,

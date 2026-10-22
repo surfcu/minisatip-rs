@@ -38,4 +38,4 @@ pub use rtsp::{
     TransportSpec, parse_request, parse_transport,
 };
 pub use satip::{ParseReport, merge_satip_url, parse_satip_url, parse_satip_url_new};
-pub use session::{DescribeOptions, SessionManager, Stream};
+pub use session::{DescribeOptions, SessionManager, Stream, UdpBinder};

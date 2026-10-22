@@ -169,38 +169,20 @@ impl StreamOutput {
         bind_dev: Option<&str>,
         send_buffer: i32,
     ) -> io::Result<Self> {
-        let rtp = match bind_connect(target.local, target.dest, target.ttl, bind_dev) {
-            Ok(socket) => socket,
-            Err(error) => {
-                // stream.cpp:560.
-                ms_log::log!(
-                    "decode_transport failed: UDP connection on rtp port to {}:{} failed",
-                    target.dest.ip(),
-                    target.dest.port()
-                );
-                return Err(error);
-            }
-        };
-        let rtcp_local = with_port(target.local, target.local.port().wrapping_add(1));
-        let rtcp_dest = with_port(target.dest, target.dest.port().wrapping_add(1));
-        let rtcp = match bind_connect(rtcp_local, rtcp_dest, target.ttl, bind_dev) {
-            Ok(socket) => socket,
-            Err(error) => {
-                // stream.cpp:577.
-                ms_log::log!(
-                    "decode_transport failed: UDP connection on rtcp port to {}:{} failed",
-                    target.dest.ip(),
-                    target.dest.port().wrapping_add(1)
-                );
-                return Err(error);
-            }
-        };
-        // udp_bind leaves RTP blocking with a 1.1 s timeout (set_linux_socket_timeout,
-        // socketworks.cpp:374-386): a burst waits for send-buffer space instead of
-        // being dropped. RTCP stays non-blocking for the `poll_rtcp` reads.
-        rtp.set_nonblocking(false)?;
-        rtp.set_write_timeout(Some(RTP_SOCKET_TIMEOUT))?;
-        rtp.set_read_timeout(Some(RTP_SOCKET_TIMEOUT))?;
+        let (rtp, rtcp) = bind_udp_pair(&target, bind_dev)?;
+        Self::udp_from_bound(rtp, rtcp, config, now_ms, send_buffer)
+    }
+
+    /// Wraps sockets from [`bind_udp_pair`], applying the `udp_bind` timeouts,
+    /// `--output-buffer` and DSCP (stream.cpp:556-584).
+    pub fn udp_from_bound(
+        rtp: UdpSocket,
+        rtcp: UdpSocket,
+        config: OutputConfig,
+        now_ms: i64,
+        send_buffer: i32,
+    ) -> io::Result<Self> {
+        prepare_rtp_socket(&rtp)?;
         let mut output = Self::udp_from_sockets(rtp, rtcp, config, now_ms);
         output.apply_udp_socket_options(send_buffer);
         Ok(output)
@@ -403,17 +385,21 @@ impl StreamOutput {
         }
     }
 
-    /// Reconnects the UDP sockets to a new client port, keeping RTP state.
-    pub fn set_udp_destination(&mut self, dest: SocketAddr) -> io::Result<()> {
-        match &self.transport {
-            Transport::Udp { rtp, rtcp } => {
-                rtp.connect(dest)?;
-                rtcp.connect(with_port(dest, dest.port().wrapping_add(1)))
-            }
-            Transport::Tcp { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
-            #[cfg(feature = "srt")]
-            Transport::Srt { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
+    /// Swaps in the sockets of a new UDP transport, keeping RTP state; the old
+    /// ones close here (`sockets_del(old_rsock_id)`, stream.cpp:525-541).
+    pub fn replace_udp_sockets(
+        &mut self,
+        rtp: UdpSocket,
+        rtcp: UdpSocket,
+        send_buffer: i32,
+    ) -> io::Result<()> {
+        if !matches!(self.transport, Transport::Udp { .. }) {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
         }
+        prepare_rtp_socket(&rtp)?;
+        self.transport = Transport::Udp { rtp, rtcp };
+        self.apply_udp_socket_options(send_buffer);
+        Ok(())
     }
 
     /// Whether a failed SRT send requested a forced close (`sid->timeout = 1`).
@@ -724,6 +710,49 @@ const RTP_SOCKET_TIMEOUT: Duration = Duration::from_millis(1100);
 
 fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
     SocketAddr::new(addr.ip(), port)
+}
+
+/// Binds and connects the RTP and RTCP sockets of `decode_transport`
+/// (stream.cpp:556-584), logging the C++ failure lines.
+pub fn bind_udp_pair(
+    target: &UdpTarget,
+    bind_dev: Option<&str>,
+) -> io::Result<(UdpSocket, UdpSocket)> {
+    let rtp = match bind_connect(target.local, target.dest, target.ttl, bind_dev) {
+        Ok(socket) => socket,
+        Err(error) => {
+            // stream.cpp:560.
+            ms_log::log!(
+                "decode_transport failed: UDP connection on rtp port to {}:{} failed",
+                target.dest.ip(),
+                target.dest.port()
+            );
+            return Err(error);
+        }
+    };
+    let rtcp_local = with_port(target.local, target.local.port().wrapping_add(1));
+    let rtcp_dest = with_port(target.dest, target.dest.port().wrapping_add(1));
+    let rtcp = match bind_connect(rtcp_local, rtcp_dest, target.ttl, bind_dev) {
+        Ok(socket) => socket,
+        Err(error) => {
+            // stream.cpp:577.
+            ms_log::log!(
+                "decode_transport failed: UDP connection on rtcp port to {}:{} failed",
+                target.dest.ip(),
+                target.dest.port().wrapping_add(1)
+            );
+            return Err(error);
+        }
+    };
+    Ok((rtp, rtcp))
+}
+
+/// udp_bind leaves RTP blocking with a 1.1 s timeout (set_linux_socket_timeout,
+/// socketworks.cpp:374-386); RTCP stays non-blocking for the `poll_rtcp` reads.
+fn prepare_rtp_socket(rtp: &UdpSocket) -> io::Result<()> {
+    rtp.set_nonblocking(false)?;
+    rtp.set_write_timeout(Some(RTP_SOCKET_TIMEOUT))?;
+    rtp.set_read_timeout(Some(RTP_SOCKET_TIMEOUT))
 }
 
 fn bind_connect(

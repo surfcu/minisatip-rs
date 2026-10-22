@@ -1,7 +1,7 @@
 //! Stream outputs over real localhost sockets and in-memory sinks.
 
 use ms_net::StreamType;
-use ms_net::output::{OutputConfig, StreamOutput, UdpTarget, rtp_server_port};
+use ms_net::output::{OutputConfig, StreamOutput, UdpTarget, bind_udp_pair, rtp_server_port};
 use ms_tuner::PidSet;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -246,9 +246,16 @@ fn udp_client_port_change_updates_rport() {
     let (rx_b, _rtcp_b) = udp_pair();
     let mut output = udp_output(rx_a.local_addr().unwrap(), 1);
     assert_eq!(output.stats().remote, Some(rx_a.local_addr().unwrap()));
-    output
-        .set_udp_destination(rx_b.local_addr().unwrap())
-        .unwrap();
+    // decode_transport binds the new sockets on the same server port while
+    // the old ones are still open (stream.cpp:556-584).
+    let local = output.udp_sockets().unwrap().0.local_addr().unwrap();
+    let target = UdpTarget {
+        local,
+        dest: rx_b.local_addr().unwrap(),
+        ttl: None,
+    };
+    let (rtp, rtcp) = bind_udp_pair(&target, None).unwrap();
+    output.replace_udp_sockets(rtp, rtcp, 0).unwrap();
     assert_eq!(
         output.stats().remote.map(|addr| addr.port()),
         Some(rx_b.local_addr().unwrap().port()),
