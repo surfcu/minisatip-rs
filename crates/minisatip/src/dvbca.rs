@@ -76,6 +76,8 @@ enum Request {
         adapter: usize,
         pmt_id: i32,
     },
+    /// The adapters' pid tables for the `added_only` CAPMT filter.
+    RequestedPids(BTreeSet<(u16, u16)>),
     Stop,
 }
 
@@ -159,6 +161,11 @@ impl Dvbca {
         let _ = self.requests.send(Request::DelPmt { adapter, pmt_id });
     }
 
+    /// Replaces the requested `(adapter, pid)` set the worker's CAPMTs filter on.
+    pub fn set_requested_pids(&self, pids: BTreeSet<(u16, u16)>) {
+        let _ = self.requests.send(Request::RequestedPids(pids));
+    }
+
     /// Withdraws pending offers `keep` rejects; the worker runs requests in
     /// order, so a late CAPMT is followed by its release.
     pub fn sweep_pending(&self, pending: &PendingOffers, keep: impl Fn(usize, &Program) -> bool) {
@@ -217,6 +224,16 @@ impl DvbcaSink {
 }
 
 impl ms_sched::pmt::CaSink for DvbcaSink {
+    /// `dvbca_add_pid` (ca.cpp:4040): the next PMT section re-sends the CAPMT.
+    fn add_pid(&mut self, service: &CaService, pid: i32) -> bool {
+        ms_log::log!(
+            "PMT {}, pid {} was added, invalidating pmt",
+            service.pmt_id,
+            pid
+        );
+        true
+    }
+
     fn add_pmt(&mut self, service: &CaService, update: bool) -> TablesResult {
         let program = program_from_service(service);
         let id = service.pmt_id;
@@ -420,6 +437,7 @@ impl Worker {
                 }
                 self.programs.del(pmt_id);
             }
+            Request::RequestedPids(pids) => self.programs.set_requested_pids(pids),
             Request::Stop => {}
         }
     }

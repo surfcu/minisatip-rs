@@ -283,6 +283,10 @@ Unvalidated rows must be called out in release notes.
   - #28 and #30 port upstream #1518 (no forced CAPMT on a kept-place rejoin) and
     3d42bee (retry a failed CAPMT write). Upstream baseline is now `28dfd78`.
   - #29 status page: SDT names, CI adapter type, CA info (DEV-212 withdrawn).
+  - EN 50221 `-c N:**M`: a multiple-PMT CAPMT lists only the ES pids in the
+    adapter's pid table (`added_only`, `find_pid`), fed to the dvbca worker from the
+    same per-tick view as DDCI; a pid added later invalidates the PMT and the CAPMT
+    is re-sent (`dvbca_add_pid`).
   - Verified on the box: FTA, DDCI descrambling of 3 channels with MTD, rejoin
     without partner glitches.
 - **Open exit criteria:**
@@ -312,3 +316,5 @@ Unvalidated rows must be called out in release notes.
   port `test_utils.cpp`; CI test step with `--features dvbcsa`; CA scenarios in
   the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak.
 - **Blockers:** no SAT>IP server (M8 exit).
+- **Tracked issues:** CI+ advertised but ignored (#35); CA harness scenarios (#36);
+  reconciler not on the runtime path (#37); banner `<build date>`/s2api 0500 (#38).

@@ -186,6 +186,26 @@ impl CaRuntime {
         }
     }
 
+    /// Sends changed adapter pid tables to the EN 50221 worker: a multiple-PMT
+    /// CAPMT lists only these ES pids (`added_only`, ca.cpp:895).
+    fn sync_requested_pids(&mut self, sched: &Scheduler) {
+        let Some(state) = self.dvbca.as_mut() else {
+            return;
+        };
+        let pids: BTreeSet<(u16, u16)> = (0..MAX_ADAPTERS)
+            .filter(|aid| sched.adapter(*aid).is_some())
+            .flat_map(|aid| {
+                adapter_pid_table(sched, aid)
+                    .into_keys()
+                    .map(move |pid| (aid as u16, pid))
+            })
+            .collect();
+        if state.requested.as_ref() != Some(&pids) {
+            state.dvbca.set_requested_pids(pids.clone());
+            state.requested = Some(pids);
+        }
+    }
+
     /// Mirrors DDCI's PID subscriptions and CAT filters into the scheduler
     /// (DDCI calls `mark_pid_add`/`add_filter` directly in C++).
     fn sync_ddci(&mut self, sched: &mut Scheduler) {
@@ -242,10 +262,7 @@ impl CaRuntime {
         // The multiple-PMT filter of `ddci_create_pmt` reads the real pid table,
         // including the pids DDCI itself owns (marked just above).
         for (aid, adapter) in link.hub.lock().ddci.adapters.iter_mut() {
-            adapter.client_pids = sched
-                .active_pids(i32::from(*aid))
-                .filter_map(|p| Some((u16::try_from(p.pid).ok()?, !p.sids.is_empty())))
-                .collect();
+            adapter.client_pids = adapter_pid_table(sched, usize::from(*aid));
         }
         link.mirrored = wanted;
         let filters: BTreeMap<usize, u16> = link
@@ -320,6 +337,7 @@ impl CaRuntime {
             caids,
             pending,
             ca_id,
+            requested: None,
         });
     }
 
@@ -425,6 +443,8 @@ impl CaRuntime {
         generation: u64,
         packets: &[u8],
     ) {
+        // A PMT handled below builds its CAPMT from the pid tables as they are now.
+        self.sync_requested_pids(sched);
         let current = handles
             .get(aid)
             .and_then(Option::as_ref)
@@ -557,6 +577,7 @@ impl CaRuntime {
             self.handle_dvbapi_event(sched, event);
         }
         self.sync_ddci(sched);
+        self.sync_requested_pids(sched);
         self.sync(sched, handles);
         let offered: Vec<(usize, usize)> = self.offered.borrow_mut().drain(..).collect();
         for (aid, pmt_id) in offered {
@@ -1086,6 +1107,8 @@ struct DvbcaState {
     caids: Rc<RefCell<BTreeMap<usize, Vec<u16>>>>,
     pending: PendingOffers,
     ca_id: i32,
+    /// Requested pids last sent to the worker (`find_pid` for `added_only`).
+    requested: Option<BTreeSet<(u16, u16)>>,
 }
 
 /// DVBAPI state shared by the runtime and the scheduler's CA sink.
@@ -1297,8 +1320,8 @@ impl<S: CaSink> CaSink for Offering<S> {
         self.inner.del_pmt(service)
     }
 
-    fn add_pid(&mut self, service: &CaService, pid: i32) {
-        self.inner.add_pid(service, pid);
+    fn add_pid(&mut self, service: &CaService, pid: i32) -> bool {
+        self.inner.add_pid(service, pid)
     }
 
     fn del_pid(&mut self, service: &CaService, pid: i32) {
@@ -1356,6 +1379,15 @@ mod tests {
         assert!(!match_filter(0, 100, &filter, &mask, 0, &other));
         assert!(match_filter(0, 100, &[0; 16], &[0; 16], 0, &other));
     }
+}
+
+/// The adapter's pid table as `find_pid` sees it: each non-inactive pid, and
+/// whether a stream owns it (`!p->sid.empty()`).
+fn adapter_pid_table(sched: &Scheduler, aid: usize) -> BTreeMap<u16, bool> {
+    sched
+        .active_pids(aid as i32)
+        .filter_map(|p| Some((u16::try_from(p.pid).ok()?, !p.sids.is_empty())))
+        .collect()
 }
 
 /// One `dvbapi_sym` key slot (dvbapi.cpp:1122-1201); the channel follows
