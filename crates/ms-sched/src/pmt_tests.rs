@@ -2543,3 +2543,110 @@ fn ca_service_carries_pcr_and_av_pids() {
     assert_eq!(service.pcr_pid, 1003);
     assert_eq!(service.av_pids, vec![1001]);
 }
+
+/// One SDT section; each service carries a 0x48 service descriptor.
+fn build_sdt(table_id: u8, tsid: u16, onid: u16, services: &[(u16, &str, &str)]) -> Vec<u8> {
+    let mut body = vec![0xC1, 0, 0];
+    body.extend_from_slice(&onid.to_be_bytes());
+    body.push(0xFF);
+    for &(sid, provider, name) in services {
+        let mut desc = vec![0x48, 0, 0x19, provider.len() as u8];
+        desc.extend_from_slice(provider.as_bytes());
+        desc.push(name.len() as u8);
+        desc.extend_from_slice(name.as_bytes());
+        desc[1] = (desc.len() - 2) as u8;
+        body.extend_from_slice(&sid.to_be_bytes());
+        // EIT schedule and p/f set; running (4) and scrambled.
+        body.push(0xFF);
+        body.push(0x90 | ((desc.len() >> 8) as u8 & 0x0F));
+        body.push(desc.len() as u8);
+        body.extend_from_slice(&desc);
+    }
+    let mut section = vec![table_id, 0, 0];
+    section.extend_from_slice(&tsid.to_be_bytes());
+    section.extend_from_slice(&body);
+    section.extend_from_slice(&[0; 4]);
+    let len = section.len() - 3;
+    section[1] = 0xB0 | ((len >> 8) as u8 & 0x0F);
+    section[2] = len as u8;
+    section
+}
+
+// pmt.cpp:2246-2291: the SDT fields follow every section, the names only the first.
+#[test]
+fn sdt_names_a_pmt_once_and_tracks_its_fields() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let id = sched.pmt_add(0, 0x409E, 67);
+    let filter = sched.add_filter(0, 17, FilterTarget::Sdt, FILTER_CRC);
+    sched.process_sdt(
+        filter,
+        &build_sdt(0x42, 43305, 1, &[(0x409E, "beIN", "beIN SPORTS 1")]),
+    );
+    let pmt = sched.pmt(id).unwrap();
+    assert_eq!(
+        (pmt.name.as_str(), pmt.provider.as_str()),
+        ("beIN SPORTS 1", "beIN")
+    );
+    let sdt = pmt.sdt.expect("has_sdt");
+    assert_eq!(
+        (
+            sdt.service_type,
+            sdt.running_status,
+            sdt.ca_mode,
+            sdt.eit_schedule,
+            sdt.eit_pf
+        ),
+        (0x19, 4, 1, 1, 1)
+    );
+    assert_eq!((sdt.tsid, sdt.onid), (43305, 1));
+
+    sched.process_sdt(
+        filter,
+        &build_sdt(0x42, 43306, 1, &[(0x409E, "x", "renamed")]),
+    );
+    let pmt = sched.pmt(id).unwrap();
+    assert_eq!(pmt.name, "beIN SPORTS 1", "the name is kept once set");
+    assert_eq!(pmt.sdt.unwrap().tsid, 43306, "the fields follow the SDT");
+}
+
+#[test]
+fn sdt_other_and_unknown_services_are_ignored() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let id = sched.pmt_add(0, 0x2000, 100);
+    let filter = sched.add_filter(0, 17, FilterTarget::Sdt, FILTER_CRC);
+    sched.process_sdt(
+        filter,
+        &build_sdt(0x46, 1, 1, &[(0x2000, "p", "other mux")]),
+    );
+    assert!(
+        sched.pmt(id).unwrap().name.is_empty(),
+        "SDT other (0x46) is skipped"
+    );
+    assert!(sched.pmt(id).unwrap().sdt.is_none());
+    sched.process_sdt(filter, &build_sdt(0x42, 1, 1, &[(0x2001, "p", "no pmt")]));
+    assert!(sched.pmt(id).unwrap().name.is_empty());
+}
+
+// ddci.cpp:1020-1032: the CI-side PMT takes the source PMT's name once.
+#[test]
+fn name_pmt_for_sid_names_the_ci_side_pmt() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let source = sched.pmt_add(0, 0x409E, 67);
+    let ci = sched.pmt_add(8, 0x409E, 67);
+    assert_eq!(
+        sched.name_pmt_for_sid(8, 0x409E, source, "beIN SPORTS 1", "beIN"),
+        Some(ci)
+    );
+    assert_eq!(sched.pmt(ci).unwrap().name, "beIN SPORTS 1");
+    assert_eq!(sched.pmt(ci).unwrap().provider, "beIN");
+    assert_eq!(
+        sched.name_pmt_for_sid(8, 0x409E, source, "beIN SPORTS 1", "beIN"),
+        None
+    );
+    assert_eq!(
+        sched.name_pmt_for_sid(8, 0x409E, ci, "other", "p"),
+        None,
+        "not itself"
+    );
+    assert_eq!(sched.name_pmt_for_sid(8, 0x1234, source, "x", "p"), None);
+}

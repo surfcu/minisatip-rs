@@ -452,6 +452,8 @@ impl Runtime {
             self.drain_events();
             self.poll_satip_xml();
             self.ca.tick(self.session.scheduler_mut(), &self.handles);
+            let (ca, keys) = self.ca.web_state(self.session.scheduler());
+            self.session.set_web_ca(ca, keys);
         }
         // socketworks.cpp:1009-1010: `run_loop` is 0 once the loop exits.
         ms_log::log!("The main loop ended, run_loop = {}", 0);

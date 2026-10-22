@@ -694,6 +694,21 @@ mod tests {
         assert!(clear >= 100, "only {clear} descrambled packets came back");
         assert_eq!(scrambled_after_clear, 0);
         assert!(cam.lock().unwrap().ts_stats().descrambled > 0);
+
+        // An SDT name arriving after the offer reaches DDCI's copy and the
+        // CI-side PMT (ddci_update_pmt_name, ddci.cpp:1020).
+        let source = sched.get_all_pmt_for_sid(0, i32::from(SID)).unwrap().id as i32;
+        sched.name_pmt_for_sid(0, i32::from(SID), -1, "Test Channel", "Test");
+        ca.tick(&mut sched, &handles);
+        assert_eq!(
+            hub.lock().programs.get(source).unwrap().name,
+            "Test Channel"
+        );
+        let ci_side = sched
+            .get_all_pmt_for_sid(1, i32::from(SID))
+            .expect("CI-side PMT");
+        assert_eq!(ci_side.name, "Test Channel");
+        assert_eq!(ci_side.provider, "Test");
     }
 }
 

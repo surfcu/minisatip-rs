@@ -10,8 +10,10 @@
 use std::collections::BTreeSet;
 
 use ms_ca::TablesResult;
-use ms_ca::{CaDescriptor as CaServiceDescriptor, CaService, StreamPid as CaServiceStream};
-use ms_psi::{CrcCheck, Pmt as ParsedPmt};
+use ms_ca::{
+    CaDescriptor as CaServiceDescriptor, CaService, SdtInfo, StreamPid as CaServiceStream,
+};
+use ms_psi::{CrcCheck, Pmt as ParsedPmt, SDT_ACTUAL_TABLE_ID, Sdt};
 
 use crate::{AdapterType, PidEntry, PidState, Scheduler, StreamId};
 
@@ -145,6 +147,8 @@ pub struct Pmt {
     pub name: String,
     /// Provider name from the SDT.
     pub provider: String,
+    /// SDT service fields (`has_sdt` and `sdt_*`, pmt.cpp:2276-2282).
+    pub sdt: Option<SdtInfo>,
 }
 
 impl Pmt {
@@ -170,6 +174,7 @@ impl Pmt {
             filter: -1,
             name: String::new(),
             provider: String::new(),
+            sdt: None,
         }
     }
 }
@@ -347,6 +352,7 @@ impl Scheduler {
         pmt.best = false;
         pmt.name.clear();
         pmt.provider.clear();
+        pmt.sdt = None;
         pmt.caids = 0;
         pmt.ca.clear();
         pmt.descriptors.clear();
@@ -396,6 +402,13 @@ impl Scheduler {
         if let Some(pmt) = self.pmt_slot_mut(id) {
             pmt.filter = -1;
         }
+    }
+
+    /// The adapter's active PMT ids (`ad->active_pmt[0..active_pmts]`).
+    pub fn active_pmt_ids(&self, aid: usize) -> &[i32] {
+        self.adapter(aid).map_or(&[][..], |adapter| {
+            &adapter.active_pmt[..adapter.active_pmts]
+        })
     }
 
     /// Adds a PMT to the adapter's active list (`pmt_add_active_pmt`).
@@ -1512,7 +1525,95 @@ impl Scheduler {
                 .filter(|stream| stream.is_audio || stream.is_video)
                 .map(|stream| stream.pid as u16)
                 .collect(),
+            name: pmt.name.clone(),
+            provider: pmt.provider.clone(),
+            sdt: pmt.sdt,
         })
+    }
+
+    /// The scheduler half of `ddci_update_pmt_name` (ddci.cpp:1020-1032): names
+    /// the first PMT for `sid` on CI adapter `aid` unless it is `source` itself
+    /// or already carries `name`. Returns the renamed PMT id.
+    pub fn name_pmt_for_sid(
+        &mut self,
+        aid: i32,
+        sid: i32,
+        source: i32,
+        name: &str,
+        provider: &str,
+    ) -> Option<i32> {
+        let pmt = self
+            .pmt
+            .pmts
+            .iter_mut()
+            .find(|pmt| pmt.enabled && pmt.adapter == aid && pmt.sid == sid)?;
+        if pmt.id as i32 == source || pmt.name == name {
+            return None;
+        }
+        pmt.name = name.to_owned();
+        pmt.provider = provider.to_owned();
+        Some(pmt.id as i32)
+    }
+
+    /// `process_sdt` (pmt.cpp:2246-2291): SDT fields and, once, the service and
+    /// provider names of the adapter's PMTs.
+    pub fn process_sdt(&mut self, filter: i32, section: &[u8]) -> i32 {
+        if section.first() != Some(&SDT_ACTUAL_TABLE_ID) {
+            return 0;
+        }
+        let Some(aid) = self.filter_slot(filter).map(|f| f.adapter) else {
+            return 0;
+        };
+        let Ok(sdt) = Sdt::parse(section, CrcCheck::Skip) else {
+            return 0;
+        };
+        ms_log::debugm!(
+            "Processing SDT for transponder {} ({:x}) with length {}, sdt[5] {:02X}",
+            sdt.transport_stream_id,
+            sdt.transport_stream_id,
+            section.len(),
+            section.get(5).copied().unwrap_or(0)
+        );
+        for service in &sdt.services {
+            let sid = i32::from(service.service_id);
+            let Some(pmt) = self
+                .pmt
+                .pmts
+                .iter_mut()
+                .find(|pmt| pmt.enabled && pmt.adapter == aid && pmt.sid == sid)
+            else {
+                ms_log::debugm!("process_sdt: no PMT found for sid {} ({:X})", sid, sid);
+                continue;
+            };
+            let previous = pmt.sdt.map_or(0, |s| s.service_type);
+            pmt.sdt = Some(SdtInfo {
+                service_type: service.service_type.unwrap_or(previous),
+                running_status: service.running_status,
+                ca_mode: u8::from(service.free_ca_mode),
+                eit_schedule: u8::from(service.eit_schedule),
+                eit_pf: u8::from(service.eit_present_following),
+                tsid: sdt.transport_stream_id,
+                onid: sdt.original_network_id,
+            });
+            if pmt.name.is_empty()
+                && let Some(name) = &service.service_name
+            {
+                pmt.provider = service
+                    .provider_name
+                    .as_deref()
+                    .map_or_else(String::new, |p| String::from_utf8_lossy(p).into_owned());
+                pmt.name = String::from_utf8_lossy(name).into_owned();
+                ms_log::log!(
+                    "SDT PMT {}: name {} provider {}, sid: {} ({:X})",
+                    pmt.id,
+                    pmt.name,
+                    pmt.provider,
+                    sid,
+                    sid
+                );
+            }
+        }
+        0
     }
 
     /// Adds a section filter (`add_filter`).

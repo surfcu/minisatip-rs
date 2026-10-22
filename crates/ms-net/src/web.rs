@@ -35,6 +35,12 @@ pub const QAM_AUTO: i32 = 6;
 pub const GUARD_INTERVAL_AUTO: i32 = 4;
 /// `adapter::type` of a Linux DVB adapter (adapter.h:22).
 pub const ADAPTER_DVB: i32 = 1;
+/// `ADAPTER_SATIP`.
+pub const ADAPTER_SATIP: i32 = 2;
+/// `ADAPTER_NETCV`.
+pub const ADAPTER_NETCV: i32 = 3;
+/// `ADAPTER_CI`.
+pub const ADAPTER_CI: i32 = 4;
 
 /// Optional C++ subsystems whose symbol tables are compiled in
 /// (symbols.cpp:27-41); every one is part of the default build.

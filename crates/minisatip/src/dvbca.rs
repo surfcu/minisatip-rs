@@ -88,6 +88,18 @@ pub enum Notice {
     Caids(usize, Vec<u16>),
     /// `ca_release_pmts`: these PMTs must be offered again.
     Released(Vec<i32>),
+    /// The device's `ca_sym` fields changed (status page).
+    State(usize, DeviceView),
+}
+
+/// `ca_devices[i]` fields read by `ca_sym` (ca.cpp:4234-4242).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceView {
+    pub enabled: bool,
+    /// `CA_STATE_*`: 0 inactive, 1 active, 2 initialized.
+    pub state: i32,
+    pub caids: Vec<u16>,
+    pub ci_name: String,
 }
 
 /// Control-thread handle of the worker.
@@ -212,7 +224,7 @@ impl ms_sched::pmt::CaSink for DvbcaSink {
         // sent; an offer for another program in the slot is released first.
         let mut pending = self.pending.borrow_mut();
         if let Some(offer) = pending.get(&id) {
-            if offer.program == program {
+            if same_offer(&offer.program, &program) {
                 return match offer.rx.try_recv() {
                     Ok(result) => {
                         pending.remove(&id);
@@ -259,6 +271,18 @@ impl ms_sched::pmt::CaSink for DvbcaSink {
     }
 }
 
+/// Whether `a` and `b` are the same CA offer. SDT names and fields arrive
+/// independently of the PMT and do not change the CAPMT, so they are ignored.
+fn same_offer(a: &Program, b: &Program) -> bool {
+    let strip = |p: &Program| Program {
+        name: String::new(),
+        provider: String::new(),
+        sdt: None,
+        ..p.clone()
+    };
+    strip(a) == strip(b)
+}
+
 /// The CAPMT view of a scheduler PMT.
 pub(crate) fn program_from_service(service: &CaService) -> Program {
     let mut program = Program {
@@ -267,6 +291,9 @@ pub(crate) fn program_from_service(service: &CaService) -> Program {
         sid: service.sid,
         pid: service.pmt_pid,
         pcr_pid: service.pcr_pid,
+        name: service.name.clone(),
+        provider: service.provider.clone(),
+        sdt: service.sdt,
         ..Program::default()
     };
     for ca in &service.ca {
@@ -316,6 +343,8 @@ struct Worker {
     programs: ProgramTable,
     adapters: BTreeMap<usize, AdapterInfo>,
     usable: BTreeSet<usize>,
+    /// Last `DeviceView` sent per device.
+    views: BTreeMap<usize, DeviceView>,
     notices: Sender<Notice>,
     next_timer: i64,
 }
@@ -348,6 +377,7 @@ impl Worker {
             programs: ProgramTable::new(),
             adapters: BTreeMap::new(),
             usable: BTreeSet::new(),
+            views: BTreeMap::new(),
             notices,
             next_timer: 0,
         }
@@ -441,6 +471,28 @@ impl Worker {
         }
         for id in ids {
             self.forward_events(id);
+            self.publish_view(id);
+        }
+    }
+
+    /// Sends the device's status-page fields when they changed.
+    fn publish_view(&mut self, id: usize) {
+        let Some(dev) = self.registry.get(id as i32) else {
+            return;
+        };
+        let view = DeviceView {
+            enabled: dev.enabled,
+            state: match dev.state {
+                ms_ca_drivers::en50221::CaState::Inactive => 0,
+                ms_ca_drivers::en50221::CaState::Active => 1,
+                ms_ca_drivers::en50221::CaState::Initialized => 2,
+            },
+            caids: dev.caids().to_vec(),
+            ci_name: dev.ci_name(),
+        };
+        if self.views.get(&id) != Some(&view) {
+            self.views.insert(id, view.clone());
+            let _ = self.notices.send(Notice::State(id, view));
         }
     }
 
@@ -589,6 +641,21 @@ mod tests {
         false
     }
 
+    // A name or SDT arriving during an offer must not release and re-send it.
+    #[test]
+    fn sdt_fields_do_not_change_an_offer() {
+        let mut named = service(0x0B00);
+        named.name = "beIN SPORTS 1".to_owned();
+        named.sdt = Some(ms_ca::SdtInfo::default());
+        let (a, b) = (
+            program_from_service(&service(0x0B00)),
+            program_from_service(&named),
+        );
+        assert_ne!(a, b);
+        assert!(same_offer(&a, &b));
+        assert!(!same_offer(&a, &program_from_service(&service(0x0100))));
+    }
+
     #[test]
     fn capmt_reaches_the_fake_cam_through_the_sink() {
         let cam = Arc::new(Mutex::new(FakeCam::new(
@@ -611,6 +678,15 @@ mod tests {
         dvbca.init_dev(AdapterInfo::dvb(0, 0, 0));
         assert!(wait_notice(&dvbca, |n| *n == Notice::Usable(0)));
         assert!(wait_notice(&dvbca, |n| *n == Notice::Caids(0, vec![0x0B00])));
+        // ca_sym: the status page reads enabled, state, CAIDs and the CAM name.
+        assert!(wait_notice(&dvbca, |n| matches!(
+            n,
+            Notice::State(0, view)
+                if view.enabled
+                    && view.state == 2
+                    && view.caids == [0x0B00]
+                    && !view.ci_name.is_empty()
+        )));
 
         let caids = Rc::new(RefCell::new(BTreeMap::from([(0, vec![0x0B00])])));
         let mut sink = DvbcaSink::new(Rc::clone(&dvbca), caids, Rc::default());

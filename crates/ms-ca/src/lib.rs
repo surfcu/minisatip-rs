@@ -52,6 +52,12 @@ pub struct CaService {
     pub streams: Vec<StreamPid>,
     /// Streams the C++ parser classifies as audio or video (CAPMT ES filter).
     pub av_pids: Vec<u16>,
+    /// Service name from the SDT (`SPMT::name`), empty until it arrives.
+    pub name: String,
+    /// Provider name from the SDT (`SPMT::provider`).
+    pub provider: String,
+    /// SDT service fields (`has_sdt` and `sdt_*`), `None` until the SDT arrives.
+    pub sdt: Option<SdtInfo>,
 }
 
 impl CaService {
