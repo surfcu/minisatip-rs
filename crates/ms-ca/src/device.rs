@@ -134,8 +134,20 @@ impl CaDevice {
         pmt_id: i32,
         multiple: usize,
     ) -> Option<usize> {
+        self.place_pmt(programs, pmt_id, multiple)
+            .map(|(slot, _)| slot)
+    }
+
+    /// `add_pmt_to_capmt` with its `rejoined` out-parameter: the slot, and
+    /// whether the program took its kept place back.
+    pub fn place_pmt(
+        &mut self,
+        programs: &ProgramTable,
+        pmt_id: i32,
+        multiple: usize,
+    ) -> Option<(usize, bool)> {
         if let Some(i) = self.slot_of(pmt_id) {
-            return Some(i);
+            return Some((i, false));
         }
         let pmt = programs.get(pmt_id)?;
         // A program back before the next send takes its kept place, matched by streams.
@@ -157,7 +169,7 @@ impl CaDevice {
                 for place in 0..MAX_PMT_PER_CAPMT {
                     if !pmt_id_is_valid(c.place(place)) && c.sent_es[place] == es {
                         *c.place_mut(place) = pmt_id;
-                        return Some(i);
+                        return Some((i, true));
                     }
                 }
             }
@@ -165,7 +177,7 @@ impl CaDevice {
         // Prefer an empty CAPMT: packing next to a running PMT restarts that channel.
         if let Some(i) = self.slots().find(|&i| self.capmt[i].pmt_count() == 0) {
             self.capmt[i].pmt_id = pmt_id;
-            return Some(i);
+            return Some((i, false));
         }
         if multiple == 0 {
             self.log_all_channels_used(multiple);
@@ -191,7 +203,7 @@ impl CaDevice {
         } else if let Some(id) = c.other_id.iter_mut().find(|id| !pmt_id_is_valid(**id)) {
             *id = pmt_id;
         }
-        Some(b)
+        Some((b, false))
     }
 
     /// `remove_pmt_from_device`: the place stays empty until the next send.
@@ -285,7 +297,7 @@ impl CaDevice {
             return TablesResult::Retry;
         }
         let was_member = self.slot_of(pmt_id).is_some();
-        let Some(slot) = self.add_pmt_to_capmt(programs, pmt_id, self.multiple_pmt) else {
+        let Some((slot, rejoined)) = self.place_pmt(programs, pmt_id, self.multiple_pmt) else {
             ms_log::log!("No free slots to add PMT {} to CA {}", pmt_id, self.id);
             return TablesResult::Retry;
         };
@@ -342,15 +354,23 @@ impl CaDevice {
                 LISTMGMT_STR[usize::from(listmgmt)],
                 capmt.pmts_str(),
                 slot,
-                if update { ", update" } else { "" }
+                if update {
+                    ", update"
+                } else if rejoined {
+                    ", rejoin"
+                } else {
+                    ""
+                }
             );
         }
+        // Only a new join forces the send; an update or a kept-place rejoin
+        // sends only when the built CAPMT changed, decided in send_capmt.
         if self
             .send_capmt(
                 slot,
                 listmgmt,
                 CMD_ID_OK_DESCRAMBLING,
-                !update,
+                !update && !rejoined,
                 programs,
                 driver,
             )
