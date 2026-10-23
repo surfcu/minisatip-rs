@@ -8,7 +8,7 @@ use ms_config::DropEncrypted;
 use ms_ts::TsStage;
 
 use super::cipher::CipherRegistry;
-use super::pipeline::{Descrambler, ServiceStats};
+use super::pipeline::{AdapterPid, Descrambler, ServiceStats};
 
 /// Messages to an adapter's descrambler.
 pub enum DescramblerCommand {
@@ -44,6 +44,8 @@ pub enum DescramblerCommand {
     SetPidsAll(bool),
     /// Replies with the decrypt statistics.
     Query(Sender<DescramblerStats>),
+    /// The adapter pid table: pid, active, claiming PMT.
+    SetAdapterPids(Vec<AdapterPid>),
 }
 
 /// Decrypt statistics of one adapter.
@@ -53,6 +55,8 @@ pub struct DescramblerStats {
     pub services: Vec<ServiceStats>,
     /// Packets left scrambled (`ad->dec_err`).
     pub dec_err: u64,
+    /// `ad_decerr`: dec errors of the two busiest active pids.
+    pub ad_decerr: u64,
 }
 
 /// Settings of one adapter's descrambler.
@@ -146,7 +150,11 @@ impl DescramblerStage {
                 let _ = reply.send(DescramblerStats {
                     services: self.descrambler.all_stats(),
                     dec_err: self.descrambler.dec_err(),
+                    ad_decerr: self.descrambler.adapter_decerr(),
                 });
+            }
+            DescramblerCommand::SetAdapterPids(table) => {
+                self.descrambler.set_adapter_pids(&table);
             }
         }
     }
@@ -166,6 +174,7 @@ impl TsStage for DescramblerStage {
         while let Ok(command) = self.commands.try_recv() {
             self.handle(command, now);
         }
+        self.descrambler.count_packets(buf, self.pids_all);
         // Clear-text adapters pass through untouched, like `ad->ca_mask == 0`.
         if !self.ca_active {
             return;

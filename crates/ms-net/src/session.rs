@@ -241,6 +241,8 @@ pub struct SessionManager {
     web_ca: Vec<Option<CaDeviceState>>,
     /// `dvbapi_sym` slots, pushed by the CA runtime.
     web_keys: Vec<Option<KeyState>>,
+    /// `ad_decerr` per adapter, pushed by the CA runtime.
+    web_decerr: Vec<i32>,
     bandwidth: Arc<Bandwidth>,
     #[cfg(feature = "srt")]
     srt: Option<SrtListener<LibSrtOps>>,
@@ -285,6 +287,7 @@ impl SessionManager {
             web_runtime: RuntimeState::default(),
             web_ca: Vec::new(),
             web_keys: Vec::new(),
+            web_decerr: Vec::new(),
             bandwidth: Arc::new(Bandwidth::new()),
             #[cfg(feature = "srt")]
             srt: None,
@@ -322,6 +325,11 @@ impl SessionManager {
     pub fn set_web_ca(&mut self, ca: Vec<Option<CaDeviceState>>, keys: Vec<Option<KeyState>>) {
         self.web_ca = ca;
         self.web_keys = keys;
+    }
+
+    /// Installs the per-adapter decrypt errors shown as `ad_decerr`.
+    pub fn set_web_decerr(&mut self, decerr: Vec<i32>) {
+        self.web_decerr = decerr;
     }
 
     /// Installs the process-wide counters reported by `/bandwidth.json`.
@@ -1359,6 +1367,7 @@ impl SessionManager {
                     .copied()
                     .unwrap_or(0)
                     .min(i32::MAX as u64) as i32,
+                decerr: self.web_decerr.get(aid).copied().unwrap_or(0),
                 pmts: self
                     .sched
                     .active_pmt_ids(aid)

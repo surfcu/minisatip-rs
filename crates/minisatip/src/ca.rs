@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use ms_ca::{CaEvent, CaService, FilterId, TablesResult};
 use ms_ca_drivers::descramble::{
-    CipherRegistry, DescramblerCommand, DescramblerStage, DescramblerStats, StageConfig,
+    AdapterPid, CipherRegistry, DescramblerCommand, DescramblerStage, DescramblerStats, StageConfig,
 };
 use ms_ca_drivers::dvbapi::transport::{self, Stream};
 use ms_ca_drivers::dvbapi::{DvbapiClient, DvbapiConfig, PmtStatus, PollAction};
@@ -38,6 +38,8 @@ const DEFAULT_LOG: u32 = ms_log::LOG_PMT;
 const DVBAPI_POLL_MS: i64 = 1000;
 /// `dvbapi_ts` runs the watchdog at most every 100 ms per adapter.
 const WATCHDOG_MS: i64 = 100;
+/// How often every descrambler is asked for its statistics (`ad_decerr`).
+const STATS_MS: i64 = 1000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 /// PID that requests the whole transport stream.
@@ -51,6 +53,8 @@ struct AdapterCa {
     pids_all: bool,
     stats: DescramblerStats,
     pending_stats: Option<Receiver<DescramblerStats>>,
+    /// Pid table last sent to the descrambler (pid, active, claiming PMT).
+    pid_table: Vec<AdapterPid>,
 }
 
 /// Owns every CA driver and the section routing of all adapters.
@@ -75,6 +79,7 @@ pub struct CaRuntime {
     ca_views: BTreeMap<usize, DeviceView>,
     next_poll: i64,
     next_watchdog: i64,
+    next_stats: i64,
 }
 
 impl CaRuntime {
@@ -103,6 +108,7 @@ impl CaRuntime {
             ca_views: BTreeMap::new(),
             next_poll: 0,
             next_watchdog: 0,
+            next_stats: 0,
         }
     }
 
@@ -138,6 +144,7 @@ impl CaRuntime {
                 pids_all: false,
                 stats: DescramblerStats::default(),
                 pending_stats: None,
+                pid_table: Vec::new(),
             },
         );
         stages.push(Box::new(stage));
@@ -560,6 +567,10 @@ impl CaRuntime {
             self.next_watchdog = now + WATCHDOG_MS;
             self.watchdog(sched, now);
         }
+        if now >= self.next_stats {
+            self.next_stats = now + STATS_MS;
+            self.request_stats();
+        }
         self.after_scheduler(sched, handles);
     }
 
@@ -727,6 +738,29 @@ impl CaRuntime {
         }
     }
 
+    /// Asks every descrambler without a pending query for its statistics.
+    fn request_stats(&mut self) {
+        for ca in self.adapters.values_mut() {
+            if ca.pending_stats.is_none() {
+                let (tx, rx) = mpsc::channel();
+                if ca.descrambler.send(DescramblerCommand::Query(tx)).is_ok() {
+                    ca.pending_stats = Some(rx);
+                }
+            }
+        }
+    }
+
+    /// `ad_decerr` of each adapter from the last statistics (`get_adapter_decerrs`).
+    pub fn web_decerr(&self) -> Vec<i32> {
+        let mut decerr = vec![0; MAX_ADAPTERS];
+        for (&aid, ca) in &self.adapters {
+            if let Some(slot) = decerr.get_mut(aid) {
+                *slot = i32::try_from(ca.stats.ad_decerr).unwrap_or(i32::MAX);
+            }
+        }
+        decerr
+    }
+
     fn collect_stats(&mut self) {
         for ca in self.adapters.values_mut() {
             let Some(rx) = ca.pending_stats.as_ref() else {
@@ -801,7 +835,18 @@ impl CaRuntime {
         let mut wanted: BTreeMap<usize, Vec<u16>> = BTreeMap::new();
         let mut pids_all = false;
         let mut ca_active = false;
+        let mut pid_table: Vec<AdapterPid> = Vec::new();
         if let Some(adapter) = sched.adapter(aid) {
+            // The pid table as find_pid sees it, for the per-pid dec errors.
+            for entry in adapter.pid_entries() {
+                if entry.state != PidState::Inactive
+                    && let Ok(pid) = u16::try_from(entry.pid)
+                    && pid < 8192
+                {
+                    pid_table.push((pid, entry.state == PidState::Active, entry.pmt));
+                }
+            }
+            pid_table.sort_unstable();
             for entry in adapter.pid_entries() {
                 if !matches!(entry.state, PidState::Active | PidState::New) {
                     continue;
@@ -839,6 +884,12 @@ impl CaRuntime {
                 });
                 ca.services.insert(pmt_id, pids);
             }
+        }
+        if ca.pid_table != pid_table {
+            let _ = ca
+                .descrambler
+                .send(DescramblerCommand::SetAdapterPids(pid_table.clone()));
+            ca.pid_table = pid_table;
         }
         if ca.ca_active != ca_active {
             ca.ca_active = ca_active;
@@ -1584,6 +1635,7 @@ mod wiring_tests {
                 pids_all: false,
                 stats: DescramblerStats::default(),
                 pending_stats: None,
+                pid_table: Vec::new(),
             },
         );
         for pid in [0, 0x100, 0x101] {
