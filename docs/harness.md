@@ -128,7 +128,7 @@ cargo run -p ms-harness -- run --runs 3 --cpp $CPP --captures ~/captures harness
 |----------|------|--------|
 | `real-fta-single` | `fta-dmax` | DMAX HD over RTSP/TCP, `/state.json` |
 | `real-fta-multi` | `fta-multi` | 19-service mux over HTTP `pids=all`, two services over RTSP/TCP |
-| `real-scrambled` | `scr-bein3` | Irdeto service with ECM/EMM pids, no CA: TSC kept |
+| `real-scrambled` | `scr-irdeto` | Irdeto service with ECM/EMM pids, no CA: TSC kept |
 
 A recorded file has no ES index, so `sets` summaries hold only what does not depend
 on timing: PIDs with their scrambling state (`clear`, `scrambled`, `mixed`), distinct

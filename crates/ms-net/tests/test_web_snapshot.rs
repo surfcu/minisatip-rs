@@ -44,13 +44,13 @@ fn adapter_pmts_come_from_the_active_list() {
     let sched = session.scheduler_mut();
     let id = sched.pmt_add(0, 0x409E, 67);
     sched.pmt_add_active_pmt(0, id);
-    sched.name_pmt_for_sid(0, 0x409E, -1, "beIN SPORTS 1", "beIN");
+    sched.name_pmt_for_sid(0, 0x409E, -1, "Service 1", "Provider");
     let snapshot = session.web_snapshot();
     assert_eq!(
         snapshot.adapters[0].pmts,
         [PmtState {
             running: false,
-            name: "beIN SPORTS 1".to_owned(),
+            name: "Service 1".to_owned(),
             pid: 67,
         }]
     );
