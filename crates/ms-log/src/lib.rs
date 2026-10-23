@@ -401,6 +401,20 @@ static DEFAULT_LOGGER: Logger = Logger {
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
+/// Local-time clock for lines logged before [`init`], supplied by the binary.
+static PREINIT_CLOCK: OnceLock<fn() -> Timestamp> = OnceLock::new();
+
+/// Installs the clock for lines logged before [`init`] (C++ uses `localtime`
+/// for every line); only the first call has an effect.
+pub fn set_preinit_clock(clock: fn() -> Timestamp) {
+    let _ = PREINIT_CLOCK.set(clock);
+}
+
+/// Timestamp of a line logged before [`init`]: the installed clock, else UTC.
+pub fn preinit_timestamp() -> Timestamp {
+    PREINIT_CLOCK.get().map_or_else(utc_now, |clock| clock())
+}
+
 /// Installs the process-wide logger. Only the first call has an effect.
 pub fn init(config: Config) {
     let _ = LOGGER.set(Logger::new(config));
@@ -449,12 +463,12 @@ pub fn thread_name() -> String {
 /// Backend used before [`init`] runs.
 const DEFAULT_BACKEND: DefaultBackend = DefaultBackend;
 
-/// Pre-init backend: UTC time computed in pure Rust, stdout output.
+/// Pre-init backend: [`preinit_timestamp`], stdout output.
 struct DefaultBackend;
 
 impl Backend for DefaultBackend {
     fn timestamp(&self) -> Timestamp {
-        utc_now()
+        preinit_timestamp()
     }
 
     fn syslog(&self, line: &str) {
