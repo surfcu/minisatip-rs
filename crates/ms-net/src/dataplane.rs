@@ -84,6 +84,8 @@ pub struct DataPlaneConfig {
     pub adapter_buffer: usize,
     /// Initial send threshold in ms (`ad->threshold`).
     pub threshold_ms: i64,
+    /// `-k`: a `pids=all` output never opens pid 8192 on the tuner.
+    pub emulate_pids_all: bool,
 }
 
 impl Default for DataPlaneConfig {
@@ -92,6 +94,7 @@ impl Default for DataPlaneConfig {
             adapter_id: 0,
             adapter_buffer: ADAPTER_BUFFER,
             threshold_ms: clamp_threshold(25),
+            emulate_pids_all: false,
         }
     }
 }
@@ -909,7 +912,13 @@ impl DataPlane {
         for subscriber in self.outputs.values() {
             pids.extend(subscriber.pids.iter());
         }
-        if let Err(error) = self.tuner.set_pids(&pids) {
+        // adapter.cpp:997: the scheduler opens the emulated pids instead; the
+        // data plane keeps PID_ALL, so check_cc stays off as in stream.cpp:899.
+        let mut tuner_pids = pids.clone();
+        if self.config.emulate_pids_all {
+            tuner_pids.remove(PID_ALL);
+        }
+        if let Err(error) = self.tuner.set_pids(&tuner_pids) {
             let _ = self.events.send(Event::TunerError(error.to_string()));
             return;
         }

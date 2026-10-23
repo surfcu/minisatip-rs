@@ -1395,7 +1395,8 @@ impl SessionManager {
                 rhost: stream.remote_host.clone(),
                 rport: stream.remote_port,
                 protocol: protocol_name(stream.stream_type).to_owned(),
-                pids: stream.params.pids.iter().map(i32::from).collect(),
+                // get_stream_pids: the adapter's active pids carrying this stream.
+                pids: self.sched.stream_pids(stream.adapter, index as StreamId),
                 ..StreamState::default()
             };
         }

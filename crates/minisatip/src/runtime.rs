@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use ms_config::Options;
+use ms_config::{DropEncrypted, Options};
 use ms_net::bandwidth::Bandwidth;
 use ms_net::bind::{BindOptions, resolve_bind_opts};
 use ms_net::dataplane::{AdapterHandle, Command, DataPlaneConfig, DataPlaneTuner};
@@ -86,6 +86,7 @@ struct SatipSettings {
     receive_buffer: i32,
     adapter_buffer: i32,
     threshold_ms: i64,
+    emulate_pids_all: bool,
     global_strength: f32,
     global_snr: f32,
     multipliers: Vec<(u8, f32, f32)>,
@@ -106,6 +107,7 @@ impl SatipSettings {
             receive_buffer: opts.satipc_buffer,
             adapter_buffer: opts.adapter_buffer,
             threshold_ms: ms_net::dataplane::clamp_threshold(opts.udp_threshold),
+            emulate_pids_all: opts.emulate_pids_all,
             global_strength: opts.strength_multiplier,
             global_snr: opts.snr_multiplier,
             multipliers: opts
@@ -234,6 +236,8 @@ impl Runtime {
         // Any `-A` entry enables virtual DiSEqC (adapter.cpp:1816).
         scheduler.set_absolute_switch(!opts.absolute_sources.is_empty());
         scheduler.set_pmt_scan(opts.pmt_scan != 0);
+        scheduler.set_emulate_pids_all(opts.emulate_pids_all);
+        scheduler.set_drop_encrypted(opts.drop_encrypted != DropEncrypted::Send);
         let replay = std::env::var_os("MINISATIP_REPLAY").map(PathBuf::from);
         let replay_enabled = replay.is_some();
         let adapter_ids = adapter_ids(opts);
@@ -1577,6 +1581,7 @@ fn spawn_adapter(
         tuner,
         buffer,
         ms_net::dataplane::clamp_threshold(opts.udp_threshold),
+        opts.emulate_pids_all,
         bandwidth,
         stages,
     )
@@ -1587,6 +1592,7 @@ fn spawn_adapter_with(
     tuner: Box<dyn Tuner + Send>,
     buffer: usize,
     threshold_ms: i64,
+    emulate_pids_all: bool,
     bandwidth: Option<Arc<Bandwidth>>,
     stages: Vec<Box<dyn TsStage>>,
 ) -> Result<AdapterHandle, String> {
@@ -1597,6 +1603,7 @@ fn spawn_adapter_with(
             adapter_id,
             adapter_buffer: buffer,
             threshold_ms,
+            emulate_pids_all,
         },
         bandwidth,
         stages,
@@ -1637,6 +1644,7 @@ fn spawn_satip(
         Box::new(tuner),
         buffer,
         settings.threshold_ms,
+        settings.emulate_pids_all,
         bandwidth,
         stages,
     )
@@ -1749,6 +1757,7 @@ fn spawn_dvb_adapters(
                         Box::new(tuner),
                         buffer,
                         ms_net::dataplane::clamp_threshold(opts.udp_threshold),
+                        opts.emulate_pids_all,
                         bandwidth.clone(),
                         ca.stages(aid),
                     )?;
@@ -1837,6 +1846,7 @@ fn spawn_ddci_adapters(
             Box::new(reader),
             buffer,
             ms_net::dataplane::clamp_threshold(opts.udp_threshold),
+            opts.emulate_pids_all,
             bandwidth.clone(),
             ca.ci_stages(aid),
         )?;

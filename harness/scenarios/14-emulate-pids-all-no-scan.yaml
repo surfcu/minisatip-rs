@@ -1,0 +1,18 @@
+name: emulate-pids-all-no-scan
+description: "-k with -9 (no PMT scan): only the enforced PSI list and the null pid"
+capture: multi
+fast: true
+args: ["-k", "-9"]
+steps:
+  - udp: u1
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=all"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - sleep: 1000
+  - capture: { from: u1, mode: sets }
+  - http: { path: /state.json, body: numbers }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }
+  - silence: { from: u1, ms: 500 }

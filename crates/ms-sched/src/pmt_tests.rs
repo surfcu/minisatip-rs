@@ -2668,3 +2668,72 @@ fn pmt_scan_opens_the_pmt_pids_of_the_pat() {
         assert_eq!(sched.find_pid(0, 0x200).is_some(), scan);
     }
 }
+
+/// Records every `set_pid` call and every bulk PID set.
+struct PidLog {
+    opened: Rc<RefCell<Vec<i32>>>,
+    bulk: Rc<RefCell<Vec<Vec<u16>>>>,
+}
+
+impl AdapterTuner for PidLog {
+    fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+        Ok(())
+    }
+
+    fn set_pid(&mut self, pid: i32) -> Result<i32, TuneError> {
+        self.opened.borrow_mut().push(pid);
+        Ok(1)
+    }
+
+    fn set_pids(&mut self, pids: &ms_tuner::PidSet) -> Result<(), TuneError> {
+        self.bulk.borrow_mut().push(pids.iter().collect());
+        Ok(())
+    }
+}
+
+// adapter.cpp:997 and pmt.cpp:62: with -k, pids=all never opens pid 8192; the
+// enforced PSI list and the null pid are opened for the stream instead.
+#[test]
+fn emulated_pids_all_opens_the_enforced_list_not_8192() {
+    for emulate in [true, false] {
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let bulk = Rc::new(RefCell::new(Vec::new()));
+        let mut sched = test_sched(AdapterType::Dvb);
+        sched.adapter_mut(0).unwrap().set_tuner(Box::new(PidLog {
+            opened: Rc::clone(&opened),
+            bulk: Rc::clone(&bulk),
+        }));
+        sched.set_emulate_pids_all(emulate);
+        assert_eq!(sched.mark_pid_add(0, 0, 8192), 0);
+        sched.update_pids(0);
+        let opened = opened.borrow();
+        let all = sched.find_pid(0, 8192).unwrap();
+        assert_eq!(all.state, PidState::Active);
+        let last = bulk.borrow().last().cloned().unwrap_or_default();
+        if emulate {
+            assert!(!opened.contains(&8192), "{opened:?}");
+            assert_eq!(all.fd, -1);
+            for pid in [0, 1, 16, 17, 18, 20, 21, 8191] {
+                assert!(opened.contains(&pid), "pid {pid} not opened: {opened:?}");
+                assert!(sched.find_pid(0, pid).unwrap().sids.contains(&0));
+            }
+            assert!(!last.contains(&8192), "{last:?}");
+        } else {
+            assert_eq!(*opened, vec![8192]);
+            assert_eq!(last, vec![8192]);
+        }
+    }
+}
+
+// pmt.cpp:1427: the null pid joins only when encrypted packets are sent (-E).
+#[test]
+fn emulated_pids_all_adds_the_null_pid_only_without_drop_encrypted() {
+    for drop in [false, true] {
+        let mut sched = test_sched(AdapterType::Dvb);
+        sched.set_emulate_pids_all(true);
+        sched.set_drop_encrypted(drop);
+        assert_eq!(sched.mark_pid_add(0, 0, 8192), 0);
+        sched.update_pids(0);
+        assert_eq!(sched.find_pid(0, 8191).is_some(), !drop, "drop {drop}");
+    }
+}
