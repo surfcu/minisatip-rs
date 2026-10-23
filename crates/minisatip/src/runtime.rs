@@ -43,7 +43,7 @@ use ms_tuner::{
 
 #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
 use ms_tuner::linux_dvb::{
-    self, DiseqcParams, LinuxDeviceTree, LinuxDvbTuner, LinuxFrontendProbe, SWITCH_JESS,
+    self, DemuxMode, DiseqcParams, LinuxDeviceTree, LinuxDvbTuner, LinuxFrontendProbe, SWITCH_JESS,
     SWITCH_SLAVE, SWITCH_UNICABLE, TUNER_FORCE_NO, TUNER_FORCE_SNR_DECIBEL,
     TUNER_FORCE_SNR_PERCENT, TUNER_FORCE_STRENGTH_DECIBEL, TUNER_FORCE_STRENGTH_PERCENT,
 };
@@ -1742,6 +1742,7 @@ fn spawn_dvb_adapters(
                 frontend.path_adapter,
                 frontend.path_frontend,
                 opts.dvr_buffer,
+                DemuxMode::from_option(opts.use_demux_device),
             ) {
                 Ok(mut tuner) => {
                     tuner.state_mut().pa = frontend.path_adapter as i32;

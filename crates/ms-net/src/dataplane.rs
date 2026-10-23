@@ -359,6 +359,9 @@ pub enum Command {
     SetThreshold(i64),
     /// PIDs with section filters; their packets are reported as [`Event::TablePackets`].
     SetSectionPids(PidSet),
+    /// PIDs the tuner opens as PSI (`dvb_is_psi`), sent by `update_pids`
+    /// ahead of [`Command::SetBasePids`].
+    SetPsiPids(PidSet),
     /// Reads the tuner even without outputs (a DDCI adapter feeding its CAM FIFO).
     KeepReading(bool),
     /// Replies with an output's counters.
@@ -628,6 +631,10 @@ impl AdapterTuner for DataPlaneTuner {
             .send(Command::SetBasePids(pids.clone()))
             .map_err(|_| TuneError::Pids)
     }
+
+    fn set_section_pids(&mut self, pids: &PidSet) {
+        let _ = self.commands.send(Command::SetPsiPids(pids.clone()));
+    }
 }
 
 struct Subscriber {
@@ -855,6 +862,7 @@ impl DataPlane {
             }
             Command::SetThreshold(threshold) => self.threshold_ms = threshold,
             Command::SetSectionPids(pids) => self.section_pids = pids,
+            Command::SetPsiPids(pids) => self.tuner.set_section_pids(&pids),
             Command::KeepReading(on) => self.keep_reading = on,
             Command::Query { stream_id, reply } => {
                 let stats = self

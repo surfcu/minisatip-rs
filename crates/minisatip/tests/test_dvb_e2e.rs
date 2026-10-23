@@ -154,6 +154,14 @@ impl DvbDevice for SharedDevice {
         Ok(())
     }
 
+    fn set_section_filter(&mut self, _fd: DemuxFd, _pid: u16) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn read_demux(&mut self, _fd: DemuxFd, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(11))
+    }
+
     fn add_pid(&mut self, _fd: DemuxFd, _pid: u16) -> io::Result<()> {
         Ok(())
     }

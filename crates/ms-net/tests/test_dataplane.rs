@@ -819,12 +819,19 @@ fn a_stage_may_grow_the_batch_for_later_stages_and_outputs() {
     let _ = std::fs::remove_file(path);
 }
 
-/// Records every PID set the data plane hands to the tuner.
+/// Records every PID set the data plane hands to the tuner; section sets
+/// are recorded with `PID_ALL + 1` added as a marker.
 struct PidSetTuner(std::sync::Arc<std::sync::Mutex<Vec<PidSet>>>);
 
 impl Tuner for PidSetTuner {
     fn tune(&mut self, _params: &TuneParams) -> Result<()> {
         Ok(())
+    }
+
+    fn set_section_pids(&mut self, pids: &PidSet) {
+        let mut marked = pids.clone();
+        marked.insert(PID_ALL + 1);
+        self.0.lock().unwrap().push(marked);
     }
 
     fn set_pids(&mut self, pids: &PidSet) -> Result<()> {
@@ -877,4 +884,32 @@ fn emulated_pids_all_keeps_pid_8192_off_the_tuner() {
         );
         adapter.stop();
     }
+}
+
+// The scheduler's PSI PIDs reach the tuner, so PES-filter demux modes open
+// them as PSI; the section tap set does not.
+#[test]
+fn psi_pids_are_forwarded_to_the_tuner() {
+    let sets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapter = AdapterHandle::spawn(
+        Box::new(PidSetTuner(sets.clone())),
+        DataPlaneConfig::default(),
+    )
+    .unwrap();
+    adapter.send(ms_net::dataplane::Command::SetSectionPids(
+        PidSet::from_pids([0x200]),
+    ));
+    adapter.send(ms_net::dataplane::Command::SetPsiPids(PidSet::from_pids([
+        0, 0x100,
+    ])));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while sets.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no section update");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        sets.lock().unwrap()[0],
+        PidSet::from_pids([0, 0x100, PID_ALL + 1])
+    );
+    adapter.stop();
 }

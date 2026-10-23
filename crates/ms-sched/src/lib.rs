@@ -166,6 +166,10 @@ pub trait AdapterTuner {
         Ok(())
     }
 
+    /// PIDs with a section filter, sent ahead of `set_pids` so PES-filter
+    /// demux modes open them as PSI (`dvb_is_psi`); the default ignores them.
+    fn set_section_pids(&mut self, _pids: &PidSet) {}
+
     /// Opens one PID filter, returning its descriptor (C++ `set_pid`).
     ///
     /// The scheduler increments `active_pids` only after this succeeds; a
@@ -1419,6 +1423,7 @@ impl Scheduler {
         // PMT/stream pids it adds can start the PMT in this same update.
         self.emulate_add_all_pids(index);
         let emulate = self.pmt.emulate_pids_all;
+        let section_pids = PidSet::from_pids(self.section_pids(index as i32));
         {
             let Some(adapter) = self.adapters[index].as_mut() else {
                 return 1;
@@ -1498,6 +1503,7 @@ impl Scheduler {
 
             // The C++ drives each PID through set_pid/del_filters above; also
             // hand the resulting active set to backends that filter in bulk.
+            adapter.tuner.set_section_pids(&section_pids);
             let pids = PidSet::from_pids(
                 adapter
                     .pids

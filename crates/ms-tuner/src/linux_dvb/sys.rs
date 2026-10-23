@@ -128,6 +128,17 @@ struct FrontendEventRaw {
     parameters: [u8; 36],
 }
 
+/// `struct dmx_sct_filter_params` (60 bytes).
+#[repr(C)]
+struct SctFilterRaw {
+    pid: u16,
+    filter: [u8; 16],
+    mask: [u8; 16],
+    mode: [u8; 16],
+    timeout: u32,
+    flags: u32,
+}
+
 /// `struct dmx_pes_filter_params` (20 bytes).
 #[repr(C)]
 struct PesFilterRaw {
@@ -229,8 +240,24 @@ pub struct LinuxDvbDevice {
 impl LinuxDvbDevice {
     /// Opens `frontendN` and `dvrN` for one adapter (`dvb_open_device`, dvb.cpp:894).
     pub fn open(adapter: u32, frontend: u32) -> io::Result<Self> {
+        Self::open_stream(adapter, frontend, false)
+    }
+
+    /// Like [`Self::open`], but `use_demux` reads the stream from `demuxN`
+    /// opened read-write (`USE_DEMUX`, `USE_PES_FILTERS_AND_DEMUX`).
+    pub fn open_stream(adapter: u32, frontend: u32, use_demux: bool) -> io::Result<Self> {
         let fe_path = path(DEV_FRONTEND, adapter, frontend);
-        let dvr_path = path(DEV_DVR, adapter, frontend);
+        let (dvr_path, flags) = if use_demux {
+            (
+                path(DEV_DEMUX, adapter, frontend),
+                libc::O_RDWR | libc::O_NONBLOCK,
+            )
+        } else {
+            (
+                path(DEV_DVR, adapter, frontend),
+                libc::O_RDONLY | libc::O_NONBLOCK,
+            )
+        };
         let fe = match open_path(&fe_path, libc::O_RDWR | libc::O_NONBLOCK) {
             Ok(fd) => fd,
             Err(error) => {
@@ -246,7 +273,7 @@ impl LinuxDvbDevice {
                 return Err(error);
             }
         };
-        let dvr = match open_path(&dvr_path, libc::O_RDONLY | libc::O_NONBLOCK) {
+        let dvr = match open_path(&dvr_path, flags) {
             Ok(fd) => fd,
             Err(error) => {
                 let (errno, text) = error_parts(&error);
@@ -455,6 +482,28 @@ impl DvbDevice for LinuxDvbDevice {
         ioctl_ptr(fd.0 as i32, NATIVE_IOCTLS.dmx_set_pes_filter, &mut filter)
     }
 
+    fn set_section_filter(&mut self, fd: DemuxFd, pid: u16) -> io::Result<()> {
+        let mut filter = SctFilterRaw {
+            pid,
+            filter: [0; 16],
+            mask: [0; 16],
+            mode: [0; 16],
+            timeout: 0,
+            flags: DMX_IMMEDIATE_START,
+        };
+        ioctl_ptr(fd.0 as i32, NATIVE_IOCTLS.dmx_set_filter, &mut filter)
+    }
+
+    fn read_demux(&mut self, fd: DemuxFd, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: buf is a valid writable slice and fd is an open demux fd.
+        let read = unsafe { libc::read(fd.0 as i32, buf.as_mut_ptr().cast(), buf.len()) };
+        if read < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(read as usize)
+        }
+    }
+
     fn add_pid(&mut self, fd: DemuxFd, pid: u16) -> io::Result<()> {
         let mut value = pid;
         ioctl_ptr(fd.0 as i32, NATIVE_IOCTLS.dmx_add_pid, &mut value)
@@ -511,6 +560,7 @@ mod tests {
         assert_eq!(size_of::<DiseqcMasterCmdRaw>(), 7);
         assert_eq!(size_of::<FrontendEventRaw>(), 40);
         assert_eq!(size_of::<PesFilterRaw>(), 20);
+        assert_eq!(size_of::<SctFilterRaw>(), 60);
         assert_eq!(size_of::<DtvPropertiesRaw>(), 2 * size_of::<usize>());
         assert_eq!(
             size_of::<DtvPropertyRaw>(),

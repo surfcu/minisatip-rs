@@ -2737,3 +2737,46 @@ fn emulated_pids_all_adds_the_null_pid_only_without_drop_encrypted() {
         assert_eq!(sched.find_pid(0, 8191).is_some(), !drop, "drop {drop}");
     }
 }
+
+type Updates = Rc<RefCell<Vec<(&'static str, Vec<u16>)>>>;
+
+/// Records the order of section-PID and PID-set updates.
+struct OrderLog(Updates);
+
+impl AdapterTuner for OrderLog {
+    fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+        Ok(())
+    }
+
+    fn set_section_pids(&mut self, pids: &ms_tuner::PidSet) {
+        self.0
+            .borrow_mut()
+            .push(("sections", pids.iter().collect()));
+    }
+
+    fn set_pids(&mut self, pids: &ms_tuner::PidSet) -> Result<(), TuneError> {
+        self.0.borrow_mut().push(("pids", pids.iter().collect()));
+        Ok(())
+    }
+}
+
+// dvb_is_psi (dvb.cpp:1824) reads the filter table when a PID opens, so the
+// section PIDs reach the tuner before the PID set of the same update.
+#[test]
+fn update_pids_sends_section_pids_before_the_pid_set() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut sched = test_sched(AdapterType::Dvb);
+    sched
+        .adapter_mut(0)
+        .unwrap()
+        .set_tuner(Box::new(OrderLog(Rc::clone(&log))));
+    sched.post_tune_adapter(0);
+    let pmt = sched.add_filter(0, 0x100, FilterTarget::Pmt(None), FILTER_ADD_REMOVE);
+    assert!(pmt >= 0);
+    sched.update_pids(0);
+    let log = log.borrow();
+    let last = log.len() - 1;
+    assert_eq!(log[last].0, "pids");
+    assert_eq!(log[last - 1], ("sections", vec![0, 17, 0x100]));
+    assert!(log[last].1.contains(&0x100), "{log:?}");
+}
