@@ -264,6 +264,8 @@ pub struct PmtTables {
     pub(crate) ca: Vec<Option<Box<dyn CaSink>>>,
     pub(crate) emulate_pids_all: bool,
     pub(crate) pmt_scan: bool,
+    /// `ad->drop_encrypted` (from `opts`): no null pid in the pids=all emulation.
+    pub(crate) drop_encrypted: bool,
 }
 
 impl Default for PmtTables {
@@ -281,6 +283,7 @@ impl PmtTables {
             ca: Vec::new(),
             emulate_pids_all: false,
             pmt_scan: false,
+            drop_encrypted: false,
         }
     }
 
@@ -1157,9 +1160,11 @@ impl Scheduler {
                     self.mark_pid_add(aid, sid, enforced);
                 }
             }
-            if !existing.contains(&(8191, sid)) {
+            if !self.pmt.drop_encrypted {
                 ms_log::log!("emulate_add_all_pids: adding (enforced) pid 8191 (NULL) too");
-                self.mark_pid_add(aid, sid, 8191);
+                if !existing.contains(&(8191, sid)) {
+                    self.mark_pid_add(aid, sid, 8191);
+                }
             }
         }
     }

@@ -310,6 +310,7 @@ fn file_replay_to_udp_routes_only_subscribed_pids() {
         adapter_id: 0,
         adapter_buffer: 100 * 188,
         threshold_ms: 25,
+        emulate_pids_all: false,
     };
     let adapter = AdapterHandle::spawn(Box::new(tuner), config).unwrap();
     adapter.tune(TuneParams {
@@ -816,4 +817,64 @@ fn a_stage_may_grow_the_batch_for_later_stages_and_outputs() {
     );
     handle.stop();
     let _ = std::fs::remove_file(path);
+}
+
+/// Records every PID set the data plane hands to the tuner.
+struct PidSetTuner(std::sync::Arc<std::sync::Mutex<Vec<PidSet>>>);
+
+impl Tuner for PidSetTuner {
+    fn tune(&mut self, _params: &TuneParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_pids(&mut self, pids: &PidSet) -> Result<()> {
+        self.0.lock().unwrap().push(pids.clone());
+        Ok(())
+    }
+
+    fn status(&self) -> SignalStatus {
+        SignalStatus::default()
+    }
+
+    fn read(&mut self, _buf: &mut TsBuf) -> Result<usize> {
+        std::thread::sleep(Duration::from_millis(5));
+        Ok(0)
+    }
+}
+
+// adapter.cpp:997: under -k a pids=all output never opens pid 8192 on the
+// tuner; without -k it does.
+#[test]
+fn emulated_pids_all_keeps_pid_8192_off_the_tuner() {
+    for emulate in [true, false] {
+        let sets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = DataPlaneConfig {
+            emulate_pids_all: emulate,
+            ..DataPlaneConfig::default()
+        };
+        let adapter = AdapterHandle::spawn(Box::new(PidSetTuner(sets.clone())), config).unwrap();
+        let (rx, _rtcp) = udp_pair();
+        adapter.set_base_pids(PidSet::from_pids([0, 0x11]));
+        adapter.start_output(
+            1,
+            output_to(rx.local_addr().unwrap(), 1),
+            PidSet::from_pids([PID_ALL]),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // One update for the base pids, one for the output.
+        let last = loop {
+            let snapshot = sets.lock().unwrap().clone();
+            if snapshot.len() >= 2 {
+                break snapshot.last().cloned().unwrap();
+            }
+            assert!(Instant::now() < deadline, "no tuner pid update");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(last.contains_exact(PID_ALL), !emulate, "emulate {emulate}");
+        assert!(
+            last.contains_exact(0) && last.contains_exact(0x11),
+            "{last:?}"
+        );
+        adapter.stop();
+    }
 }

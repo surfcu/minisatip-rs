@@ -53,7 +53,7 @@ C++ binary in slot A, so `--record` writes the oracle transcript. `--golden DIR`
 checks every run of both sides against `DIR/<scenario>.txt`; `--record` writes only
 the first run of A.
 
-The fast subset is all twelve scenarios in `harness/scenarios/`; CI runs it ten
+The fast subset is all fourteen scenarios in `harness/scenarios/`; CI runs it ten
 times Rust-vs-Rust. The `cpp-reference` CI job builds the reference with the
 script above, uploads it, and runs every scenario three times C++-vs-Rust and
 against `harness/golden` (recorded from C++). If upstream no longer builds or
@@ -161,4 +161,4 @@ digit run; `body: length` keeps only the length and an FNV-1a hash.
 
 `http-state` fails C++-vs-Rust only on `/state.json`: Rust emits the M3 symbol
 subset and different absent values, which is DEV-051 and arrives with later
-milestones. Rust-vs-Rust and C++-vs-C++ are green for all twelve scenarios.
+milestones. Rust-vs-Rust and C++-vs-C++ are green for all fourteen scenarios.

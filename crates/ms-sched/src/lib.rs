@@ -513,6 +513,16 @@ impl Scheduler {
         self.pmt.set_pmt_scan(enabled);
     }
 
+    /// Emulates `pids=all` from the PAT/PMT instead of opening pid 8192 (`-k`).
+    pub fn set_emulate_pids_all(&mut self, enabled: bool) {
+        self.pmt.set_emulate_pids_all(enabled);
+    }
+
+    /// `opts.drop_encrypted != 0`: the emulation leaves out the null pid.
+    pub fn set_drop_encrypted(&mut self, enabled: bool) {
+        self.pmt.drop_encrypted = enabled;
+    }
+
     /// Sets the absolute-source table of `aid`.
     pub fn set_absolute_table(&mut self, aid: usize, table: [u8; MAX_SOURCES]) {
         if let Some(adapter) = self.adapter_mut(aid) {
@@ -1408,6 +1418,7 @@ impl Scheduler {
         // pids=all expansion must precede the NEW->ACTIVE pass below, so the
         // PMT/stream pids it adds can start the PMT in this same update.
         self.emulate_add_all_pids(index);
+        let emulate = self.pmt.emulate_pids_all;
         {
             let Some(adapter) = self.adapters[index].as_mut() else {
                 return 1;
@@ -1448,7 +1459,13 @@ impl Scheduler {
                 }
                 if adapter.pids[slot].fd <= 0 {
                     let pid = adapter.pids[slot].pid;
-                    match adapter.tuner.set_pid(pid) {
+                    // adapter.cpp:997: emulation opens the PAT-derived pids instead.
+                    let opened = if emulate && pid == PID_ALL {
+                        Ok(-1)
+                    } else {
+                        adapter.tuner.set_pid(pid)
+                    };
+                    match opened {
                         Ok(fd) => adapter.pids[slot].fd = fd,
                         Err(_) => {
                             adapter.max_pids = adapter.max_active_pids - 1;
