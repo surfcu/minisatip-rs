@@ -210,6 +210,12 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 - [ ] All C++ tests ported and passing; full harness suite clean
 - [ ] Soak test on the box: 7 days as tvheadend backend, no regressions
 - [ ] Memory/CPU/binary size comparison vs C++ documented
+- [ ] `-k` (`emulate_pids_all`) for enigma2 boxes: no `set_pid(8192)` when emulating
+  (adapter.cpp:997), feed PID 0 packets to filters on 8192 (pmt.cpp:1505-1509),
+  the enigma2 auto-detect when `/etc/enigma2/settings` exists, which also switches the
+  demux mode (minisatip.cpp:631-632, 688-690), then wire `opts.emulate_pids_all` to
+  the existing `PmtTables::set_emulate_pids_all`; check `pids=all` on the
+  user's enigma2 box, where C++ v2.0.160 returned only PSI and null packets
 - **Exit:** daily-driver replacement for the user's own setup
 
 ### M10 — Experimental + improvements
@@ -295,9 +301,7 @@ Unvalidated rows must be called out in release notes.
   in `~/captures` outside git (README there). `ms-harness run --captures ~/captures
   harness/scenarios-real`: 3/3 pass C++ against Rust, `--runs 3`. They found that
   `pmt_scan` never reached the scheduler (unrequested PMTs were not read).
-  Known gap: `-k` (`emulate_pids_all`) is parsed but not wired; the C++ `fd = -1` for
-  pid 8192 (adapter.cpp:997), the PID 0 feed to 8192 filters (pmt.cpp:1505-1509) and
-  the enigma2 auto-enable (minisatip.cpp:631-632, 688-690) are not ported.
+  Known gap: `-k` (`emulate_pids_all`) is parsed but not wired (M9 item).
 - **Open exit criteria:**
   - M1: C++-against-itself determinism run (10 runs) not recorded.
   - M2: 1 h fuzz run not recorded.
@@ -320,7 +324,8 @@ Unvalidated rows must be called out in release notes.
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:** status page check on the box (#29); report the SAT>IP adapter type;
-  port `test_utils.cpp`; CA scenarios in the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak.
+  port `test_utils.cpp`; CA scenarios in the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak;
+  `-k` for enigma2 boxes (M9).
 - **Blockers:** no SAT>IP server (M8 exit).
 - **Tracked issues:** CI+ advertised but ignored (#35); CA harness scenarios (#36);
   reconciler not on the runtime path (#37); banner `<build date>`/s2api 0500 (#38).
