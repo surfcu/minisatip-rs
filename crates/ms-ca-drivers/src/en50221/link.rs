@@ -141,7 +141,8 @@ impl AdapterInfo {
 /// Opens CA devices and answers the host-file probes of `dvbca_init_dev`.
 pub trait CaOpener {
     fn open(&mut self, path: &str) -> io::Result<Box<dyn CaLink>>;
-    /// `access("/etc/ssl/certs/root.pem")`: without it the host offers plain CI.
+    /// `access("/etc/ssl/certs/root.pem")`: plain CI is forced either way (DEV-151);
+    /// with it the slot init logs that CI+ is not supported.
     fn has_ciplus_root_cert(&self) -> bool {
         std::path::Path::new("/etc/ssl/certs/root.pem").exists()
     }

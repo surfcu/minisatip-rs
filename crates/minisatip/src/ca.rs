@@ -1557,7 +1557,7 @@ mod wiring_tests {
     fn key_state_resolves_the_channel_like_get_channel_for_key() {
         let mut sched = sched();
         let named = sched.pmt_add(0, 0x409E, 67);
-        sched.name_pmt_for_sid(0, 0x409E, -1, "beIN SPORTS 1", "beIN");
+        sched.name_pmt_for_sid(0, 0x409E, -1, "Service 1", "Provider");
         let unnamed = sched.pmt_add(0, 0x2000, 100);
         let key = |pmt_id: i32, enabled: bool| ms_ca_drivers::dvbapi::Key {
             enabled,
@@ -1582,7 +1582,7 @@ mod wiring_tests {
         assert_eq!(
             state.channel,
             Some(KeyChannel {
-                name: "beIN SPORTS 1".to_owned(),
+                name: "Service 1".to_owned(),
                 sid: 0x409E
             })
         );

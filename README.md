@@ -33,8 +33,10 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
 
 ### Known limitations
 
-- **CI+ is not implemented.** The content-control resources are advertised, but
-  their APDUs are ignored (DEV-151), so CI+ CAMs will not authenticate.
+- CI+ authentication is not implemented (DEV-151). The host always talks plain
+  CI to CAMs; CI+ CAMs work in CI-compatible mode, as with a C++ build without CI+
+  certificates. Channels whose operator requires CI+ protection will not
+  descramble.
 - The CA harness scenarios are still missing. CAPMT sequences are compared with
   C++ only by the ported unit tests and by the real-CAM check.
 - The runtime drives `ms_ca::CaDevice` directly; the `Reconciler` and its policies

@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn sdt_fields_do_not_change_an_offer() {
         let mut named = service(0x0B00);
-        named.name = "beIN SPORTS 1".to_owned();
+        named.name = "Service 1".to_owned();
         named.sdt = Some(ms_ca::SdtInfo::default());
         let (a, b) = (
             program_from_service(&service(0x0B00)),

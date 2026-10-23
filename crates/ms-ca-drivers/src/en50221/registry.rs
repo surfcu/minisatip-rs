@@ -151,7 +151,15 @@ impl CaRegistry {
         c.key = [[0; 16]; 2];
         c.iv = [[0; 16]; 2];
         c.push_event(HostEvent::Opened);
-        if !c.force_ci && !opener.has_ciplus_root_cert() {
+        // CI+ content control is not implemented (DEV-151): plain CI even when
+        // C++ would use the certificates for the SAC protocol.
+        if !c.force_ci {
+            if opener.has_ciplus_root_cert() {
+                ms_log::log!(
+                    "CA {}: CI+ certificates found but CI+ is not supported, using plain CI",
+                    c.id
+                );
+            }
             c.force_ci = true;
         }
         if !enigma && !c.slot_present() {

@@ -1,6 +1,6 @@
 name: real-scrambled
-description: beIN SPORTS 3 (Irdeto) with ECM/EMM pids and no CA; scrambled packets pass with TSC set
-capture: file:scr-bein3
+description: an Irdeto-scrambled service with ECM/EMM pids and no CA; scrambled packets pass with TSC set
+capture: file:scr-irdeto
 bitrate: 13278594
 steps:
   - rtsp:

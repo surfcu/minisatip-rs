@@ -2580,12 +2580,12 @@ fn sdt_names_a_pmt_once_and_tracks_its_fields() {
     let filter = sched.add_filter(0, 17, FilterTarget::Sdt, FILTER_CRC);
     sched.process_sdt(
         filter,
-        &build_sdt(0x42, 43305, 1, &[(0x409E, "beIN", "beIN SPORTS 1")]),
+        &build_sdt(0x42, 43305, 1, &[(0x409E, "Provider", "Service 1")]),
     );
     let pmt = sched.pmt(id).unwrap();
     assert_eq!(
         (pmt.name.as_str(), pmt.provider.as_str()),
-        ("beIN SPORTS 1", "beIN")
+        ("Service 1", "Provider")
     );
     let sdt = pmt.sdt.expect("has_sdt");
     assert_eq!(
@@ -2605,7 +2605,7 @@ fn sdt_names_a_pmt_once_and_tracks_its_fields() {
         &build_sdt(0x42, 43306, 1, &[(0x409E, "x", "renamed")]),
     );
     let pmt = sched.pmt(id).unwrap();
-    assert_eq!(pmt.name, "beIN SPORTS 1", "the name is kept once set");
+    assert_eq!(pmt.name, "Service 1", "the name is kept once set");
     assert_eq!(pmt.sdt.unwrap().tsid, 43306, "the fields follow the SDT");
 }
 
@@ -2634,13 +2634,13 @@ fn name_pmt_for_sid_names_the_ci_side_pmt() {
     let source = sched.pmt_add(0, 0x409E, 67);
     let ci = sched.pmt_add(8, 0x409E, 67);
     assert_eq!(
-        sched.name_pmt_for_sid(8, 0x409E, source, "beIN SPORTS 1", "beIN"),
+        sched.name_pmt_for_sid(8, 0x409E, source, "Service 1", "Provider"),
         Some(ci)
     );
-    assert_eq!(sched.pmt(ci).unwrap().name, "beIN SPORTS 1");
-    assert_eq!(sched.pmt(ci).unwrap().provider, "beIN");
+    assert_eq!(sched.pmt(ci).unwrap().name, "Service 1");
+    assert_eq!(sched.pmt(ci).unwrap().provider, "Provider");
     assert_eq!(
-        sched.name_pmt_for_sid(8, 0x409E, source, "beIN SPORTS 1", "beIN"),
+        sched.name_pmt_for_sid(8, 0x409E, source, "Service 1", "Provider"),
         None
     );
     assert_eq!(

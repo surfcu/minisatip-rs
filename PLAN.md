@@ -44,7 +44,8 @@ allocation and PSI processing are each owned by one component.
 ### Explicitly deferred
 - Enigma2-specific paths: until after M9, only if someone can test them
 - CI+ crypto: ported last, behind a cargo feature, marked experimental until
-  validated on real CI+ CAMs
+  validated on real CI+ CAMs. Until then the host forces plain CI on every slot,
+  even when CI+ certificates are installed (DEV-151)
 
 ### Supported / parked / dropped
 
@@ -229,6 +230,7 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 |---|---|---|
 | Linux DVB, 8 tuners | user's box | real: FTA through tvheadend (2026-10-22) |
 | DDCI, 1 CAM | user's box | real: Irdeto CAM on a DuoFlex CI, `-c 8:**2`, 3 channels through tvheadend without glitches (2026-10-22) |
+| CI+ CAM in CI-compatible mode | user's box | real: Smit Irdeto CAM on a DuoFlex CI |
 | Multi-CAM | — | fake CAM only |
 | DVBAPI / oscam | — | fake oscam only; no oscam on the box |
 | Unicable/JESS | — | tests + external testers |
@@ -297,7 +299,7 @@ Unvalidated rows must be called out in release notes.
   - Verified on the box: FTA, DDCI descrambling of 3 channels with MTD, rejoin
     without partner glitches.
 - **Real captures (2026-10-23):** FTA DMAX mux (12015 H), 19-service FTA mux
-  (11425 V) and beIN SPORTS 3 with ECM/EMM (12073 V, from a second box with `-E`), kept
+  (11425 V) and an Irdeto-scrambled service with ECM/EMM (12073 V, from a second box with `-E`), kept
   in `~/captures` outside git (README there). `ms-harness run --captures ~/captures
   harness/scenarios-real`: 3/3 pass C++ against Rust, `--runs 3`. They found that
   `pmt_scan` never reached the scheduler (unrequested PMTs were not read).
@@ -327,5 +329,9 @@ Unvalidated rows must be called out in release notes.
   port `test_utils.cpp`; CA scenarios in the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak;
   `-k` for enigma2 boxes (M9).
 - **Blockers:** no SAT>IP server (M8 exit).
-- **Tracked issues:** CI+ advertised but ignored (#35); CA harness scenarios (#36);
+- **CI+ (2026-10-23):** plain CI is forced on every slot, even with
+  `/etc/ssl/certs/root.pem`, so the CI+ content-control resources are never
+  advertised and then ignored; a notice is logged once per slot. CI+ CAMs keep
+  working in CI-compatible mode, as validated with the CAM on the user's box.
+- **Tracked issues:** CI+ content control not implemented, plain CI forced (#35); CA harness scenarios (#36);
   reconciler not on the runtime path (#37); banner `<build date>`/s2api 0500 (#38).
