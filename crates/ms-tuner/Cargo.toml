@@ -17,6 +17,7 @@ srt = ["dep:ms-srt", "ms-srt/srt"]
 # satipc uses libc unconditionally, so it stays a plain dependency.
 [dependencies]
 ms-log = { path = "../ms-log" }
+ms-ts = { path = "../ms-ts" }
 libc = "0.2"
 ms-srt = { path = "../ms-srt", optional = true }
 

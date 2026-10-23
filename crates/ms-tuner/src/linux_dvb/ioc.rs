@@ -94,6 +94,7 @@ pub struct DvbIoctls {
     pub fe_set_property: u32,
     pub fe_get_property: u32,
     pub dmx_stop: u32,
+    pub dmx_set_filter: u32,
     pub dmx_set_pes_filter: u32,
     pub dmx_set_buffer_size: u32,
     pub dmx_set_source: u32,
@@ -109,6 +110,8 @@ pub const DISEQC_MASTER_CMD_SIZE: usize = 7;
 pub const FRONTEND_EVENT_SIZE: usize = 40;
 /// `sizeof(struct dmx_pes_filter_params)`.
 pub const PES_FILTER_SIZE: usize = 20;
+/// `sizeof(struct dmx_sct_filter_params)`.
+pub const SCT_FILTER_SIZE: usize = 60;
 
 impl DvbIoctls {
     /// Request numbers; `ptr_size` is `sizeof(void *)`, which sizes `struct dtv_properties`.
@@ -129,6 +132,7 @@ impl DvbIoctls {
             fe_set_property: layout.iow(o, 82, dtv_properties),
             fe_get_property: layout.ior(o, 83, dtv_properties),
             dmx_stop: layout.io(o, 42),
+            dmx_set_filter: layout.iow(o, 43, SCT_FILTER_SIZE),
             dmx_set_pes_filter: layout.iow(o, 44, PES_FILTER_SIZE),
             dmx_set_buffer_size: layout.io(o, 45),
             dmx_set_source: layout.iow(o, 49, 4),
@@ -163,6 +167,7 @@ mod tests {
         assert_eq!(io.fe_get_property, 0x8010_6f53);
         assert_eq!(io.dmx_stop, 0x0000_6f2a);
         assert_eq!(io.dmx_set_pes_filter, 0x4014_6f2c);
+        assert_eq!(io.dmx_set_filter, 0x403c_6f2b);
         assert_eq!(io.dmx_set_buffer_size, 0x0000_6f2d);
         assert_eq!(io.dmx_set_source, 0x4004_6f31);
         assert_eq!(io.dmx_add_pid, 0x4002_6f33);
@@ -192,6 +197,7 @@ mod tests {
         assert_eq!(io.fe_get_property, 0x4008_6f53);
         assert_eq!(io.dmx_stop, 0x2000_6f2a);
         assert_eq!(io.dmx_set_pes_filter, 0x8014_6f2c);
+        assert_eq!(io.dmx_set_filter, 0x803c_6f2b);
         assert_eq!(io.dmx_add_pid, 0x8002_6f33);
     }
 

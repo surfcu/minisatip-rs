@@ -28,6 +28,6 @@ pub use state::*;
 pub use transponder::*;
 
 #[cfg(target_os = "linux")]
-pub use backend::LinuxDvbTuner;
+pub use backend::{DemuxMode, LinuxDvbTuner};
 #[cfg(target_os = "linux")]
 pub use sys::{LinuxDeviceTree, LinuxFrontendProbe};

@@ -163,6 +163,10 @@ pub trait DvbDevice: SecDevice {
     fn close_demux(&mut self, fd: DemuxFd);
     /// `DMX_SET_PES_FILTER` with `DMX_IN_FRONTEND`, `DMX_PES_OTHER`, `DMX_IMMEDIATE_START`.
     fn set_pes_filter(&mut self, fd: DemuxFd, pid: u16, output: PesOutput) -> io::Result<()>;
+    /// `DMX_SET_FILTER` for every section on `pid`, no timeout, `DMX_IMMEDIATE_START`.
+    fn set_section_filter(&mut self, fd: DemuxFd, pid: u16) -> io::Result<()>;
+    /// Reads one section from a section-filter fd.
+    fn read_demux(&mut self, fd: DemuxFd, buf: &mut [u8]) -> io::Result<usize>;
     /// `DMX_ADD_PID`.
     fn add_pid(&mut self, fd: DemuxFd, pid: u16) -> io::Result<()>;
     /// `DMX_REMOVE_PID`.

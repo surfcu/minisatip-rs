@@ -482,6 +482,9 @@ pub trait Tuner {
     fn tune(&mut self, params: &TuneParams) -> Result<()>;
     /// Replaces the PID filter.
     fn set_pids(&mut self, pids: &PidSet) -> Result<()>;
+    /// PIDs that carry a section filter, so PES-filter demux modes open them
+    /// as PSI (`dvb_is_psi`); the default ignores them.
+    fn set_section_pids(&mut self, _pids: &PidSet) {}
     /// Latest frontend status.
     fn status(&self) -> SignalStatus;
     /// Appends whole TS packets to `buf` and returns the bytes appended.

@@ -1,6 +1,7 @@
 //! Ports of `tests/test_dvb.cpp` plus backend tests against a recording fake device.
 #![cfg(feature = "linux-dvb")]
 
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 
 use ms_tuner::linux_dvb::*;
@@ -28,6 +29,7 @@ enum Call {
     OpenDemux,
     CloseDemux(DemuxFd),
     SetPesFilter(DemuxFd, u16, PesOutput),
+    SetSectionFilter(DemuxFd, u16),
     AddPid(DemuxFd, u16),
     RemovePid(DemuxFd, u16),
     DemuxStop(DemuxFd),
@@ -52,6 +54,10 @@ struct FakeDevice {
     stream: Vec<u8>,
     stream_pos: usize,
     next_fd: u32,
+    /// Sections queued per section-filter fd.
+    sections: BTreeMap<DemuxFd, VecDeque<Vec<u8>>>,
+    /// errno returned by every `add_pid`.
+    add_pid_errno: Option<i32>,
 }
 
 impl FakeDevice {
@@ -73,6 +79,8 @@ impl FakeDevice {
             stream: Vec::new(),
             stream_pos: 0,
             next_fd: 100,
+            sections: BTreeMap::new(),
+            add_pid_errno: None,
         }
     }
 
@@ -249,9 +257,25 @@ impl DvbDevice for FakeDevice {
         Ok(())
     }
 
+    fn set_section_filter(&mut self, fd: DemuxFd, pid: u16) -> io::Result<()> {
+        self.calls.push(Call::SetSectionFilter(fd, pid));
+        Ok(())
+    }
+
+    fn read_demux(&mut self, fd: DemuxFd, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(section) = self.sections.get_mut(&fd).and_then(VecDeque::pop_front) else {
+            return Err(io::ErrorKind::WouldBlock.into());
+        };
+        buf[..section.len()].copy_from_slice(&section);
+        Ok(section.len())
+    }
+
     fn add_pid(&mut self, fd: DemuxFd, pid: u16) -> io::Result<()> {
         self.calls.push(Call::AddPid(fd, pid));
-        Ok(())
+        match self.add_pid_errno {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => Ok(()),
+        }
     }
 
     fn remove_pid(&mut self, fd: DemuxFd, pid: u16) -> io::Result<()> {
@@ -1501,6 +1525,156 @@ fn backend_sets_dvr_buffer_and_per_pid_filters() {
         Err(TunerError::Backend(-1)) => {}
         other => panic!("PID above 8192 must be rejected, got {other:?}"),
     }
+}
+
+// dvb.h:265-275 and dvb.cpp:896-897: option values and the stream device.
+#[test]
+fn demux_mode_follows_the_option() {
+    assert_eq!(DemuxMode::from_option(0), DemuxMode::Dvr);
+    assert_eq!(DemuxMode::from_option(1), DemuxMode::Demux);
+    assert_eq!(DemuxMode::from_option(2), DemuxMode::PesFiltersAndDvr);
+    assert_eq!(DemuxMode::from_option(3), DemuxMode::PesFiltersAndDemux);
+    assert_eq!(DemuxMode::from_option(7), DemuxMode::Dvr);
+    let reads: Vec<bool> = [0, 1, 2, 3]
+        .map(|value| DemuxMode::from_option(value).reads_demux())
+        .to_vec();
+    assert_eq!(reads, [false, true, false, true]);
+}
+
+fn mode_tuner(mode: DemuxMode, dev: FakeDevice) -> LinuxDvbTuner<FakeDevice> {
+    let mut tuner = LinuxDvbTuner::with_device(dev, backend_state()).with_demux_mode(mode);
+    tuner.device_mut().calls.clear();
+    tuner
+}
+
+// dvb_demux_set_pid / dvb_demux_del_filters (dvb.cpp:1642-1714): one shared
+// fd, a TSDEMUX_TAP PES filter for the first PID, then ADD/REMOVE_PID and a
+// DMX_STOP once the last PID is gone.
+#[test]
+fn demux_mode_shares_the_stream_fd() {
+    let mut tuner = mode_tuner(DemuxMode::Demux, FakeDevice::new());
+    let stream = DemuxFd(42);
+    tuner
+        .set_pids(&PidSet::from_pids([0_u16, 16, 256]))
+        .unwrap();
+    assert_eq!(
+        tuner.device().calls,
+        [
+            Call::SetPesFilter(stream, 0, PesOutput::TsDemuxTap),
+            Call::AddPid(stream, 16),
+            Call::AddPid(stream, 256),
+        ]
+    );
+    tuner.device_mut().calls.clear();
+    tuner.set_pids(&PidSet::from_pids([256_u16])).unwrap();
+    assert_eq!(
+        tuner.device().calls,
+        [Call::RemovePid(stream, 0), Call::RemovePid(stream, 16)]
+    );
+    tuner.device_mut().calls.clear();
+    tuner.set_pids(&PidSet::new()).unwrap();
+    assert_eq!(
+        tuner.device().calls,
+        [Call::RemovePid(stream, 256), Call::DemuxStop(stream)]
+    );
+    tuner.device_mut().calls.clear();
+    tuner.set_pids(&PidSet::from_pids([17_u16])).unwrap();
+    assert_eq!(
+        tuner.device().calls,
+        [Call::SetPesFilter(stream, 17, PesOutput::TsDemuxTap)],
+        "the next PID re-arms the demux"
+    );
+}
+
+// dvb.cpp:1661-1681: a failed DMX_ADD_PID while other PIDs share the fd is
+// an error and leaves the counter as it was.
+#[test]
+fn demux_mode_add_pid_failure_is_an_error() {
+    let mut tuner = mode_tuner(DemuxMode::Demux, FakeDevice::new());
+    tuner.set_pids(&PidSet::from_pids([0_u16])).unwrap();
+    tuner.device_mut().add_pid_errno = Some(libc::EINVAL);
+    assert!(tuner.set_pids(&PidSet::from_pids([0_u16, 16])).is_err());
+    tuner.device_mut().add_pid_errno = None;
+    tuner.device_mut().calls.clear();
+    tuner.set_pids(&PidSet::from_pids([0_u16, 16])).unwrap();
+    assert_eq!(tuner.device().calls, [Call::AddPid(DemuxFd(42), 16)]);
+}
+
+// dvb_set_psi_pes_filter (dvb.cpp:1834): PIDs below 32 and PIDs with a
+// section filter get their own DMX_SET_FILTER fd; the rest follow the mode.
+#[test]
+fn pes_filter_modes_open_psi_as_section_filters() {
+    let mut tuner = mode_tuner(DemuxMode::PesFiltersAndDemux, FakeDevice::new());
+    tuner.set_section_pids(&PidSet::from_pids([0x100_u16]));
+    tuner
+        .set_pids(&PidSet::from_pids([0_u16, 18, 0x100, 0x101]))
+        .unwrap();
+    assert_eq!(
+        tuner.device().calls,
+        [
+            Call::OpenDemux,
+            Call::SetSectionFilter(DemuxFd(100), 0),
+            Call::OpenDemux,
+            Call::SetSectionFilter(DemuxFd(101), 18),
+            Call::OpenDemux,
+            Call::SetSectionFilter(DemuxFd(102), 0x100),
+            Call::SetPesFilter(DemuxFd(42), 0x101, PesOutput::TsDemuxTap),
+        ]
+    );
+    // The kind is fixed at open: a later section-set change does not reopen.
+    tuner.device_mut().calls.clear();
+    tuner.set_section_pids(&PidSet::from_pids([0x101_u16]));
+    tuner
+        .set_pids(&PidSet::from_pids([0_u16, 18, 0x101]))
+        .unwrap();
+    assert_eq!(
+        tuner.device().calls,
+        [
+            Call::DemuxStop(DemuxFd(102)),
+            Call::CloseDemux(DemuxFd(102)),
+        ]
+    );
+
+    let mut tuner = mode_tuner(DemuxMode::PesFiltersAndDvr, FakeDevice::new());
+    tuner.set_pids(&PidSet::from_pids([1_u16, 0x200])).unwrap();
+    assert_eq!(
+        tuner.device().calls,
+        [
+            Call::OpenDemux,
+            Call::SetSectionFilter(DemuxFd(100), 1),
+            Call::OpenDemux,
+            Call::SetPesFilter(DemuxFd(101), 0x200, PesOutput::TsTap),
+        ]
+    );
+}
+
+// dvb_psi_read (dvb.cpp:1716-1768): each section becomes TS packets on its
+// PID with a pointer field and the PID's own CC, ahead of the stream data.
+#[test]
+fn section_filters_are_read_as_ts_packets() {
+    let mut dev = FakeDevice::new();
+    dev.stream = vec![0x47; 188];
+    let pat = vec![
+        0x00, 0xb0, 0x0d, 0x04, 0x57, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00, 1, 2, 3, 4,
+    ];
+    dev.sections
+        .insert(DemuxFd(100), VecDeque::from([pat.clone(), pat.clone()]));
+    let mut tuner = mode_tuner(DemuxMode::PesFiltersAndDemux, dev);
+    tuner.set_pids(&PidSet::from_pids([0_u16, 0x101])).unwrap();
+
+    let mut buf = TsBuf::with_packets(8);
+    assert_eq!(tuner.read(&mut buf).unwrap(), 3 * 188);
+    let bytes = buf.as_bytes();
+    for (index, packet) in bytes.chunks(188).take(2).enumerate() {
+        assert_eq!(&packet[..5], &[0x47, 0x40, 0x00, 0x10 | index as u8, 0x00]);
+        assert_eq!(&packet[5..5 + pat.len()], &pat[..]);
+        assert!(packet[5 + pat.len()..].iter().all(|&b| b == 0xff));
+    }
+    assert_eq!(
+        &bytes[2 * 188..3 * 188],
+        &[0x47; 188][..],
+        "stream data follows"
+    );
 }
 
 #[test]
