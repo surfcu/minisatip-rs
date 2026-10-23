@@ -871,7 +871,10 @@ fn emulated_pids_all_keeps_pid_8192_off_the_tuner() {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(last.contains_exact(PID_ALL), !emulate, "emulate {emulate}");
-        assert!(last.contains_exact(0) && last.contains_exact(0x11), "{last:?}");
+        assert!(
+            last.contains_exact(0) && last.contains_exact(0x11),
+            "{last:?}"
+        );
         adapter.stop();
     }
 }
