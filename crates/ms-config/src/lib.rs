@@ -14,5 +14,7 @@ pub use options::{
     MAX_SOURCES, Options, SATIP_STR_LEN, SignalForce, SignalMultiplier, SlaveConfig,
     UnicableConfig, UnicableKind,
 };
-pub use parse::{ParseOutcome, parse_args, parse_dvbapi_opt, parse_sdt_charset_opt};
+pub use parse::{
+    Host, ParseOutcome, parse_args, parse_args_on, parse_dvbapi_opt, parse_sdt_charset_opt,
+};
 pub use usage::{BUILT_INFO, USAGE, VERSION_BANNER, built_info, usage_text};

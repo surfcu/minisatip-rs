@@ -21,7 +21,13 @@ fn main() {
         options,
         warnings,
         error,
-    } = ms_config::parse_args(&args);
+    } = ms_config::parse_args_on(
+        &args,
+        ms_config::Host {
+            enigma: std::path::Path::new("/etc/enigma2/settings").exists(),
+            fbc: fbc_host(),
+        },
+    );
     // glibc getopt prints these as it walks argv; the C++ switch has no default
     // case, so they are diagnostics and parsing continues.
     for warning in &warnings {
@@ -107,6 +113,18 @@ fn command_line(program: &str, args: &[String]) -> String {
         .chain(args.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `access("/proc/stb/frontend/0/fbc_connect", W_OK) == 0` (minisatip.cpp:1172).
+#[cfg(all(feature = "linux-dvb", target_os = "linux"))]
+fn fbc_host() -> bool {
+    use ms_tuner::linux_dvb::{DeviceTree, LinuxDeviceTree};
+    LinuxDeviceTree.writable("/proc/stb/frontend/0/fbc_connect")
+}
+
+#[cfg(not(all(feature = "linux-dvb", target_os = "linux")))]
+fn fbc_host() -> bool {
+    false
 }
 
 #[cfg(test)]

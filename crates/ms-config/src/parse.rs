@@ -497,9 +497,32 @@ enum LongMatch<'a> {
 /// the C++ code call `exit(1)` stop parsing and are returned in
 /// [`ParseOutcome::error`].
 pub fn parse_args(args: &[String]) -> ParseOutcome {
+    parse_args_on(args, Host::default())
+}
+
+/// What `set_options` learns from the host before it reads argv.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Host {
+    /// `/etc/enigma2/settings` exists (minisatip.cpp:631).
+    pub enigma: bool,
+    /// `/proc/stb/frontend/0/fbc_connect` is writable (minisatip.cpp:1172).
+    pub fbc: bool,
+}
+
+/// [`parse_args`] on a host probed by the caller: an enigma2 box starts from
+/// its defaults (minisatip.cpp:661-665, 688-690), which argv can override.
+pub fn parse_args_on(args: &[String], host: Host) -> ParseOutcome {
+    let mut opts = Options::default();
+    if host.enigma {
+        opts.enigma = true;
+        // /var/cache is a tmpfs on enigma2, so the cache must persist elsewhere.
+        opts.cache_dir = "/var/lib/minisatip".into();
+        opts.use_demux_device = 3;
+        opts.emulate_pids_all = true;
+    }
     let mut parser = Parser {
         args,
-        opts: Options::default(),
+        opts,
         warnings: Vec::new(),
         is_log: false,
         disabled: [false; MAX_ADAPTERS],
@@ -510,7 +533,14 @@ pub fn parse_args(args: &[String]) -> ParseOutcome {
     let error = match parser.run() {
         // The C++ binary exits inside the getopt loop for -h/-v, before the
         // post-loop bind resolution.
-        Ok(()) if !parser.opts.help && !parser.opts.version => parser.finish().err(),
+        Ok(()) if !parser.opts.help && !parser.opts.version => {
+            let error = parser.finish().err();
+            // FBC setup ends set_options; adapters bound by -S keep their master.
+            if error.is_none() && host.fbc {
+                parser.parse_slave("2-7:0");
+            }
+            error
+        }
         Ok(()) => None,
         Err(error) => Some(error),
     };

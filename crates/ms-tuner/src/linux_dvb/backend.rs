@@ -159,6 +159,59 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
         }
     }
 
+    /// The tail of `dvb_open_device` (dvb.cpp:931-944): FBC links, then
+    /// `DMX_SET_SOURCE` when `dmx_source` is set; `master_source` is -1 or
+    /// the master adapter of a slave.
+    pub fn post_open(&mut self, fbc: bool, master_source: i32, dmx_source: i32) {
+        let fn_num = self.state.fn_num;
+        if fbc {
+            if master_source >= 0 {
+                self.set_proc_data(fn_num, "fbc_link", 1);
+                self.set_proc_data(fn_num, "fbc_connect", master_source);
+            } else {
+                if fn_num > 1 {
+                    ms_log::log!(
+                        "FBC master adapter is recommended to be adapter 0 or 1, depending on the number of physical inputs"
+                    );
+                }
+                self.set_proc_data(fn_num, "fbc_link", 0);
+                self.set_proc_data(fn_num, "fbc_connect", fn_num);
+            }
+        }
+        if dmx_source >= 0 {
+            let Ok(fd) = self.dev.open_demux() else {
+                ms_log::log!("DMX_SET_SOURCE: Failed opening {}", self.demux_path());
+                return;
+            };
+            let result = self.dev.set_demux_source(fd, dmx_source);
+            self.dev.close_demux(fd);
+            match result {
+                Ok(()) => ms_log::log!(
+                    "Set DMX_SET_SOURCE for adapter {} to {}",
+                    self.state.id,
+                    dmx_source
+                ),
+                Err(error) => {
+                    let (errno, text) = error_parts(&error);
+                    ms_log::log!(
+                        "DMX_SET_SOURCE failed for adapter {} - {}: {}",
+                        self.state.id,
+                        errno,
+                        text
+                    );
+                }
+            }
+        }
+    }
+
+    fn set_proc_data(&mut self, frontend: i32, name: &str, val: i32) {
+        let filename = format!("/proc/stb/frontend/{frontend}/{name}");
+        ms_log::log!("setProcData {} -> {}", filename, val);
+        if let Err(error) = self.dev.set_proc_data(frontend, name, val) {
+            ms_log::log!("setProcData open failed, {}: {}", filename, error);
+        }
+    }
+
     /// Opens PIDs as `mode` does; the device must read the matching stream fd.
     pub fn with_demux_mode(mut self, mode: DemuxMode) -> Self {
         self.mode = mode;

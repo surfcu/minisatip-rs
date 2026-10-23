@@ -701,3 +701,60 @@ fn usage_and_build_lines_follow_the_netceiver_feature() {
         assert!(lines.contains(&"Built without netceiver"));
     }
 }
+
+fn argv(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| arg.to_string()).collect()
+}
+
+// minisatip.cpp:631-632, 661-665, 688-690: an enigma2 host starts from PES
+// filters on the demux, pids=all emulation and a persistent cache dir.
+#[test]
+fn enigma_hosts_start_from_the_enigma_defaults() {
+    let plain = ms_config::parse_args_on(&argv(&[]), ms_config::Host::default()).options;
+    assert!(!plain.enigma && !plain.emulate_pids_all);
+    assert_eq!(
+        (plain.use_demux_device, plain.cache_dir.as_str()),
+        (0, "/var/cache/minisatip")
+    );
+
+    let host = ms_config::Host {
+        enigma: true,
+        fbc: false,
+    };
+    let opts = ms_config::parse_args_on(&argv(&[]), host).options;
+    assert!(opts.enigma && opts.emulate_pids_all);
+    assert_eq!(
+        (opts.use_demux_device, opts.cache_dir.as_str()),
+        (3, "/var/lib/minisatip")
+    );
+
+    // getopt runs after the host defaults, so argv still wins.
+    let opts = ms_config::parse_args_on(&argv(&["-1", "0", "--cache-dir", "/tmp/c"]), host).options;
+    assert_eq!(
+        (opts.use_demux_device, opts.cache_dir.as_str()),
+        (0, "/tmp/c")
+    );
+    assert!(opts.enigma && opts.emulate_pids_all);
+}
+
+// minisatip.cpp:1171-1173: an FBC box binds adapters 2-7 to master 0 after
+// argv, so a -S binding from the command line is kept.
+#[test]
+fn fbc_hosts_bind_adapters_2_to_7_to_adapter_0() {
+    let host = ms_config::Host {
+        enigma: false,
+        fbc: true,
+    };
+    let masters = |args: &[&str]| -> Vec<(u8, i32)> {
+        let opts = ms_config::parse_args_on(&argv(args), host).options;
+        opts.slaves.iter().map(|s| (s.adapter, s.master)).collect()
+    };
+    assert_eq!(masters(&[]), (2..=7).map(|a| (a, 0)).collect::<Vec<_>>());
+    let with_s = masters(&["-S", "3:1"]);
+    assert_eq!(with_s[0], (3, 1));
+    assert!(
+        with_s.contains(&(2, 0)) && !with_s.contains(&(3, 0)),
+        "{with_s:?}"
+    );
+    assert!(ms_config::parse_args(&argv(&[])).options.slaves.is_empty());
+}
