@@ -574,6 +574,26 @@ fn read_tpdu_answers_ctc_and_status_byte() {
     );
 }
 
+#[test]
+fn read_tpdu_status_byte_without_data_is_quiet() {
+    let (_, mut d) = dev(0);
+    let m = Mock::default();
+    d.set_link(m.boxed());
+    m.push_read(Ok(vec![0, 1, T_SB, 2, 1, 0x00]));
+    assert_eq!(d.read_tpdu(), ReadOutcome::Data(Vec::new()));
+    assert!(m.take_writes().is_empty(), "no T_RCV without data");
+}
+
+#[test]
+fn read_tpdu_status_byte_with_data_requests_it() {
+    let (_, mut d) = dev(0);
+    let m = Mock::default();
+    d.set_link(m.boxed());
+    m.push_read(Ok(vec![0, 1, T_SB, 2, 1, 0x80]));
+    assert_eq!(d.read_tpdu(), ReadOutcome::Data(Vec::new()));
+    assert_eq!(m.take_writes(), [vec![0, 1, T_RCV, 1, 1]]);
+}
+
 // Ported from tests/test_ca.cpp:1580 (NULL-pointer guards have no Rust equivalent)
 #[test]
 fn ca_read_enigma_removal() {

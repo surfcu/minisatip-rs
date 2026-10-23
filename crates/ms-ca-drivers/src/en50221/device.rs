@@ -565,8 +565,10 @@ impl CaDevice {
                     );
                 }
                 T_DATA_MORE | T_DATA_LAST => out.extend_from_slice(body),
-                T_SB if body.first().is_some_and(|b| b & 0x80 != 0) => {
-                    self.write_tpdu(T_RCV, &[]);
+                T_SB => {
+                    if body.first().is_some_and(|b| b & 0x80 != 0) {
+                        self.write_tpdu(T_RCV, &[]);
+                    }
                 }
                 _ => ms_log::log!("unhandled tpdu_tag 0x{:x}\n", tag),
             }
