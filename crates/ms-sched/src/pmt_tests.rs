@@ -2650,3 +2650,21 @@ fn name_pmt_for_sid_names_the_ci_side_pmt() {
     );
     assert_eq!(sched.name_pmt_for_sid(8, 0x1234, source, "x", "p"), None);
 }
+
+// pmt.cpp:1918-1925: with pmt_scan (the default) each PAT entry's PMT filter
+// opens its pid; without it the pid waits for a stream to request it.
+#[test]
+fn pmt_scan_opens_the_pmt_pids_of_the_pat() {
+    for scan in [true, false] {
+        let mut sched = test_sched(AdapterType::Dvb);
+        sched.set_pmt_scan(scan);
+        sched.post_tune_adapter(0);
+        let pat_filter = sched.filters_for_pid(0, 0)[0];
+        sched.process_pat(pat_filter, &build_pat(0x10, 1, &[(100, 0x200)]));
+        let pmt = sched.filters_for_pid(0, 0x200);
+        assert_eq!(pmt.len(), 1, "scan {scan}");
+        let flags = sched.filter_slot(pmt[0]).unwrap().flags;
+        assert_eq!(flags & FILTER_ADD_REMOVE != 0, scan);
+        assert_eq!(sched.find_pid(0, 0x200).is_some(), scan);
+    }
+}

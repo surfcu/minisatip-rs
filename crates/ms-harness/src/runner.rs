@@ -9,22 +9,37 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::analysis::{self, Units};
+use crate::analysis::{self, Seams, Units};
 use crate::client::{self, HttpStream, RtspConn, Shared, UdpPair};
 use crate::diff::diff;
 use crate::normalize::{self, Normalizer};
-use crate::scenario::{BodyMode, CaptureStep, HttpStep, HttpStreamStep, RtspStep, Scenario, Step};
+use crate::scenario::{
+    BodyMode, CaptureMode, CaptureStep, HttpStep, HttpStreamStep, RtspStep, Scenario, Step,
+};
 use crate::server::{Binary, Launch, RTP_RANGE, Server};
+
+/// Extra time a `sets` capture runs beyond one loop of the file.
+const LOOP_MARGIN_MS: u64 = 1000;
 
 /// Paths shared by every run.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     pub html: PathBuf,
     pub workroot: PathBuf,
+    /// Directory of recorded `file:` captures.
+    pub captures: Option<PathBuf>,
+}
+
+/// Loop length and seams of the replayed file, for `sets` captures.
+#[derive(Default)]
+struct Replay {
+    loop_ms: u64,
+    seams: Seams,
 }
 
 struct Context<'a> {
     server: &'a Server,
+    replay: Replay,
     norm: Normalizer,
     conns: HashMap<String, RtspConn>,
     udp: HashMap<String, UdpPair>,
@@ -46,13 +61,45 @@ pub fn capture_file(dir: &Path, profile: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Path of the capture `scenario` replays: generated, or recorded under `--captures`.
+pub fn capture_path(scenario: &Scenario, options: &RunOptions) -> Result<PathBuf, String> {
+    let Some(name) = scenario.capture_file_name() else {
+        return capture_file(&options.workroot, &scenario.capture);
+    };
+    let dir = options
+        .captures
+        .as_ref()
+        .ok_or_else(|| format!("{}: capture file:{name} needs --captures", scenario.name))?;
+    let path = dir.join(format!("{name}.ts"));
+    if !path.is_file() {
+        return Err(format!("{}: capture not found", path.display()));
+    }
+    Ok(path)
+}
+
+fn replay(scenario: &Scenario, capture: &Path) -> Result<Replay, String> {
+    let sets = scenario.steps.iter().any(
+        |step| matches!(step, Step::Capture(capture) if capture.mode == Some(CaptureMode::Sets)),
+    );
+    if !sets {
+        return Ok(Replay::default());
+    }
+    let file = fs::read(capture).map_err(|error| format!("{}: {error}", capture.display()))?;
+    let bits = file.len() as u64 * 8;
+    Ok(Replay {
+        loop_ms: bits.saturating_mul(1000) / scenario.bitrate.max(1),
+        seams: Seams::of(&file),
+    })
+}
+
 /// Runs `scenario` once against `binary` and returns the normalised transcript.
 pub fn run_once(
     scenario: &Scenario,
     binary: &Binary,
     options: &RunOptions,
 ) -> Result<Vec<String>, String> {
-    let capture = capture_file(&options.workroot, &scenario.capture)?;
+    let capture = capture_path(scenario, options)?;
+    let replay = replay(scenario, &capture)?;
     let workdir = options.workroot.join(&scenario.name).join(&binary.label);
     fs::create_dir_all(&workdir).map_err(|error| error.to_string())?;
     let launch = Launch {
@@ -77,6 +124,7 @@ pub fn run_once(
     }
     let mut context = Context {
         server: &server,
+        replay,
         norm,
         conns: HashMap::new(),
         udp: HashMap::new(),
@@ -370,6 +418,25 @@ impl Context<'_> {
         let is_ts = self.streams.contains_key(&step.from);
         thread::sleep(Duration::from_millis(step.settle_ms));
         client::clear(&buffer);
+        if step.mode == Some(CaptureMode::Sets) {
+            // One whole loop, so every PID and section of the file is seen.
+            thread::sleep(Duration::from_millis(self.replay.loop_ms + LOOP_MARGIN_MS));
+            let lines = client::with(&buffer, |b| {
+                let view = if is_ts {
+                    Units::Ts(&b.bytes)
+                } else {
+                    Units::Rtp(&b.datagrams)
+                };
+                analysis::summarize_sets(&view, &self.replay.seams)
+            });
+            // Two silent servers would otherwise produce matching transcripts.
+            if lines.iter().any(|line| line.contains("packets=none")) {
+                return Err(format!("capture {}: no TS packets received", step.from));
+            }
+            self.out.push(format!("== {number} capture {}", step.from));
+            self.out.extend(lines);
+            return Ok(());
+        }
         let deadline = Instant::now() + Duration::from_millis(step.timeout_ms);
         let units = |b: &client::Buffer| -> Vec<String> {
             let view = if is_ts {
@@ -513,5 +580,33 @@ pub fn compare(scenario: &Scenario, comparison: &Comparison<'_>, options: &RunOp
         name: scenario.name.clone(),
         passed,
         report,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_captures_need_an_existing_file_under_captures() {
+        let text = "name: r\ncapture: file:rec\nsteps: [{ capture: { from: c } }]\n";
+        let scenario = Scenario::parse(text, Path::new("r.yaml")).expect("parse");
+        let dir = std::env::temp_dir().join(format!("ms-harness-cap-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let mut options = RunOptions {
+            html: dir.clone(),
+            workroot: dir.clone(),
+            captures: None,
+        };
+        let error = capture_path(&scenario, &options).expect_err("no --captures");
+        assert!(error.contains("--captures"), "{error}");
+        options.captures = Some(dir.clone());
+        let error = capture_path(&scenario, &options).expect_err("missing file");
+        assert!(error.contains("not found"), "{error}");
+        fs::write(dir.join("rec.ts"), [0x47u8; 188 * 4]).expect("write");
+        assert_eq!(capture_path(&scenario, &options), Ok(dir.join("rec.ts")));
+        let replay = replay(&scenario, &dir.join("rec.ts")).expect("replay");
+        assert_eq!(replay.loop_ms, 188 * 4 * 8 * 1000 / scenario.bitrate);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

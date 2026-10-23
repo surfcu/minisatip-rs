@@ -233,6 +233,7 @@ impl Runtime {
         let mut scheduler = Scheduler::new();
         // Any `-A` entry enables virtual DiSEqC (adapter.cpp:1816).
         scheduler.set_absolute_switch(!opts.absolute_sources.is_empty());
+        scheduler.set_pmt_scan(opts.pmt_scan != 0);
         let replay = std::env::var_os("MINISATIP_REPLAY").map(PathBuf::from);
         let replay_enabled = replay.is_some();
         let adapter_ids = adapter_ids(opts);

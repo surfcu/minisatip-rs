@@ -1,0 +1,20 @@
+name: real-fta-multi
+description: The recorded 19-service 11425 V mux over HTTP pids=all, then two services over RTSP/TCP
+capture: file:fta-multi
+bitrate: 65325708
+steps:
+  - http_stream:
+      name: h
+      path: "/?src=1&freq=11425&pol=v&sr=30000&msys=dvbs2&mtype=8psk&fec=34&pids=all"
+  - capture: { from: h }
+  - close: h
+  - sleep: 500
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=11425&pol=v&sr=30000&msys=dvbs2&mtype=8psk&fec=34&pids=0,17,2300,6300,6400,6450,2306,6306,6406,6506,6556"
+      headers: { Transport: "RTP/AVP/TCP;interleaved=0-1" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - capture: { from: c }
+  - http: { path: /state.json, body: numbers }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }

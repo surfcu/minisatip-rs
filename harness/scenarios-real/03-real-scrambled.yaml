@@ -1,0 +1,14 @@
+name: real-scrambled
+description: beIN SPORTS 3 (Irdeto) with ECM/EMM pids and no CA; scrambled packets pass with TSC set
+capture: file:scr-bein3
+bitrate: 13278594
+steps:
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=12073&pol=v&sr=27500&msys=dvbs2&mtype=8psk&fec=34&pids=0,1,16,17,18,20,61,1541,1542,2545,7945,4945,5045,5145"
+      headers: { Transport: "RTP/AVP/TCP;interleaved=0-1" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - capture: { from: c }
+  - http: { path: /state.json, body: numbers }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }

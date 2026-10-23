@@ -1,7 +1,8 @@
 //! Output stream summaries: PID set, packet counts, PSI sections, CC continuity.
 //!
 //! Counts cover exactly one replay period (between two arrivals of the lowest
-//! ES index seen), so they do not depend on when the capture started.
+//! ES index seen), so they do not depend on when the capture started. Recorded
+//! files have no index; their `sets` summaries report only what arrived.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,8 +16,66 @@ pub enum Units<'a> {
     Ts(&'a [u8]),
 }
 
-/// Extracts TS packets and summarises RTP framing.
-fn packets<'a>(units: &Units<'a>, lines: &mut Vec<String>) -> Vec<&'a [u8]> {
+/// CC transitions a replayed file makes by itself: the loop seam of every PID
+/// and the discontinuities already recorded in the file.
+#[derive(Debug, Clone, Default)]
+pub struct Seams(BTreeSet<(u16, u8, u8)>);
+
+impl Seams {
+    pub fn of(file: &[u8]) -> Self {
+        let mut set = BTreeSet::new();
+        let mut first = BTreeMap::new();
+        let mut last = BTreeMap::new();
+        for packet in file.as_chunks::<TS>().0 {
+            let Some((pid, cc)) = cc_of(packet) else {
+                continue;
+            };
+            first.entry(pid).or_insert(cc);
+            if let Some(previous) = last.insert(pid, cc)
+                && (previous + 1) & 0x0f != cc
+            {
+                set.insert((pid, previous, cc));
+            }
+        }
+        for (pid, previous) in last {
+            set.insert((pid, previous, first[&pid]));
+        }
+        Self(set)
+    }
+}
+
+/// PID and continuity counter of a packet that carries a payload.
+fn cc_of(packet: &[u8]) -> Option<(u16, u8)> {
+    let pid = pid(packet);
+    (packet[0] == 0x47 && pid != 0x1fff && payload(packet).is_some())
+        .then_some((pid, packet[3] & 0x0f))
+}
+
+/// CC discontinuities, ignoring the transitions listed in `seams`; a real loss
+/// that happens to produce a seam's (pid, last, cc) triple is not counted.
+fn cc_errors(packets: &[&[u8]], seams: &Seams) -> usize {
+    let mut errors = 0;
+    let mut last_cc: BTreeMap<u16, u8> = BTreeMap::new();
+    for packet in packets {
+        let Some((pid, cc)) = cc_of(packet) else {
+            continue;
+        };
+        if let Some(last) = last_cc.insert(pid, cc)
+            && (last + 1) & 0x0f != cc
+            && !seams.0.contains(&(pid, last, cc))
+        {
+            errors += 1;
+        }
+    }
+    errors
+}
+
+fn some(count: usize) -> &'static str {
+    if count == 0 { "none" } else { "some" }
+}
+
+/// Extracts TS packets and summarises RTP framing; `exact` keeps the counts.
+fn packets<'a>(units: &Units<'a>, lines: &mut Vec<String>, exact: bool) -> Vec<&'a [u8]> {
     match units {
         Units::Ts(bytes) => bytes.as_chunks::<TS>().0.iter().map(|c| &c[..]).collect(),
         Units::Rtp(datagrams) => {
@@ -52,6 +111,11 @@ fn packets<'a>(units: &Units<'a>, lines: &mut Vec<String>) -> Vec<&'a [u8]> {
                 }
                 out.extend(payload.as_chunks::<TS>().0.iter().map(|c| &c[..]));
             }
+            let (gaps, bad_payload) = if exact {
+                (gaps.to_string(), bad_payload.to_string())
+            } else {
+                (some(gaps).to_owned(), some(bad_payload).to_owned())
+            };
             if datagrams.is_empty() {
                 lines.push("rtp: none".to_owned());
             } else {
@@ -163,7 +227,7 @@ fn span<T>(hits: &[(usize, T)], matches: impl Fn(&T) -> bool) -> Option<(usize, 
 
 /// True when the units hold one full period, or `budget` packets without ES indexes.
 pub fn complete(units: &Units<'_>, budget: usize) -> bool {
-    let packets = packets(units, &mut Vec::new());
+    let packets = packets(units, &mut Vec::new(), true);
     period(&packets).is_some()
         || (packets.len() >= budget && !packets.iter().any(|p| es_index(p).is_some()))
 }
@@ -171,24 +235,10 @@ pub fn complete(units: &Units<'_>, budget: usize) -> bool {
 /// Normalised summary lines for the captured units.
 pub fn summarize(units: &Units<'_>) -> Vec<String> {
     let mut lines = Vec::new();
-    let packets = packets(units, &mut lines);
+    let packets = packets(units, &mut lines, true);
     let sync_errors = packets.iter().filter(|packet| packet[0] != 0x47).count();
     let good: Vec<&[u8]> = packets.iter().copied().filter(|p| p[0] == 0x47).collect();
-
-    let mut cc_errors = 0usize;
-    let mut last_cc: BTreeMap<u16, u8> = BTreeMap::new();
-    for packet in &good {
-        let pid = pid(packet);
-        if pid == 0x1fff || payload(packet).is_none() {
-            continue;
-        }
-        let cc = packet[3] & 0x0f;
-        if let Some(last) = last_cc.insert(pid, cc)
-            && (last + 1) & 0x0f != cc
-        {
-            cc_errors += 1;
-        }
-    }
+    let cc_errors = cc_errors(&good, &Seams::default());
 
     let (window, state) = match period(&good) {
         Some((start, end)) => (&good[start..end], "complete"),
@@ -220,16 +270,49 @@ pub fn summarize(units: &Units<'_>) -> Vec<String> {
             "pid {pid:#06x} packets={count} scrambled={scrambled}"
         ));
     }
-    for line in sections(window) {
-        lines.push(line);
+    lines.extend(sections(window, true));
+    lines
+}
+
+/// Summary of a recorded-file capture covering at least one full loop: which
+/// PIDs, scrambling states and sections arrived, never how many.
+pub fn summarize_sets(units: &Units<'_>, seams: &Seams) -> Vec<String> {
+    let mut lines = Vec::new();
+    let packets = packets(units, &mut lines, false);
+    let sync_errors = packets.iter().filter(|packet| packet[0] != 0x47).count();
+    let good: Vec<&[u8]> = packets.iter().copied().filter(|p| p[0] == 0x47).collect();
+    lines.push(format!(
+        "ts: mode=sets packets={} sync_errors={} cc_errors={}",
+        some(good.len()),
+        some(sync_errors),
+        some(cc_errors(&good, seams)),
+    ));
+    let mut states: BTreeMap<u16, (bool, bool)> = BTreeMap::new();
+    for packet in &good {
+        let state = states.entry(pid(packet)).or_default();
+        if packet[3] & 0xc0 != 0 {
+            state.1 = true;
+        } else {
+            state.0 = true;
+        }
     }
+    for (pid, state) in states {
+        let state = match state {
+            (true, false) => "clear",
+            (false, true) => "scrambled",
+            _ => "mixed",
+        };
+        lines.push(format!("pid {pid:#06x} {state}"));
+    }
+    lines.extend(sections(&good, false));
     lines
 }
 
 /// Distinct PSI sections on PID 0, 0x11 and the PMT PIDs listed in any PAT.
-fn sections(window: &[&[u8]]) -> Vec<String> {
+fn sections(window: &[&[u8]], counts: bool) -> Vec<String> {
     let mut psi_pids: BTreeSet<u16> = [0u16, 0x11].into_iter().collect();
     let mut buffers: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+    let mut last_cc: BTreeMap<u16, u8> = BTreeMap::new();
     let mut found: BTreeMap<(u16, Vec<u8>), usize> = BTreeMap::new();
     for packet in window {
         let pid = pid(packet);
@@ -239,7 +322,15 @@ fn sections(window: &[&[u8]]) -> Vec<String> {
         let Some(data) = payload(packet) else {
             continue;
         };
+        let cc = packet[3] & 0x0f;
+        let broken = last_cc
+            .insert(pid, cc)
+            .is_some_and(|last| (last + 1) & 0x0f != cc);
         let buffer = buffers.entry(pid).or_default();
+        // A section cut by a CC break (loop seam, loss) cannot be completed.
+        if broken {
+            buffer.clear();
+        }
         if packet[1] & 0x40 != 0 {
             let pointer = usize::from(*data.first().unwrap_or(&0));
             buffer.clear();
@@ -277,10 +368,11 @@ fn sections(window: &[&[u8]]) -> Vec<String> {
                 .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
                 .unwrap_or_default();
             format!(
-                "section pid={pid:#06x} table={:#04x} ext={ext:#06x} v={version} len={} crc={crc}{} count={count}",
+                "section pid={pid:#06x} table={:#04x} ext={ext:#06x} v={version} len={} crc={crc}{}{}",
                 section[0],
                 section.len(),
                 if crc_ok { "" } else { " BAD-CRC" },
+                if counts { format!(" count={count}") } else { String::new() },
             )
         })
         .collect()
@@ -340,6 +432,80 @@ mod tests {
         assert_eq!(a, b);
         assert!(a[0].contains("period=complete"), "{a:?}");
         assert!(a.iter().any(|line| line.contains("table=0x02")), "{a:?}");
+    }
+
+    /// A recorded-like file: no ES index, and a length that breaks CC at the seam.
+    fn recorded() -> Vec<u8> {
+        let mut file: Vec<u8> = generate("multi").expect("multi")[..TS * 333].to_vec();
+        for packet in file.as_chunks_mut::<TS>().0 {
+            if let Some(start) = payload(packet).map(|data| TS - data.len())
+                && packet[start..].starts_with(MAGIC)
+            {
+                packet[start..].fill(0xaa);
+            }
+        }
+        file
+    }
+
+    fn looped(file: &[u8], skip: usize, loops: usize) -> Vec<u8> {
+        let mut out = file[skip * TS..].to_vec();
+        for _ in 0..loops {
+            out.extend_from_slice(file);
+        }
+        out
+    }
+
+    #[test]
+    fn sets_summary_ignores_start_offset_and_loop_seams() {
+        let file = recorded();
+        let seams = Seams::of(&file);
+        assert!(!seams.0.is_empty(), "the cut length breaks CC at the seam");
+        let a = summarize_sets(&Units::Ts(&looped(&file, 3, 1)), &seams);
+        let b = summarize_sets(&Units::Ts(&looped(&file, 200, 2)), &seams);
+        assert_eq!(a, b);
+        assert_eq!(
+            a[0],
+            "ts: mode=sets packets=some sync_errors=none cc_errors=none"
+        );
+        assert!(
+            a.iter().any(|line| line.starts_with("pid 0x0101 clear")),
+            "{a:?}"
+        );
+        assert!(
+            a.iter()
+                .all(|line| !line.contains("count=") && !line.contains("BAD-CRC"))
+        );
+        // The seam set only exempts the file's own transitions.
+        let mut lossy = looped(&file, 3, 1);
+        lossy.drain(TS * 100..TS * 101);
+        assert!(summarize_sets(&Units::Ts(&lossy), &seams)[0].contains("cc_errors=some"));
+        assert!(!summarize(&Units::Ts(&looped(&file, 3, 1)))[0].contains("cc_errors=0"));
+    }
+
+    #[test]
+    fn a_cc_break_drops_the_partial_section() {
+        let body = vec![0x5a; 300];
+        let section = crate::tsgen::section(0x42, 1, 0, &body);
+        let packet = |pusi: bool, cc: u8, data: &[u8]| {
+            let mut p = vec![0x47, if pusi { 0x40 } else { 0 }, 0x11, 0x10 | cc];
+            if pusi {
+                p.push(0);
+            }
+            p.extend_from_slice(data);
+            p.resize(TS, 0xff);
+            p
+        };
+        let head = &section[..183];
+        let tail = &section[183..];
+        let mut stream = Vec::new();
+        stream.extend(packet(true, 0, head));
+        stream.extend(packet(false, 5, &[0x11; 184]));
+        stream.extend(packet(true, 6, head));
+        stream.extend(packet(false, 7, tail));
+        let lines = summarize_sets(&Units::Ts(&stream), &Seams::default());
+        let sections: Vec<_> = lines.iter().filter(|l| l.starts_with("section")).collect();
+        assert_eq!(sections.len(), 1, "{lines:?}");
+        assert!(!sections[0].contains("BAD-CRC"), "{lines:?}");
     }
 
     #[test]

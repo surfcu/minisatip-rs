@@ -92,7 +92,7 @@ session and stream ids stay available after a `close` step.
 | `http` | One request on a fresh connection; `body` selects `full` (default), `numbers`, `length` or `none` |
 | `http_stream` | Opens a GET whose TS body is captured under `name` |
 | `udp` | Binds an RTP/RTCP client port pair under `name` |
-| `capture` | Summarises one replay period from a UDP pair, an RTSP connection (interleaved) or an HTTP stream; skips `settle_ms` (300) and waits up to `timeout_ms` (5000) for a complete period |
+| `capture` | Summarises one replay period from a UDP pair, an RTSP connection (interleaved) or an HTTP stream; skips `settle_ms` (300) and waits up to `timeout_ms` (5000) for a complete period. `mode: sets` (the default for `file:` captures) instead records one full loop of the file |
 | `silence` | Records whether the source stays quiet for `ms` |
 | `close` | Closes a connection or stream |
 | `sleep` | Waits `ms` |
@@ -113,6 +113,30 @@ type, SSRC stability, sequence gaps and payload alignment) and reduces them to:
 The generator writes `MSRS` plus a big-endian ES index into every ES packet, so
 counts do not depend on when the capture started. Profiles: `fta` (one service),
 `multi` (three services, null/stuffing PIDs) and `pmtver` (PMT version change).
+
+## Recorded captures
+
+`capture: file:<name>` replays `<DIR>/<name>.ts` from `--captures DIR`. Recordings
+from the box stay outside git; without `--captures` those scenarios are reported as
+`SKIP`, and a run where every scenario is skipped fails.
+
+```
+cargo run -p ms-harness -- run --runs 3 --cpp $CPP --captures ~/captures harness/scenarios-real
+```
+
+| Scenario | File | Checks |
+|----------|------|--------|
+| `real-fta-single` | `fta-dmax` | DMAX HD over RTSP/TCP, `/state.json` |
+| `real-fta-multi` | `fta-multi` | 19-service mux over HTTP `pids=all`, two services over RTSP/TCP |
+| `real-scrambled` | `scr-bein3` | Irdeto service with ECM/EMM pids, no CA: TSC kept |
+
+A recorded file has no ES index, so `sets` summaries hold only what does not depend
+on timing: PIDs with their scrambling state (`clear`, `scrambled`, `mixed`), distinct
+PSI sections without repeat counts, and RTP gaps, sync and CC errors as `none`/`some`.
+The capture runs for the file length at the scenario `bitrate` plus one second. CC
+transitions the file makes itself (its loop seam and recorded discontinuities) are not
+errors, and a CC break drops a partly assembled section. Set `bitrate` to the file's
+PCR rate.
 
 ## Normalisation
 
