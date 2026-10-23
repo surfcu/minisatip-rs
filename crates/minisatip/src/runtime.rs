@@ -1745,8 +1745,6 @@ fn spawn_dvb_adapters(
                 DemuxMode::from_option(opts.use_demux_device),
             ) {
                 Ok(mut tuner) => {
-                    tuner.state_mut().pa = frontend.path_adapter as i32;
-                    tuner.state_mut().fn_num = frontend.path_frontend as i32;
                     // adapter.cpp:300: enigma2 sources each demux from its frontend.
                     let dmx_source = if opts.enigma {
                         frontend.path_frontend as i32

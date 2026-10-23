@@ -125,7 +125,13 @@ impl LinuxDvbTuner<LinuxDvbDevice> {
                 dev.dvr_fd()
             );
         }
-        Ok(Self::with_dvr_buffer(dev, AdapterState::alloc(), dvr_buffer).with_demux_mode(mode))
+        let mut tuner =
+            Self::with_dvr_buffer(dev, AdapterState::alloc(), dvr_buffer).with_demux_mode(mode);
+        // ad->id, pa and fn exist before dvb_open_device logs with them.
+        tuner.state.id = aid.unwrap_or(tuner.state.id);
+        tuner.state.pa = adapter as i32;
+        tuner.state.fn_num = frontend as i32;
+        Ok(tuner)
     }
 }
 

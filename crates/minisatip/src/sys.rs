@@ -233,28 +233,33 @@ impl SysLogBackend {
     }
 }
 
+/// `gettimeofday` + `localtime_r`, as every C++ log line is stamped.
+pub fn local_timestamp() -> Timestamp {
+    // SAFETY: gettimeofday only writes into the provided timeval.
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    // SAFETY: `tv` is a valid, writable timeval.
+    if unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) } != 0 {
+        return Timestamp::fallback();
+    }
+    // SAFETY: localtime_r only reads the time_t and writes into `tm`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `tm` is a valid, writable tm and `tv.tv_sec` is its time_t.
+    if unsafe { libc::localtime_r(&tv.tv_sec, &mut tm) }.is_null() {
+        return Timestamp::fallback();
+    }
+    Timestamp::new(
+        tm.tm_mday.max(0) as u32,
+        (tm.tm_mon + 1).max(0) as u32,
+        tm.tm_hour.max(0) as u32,
+        tm.tm_min.max(0) as u32,
+        tm.tm_sec.max(0) as u32,
+        u32::try_from(tv.tv_usec / 1000).unwrap_or(0),
+    )
+}
+
 impl Backend for SysLogBackend {
     fn timestamp(&self) -> Timestamp {
-        // SAFETY: gettimeofday only writes into the provided timeval.
-        let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
-        // SAFETY: `tv` is a valid, writable timeval.
-        if unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) } != 0 {
-            return Timestamp::fallback();
-        }
-        // SAFETY: localtime_r only reads the time_t and writes into `tm`.
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        // SAFETY: `tm` is a valid, writable tm and `tv.tv_sec` is its time_t.
-        if unsafe { libc::localtime_r(&tv.tv_sec, &mut tm) }.is_null() {
-            return Timestamp::fallback();
-        }
-        Timestamp::new(
-            tm.tm_mday.max(0) as u32,
-            (tm.tm_mon + 1).max(0) as u32,
-            tm.tm_hour.max(0) as u32,
-            tm.tm_min.max(0) as u32,
-            tm.tm_sec.max(0) as u32,
-            u32::try_from(tv.tv_usec / 1000).unwrap_or(0),
-        )
+        local_timestamp()
     }
 
     fn syslog(&self, line: &str) {

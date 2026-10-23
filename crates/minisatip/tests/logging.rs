@@ -168,3 +168,66 @@ fn terminate(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// The hour of the first log line containing `needle`.
+fn hour_of(text: &str, needle: &str) -> Option<u64> {
+    let line = text.lines().find(|line| line.contains(needle))?;
+    let time = line.strip_prefix('[')?.split(' ').nth(1)?;
+    time.get(..2)?.parse().ok()
+}
+
+// Lines logged while parsing, before the logger is installed, are stamped with
+// local time like every other line (C++ uses localtime throughout).
+#[test]
+fn lines_logged_while_parsing_use_local_time() -> io::Result<()> {
+    let utc_hour = || {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        secs / 3600 % 24
+    };
+    let before = utc_hour();
+    // -c logs while parsing; the bind conflict then exits after parsing.
+    let dir = unique_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("stdout.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_minisatip"))
+        .args([
+            "-f",
+            "-c",
+            "0:*2",
+            "--bind-dev",
+            "lo",
+            "--bind",
+            "127.0.0.1",
+        ])
+        .env("TZ", "XXX-14")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(File::create(&path)?))
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + TIMEOUT;
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            terminate(&mut child);
+            panic!("minisatip did not exit after the bind conflict");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let after = utc_hour();
+    let text = fs::read_to_string(&path)?;
+    let _ = fs::remove_dir_all(&dir);
+    let hour = hour_of(&text, "Forcing CA 0").unwrap_or_else(|| {
+        panic!(
+            "no line in:
+{text}"
+        )
+    });
+    assert!(
+        [before, after].iter().any(|utc| (utc + 14) % 24 == hour),
+        "hour {hour} is not UTC+14 (UTC {before}..{after}):
+{text}"
+    );
+    Ok(())
+}

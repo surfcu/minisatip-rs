@@ -8,6 +8,8 @@ mod runtime;
 mod sys;
 
 fn main() {
+    // Lines logged while parsing use local time too.
+    ms_log::set_preinit_clock(sys::local_timestamp);
     let args: Vec<String> = std::env::args_os()
         .skip(1)
         .map(|arg| {
