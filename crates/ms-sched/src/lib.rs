@@ -508,6 +508,11 @@ impl Scheduler {
         self.absolute_switch = enabled;
     }
 
+    /// Creates PAT->PMT filters with `FILTER_ADD_REMOVE` (`opts.pmt_scan`).
+    pub fn set_pmt_scan(&mut self, enabled: bool) {
+        self.pmt.set_pmt_scan(enabled);
+    }
+
     /// Sets the absolute-source table of `aid`.
     pub fn set_absolute_table(&mut self, aid: usize, table: [u8; MAX_SOURCES]) {
         if let Some(adapter) = self.adapter_mut(aid) {

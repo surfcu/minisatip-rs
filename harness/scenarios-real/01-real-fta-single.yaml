@@ -1,0 +1,14 @@
+name: real-fta-single
+description: DMAX HD from the recorded 12015 H mux over RTSP/TCP, then /state.json
+capture: file:fta-dmax
+bitrate: 59882006
+steps:
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=12015&pol=h&sr=27500&msys=dvbs2&mtype=8psk&fec=34&pids=0,17,110,1710,1810,6004"
+      headers: { Transport: "RTP/AVP/TCP;interleaved=0-1" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - capture: { from: c }
+  - http: { path: /state.json, body: numbers }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }

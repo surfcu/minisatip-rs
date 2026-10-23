@@ -8,6 +8,8 @@ use serde::{Deserialize, Deserializer};
 
 /// Default replay bitrate in bits per second.
 pub const DEFAULT_BITRATE: u64 = 2_000_000;
+/// Prefix of `capture:` values naming a recorded file under `--captures`.
+pub const FILE_PREFIX: &str = "file:";
 
 /// One scenario file.
 #[derive(Debug, Clone, Deserialize)]
@@ -16,7 +18,8 @@ pub struct Scenario {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    /// Generator profile (see [`crate::tsgen::PROFILES`]).
+    /// Generator profile (see [`crate::tsgen::PROFILES`]) or `file:<name>`
+    /// for `<captures>/<name>.ts`.
     pub capture: String,
     /// Number of replay adapters (`-e 0-(n-1)`).
     #[serde(default = "one")]
@@ -160,6 +163,17 @@ pub struct CaptureStep {
     /// Packet budget when the source carries no indexed ES packets.
     #[serde(default = "max_packets")]
     pub packets: usize,
+    /// Summary kind; `parse` fills it in (`sets` for recorded files).
+    pub mode: Option<CaptureMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    /// Counts over one replay period of a generated capture.
+    Period,
+    /// Timing-independent sets over one full loop of a recorded file.
+    Sets,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -194,18 +208,46 @@ impl Scenario {
     pub fn parse(text: &str, path: &Path) -> Result<Self, String> {
         let mut scenario: Scenario =
             serde_yaml::from_str(text).map_err(|error| format!("{}: {error}", path.display()))?;
-        if crate::tsgen::generate(&scenario.capture).is_none() {
-            return Err(format!(
-                "{}: unknown capture profile {}",
-                path.display(),
-                scenario.capture
-            ));
+        let file = scenario.capture_file_name().is_some();
+        match scenario.capture_file_name() {
+            Some(name)
+                if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) =>
+            {
+                return Err(format!("{}: bad capture file name {name}", path.display()));
+            }
+            Some(_) => {}
+            None if crate::tsgen::generate(&scenario.capture).is_none() => {
+                return Err(format!(
+                    "{}: unknown capture profile {}",
+                    path.display(),
+                    scenario.capture
+                ));
+            }
+            None => {}
+        }
+        for step in &mut scenario.steps {
+            if let Step::Capture(capture) = step {
+                let mode = capture.mode.get_or_insert(if file {
+                    CaptureMode::Sets
+                } else {
+                    CaptureMode::Period
+                });
+                // Recorded files carry no ES index, so periods depend on timing.
+                if file && *mode == CaptureMode::Period {
+                    return Err(format!("{}: file captures need mode: sets", path.display()));
+                }
+            }
         }
         if scenario.adapters == 0 {
             return Err(format!("{}: adapters must be at least 1", path.display()));
         }
         scenario.path = path.to_owned();
         Ok(scenario)
+    }
+
+    /// Name of the recorded capture file, for `capture: file:<name>`.
+    pub fn capture_file_name(&self) -> Option<&str> {
+        self.capture.strip_prefix(FILE_PREFIX)
     }
 
     /// Loads scenario files; directories contribute their `*.yaml` files in name order.
@@ -266,5 +308,34 @@ steps:
     fn rejects_unknown_profile() {
         let text = "name: x\ncapture: nope\nsteps: []\n";
         assert!(Scenario::parse(text, Path::new("x.yaml")).is_err());
+    }
+
+    fn capture_mode(scenario: &Scenario) -> Option<CaptureMode> {
+        scenario.steps.iter().find_map(|step| match step {
+            Step::Capture(capture) => capture.mode,
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn file_captures_default_to_sets_and_reject_period() {
+        let parse = |text: &str| Scenario::parse(text, Path::new("f.yaml"));
+        let text = "name: f\ncapture: file:fta-dmax\nsteps: [{ capture: { from: c } }]\n";
+        let scenario = parse(text).expect("parse");
+        assert_eq!(scenario.capture_file_name(), Some("fta-dmax"));
+        assert_eq!(capture_mode(&scenario), Some(CaptureMode::Sets));
+        let text = "name: g\ncapture: fta\nsteps: [{ capture: { from: c } }]\n";
+        assert_eq!(
+            capture_mode(&parse(text).expect("parse")),
+            Some(CaptureMode::Period)
+        );
+        let text = "name: f\ncapture: file:x\nsteps: [{ capture: { from: c, mode: period } }]\n";
+        assert!(parse(text).is_err());
+        for name in ["file:", "file:../x", "file:a/b", "file:.x"] {
+            assert!(
+                parse(&format!("name: f\ncapture: {name}\nsteps: []\n")).is_err(),
+                "{name}"
+            );
+        }
     }
 }

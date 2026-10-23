@@ -18,6 +18,8 @@ usage:
       --record DIR    write A's transcript to DIR/<name>.txt
       --html DIR      web root passed with -R (default: html)
       --work DIR      scratch directory (default: system temp)
+      --captures DIR  recorded captures for `capture: file:<name>` scenarios
+                      (skipped without it; harness/scenarios-real uses them)
       -v              print transcripts of passing scenarios
   ms-harness show --bin BIN SCENARIO.yaml   print one transcript
   ms-harness gen PROFILE OUT.ts             write a capture (fta, multi, pmtver)
@@ -39,6 +41,7 @@ struct Args {
     record: Option<PathBuf>,
     html: PathBuf,
     work: Option<PathBuf>,
+    captures: Option<PathBuf>,
     paths: Vec<PathBuf>,
 }
 
@@ -59,6 +62,7 @@ fn parse(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
         record: None,
         html: PathBuf::from("html"),
         work: None,
+        captures: None,
         paths: Vec::new(),
     };
     while let Some(arg) = raw.next() {
@@ -75,6 +79,7 @@ fn parse(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--record" => args.record = Some(value()?.into()),
             "--html" => args.html = value()?.into(),
             "--work" => args.work = Some(value()?.into()),
+            "--captures" => args.captures = Some(value()?.into()),
             "--fast" => args.fast = true,
             "-v" | "--verbose" => args.verbose = true,
             "-h" | "--help" => return Err(String::new()),
@@ -127,7 +132,18 @@ fn options(args: &Args) -> Result<RunOptions, String> {
     let workroot = std::fs::canonicalize(&workroot).map_err(|error| format!("--work: {error}"))?;
     let html = std::fs::canonicalize(&args.html)
         .map_err(|error| format!("--html {}: {error}", args.html.display()))?;
-    Ok(RunOptions { html, workroot })
+    let captures = match &args.captures {
+        Some(dir) => Some(
+            std::fs::canonicalize(dir)
+                .map_err(|error| format!("--captures {}: {error}", dir.display()))?,
+        ),
+        None => None,
+    };
+    Ok(RunOptions {
+        html,
+        workroot,
+        captures,
+    })
 }
 
 fn run(args: &Args) -> Result<bool, String> {
@@ -163,7 +179,13 @@ fn run(args: &Args) -> Result<bool, String> {
         args.runs.max(1)
     );
     let mut failed = Vec::new();
+    let mut skipped = 0;
     for scenario in &list {
+        if scenario.capture_file_name().is_some() && options.captures.is_none() {
+            println!("SKIP {} (no --captures)", scenario.name);
+            skipped += 1;
+            continue;
+        }
         let outcome = compare(scenario, &comparison, &options);
         println!(
             "{} {}",
@@ -178,8 +200,8 @@ fn run(args: &Args) -> Result<bool, String> {
         }
     }
     println!(
-        "ms-harness: {} passed, {} failed{}",
-        list.len() - failed.len(),
+        "ms-harness: {} passed, {} failed, {skipped} skipped{}",
+        list.len() - failed.len() - skipped,
         failed.len(),
         if failed.is_empty() {
             String::new()
@@ -189,6 +211,9 @@ fn run(args: &Args) -> Result<bool, String> {
     );
     if args.work.is_none() && failed.is_empty() {
         let _ = std::fs::remove_dir_all(&options.workroot);
+    }
+    if skipped == list.len() {
+        return Err("every selected scenario needs --captures".to_owned());
     }
     Ok(failed.is_empty())
 }
@@ -248,8 +273,19 @@ mod tests {
 
     #[test]
     fn parses_run_options() {
-        let raw = ["run", "--cpp", "/x", "--runs", "10", "--fast", "a.yaml"];
+        let raw = [
+            "run",
+            "--cpp",
+            "/x",
+            "--runs",
+            "10",
+            "--fast",
+            "--captures",
+            "/c",
+            "a.yaml",
+        ];
         let args = parse(raw.iter().map(|s| s.to_string())).expect("parse");
+        assert_eq!(args.captures.as_deref(), Some(Path::new("/c")));
         assert_eq!(args.runs, 10);
         assert!(args.fast);
         assert_eq!(args.cpp.as_deref(), Some(Path::new("/x")));
