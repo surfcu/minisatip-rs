@@ -145,6 +145,11 @@ pub trait CaOpener {
     fn has_ciplus_root_cert(&self) -> bool {
         std::path::Path::new("/etc/ssl/certs/root.pem").exists()
     }
+    /// Writes a host control file, such as `/proc/stb/tsmux/input0` for the
+    /// enigma2 CI routing (`set_tuner_input`, `set_input_ci`).
+    fn write_file(&mut self, path: &str, value: &[u8]) -> io::Result<()> {
+        std::fs::write(path, value)
+    }
 }
 
 #[cfg(test)]

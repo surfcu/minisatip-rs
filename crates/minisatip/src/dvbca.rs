@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ms_ca::{CaCaps, CaDriver, CaService, EsStream, Program, ProgramTable, TablesResult};
 use ms_ca_drivers::en50221::device::{CaDevice as CiDevice, CaPmtSink, CaState, HostEvent};
-use ms_ca_drivers::en50221::{AdapterInfo, CaOpener, CaRegistry, Clock};
+use ms_ca_drivers::en50221::{AdapterInfo, CaOpener, CaRegistry, Clock, InitResult};
 use ms_config::Options;
 
 /// `DEFAULT_CA_PMT` (ca.h:11).
@@ -365,6 +365,9 @@ struct Worker {
     usable: BTreeSet<usize>,
     /// Last `DeviceView` sent per device.
     views: BTreeMap<usize, DeviceView>,
+    /// `d->linked_adapter`: the adapter each enigma2 CI is routed to; C++
+    /// zero-allocates the device, so a CI starts linked to adapter 0.
+    linked: BTreeMap<usize, i32>,
     notices: Sender<Notice>,
     next_timer: i64,
 }
@@ -399,6 +402,7 @@ impl Worker {
             adapters: BTreeMap::new(),
             usable: BTreeSet::new(),
             views: BTreeMap::new(),
+            linked: BTreeMap::new(),
             notices,
             next_timer: 0,
         }
@@ -423,7 +427,17 @@ impl Worker {
                 };
                 self.adapters.insert(id, info);
                 // A Retry leaves the slot enabled for the reconnect poller.
-                let _ = self.registry.init_dev(&info, self.opener.as_mut());
+                let result = self.registry.init_dev(&info, self.opener.as_mut());
+                // ca.cpp:3936-3941: on enigma2 an adapter without its own CI
+                // uses the registered ones, routed to it per PMT.
+                let own_ci = self.registry.get(info.id).is_some_and(CiDevice::has_link);
+                if matches!(result, InitResult::Ok)
+                    && self.registry.enigma
+                    && !own_ci
+                    && self.usable.insert(id)
+                {
+                    let _ = self.notices.send(Notice::Usable(id));
+                }
             }
             Request::AddPmt {
                 program,
@@ -433,9 +447,12 @@ impl Worker {
                 let _ = reply.send(self.add_pmt(*program, update));
             }
             Request::DelPmt { adapter, pmt_id } => {
+                // get_capmt_for_pmt: the CI holding the PMT, which on enigma2
+                // need not be the adapter's own.
+                let device = self.device_with_pmt(pmt_id).unwrap_or(adapter);
                 if let (Some(capmt), Some(dev)) = (
-                    self.capmt.get_mut(&adapter),
-                    self.registry.get_mut(adapter as i32),
+                    self.capmt.get_mut(&device),
+                    self.registry.get_mut(device as i32),
                 ) {
                     capmt.del_pmt(pmt_id, &self.programs, &mut SlotDriver(dev));
                 }
@@ -446,21 +463,138 @@ impl Worker {
         }
     }
 
-    /// `dvbca_process_pmt` without the enigma CI routing (DEV-214).
+    /// `dvbca_process_pmt` (ca.cpp:1232-1280). On enigma2 the CI is the one
+    /// whose CAIDs match, routed to the PMT's adapter first.
     fn add_pmt(&mut self, program: Program, update: bool) -> TablesResult {
         let adapter = usize::from(program.adapter);
         let pmt_id = program.id;
-        let Some(dev) = self.registry.get_mut(adapter as i32) else {
-            return TablesResult::NoRetry;
-        };
-        let Some(capmt) = self.capmt.get_mut(&adapter) else {
+        let mut device = adapter;
+        // None: the CI was not moved for this call (`prev_linked == -2`).
+        let mut prev_linked = None;
+        if self.registry.enigma {
+            let Some(found) = self.find_dvbca_for_pmt(&program) else {
+                return if self.any_ca_initializing() {
+                    TablesResult::Retry
+                } else {
+                    TablesResult::NoRetry
+                };
+            };
+            device = found;
+            let linked = self.linked.get(&device).copied().unwrap_or(0);
+            prev_linked = Some(linked);
+            // Detach the CI from the previous adapter.
+            if linked != adapter as i32 {
+                self.set_tuner_input(-1, linked);
+            }
+            self.set_tuner_input(device as i32, adapter as i32);
+            self.set_input_ci(device, adapter as i32);
+            self.linked.insert(device, adapter as i32);
+        }
+        let (Some(dev), Some(capmt)) = (
+            self.registry.get_mut(device as i32),
+            self.capmt.get_mut(&device),
+        ) else {
             return TablesResult::NoRetry;
         };
         if dev.state != CaState::Initialized {
+            self.restore_ci_link(device, adapter as i32, prev_linked);
+            ms_log::log!("CAM not yet initialized");
             return TablesResult::Retry;
         }
         self.programs.insert(program);
-        capmt.process_pmt(pmt_id, update, &self.programs, &mut SlotDriver(dev))
+        let result = capmt.process_pmt(pmt_id, update, &self.programs, &mut SlotDriver(dev));
+        // ca.cpp:1265,1276: a PMT that found no place puts the CI back.
+        if result == TablesResult::Retry && capmt.slot_of(pmt_id).is_none() {
+            self.restore_ci_link(device, adapter as i32, prev_linked);
+        }
+        result
+    }
+
+    /// `find_dvbca_for_pmt` (ca.cpp:1186): the first initialised CI with a
+    /// CAID that matches the program.
+    fn find_dvbca_for_pmt(&self, program: &Program) -> Option<usize> {
+        self.capmt.iter().find_map(|(id, capmt)| {
+            let ready = self
+                .registry
+                .get(*id as i32)
+                .is_some_and(|dev| dev.state == CaState::Initialized);
+            let matched = capmt
+                .caid_filter
+                .iter()
+                .any(|(caid, mask)| program.match_caid(*caid, *mask));
+            (ready && matched).then(|| {
+                ms_log::log!("Found CA {} for PMT {}", id, program.id);
+                *id
+            })
+        })
+    }
+
+    /// `any_ca_initializing`: an enabled CI that has not finished its init.
+    fn any_ca_initializing(&self) -> bool {
+        self.adapters.keys().any(|id| {
+            self.registry
+                .get(*id as i32)
+                .is_some_and(|dev| dev.enabled && dev.state != CaState::Initialized)
+        })
+    }
+
+    /// The initialised CI whose CAPMT slots hold `pmt_id` (`get_capmt_for_pmt`).
+    fn device_with_pmt(&self, pmt_id: i32) -> Option<usize> {
+        self.capmt.iter().find_map(|(id, capmt)| {
+            let ready = self
+                .registry
+                .get(*id as i32)
+                .is_some_and(|dev| dev.enabled && dev.state == CaState::Initialized);
+            (ready && capmt.slot_of(pmt_id).is_some()).then_some(*id)
+        })
+    }
+
+    /// `restore_ci_link` (ca.cpp:1216): routes the CI back to the adapter it
+    /// served before this call.
+    fn restore_ci_link(&mut self, device: usize, adapter: i32, prev_linked: Option<i32>) {
+        let Some(prev) = prev_linked.filter(|prev| *prev != adapter) else {
+            return;
+        };
+        self.set_tuner_input(-1, adapter);
+        if prev < 0 {
+            self.linked.insert(device, -1);
+            return;
+        }
+        self.set_tuner_input(device as i32, prev);
+        self.set_input_ci(device, prev);
+        self.linked.insert(device, prev);
+    }
+
+    /// `set_input_ci` (ca.cpp:1141): the CI reads from the adapter's tuner.
+    fn set_input_ci(&mut self, ci: usize, adapter: i32) {
+        let filename = format!("/proc/stb/tsmux/ci{ci}_input");
+        let value = [b'A'.wrapping_add(adapter as u8)];
+        ms_log::log!("set_input_ci: {} -> {}", filename, char::from(value[0]));
+        if self.opener.write_file(&filename, &value).is_err() {
+            ms_log::log!("set_input_ci open failed, {}", filename);
+        }
+    }
+
+    /// `set_tuner_input` (ca.cpp:1155): the adapter reads through the CI, or
+    /// straight from its tuner when `ci` is -1.
+    fn set_tuner_input(&mut self, ci: i32, adapter: i32) {
+        if adapter == -1 {
+            return;
+        }
+        let value = if ci == -1 {
+            vec![b'A'.wrapping_add(adapter as u8)]
+        } else {
+            format!("CI{ci}").into_bytes()
+        };
+        let filename = format!("/proc/stb/tsmux/input{adapter}");
+        ms_log::log!(
+            "set_tuner_input: {} -> {}",
+            filename,
+            String::from_utf8_lossy(&value)
+        );
+        if self.opener.write_file(&filename, &value).is_err() {
+            ms_log::log!("set_tuner_input:  open failed, {}", filename);
+        }
     }
 
     /// Reads the CAMs, runs the 1 s timers and forwards host events.
@@ -757,6 +891,159 @@ mod tests {
             .map(|p| p.number())
             .collect();
         assert_eq!(programs, [0x64]);
+    }
+
+    /// Records the host control files the worker writes; no CI device opens.
+    struct ProcLog(Arc<Mutex<Vec<(String, String)>>>);
+
+    impl CaOpener for ProcLog {
+        fn open(&mut self, _: &str) -> io::Result<Box<dyn CaLink>> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+
+        fn write_file(&mut self, path: &str, value: &[u8]) -> io::Result<()> {
+            let value = String::from_utf8_lossy(value).into_owned();
+            self.0.lock().unwrap().push((path.to_owned(), value));
+            Ok(())
+        }
+    }
+
+    type Writes = Arc<Mutex<Vec<(String, String)>>>;
+
+    fn enigma_worker() -> (Worker, Writes, Receiver<Notice>) {
+        let writes = Writes::default();
+        let (tx, rx) = mpsc::channel();
+        let opts = Options {
+            enigma: true,
+            ..Options::default()
+        };
+        let worker = Worker::new(
+            DvbcaSettings::from_options(&opts),
+            Box::new(ProcLog(Arc::clone(&writes))),
+            Arc::new(ManualClock::new(0, 0)),
+            tx,
+        );
+        (worker, writes, rx)
+    }
+
+    /// An initialised CI on `id` that reported `caid`, but with no CA session.
+    fn ready_ci(worker: &mut Worker, id: usize, caid: u16) {
+        let dev = worker.registry.device(id);
+        dev.enabled = true;
+        dev.state = CaState::Initialized;
+        let mut capmt = ms_ca::CaDevice::new(id as i32, 1, 0);
+        capmt.state = ms_ca::CaState::Initialized;
+        capmt.caid_filter = vec![(caid, 0xFFFF)];
+        worker.capmt.insert(id, capmt);
+        worker
+            .adapters
+            .insert(id, AdapterInfo::dvb(id as i32, 0, id as u32));
+    }
+
+    fn program_on(adapter: u16, caid: u16) -> Program {
+        let mut program = program_from_service(&service(caid));
+        program.adapter = adapter;
+        program
+    }
+
+    fn pairs(writes: &Writes) -> Vec<(String, String)> {
+        std::mem::take(&mut *writes.lock().unwrap())
+    }
+
+    fn proc(name: &str, value: &str) -> (String, String) {
+        (format!("/proc/stb/tsmux/{name}"), value.to_owned())
+    }
+
+    // ca.cpp:1238-1256 and 1216-1227: the matching CI is routed to the PMT's
+    // adapter, detached from the previous one, and put back when the PMT
+    // finds no place.
+    #[test]
+    fn enigma_routes_the_matching_ci_and_restores_it_on_failure() {
+        let (mut worker, writes, _rx) = enigma_worker();
+        ready_ci(&mut worker, 0, 0x0604);
+        // A new CI starts linked to adapter 0 (alloc_ca_device zeroes it).
+        // ca.cpp:1276: the only CAPMT slot is taken, so the PMT finds no place.
+        worker.capmt.get_mut(&0).unwrap().capmt[0].pmt_id = 99;
+        assert_eq!(
+            worker.add_pmt(program_on(3, 0x0604), false),
+            TablesResult::Retry
+        );
+        assert_eq!(
+            pairs(&writes),
+            [
+                proc("input0", "A"),
+                proc("input3", "CI0"),
+                proc("ci0_input", "D"),
+                proc("input3", "D"),
+                proc("input0", "CI0"),
+                proc("ci0_input", "A"),
+            ]
+        );
+        assert_eq!(worker.linked.get(&0), Some(&0));
+
+        // A free slot but no CA session: the failed first send also restores.
+        worker.capmt.get_mut(&0).unwrap().capmt[0].pmt_id = -1;
+        worker.linked.insert(0, 5);
+        assert_eq!(
+            worker.add_pmt(program_on(3, 0x0604), false),
+            TablesResult::Retry
+        );
+        assert_eq!(worker.capmt[&0].slot_of(3), None);
+        assert_eq!(
+            pairs(&writes),
+            [
+                proc("input5", "F"),
+                proc("input3", "CI0"),
+                proc("ci0_input", "D"),
+                proc("input3", "D"),
+                proc("input5", "CI0"),
+                proc("ci0_input", "F"),
+            ]
+        );
+        assert_eq!(worker.linked.get(&0), Some(&5));
+    }
+
+    // find_dvbca_for_pmt / any_ca_initializing: no matching CI is final unless
+    // another CI is still starting.
+    #[test]
+    fn enigma_without_a_matching_ci_retries_only_while_one_initialises() {
+        let (mut worker, writes, _rx) = enigma_worker();
+        ready_ci(&mut worker, 0, 0x0604);
+        assert_eq!(
+            worker.add_pmt(program_on(3, 0x0100), false),
+            TablesResult::NoRetry
+        );
+        let starting = worker.registry.device(1);
+        starting.enabled = true;
+        worker.adapters.insert(1, AdapterInfo::dvb(1, 0, 1));
+        assert_eq!(
+            worker.add_pmt(program_on(3, 0x0100), false),
+            TablesResult::Retry
+        );
+        assert!(pairs(&writes).is_empty(), "no CI, no routing");
+    }
+
+    // ca.cpp:3936-3941: with a CI registered, an adapter without its own CI
+    // device is enabled for the CA.
+    #[test]
+    fn enigma_adapters_without_a_ci_use_the_registered_ones() {
+        let (mut worker, _writes, rx) = enigma_worker();
+        worker.handle(Request::Init(AdapterInfo::dvb(4, 0, 4)));
+        assert!(rx.try_recv().is_err(), "no CI registered yet");
+        worker.registry.has_ci = true;
+        worker.handle(Request::Init(AdapterInfo::dvb(5, 0, 5)));
+        assert_eq!(rx.try_recv().ok(), Some(Notice::Usable(5)));
+    }
+
+    // get_capmt_for_pmt: a PMT is found on whichever initialised CI holds it.
+    #[test]
+    fn a_pmt_is_found_on_the_ci_that_holds_it() {
+        let (mut worker, _writes, _rx) = enigma_worker();
+        ready_ci(&mut worker, 0, 0x0604);
+        ready_ci(&mut worker, 2, 0x0B00);
+        worker.capmt.get_mut(&2).unwrap().capmt[0].pmt_id = 7;
+        assert_eq!(worker.device_with_pmt(7), Some(2));
+        assert_eq!(worker.device_with_pmt(8), None);
     }
 
     #[test]
