@@ -56,6 +56,8 @@ impl CaLink for CamLink {
 
 struct CamOpener {
     cam: Arc<Mutex<FakeCam>>,
+    /// `/etc/ssl/certs/root.pem` present.
+    root_cert: bool,
 }
 
 impl CaOpener for CamOpener {
@@ -67,7 +69,7 @@ impl CaOpener for CamOpener {
     }
 
     fn has_ciplus_root_cert(&self) -> bool {
-        false
+        self.root_cert
     }
 }
 
@@ -198,6 +200,41 @@ fn force_ci_host_profile_stops_before_ci_plus() {
     assert_eq!(profile.len(), 6 * 4, "CI profile only");
 }
 
+// DEV-151: with CI+ certificates present the slot still runs plain CI, so
+// the host profile stops before the CI+ resources.
+#[test]
+fn force_ci_with_root_cert_still_stops_before_ci_plus() {
+    let cam = Arc::new(Mutex::new(FakeCam::new(
+        CamConfig::default(),
+        Arc::new(ms_fakecam::ManualClock::new(0)),
+    )));
+    let mut reg = CaRegistry::new(Arc::new(ManualClock::new(0, UNIX)));
+    let mut opener = CamOpener {
+        cam: Arc::clone(&cam),
+        root_cert: true,
+    };
+    assert_eq!(
+        reg.init_dev(&AdapterInfo::dvb(0, 0, 0), &mut opener),
+        InitResult::Ok
+    );
+    let dev = reg.get_mut(0).expect("device allocated");
+    assert!(dev.force_ci, "plain CI is forced");
+    assert!(dev.service(), "the link stays up");
+    assert_eq!(dev.state, CaState::Initialized);
+    let cam = cam.lock().unwrap();
+    let expected: Vec<u32> = APPLICATION_HANDLERS[..6]
+        .iter()
+        .map(|h| h.resource)
+        .collect();
+    assert_eq!(cam.host_resources(), expected);
+    let profile = host_apdus(&cam)
+        .into_iter()
+        .find(|(tag, _)| *tag == TAG_PROFILE)
+        .expect("profile reply")
+        .1;
+    assert_eq!(profile.len(), 6 * 4, "EN 50221 resources only");
+}
+
 #[test]
 fn refused_resource_is_logged_by_the_fake_cam() {
     let bad = TS103205_APP_MMI_RESOURCEID;
@@ -227,6 +264,7 @@ fn registry_init_dev_drives_the_fake_cam() {
     let mut reg = CaRegistry::new(Arc::new(clock));
     let mut opener = CamOpener {
         cam: Arc::clone(&cam),
+        root_cert: false,
     };
     assert_eq!(
         reg.init_dev(&AdapterInfo::dvb(0, 0, 0), &mut opener),

@@ -10,6 +10,7 @@ hardware must be called out in release notes.
 | Multi-CAM | — | fake CAM only | `ms-fakecam` provides N instances from M1 onwards. |
 | DVBAPI / oscam | — | fake oscam only | No oscam on the box; diffed against a fake oscam socket only. |
 | Unicable/JESS | — | tests + external testers | Needs external hardware to validate. |
+| CI+ CAM in CI-compatible mode | user's box | real: Smit Irdeto CAM on a DuoFlex CI | Plain CI is forced on every slot (DEV-151), so the CAM runs as a CI CAM. |
 | CI+ | — | external testers | Feature-gated and experimental until validated. |
 | SAT>IP client | TBD | real server if available | Backend lands in M8. |
 | Netceiver, hw descrambler, Enigma2 | — | tests only | Unvalidated; must be flagged in release notes. Netceiver is parked (PLAN §3) and not part of the binary. |

@@ -236,9 +236,9 @@ with printf conversion translated to the equivalent Rust formatting.
 | 3921 | LOG_AND_RETURN | No CA device detected on adapter %d: enabling already registered CAs | crates/ms-ca-drivers/src/en50221/registry.rs:121 |
 | 3926 | LOG_AND_RETURN | No CA device detected on adapter %d: file %s | crates/ms-ca-drivers/src/en50221/registry.rs:128 |
 | 3935 | LOG_AND_RETURN | Could not allocate memory for CA device %d | n/a: no Rust malloc fallback |
-| 3972 | LOG | CA %d: no module in slot, deferring init | crates/ms-ca-drivers/src/en50221/registry.rs:158 |
+| 3972 | LOG | CA %d: no module in slot, deferring init | crates/ms-ca-drivers/src/en50221/registry.rs:166 |
 | 4023 | LOG | PMT %d, pid %d was added, invalidating pmt | n/a: DvbcaSink has no add_pid hook |
-| 4050 | LOG | Trying to reconnect to CA %d | crates/ms-ca-drivers/src/en50221/registry.rs:203 |
+| 4050 | LOG | Trying to reconnect to CA %d | crates/ms-ca-drivers/src/en50221/registry.rs:211 |
 | 4120 | LOG | Forcing CA %d to CI | crates/ms-config/src/parse.rs:1419 |
 | 4146 | LOG | Setting CA %d pin to %s | crates/ms-config/src/parse.rs:1407 |
 | 4185 | LOG | Forcing CA %d to use maximum %d CAPMTs with %d PMTs each | crates/ms-config/src/parse.rs:1441 |
