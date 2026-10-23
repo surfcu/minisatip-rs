@@ -71,6 +71,7 @@ fn frontend(adapter: u32, path_adapter: u32, path_frontend: u32) -> DvbFrontend 
         path_frontend,
         name: String::new(),
         systems: Vec::new(),
+        fbc: false,
     }
 }
 
@@ -100,6 +101,7 @@ fn two_adapters_with_two_frontends_mixed_s2_and_t2() {
             path_frontend: 0,
             name: "S2-0".to_owned(),
             systems: vec![DeliverySystem::DvbS2, DeliverySystem::DvbS],
+            fbc: false,
         }
     );
     assert_eq!(
@@ -110,6 +112,7 @@ fn two_adapters_with_two_frontends_mixed_s2_and_t2() {
             path_frontend: 1,
             name: "S2-1".to_owned(),
             systems: vec![DeliverySystem::DvbS2, DeliverySystem::DvbS],
+            fbc: false,
         }
     );
     assert_eq!(
@@ -120,6 +123,7 @@ fn two_adapters_with_two_frontends_mixed_s2_and_t2() {
             path_frontend: 0,
             name: "T2-0".to_owned(),
             systems: vec![DeliverySystem::DvbT2, DeliverySystem::DvbT],
+            fbc: false,
         }
     );
     assert_eq!(
@@ -130,6 +134,7 @@ fn two_adapters_with_two_frontends_mixed_s2_and_t2() {
             path_frontend: 1,
             name: "T2-1".to_owned(),
             systems: vec![DeliverySystem::DvbT2, DeliverySystem::DvbT],
+            fbc: false,
         }
     );
 }
@@ -258,4 +263,24 @@ fn delivery_system_numbers_match_the_kernel() {
         delivery_system_from_number(999),
         Some(DeliverySystem::Other(999))
     );
+}
+
+// dvb.cpp:2442-2446: only adapter 0 frontends with a writable fbc_connect
+// are FBC tuners.
+#[test]
+fn fbc_frontends_are_marked() {
+    let mut tree = FakeTree::default()
+        .with_frontend(0, 0)
+        .with_frontend(0, 1)
+        .with_frontend(1, 0);
+    tree.writable
+        .insert("/proc/stb/frontend/1/fbc_connect".to_owned());
+    tree.writable
+        .insert("/proc/stb/frontend/0/fbc_connect".to_owned());
+    let found = enumerate(&tree, &FakeProbe::default());
+    let fbc: Vec<(u32, u32, bool)> = found
+        .iter()
+        .map(|f| (f.path_adapter, f.path_frontend, f.fbc))
+        .collect();
+    assert_eq!(fbc, [(0, 0, true), (0, 1, true), (1, 0, false)]);
 }

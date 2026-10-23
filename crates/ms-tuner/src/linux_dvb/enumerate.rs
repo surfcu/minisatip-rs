@@ -76,6 +76,8 @@ pub struct DvbFrontend {
     pub name: String,
     /// Detected delivery systems.
     pub systems: Vec<DeliverySystem>,
+    /// Writable `/proc/stb/frontend/M/fbc_connect` on adapter 0 (`is_fbc`).
+    pub fbc: bool,
 }
 
 /// Discovers DVB frontends in `find_dvb_adapter` order (dvb.cpp:2373).
@@ -109,12 +111,15 @@ pub fn enumerate(tree: &dyn DeviceTree, probe: &dyn FrontendProbe) -> Vec<DvbFro
                 path_adapter,
                 path_frontend
             );
+            let fbc = path_adapter == 0
+                && tree.writable(&format!("/proc/stb/frontend/{path_frontend}/fbc_connect"));
             found.push(DvbFrontend {
                 adapter: found.len() as u32,
                 path_adapter,
                 path_frontend,
                 name: probed.name,
                 systems: probed.systems,
+                fbc,
             });
         }
     }

@@ -29,6 +29,8 @@ pub struct DvbcaSettings {
     force_ci: BTreeSet<usize>,
     /// `(max_ca_pmt, multiple_pmt, forced caids)`.
     channels: BTreeMap<usize, (usize, usize, Vec<u16>)>,
+    /// `opts.enigma`: `/dev/ciN` with bare SPDUs.
+    enigma: bool,
 }
 
 impl DvbcaSettings {
@@ -53,6 +55,7 @@ impl DvbcaSettings {
                 ),
             );
         }
+        settings.enigma = opts.enigma;
         settings
     }
 
@@ -374,6 +377,7 @@ impl Worker {
         notices: Sender<Notice>,
     ) -> Self {
         let mut registry = CaRegistry::new(Arc::clone(&clock));
+        registry.enigma = settings.enigma;
         for (id, pin) in &settings.pins {
             registry.device(*id).set_pin(pin.as_bytes());
         }
@@ -574,6 +578,39 @@ mod tests {
     use std::io;
     use std::rc::Rc;
     use std::sync::Mutex;
+
+    // ca.cpp:3932-3934: with opts.enigma the worker opens /dev/ciN, the
+    // adapter id, instead of /dev/dvb/adapterN/caM.
+    #[test]
+    fn the_registry_follows_opts_enigma() {
+        struct Paths(Arc<Mutex<Vec<String>>>);
+        impl CaOpener for Paths {
+            fn open(&mut self, path: &str) -> io::Result<Box<dyn CaLink>> {
+                self.0.lock().unwrap().push(path.to_owned());
+                Err(io::ErrorKind::NotFound.into())
+            }
+        }
+        for (enigma, expected) in [(false, "/dev/dvb/adapter1/ca2"), (true, "/dev/ci3")] {
+            let opts = Options {
+                enigma,
+                ..Options::default()
+            };
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let dvbca = Dvbca::spawn(
+                DvbcaSettings::from_options(&opts),
+                Box::new(Paths(Arc::clone(&paths))),
+                Arc::new(ManualClock::new(0, 0)),
+            )
+            .unwrap();
+            dvbca.init_dev(AdapterInfo::dvb(3, 1, 2));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while paths.lock().unwrap().is_empty() {
+                assert!(std::time::Instant::now() < deadline, "no open");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(paths.lock().unwrap()[0], expected);
+        }
+    }
     use std::time::Instant;
 
     /// A CI slot whose CAM is an `ms-fakecam` instance.

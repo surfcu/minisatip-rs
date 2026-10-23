@@ -175,8 +175,10 @@ pub trait DvbDevice: SecDevice {
     fn demux_stop(&mut self, fd: DemuxFd) -> io::Result<()>;
     /// `DMX_SET_BUFFER_SIZE`.
     fn set_buffer_size(&mut self, fd: DemuxFd, size: i32) -> io::Result<()>;
-    /// Opens `demuxN`, issues `DMX_SET_SOURCE` and closes it again.
-    fn set_demux_source(&mut self, source: i32) -> io::Result<()>;
+    /// `DMX_SET_SOURCE` on an open demux fd.
+    fn set_demux_source(&mut self, fd: DemuxFd, source: i32) -> io::Result<()>;
+    /// Writes `val` to `/proc/stb/frontend/<frontend>/<name>` (`set_proc_data`).
+    fn set_proc_data(&mut self, frontend: i32, name: &str, val: i32) -> io::Result<()>;
     /// Reads TS bytes from the stream fd.
     fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize>;
     /// Monotonic milliseconds (`getTick`).

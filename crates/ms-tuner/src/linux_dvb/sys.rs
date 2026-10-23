@@ -526,13 +526,16 @@ impl DvbDevice for LinuxDvbDevice {
         )
     }
 
-    fn set_demux_source(&mut self, source: i32) -> io::Result<()> {
-        let demux_path = path(DEV_DEMUX, self.adapter, self.frontend);
-        let fd = open_path(&demux_path, libc::O_RDWR | libc::O_NONBLOCK)?;
+    fn set_demux_source(&mut self, fd: DemuxFd, source: i32) -> io::Result<()> {
         let mut value = source;
-        let result = ioctl_ptr(fd, NATIVE_IOCTLS.dmx_set_source, &mut value);
-        close_fd(fd);
-        result
+        ioctl_ptr(fd.0 as i32, NATIVE_IOCTLS.dmx_set_source, &mut value)
+    }
+
+    fn set_proc_data(&mut self, frontend: i32, name: &str, val: i32) -> io::Result<()> {
+        std::fs::write(
+            format!("/proc/stb/frontend/{frontend}/{name}"),
+            val.to_string(),
+        )
     }
 
     fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize> {

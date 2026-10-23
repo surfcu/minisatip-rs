@@ -183,7 +183,11 @@ impl DvbDevice for SharedDevice {
         Ok(())
     }
 
-    fn set_demux_source(&mut self, _source: i32) -> io::Result<()> {
+    fn set_demux_source(&mut self, _fd: DemuxFd, _source: i32) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_proc_data(&mut self, _frontend: i32, _name: &str, _val: i32) -> io::Result<()> {
         Ok(())
     }
 

@@ -1747,6 +1747,14 @@ fn spawn_dvb_adapters(
                 Ok(mut tuner) => {
                     tuner.state_mut().pa = frontend.path_adapter as i32;
                     tuner.state_mut().fn_num = frontend.path_frontend as i32;
+                    // adapter.cpp:300: enigma2 sources each demux from its frontend.
+                    let dmx_source = if opts.enigma {
+                        frontend.path_frontend as i32
+                    } else {
+                        -1
+                    };
+                    let master = slave_masters(opts)[aid].map_or(-1, |master| master as i32);
+                    tuner.post_open(frontend.fbc, master, dmx_source);
                     apply_tuner_options(opts, aid, &diseqc, &mut tuner);
                     ca.set_hw_node(
                         aid,

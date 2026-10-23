@@ -34,7 +34,8 @@ enum Call {
     RemovePid(DemuxFd, u16),
     DemuxStop(DemuxFd),
     SetBufferSize(DemuxFd, i32),
-    SetDemuxSource(i32),
+    SetDemuxSource(DemuxFd, i32),
+    SetProcData(i32, String, i32),
 }
 
 struct FakeDevice {
@@ -293,8 +294,14 @@ impl DvbDevice for FakeDevice {
         Ok(())
     }
 
-    fn set_demux_source(&mut self, source: i32) -> io::Result<()> {
-        self.calls.push(Call::SetDemuxSource(source));
+    fn set_demux_source(&mut self, fd: DemuxFd, source: i32) -> io::Result<()> {
+        self.calls.push(Call::SetDemuxSource(fd, source));
+        Ok(())
+    }
+
+    fn set_proc_data(&mut self, frontend: i32, name: &str, val: i32) -> io::Result<()> {
+        self.calls
+            .push(Call::SetProcData(frontend, name.to_owned(), val));
         Ok(())
     }
 
@@ -1761,4 +1768,40 @@ fn snr_calibration_names_match_enigma2() {
     assert_eq!(snr_calibration("BCM45308"), SnrCalib::BcmFbc);
     assert_eq!(snr_calibration("NIM(45308X FBC)"), SnrCalib::NimFbc);
     assert_eq!(snr_calibration("Mock FE"), SnrCalib::None);
+}
+
+// dvb.cpp:931-944 and adapter.cpp:300: FBC links on open, then the enigma2
+// DMX_SET_SOURCE to the frontend number.
+#[test]
+fn post_open_links_fbc_and_sets_the_demux_source() {
+    let proc_data =
+        |frontend: i32, name: &str, val: i32| Call::SetProcData(frontend, name.to_owned(), val);
+    let mut state = backend_state();
+    state.fn_num = 2;
+    let mut tuner = LinuxDvbTuner::with_device(FakeDevice::new(), state.clone());
+    tuner.device_mut().calls.clear();
+    tuner.post_open(true, -1, 2);
+    assert_eq!(
+        tuner.device().calls,
+        [
+            proc_data(2, "fbc_link", 0),
+            proc_data(2, "fbc_connect", 2),
+            Call::OpenDemux,
+            Call::SetDemuxSource(DemuxFd(100), 2),
+            Call::CloseDemux(DemuxFd(100)),
+        ]
+    );
+
+    let mut tuner = LinuxDvbTuner::with_device(FakeDevice::new(), state);
+    tuner.device_mut().calls.clear();
+    tuner.post_open(true, 0, -1);
+    assert_eq!(
+        tuner.device().calls,
+        [proc_data(2, "fbc_link", 1), proc_data(2, "fbc_connect", 0)]
+    );
+
+    let mut tuner = LinuxDvbTuner::with_device(FakeDevice::new(), backend_state());
+    tuner.device_mut().calls.clear();
+    tuner.post_open(false, -1, -1);
+    assert!(tuner.device().calls.is_empty());
 }
