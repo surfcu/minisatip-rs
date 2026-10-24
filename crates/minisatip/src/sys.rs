@@ -3,6 +3,11 @@
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
+#[cfg_attr(not(target_env = "musl"), allow(unused_imports))]
+use std::io::Write;
+use std::os::unix::net::UnixDatagram;
+use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ms_log::{Backend, Timestamp};
@@ -13,6 +18,18 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// can close it before its descriptor sweep and the next line reopens it
 /// with the C++ options (`minisatip.cpp:1919-1923`).
 static SYSLOG_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// glibc's default syslog socket (`_PATH_LOG`).
+#[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+const SYSLOG_PATH: &str = "/dev/log";
+
+/// `LOG_DAEMON | LOG_NOTICE`, the PRI the C++ `syslog(LOG_NOTICE, ...)` emits.
+#[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+const SYSLOG_PRI: u8 = (libc::LOG_DAEMON | libc::LOG_NOTICE) as u8;
+
+/// musl's `syslog` uses UTC; this keeps the socket glibc would keep open.
+#[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+static SYSLOG_SOCKET: Mutex<Option<UnixDatagram>> = Mutex::new(None);
 
 /// C++ `app_name` (`minisatip.cpp:78`).
 const APP_NAME: &str = "minisatip";
@@ -136,8 +153,15 @@ pub fn become_daemon(log_file: &str) -> Result<(), String> {
     // Drop the syslog socket before the sweep closes it behind libc's back;
     // the next syslog line reopens it (C++ opens syslog after daemonising).
     if SYSLOG_OPEN.swap(false, Ordering::SeqCst) {
-        // SAFETY: closelog(3) has no preconditions.
-        unsafe { libc::closelog() };
+        #[cfg(target_env = "musl")]
+        {
+            syslog_close(&SYSLOG_SOCKET);
+        }
+        #[cfg(not(target_env = "musl"))]
+        {
+            // SAFETY: closelog(3) has no preconditions.
+            unsafe { libc::closelog() };
+        }
     }
 
     // SAFETY: sysconf only reads the descriptor limit.
@@ -160,7 +184,7 @@ pub fn become_daemon(log_file: &str) -> Result<(), String> {
         return Err("cannot open /dev/null as stdin".to_owned());
     }
 
-    let Ok(path) = std::ffi::CString::new(log_file) else {
+    let Ok(path) = CString::new(log_file) else {
         return Err("invalid log file name".to_owned());
     };
     let flags = if std::fs::metadata(log_file).is_ok() {
@@ -219,9 +243,8 @@ fn kill_previous_instance() {
 /// The real backend: local time through `localtime_r` and lines through
 /// syslog when `-g` is active.
 ///
-/// `openlog` runs lazily on the first syslog line, and again after
-/// `become_daemon` closed it (C++ opens it in `main` after daemonising,
-/// `minisatip.cpp:1919-1923`).
+/// On musl, lines go straight to /dev/log; otherwise `openlog` runs lazily,
+/// and again after `become_daemon` closed it (minisatip.cpp:1919-1923).
 pub struct SysLogBackend {
     perror: bool,
 }
@@ -257,30 +280,110 @@ pub fn local_timestamp() -> Timestamp {
     )
 }
 
+/// Formats one line as glibc's `syslog` does:
+/// `<PRI>Mmm dd HH:MM:SS minisatip[PID]: MESSAGE`.
+#[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn syslog_line(
+    pri: u8,
+    month: u32,
+    day: u32,
+    hour: u32,
+    min: u32,
+    sec: u32,
+    pid: u32,
+    message: &str,
+) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS[(month.clamp(1, 12) - 1) as usize];
+    let message: String = message.chars().filter(|c| *c != '\0').collect();
+    format!("<{pri}>{month} {day:>2} {hour:02}:{min:02}:{sec:02} {APP_NAME}[{pid}]: {message}")
+}
+
+/// Sends one datagram, connecting lazily and reconnecting once on failure.
+#[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+fn syslog_send(path: &Path, state: &Mutex<Option<UnixDatagram>>, line: &[u8]) {
+    let mut socket = state.lock().unwrap_or_else(|error| error.into_inner());
+    if socket.is_none() {
+        *socket = syslog_connect(path);
+    }
+    if socket.as_ref().is_some_and(|s| s.send(line).is_ok()) {
+        return;
+    }
+    // glibc reconnects once; without LOG_CONS a second failure drops the line.
+    *socket = syslog_connect(path);
+    if let Some(socket) = socket.as_ref() {
+        let _ = socket.send(line);
+    }
+}
+
+#[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+fn syslog_connect(path: &Path) -> Option<UnixDatagram> {
+    let socket = UnixDatagram::unbound().ok()?;
+    socket.connect(path).ok()?;
+    Some(socket)
+}
+
+#[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+fn syslog_close(state: &Mutex<Option<UnixDatagram>>) {
+    *state.lock().unwrap_or_else(|error| error.into_inner()) = None;
+}
+
 impl Backend for SysLogBackend {
     fn timestamp(&self) -> Timestamp {
         local_timestamp()
     }
 
     fn syslog(&self, line: &str) {
-        if !SYSLOG_OPEN.swap(true, Ordering::SeqCst) {
-            let options = libc::LOG_NDELAY
-                | libc::LOG_NOWAIT
-                | libc::LOG_PID
-                | if self.perror { libc::LOG_PERROR } else { 0 };
-            // SAFETY: the identifier is a static NUL-terminated C string;
-            // openlog keeps the pointer, which stays valid for the process.
-            unsafe { libc::openlog(c"minisatip".as_ptr(), options, libc::LOG_DAEMON) };
-        }
         // C++ passes the line to "%s", which stops at a NUL; strip any so the
         // whole line reaches syslog.
-        let clean: String = line.chars().filter(|c| *c != '\0').collect();
-        let Ok(message) = CString::new(clean) else {
-            return;
-        };
-        // SAFETY: "%s" is a static NUL-terminated format string and `message`
-        // is NUL-terminated; syslog copies both before returning.
-        unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), message.as_ptr()) };
+        #[cfg(target_env = "musl")]
+        {
+            SYSLOG_OPEN.store(true, Ordering::SeqCst);
+            let timestamp = local_timestamp();
+            let text = syslog_line(
+                SYSLOG_PRI,
+                timestamp.month,
+                timestamp.day,
+                timestamp.hour,
+                timestamp.minute,
+                timestamp.second,
+                std::process::id(),
+                line,
+            );
+            if self.perror {
+                // glibc's LOG_PERROR ignores write errors and adds a missing newline.
+                let message: String = line.chars().filter(|c| *c != '\0').collect();
+                let end = if message.ends_with('\n') { "" } else { "\n" };
+                let _ = write!(
+                    std::io::stderr().lock(),
+                    "{APP_NAME}[{}]: {message}{end}",
+                    std::process::id()
+                );
+            }
+            syslog_send(Path::new(SYSLOG_PATH), &SYSLOG_SOCKET, text.as_bytes());
+        }
+        #[cfg(not(target_env = "musl"))]
+        {
+            if !SYSLOG_OPEN.swap(true, Ordering::SeqCst) {
+                let options = libc::LOG_NDELAY
+                    | libc::LOG_NOWAIT
+                    | libc::LOG_PID
+                    | if self.perror { libc::LOG_PERROR } else { 0 };
+                // SAFETY: the identifier is a static NUL-terminated C string;
+                // openlog keeps the pointer, which stays valid for the process.
+                unsafe { libc::openlog(c"minisatip".as_ptr(), options, libc::LOG_DAEMON) };
+            }
+            let clean: String = line.chars().filter(|c| *c != '\0').collect();
+            let Ok(message) = CString::new(clean) else {
+                return;
+            };
+            // SAFETY: "%s" is a static NUL-terminated format string and `message`
+            // is NUL-terminated; syslog copies both before returning.
+            unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), message.as_ptr()) };
+        }
     }
 }
 
@@ -306,7 +409,11 @@ pub fn elapsed_string(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::elapsed_string;
+    use super::{SYSLOG_PRI, elapsed_string, syslog_line, syslog_send};
+    use std::os::unix::net::UnixDatagram;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     #[test]
     fn elapsed_matches_cpp_format() {
@@ -314,5 +421,82 @@ mod tests {
         assert_eq!(elapsed_string(0), "00:00:00");
         assert_eq!(elapsed_string(61), "00:01:01");
         assert_eq!(elapsed_string(3 * 86_400 + 3_661), "3d 01:01:01");
+    }
+
+    #[test]
+    fn syslog_line_pads_like_glibc() {
+        assert_eq!(SYSLOG_PRI, 29);
+        assert_eq!(
+            syslog_line(SYSLOG_PRI, 10, 4, 9, 5, 7, 1234, "hello"),
+            "<29>Oct  4 09:05:07 minisatip[1234]: hello"
+        );
+        assert_eq!(
+            syslog_line(SYSLOG_PRI, 10, 24, 2, 5, 41, 1, "hello"),
+            "<29>Oct 24 02:05:41 minisatip[1]: hello"
+        );
+    }
+
+    #[test]
+    fn syslog_line_names_every_month_and_strips_nul() {
+        let names = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        for (index, name) in names.iter().enumerate() {
+            let line = syslog_line(SYSLOG_PRI, index as u32 + 1, 1, 0, 0, 0, 1, "m");
+            assert!(line.starts_with(&format!("<29>{name} ")), "{line}");
+        }
+        assert_eq!(
+            syslog_line(SYSLOG_PRI, 1, 1, 0, 0, 0, 1, "a\0b\0"),
+            "<29>Jan  1 00:00:00 minisatip[1]: ab"
+        );
+    }
+
+    /// Empty socket directory and listening path for one test.
+    fn temp_socket(name: &str) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("minisatip-syslog-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log");
+        (dir, path)
+    }
+
+    fn receiver(path: &Path) -> UnixDatagram {
+        let socket = UnixDatagram::bind(path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+    }
+
+    #[test]
+    fn syslog_writer_sends_one_datagram() {
+        let (dir, path) = temp_socket("one");
+        let listener = receiver(&path);
+        let state = Mutex::new(None);
+        let line = b"<29>Oct  4 09:05:07 minisatip[42]: hello";
+        syslog_send(&path, &state, line);
+        let mut buffer = [0u8; 128];
+        let len = listener.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], line);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn syslog_writer_reconnects_after_rebind() {
+        let (dir, path) = temp_socket("rebind");
+        let state = Mutex::new(None);
+        let listener = receiver(&path);
+        syslog_send(&path, &state, b"first");
+        let mut buffer = [0u8; 128];
+        let len = listener.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"first");
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        let listener = receiver(&path);
+        syslog_send(&path, &state, b"second");
+        let len = listener.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"second");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
