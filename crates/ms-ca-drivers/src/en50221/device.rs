@@ -8,6 +8,7 @@ use super::link::{
 };
 use super::resources::{Handler, cmd_reply, cmd_tracked, find_handler};
 use std::collections::VecDeque;
+use std::fmt;
 use std::io;
 use std::sync::Arc;
 
@@ -63,6 +64,33 @@ pub enum HostEvent {
         blind: bool,
         answer_len: u8,
     },
+    /// `check_new_key`: a descrambling key and its IV for `parity` (0 even,
+    /// 1 odd). The bytes are never printed.
+    CcKey {
+        parity: u8,
+        key: CcKeyBytes,
+        iv: CcKeyBytes,
+    },
+    /// `disable_cws_for_all_pmts`: stop descrambling until the SAC resyncs.
+    CcDisableCws,
+}
+
+/// AES key or IV carried by [`HostEvent::CcKey`]; zeroed on drop.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CcKeyBytes(pub [u8; 16]);
+
+impl fmt::Debug for CcKeyBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CcKeyBytes(..)")
+    }
+}
+
+impl Drop for CcKeyBytes {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        // Keeps the zeroing from being optimised away.
+        std::hint::black_box(&self.0);
+    }
 }
 
 /// An open session (`ca_session_t`).
@@ -107,6 +135,14 @@ pub struct CaDevice {
     pub(super) pin: Vec<u8>,
     pub key: [[u8; 16]; 2],
     pub iv: [[u8; 16]; 2],
+    /// Key register of the last `check_new_key` (0 even, 1 odd).
+    pub parity: u8,
+    #[cfg(feature = "ci-plus")]
+    pub(crate) cc: Option<Box<super::ciplus::cc::CcState>>,
+    #[cfg(feature = "ci-plus")]
+    pub(super) ciplus_cert_dir: String,
+    #[cfg(feature = "ci-plus")]
+    pub(super) ciplus_cache_dir: String,
     pub datetime_response_interval: u64,
     pub datetime_next_send: i64,
     pub reconnect_next_try: i64,
@@ -140,6 +176,13 @@ impl CaDevice {
             pin: Vec::new(),
             key: [[0; 16]; 2],
             iv: [[0; 16]; 2],
+            parity: 0,
+            #[cfg(feature = "ci-plus")]
+            cc: None,
+            #[cfg(feature = "ci-plus")]
+            ciplus_cert_dir: "/etc/ssl/certs".to_owned(),
+            #[cfg(feature = "ci-plus")]
+            ciplus_cache_dir: "/var/cache/minisatip".to_owned(),
             datetime_response_interval: 0,
             datetime_next_send: 0,
             reconnect_next_try: 0,
@@ -200,6 +243,35 @@ impl CaDevice {
 
     pub fn set_ci_name(&mut self, name: &[u8]) {
         self.ci_name = name[..name.len().min(CI_NAME_MAX)].to_vec();
+        #[cfg(feature = "ci-plus")]
+        if let Some(cc) = self.cc.as_mut() {
+            cc.set_ci_name(self.ci_name.clone());
+        }
+    }
+
+    /// CI+ certificate (`root.pem`, ...) and authdata cache directories.
+    #[cfg(feature = "ci-plus")]
+    pub fn set_ciplus_paths(&mut self, cert_dir: &str, cache_dir: &str) {
+        self.ciplus_cert_dir = cert_dir.to_owned();
+        self.ciplus_cache_dir = cache_dir.to_owned();
+        if let Some(cc) = self.cc.as_mut() {
+            cc.set_paths(self.ciplus_cert_dir.clone(), self.ciplus_cache_dir.clone());
+        }
+    }
+
+    /// `cc_ctrl_data`: created by `CIPLUS_APP_CC_create`, kept over teardown.
+    #[cfg(feature = "ci-plus")]
+    pub(crate) fn cc_state(&mut self) -> &mut super::ciplus::cc::CcState {
+        let cert_dir = self.ciplus_cert_dir.clone();
+        let cache_dir = self.ciplus_cache_dir.clone();
+        let slot = self.id as u32;
+        let ci_name = self.ci_name.clone();
+        let uri_mask = self.uri_mask;
+        self.cc.get_or_insert_with(|| {
+            Box::new(super::ciplus::cc::CcState::new(
+                cert_dir, cache_dir, slot, ci_name, uri_mask,
+            ))
+        })
     }
 
     /// `set_ca_pin`: at most 9 bytes are kept.

@@ -15,6 +15,8 @@ pub mod resources;
 #[cfg(target_os = "linux")]
 pub mod sys;
 
+#[cfg(all(test, feature = "ci-plus"))]
+mod ciplus_tests;
 #[cfg(test)]
 mod fakecam_tests;
 #[cfg(test)]

@@ -1,7 +1,11 @@
 //! Application resources (`APP_*_handler`/`_create`/`_close` in ca.cpp).
 
 use super::asn1::decode_len;
+#[cfg(feature = "ci-plus")]
+use super::ciplus::cc::CcAction;
 use super::consts::*;
+#[cfg(feature = "ci-plus")]
+use super::device::CcKeyBytes;
 use super::device::{CaDevice, CaState, HostEvent};
 use super::resources::App;
 
@@ -103,6 +107,11 @@ impl CaDevice {
                 } else {
                     3
                 };
+                #[cfg(feature = "ci-plus")]
+                {
+                    let mask = self.uri_mask;
+                    self.cc_state().set_uri_mask(mask);
+                }
             }
             Some(App::HostLanguage) => {
                 ms_log::log!("APP_LANG_create: Sending language to the CAM");
@@ -184,9 +193,42 @@ impl CaDevice {
             }
             Some(App::OperatorProfile) => self.oprf_apdu(idx, tag, data),
             Some(App::Empty) => ms_log::log!("Got unhandled resource {:06X}", tag),
-            Some(App::ContentControl) | None => {}
+            Some(App::ContentControl) => self.cc_apdu(idx, tag, data),
+            None => {}
         }
     }
+
+    /// `CIPLUS_APP_CC_handler`: the state machine answers, the device applies.
+    #[cfg(feature = "ci-plus")]
+    fn cc_apdu(&mut self, idx: usize, tag: u32, data: &[u8]) {
+        let actions = self.cc_state().handle(tag, data);
+        for action in actions {
+            match action {
+                CcAction::Apdu { tag, body } => {
+                    self.write_apdu(idx, tag, &body);
+                }
+                CcAction::NewKey { parity, key, iv } => {
+                    let slot = usize::from(parity);
+                    if slot < 2 {
+                        self.key[slot] = key;
+                        self.iv[slot] = iv;
+                        self.parity = parity;
+                        self.push_event(HostEvent::CcKey {
+                            parity,
+                            key: CcKeyBytes(key),
+                            iv: CcKeyBytes(iv),
+                        });
+                    }
+                }
+                CcAction::DisableCws => self.push_event(HostEvent::CcDisableCws),
+                CcAction::ForceCi => self.force_ci = true,
+            }
+        }
+    }
+
+    /// Plain CI: content control is not handled.
+    #[cfg(not(feature = "ci-plus"))]
+    fn cc_apdu(&mut self, _idx: usize, _tag: u32, _data: &[u8]) {}
 
     fn rm_apdu(&mut self, idx: usize, tag: u32) {
         match tag {
@@ -234,7 +276,7 @@ impl CaDevice {
                     );
                     let n = usize::from(data[5]).min(data.len() - 6).min(CI_NAME_MAX);
                     if n > 0 {
-                        self.ci_name = data[6..6 + n].to_vec();
+                        self.set_ci_name(&data[6..6 + n]);
                     }
                     ms_log::log!("  CAM Name: {} ({})", self.ci_name(), n);
                     if self.sessions[idx].is_some_and(|s| s.ai_version >= 3) {

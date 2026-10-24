@@ -70,6 +70,9 @@ pub struct CamConfig {
     pub pmt_reply: PmtReplyMode,
     /// Split SPDUs larger than this into T_DATA_MORE chunks.
     pub max_tpdu_data: Option<usize>,
+    /// CI+ content control credentials; `None` keeps the CI+ resources inert.
+    #[cfg(feature = "ci-plus")]
+    pub ciplus: Option<crate::ciplus::CiPlusCam>,
 }
 
 impl Default for CamConfig {
@@ -94,6 +97,8 @@ impl Default for CamConfig {
             quirks: Quirks::default(),
             pmt_reply: PmtReplyMode::default(),
             max_tpdu_data: None,
+            #[cfg(feature = "ci-plus")]
+            ciplus: None,
         }
     }
 }
