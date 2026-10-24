@@ -930,6 +930,18 @@ mod tests {
             .expect("CI-side PMT");
         assert_eq!(ci_side.name, "Test Channel");
         assert_eq!(ci_side.provider, "Test");
+        // The CI adapter's descrambler knows the CI-side PMT, so a CW the
+        // CAM sends for it (send_cw_to_all_pmts) has a service to land on.
+        let ci_pmt = ci_side.id;
+        assert!(
+            sched.adapter_ca_mask(1) != 0,
+            "decrypt runs on the CI adapter"
+        );
+        assert!(
+            ca.descrambler_services(1).contains(&ci_pmt),
+            "CI adapter services {:?} lack PMT {ci_pmt}",
+            ca.descrambler_services(1)
+        );
     }
 }
 
