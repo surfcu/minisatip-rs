@@ -7,6 +7,8 @@
 pub mod asn1;
 pub mod cam;
 pub mod capmt;
+#[cfg(feature = "ci-plus")]
+pub mod ciplus;
 pub mod clock;
 pub mod config;
 pub mod ddci;
@@ -18,6 +20,8 @@ pub mod tags;
 
 pub use cam::FakeCam;
 pub use capmt::{CaPmt, CaPmtReply, CaPmtStream, ListManagement};
+#[cfg(feature = "ci-plus")]
+pub use ciplus::{CiPlusCam, CiPlusStatus};
 pub use clock::{Clock, ManualClock, MonotonicClock};
 pub use config::{AppInfo, CamConfig, PmtReplyMode, Quirks};
 pub use ddci::TsStats;

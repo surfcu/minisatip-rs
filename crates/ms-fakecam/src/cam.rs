@@ -2,6 +2,8 @@
 
 use crate::asn1::{decode_len, encode_len};
 use crate::capmt::{CaPmt, encode_reply};
+#[cfg(feature = "ci-plus")]
+use crate::ciplus::{CcRuntime, CiPlusStatus};
 use crate::clock::Clock;
 use crate::config::{CamConfig, PmtReplyMode};
 use crate::ddci::{DdciPort, TsStats};
@@ -65,6 +67,8 @@ pub struct FakeCam {
     date_time: Option<Vec<u8>>,
     programs: ProgramList,
     ddci: DdciPort,
+    #[cfg(feature = "ci-plus")]
+    ciplus: Option<CcRuntime>,
 }
 
 impl FakeCam {
@@ -77,6 +81,11 @@ impl FakeCam {
         Self {
             programs: ProgramList::new(&config),
             ddci: DdciPort::new(&config),
+            #[cfg(feature = "ci-plus")]
+            ciplus: config
+                .ciplus
+                .as_ref()
+                .map(|cfg| CcRuntime::new(cfg.clone())),
             config,
             clock,
             recorder,
@@ -331,9 +340,24 @@ impl FakeCam {
             let interval = self.config.datetime_interval_s;
             self.send_apdu(session, TAG_DATE_TIME_ENQUIRY, &[interval]);
         }
+        #[cfg(feature = "ci-plus")]
+        if is_cc_resource(resource) {
+            let actions = match self.ciplus.as_mut() {
+                Some(runtime) => runtime.open(resource),
+                None => Vec::new(),
+            };
+            for (tag, body) in actions {
+                self.send_apdu(session, tag, &body);
+            }
+        }
     }
 
     fn on_apdu(&mut self, session: u16, resource: u32, tag: u32, body: &[u8]) {
+        #[cfg(feature = "ci-plus")]
+        if is_cc_resource(resource) {
+            self.cc_apdu(session, tag, body);
+            return;
+        }
         match (resource, tag) {
             (RESOURCE_MANAGER, TAG_PROFILE_ENQUIRY) => {
                 let ids: Vec<u8> = self
@@ -394,6 +418,47 @@ impl FakeCam {
             }
             (DATE_TIME, TAG_DATE_TIME) => self.date_time = Some(body.to_vec()),
             _ => {}
+        }
+    }
+
+    /// What the CI+ handshake did so far; `None` without a CI+ configuration.
+    #[cfg(feature = "ci-plus")]
+    pub fn ciplus_status(&self) -> Option<CiPlusStatus> {
+        self.ciplus.as_ref().map(CcRuntime::status)
+    }
+
+    /// Sends one raw CC APDU on the content control session (tests).
+    #[cfg(feature = "ci-plus")]
+    pub fn send_cc_raw(&mut self, tag: u32, body: &[u8]) -> bool {
+        let Some(resource) = self.ciplus.as_ref().map(CcRuntime::resource) else {
+            return false;
+        };
+        self.send_to_resource(resource, tag, body)
+    }
+
+    /// Sends another SAC key register request after the handshake (tests).
+    #[cfg(feature = "ci-plus")]
+    pub fn send_sac_key_request(&mut self, parity: u8, corrupt_mac: bool) -> bool {
+        let Some(resource) = self.ciplus.as_ref().map(CcRuntime::resource) else {
+            return false;
+        };
+        let Some(mut body) = self.ciplus.as_mut().and_then(|r| r.key_request(parity)) else {
+            return false;
+        };
+        if corrupt_mac && let Some(last) = body.last_mut() {
+            *last ^= 0x01;
+        }
+        self.send_to_resource(resource, TAG_CC_SAC_DATA_REQ, &body)
+    }
+
+    #[cfg(feature = "ci-plus")]
+    fn cc_apdu(&mut self, session: u16, tag: u32, body: &[u8]) {
+        let actions = match self.ciplus.as_mut() {
+            Some(runtime) => runtime.on_apdu(tag, body),
+            None => return,
+        };
+        for (tag, body) in actions {
+            self.send_apdu(session, tag, &body);
         }
     }
 

@@ -31,6 +31,10 @@ pub const CA_SUPPORT: u32 = mkrid(3, 1, 1);
 pub const HOST_CONTROL: u32 = mkrid(32, 1, 1);
 pub const DATE_TIME: u32 = mkrid(36, 1, 1);
 pub const MMI: u32 = mkrid(64, 1, 1);
+/// CI+ content control resources, versions 1, 2 and the TS 103 205 one.
+pub const CIPLUS_CC: u32 = mkrid(140, 64, 1);
+pub const CIPLUS_CC_TWO: u32 = mkrid(140, 64, 2);
+pub const TS103205_CC_THREE: u32 = mkrid(140, 64, 4);
 
 pub const TAG_PROFILE_ENQUIRY: u32 = 0x9F8010;
 pub const TAG_PROFILE: u32 = 0x9F8011;
@@ -53,6 +57,21 @@ pub const TAG_ANSWER: u32 = 0x9F8808;
 pub const TAG_MENU_LAST: u32 = 0x9F8809;
 pub const TAG_MENU_ANSWER: u32 = 0x9F880B;
 pub const TAG_LIST_LAST: u32 = 0x9F880C;
+pub const TAG_CC_OPEN_REQ: u32 = 0x9F9001;
+pub const TAG_CC_OPEN_CNF: u32 = 0x9F9002;
+pub const TAG_CC_DATA_REQ: u32 = 0x9F9003;
+pub const TAG_CC_DATA_CNF: u32 = 0x9F9004;
+pub const TAG_CC_SYNC_REQ: u32 = 0x9F9005;
+pub const TAG_CC_SYNC_CNF: u32 = 0x9F9006;
+pub const TAG_CC_SAC_DATA_REQ: u32 = 0x9F9007;
+pub const TAG_CC_SAC_DATA_CNF: u32 = 0x9F9008;
+pub const TAG_CC_SAC_SYNC_REQ: u32 = 0x9F9009;
+pub const TAG_CC_SAC_SYNC_CNF: u32 = 0x9F9010;
+
+/// True for the three content control resources.
+pub fn is_cc_resource(resource: u32) -> bool {
+    matches!(resource, CIPLUS_CC | CIPLUS_CC_TWO | TS103205_CC_THREE)
+}
 
 /// Short name of an APDU tag for the recorded log; `None` when unknown.
 pub fn apdu_name(tag: u32) -> Option<&'static str> {
@@ -78,6 +97,16 @@ pub fn apdu_name(tag: u32) -> Option<&'static str> {
         TAG_MENU_LAST => "menu_last",
         TAG_MENU_ANSWER => "menu_answer",
         TAG_LIST_LAST => "list_last",
+        TAG_CC_OPEN_REQ => "cc_open_req",
+        TAG_CC_OPEN_CNF => "cc_open_cnf",
+        TAG_CC_DATA_REQ => "cc_data_req",
+        TAG_CC_DATA_CNF => "cc_data_cnf",
+        TAG_CC_SYNC_REQ => "cc_sync_req",
+        TAG_CC_SYNC_CNF => "cc_sync_cnf",
+        TAG_CC_SAC_DATA_REQ => "cc_sac_data_req",
+        TAG_CC_SAC_DATA_CNF => "cc_sac_data_cnf",
+        TAG_CC_SAC_SYNC_REQ => "cc_sac_sync_req",
+        TAG_CC_SAC_SYNC_CNF => "cc_sac_sync_cnf",
         _ => return None,
     })
 }

@@ -137,6 +137,7 @@ name = "ms-fakecam"
 version = "0.1.0"
 dependencies = [
  "ms-ts",
+ "openssl",
 ]
 
 [[package]]

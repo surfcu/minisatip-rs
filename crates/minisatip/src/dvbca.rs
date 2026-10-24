@@ -693,6 +693,8 @@ impl Worker {
                 HostEvent::CaSessionClosed => capmt.state = ms_ca::CaState::Inactive,
                 // The C++ MMI logs live in APP_MMI_handler (en50221/apps.rs).
                 HostEvent::MmiMenu { .. } | HostEvent::MmiEnquiry { .. } => {}
+                // CI+ key delivery reaches the descrambler in a later milestone.
+                HostEvent::CcKey { .. } | HostEvent::CcDisableCws => {}
                 HostEvent::CloseRequested => {}
             }
         }
