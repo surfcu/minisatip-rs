@@ -16,7 +16,7 @@ use ms_ca_drivers::descramble::{
 use ms_ca_drivers::dvbapi::transport::{self, Stream};
 use ms_ca_drivers::dvbapi::{DvbapiClient, DvbapiConfig, PmtStatus, PollAction};
 use ms_ca_drivers::en50221::AdapterInfo;
-use ms_config::Options;
+use ms_config::{DropEncrypted, Options};
 
 use crate::ddci::{DdciCapture, DdciHub, DdciSink, DdciStage};
 use crate::dvbca::{DeviceView, Dvbca, DvbcaSettings, DvbcaSink, Notice, PendingOffers};
@@ -130,11 +130,17 @@ impl CaRuntime {
         if let Some(link) = self.ddci.as_ref() {
             stages.push(Box::new(DdciStage::new(link.hub.clone(), aid)));
         }
+        stages.push(self.descrambler_stage(aid, self.stage_config));
+        stages
+    }
+
+    /// Registers the adapter's descrambler and returns its stage.
+    fn descrambler_stage(&mut self, aid: usize, config: StageConfig) -> Box<dyn TsStage> {
         let registry = match (self.hw.as_ref(), self.hw_nodes.get(&aid)) {
             (Some((factory, _)), Some(&(pa, fe))) => factory(aid, pa, fe),
             _ => CipherRegistry::software(),
         };
-        let (sender, stage) = DescramblerStage::new(registry, self.stage_config, self.origin);
+        let (sender, stage) = DescramblerStage::new(registry, config, self.origin);
         self.adapters.insert(
             aid,
             AdapterCa {
@@ -147,8 +153,7 @@ impl CaRuntime {
                 pid_table: Vec::new(),
             },
         );
-        stages.push(Box::new(stage));
-        stages
+        Box::new(stage)
     }
 
     /// Registers `hw_ca_op` and the hardware ciphers (`init_hw_descrambler`).
@@ -185,12 +190,30 @@ impl CaRuntime {
         });
     }
 
-    /// Stages of a DDCI adapter: its batches feed the device FIFO.
+    /// Stages of a DDCI adapter: decrypt, then the device FIFO
+    /// (`ddci_read_sec_data` runs `read_dmx` before `fifo_push_force`).
     pub fn ci_stages(&mut self, aid: usize) -> Vec<Box<dyn TsStage>> {
-        match self.ddci.as_ref() {
-            Some(link) => vec![Box::new(DdciCapture::new(link.hub.clone(), aid))],
-            None => Vec::new(),
-        }
+        let Some(hub) = self.ddci.as_ref().map(|link| link.hub.clone()) else {
+            return Vec::new();
+        };
+        // ddci.cpp:1678: DDCI adapters never drop encrypted packets.
+        let config = StageConfig {
+            drop_encrypted: DropEncrypted::Send,
+            ..self.stage_config
+        };
+        vec![
+            self.descrambler_stage(aid, config),
+            Box::new(DdciCapture::new(hub, aid)),
+        ]
+    }
+
+    /// PMT ids whose PIDs were pushed to the adapter's descrambler.
+    #[cfg(test)]
+    pub(crate) fn descrambler_services(&self, aid: usize) -> Vec<usize> {
+        self.adapters
+            .get(&aid)
+            .map(|ca| ca.services.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Sends changed adapter pid tables to the EN 50221 worker: a multiple-PMT
@@ -1692,5 +1715,126 @@ mod wiring_tests {
         ca.after_scheduler(&mut sched, &[]);
         let dvbapi = ca.dvbapi.as_ref().unwrap();
         assert!(dvbapi.filters.is_empty() && dvbapi.by_id.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ci_stage_tests {
+    use super::*;
+    use ms_ca::CwAlgo;
+    use ms_ca_drivers::ddci::CiWriter;
+    use ms_ca_drivers::descramble::aes::Aes128;
+
+    struct Sink;
+
+    impl CiWriter for Sink {
+        fn writev(&mut self, iov: &[&[u8]]) -> isize {
+            iov.iter().map(|part| part.len()).sum::<usize>() as isize
+        }
+    }
+
+    // ddci_read_sec_data: read_dmx decrypts the CAM output on the CI adapter
+    // (pmt_decrypt_stream) before fifo_push_force hands it to the tuners.
+    #[test]
+    fn ci_adapter_decrypts_before_the_fifo() {
+        const PID: u16 = 0x101;
+        const PMT: usize = 7;
+        let key = [0x11u8; 16];
+        let mut sched = Scheduler::new();
+        let mut ca = CaRuntime::new(&Options::default());
+        let hub = DdciHub::new();
+        ca.attach_ddci(&mut sched, hub.clone());
+        hub.open_device(1, Box::new(Sink));
+        let mut stages = ca.ci_stages(1);
+        assert_eq!(stages.len(), 2, "descrambler, then the FIFO capture");
+        let descrambler = ca
+            .adapters
+            .get(&1)
+            .expect("CI adapter descrambler")
+            .descrambler
+            .clone();
+        for command in [
+            DescramblerCommand::AddService {
+                pmt_id: PMT,
+                pids: vec![PID],
+            },
+            DescramblerCommand::SetCaActive(true),
+            DescramblerCommand::Ca(CaEvent::ControlWord {
+                pmt_id: PMT,
+                algo: CwAlgo::Aes128Cbc,
+                parity: 0,
+                cw: key.to_vec(),
+                icam_ecm: 0,
+            }),
+        ] {
+            descrambler.send(command).unwrap();
+        }
+
+        let mut clear = vec![0u8; 188];
+        clear[..4].copy_from_slice(&[0x47, (PID >> 8) as u8, PID as u8, 0x10]);
+        for (i, b) in clear[4..].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut scrambled = clear.clone();
+        scrambled[3] = 0x90;
+        Aes128::new(&key).encrypt_cbc(&[0; 16], &mut scrambled[4..4 + 176]);
+        let mut buf: Vec<u8> = std::iter::repeat_n(scrambled, 64).flatten().collect();
+        for stage in stages.iter_mut() {
+            stage.process(&mut buf);
+        }
+
+        let state = hub.lock();
+        let device = &state.ddci.devices[&1];
+        let mut fifo = vec![0u8; buf.len()];
+        let mut read = 0;
+        assert_eq!(device.fifo.pop_offset(&mut fifo, &mut read), buf.len());
+        for packet in fifo.chunks(188) {
+            assert_eq!(
+                packet,
+                clear.as_slice(),
+                "the FIFO gets the decrypted packet"
+            );
+        }
+    }
+
+    // ddci.cpp:1678 sets drop_encrypted = 0: packets the CAM left scrambled
+    // reach the tuners unchanged, for another CA to decrypt.
+    #[test]
+    fn ci_adapter_keeps_packets_it_cannot_decrypt() {
+        const PID: u16 = 0x102;
+        let mut sched = Scheduler::new();
+        let mut ca = CaRuntime::new(&Options::default());
+        let hub = DdciHub::new();
+        ca.attach_ddci(&mut sched, hub.clone());
+        hub.open_device(1, Box::new(Sink));
+        let mut stages = ca.ci_stages(1);
+        let descrambler = ca.adapters.get(&1).unwrap().descrambler.clone();
+        for command in [
+            DescramblerCommand::AddService {
+                pmt_id: 3,
+                pids: vec![PID],
+            },
+            DescramblerCommand::SetCaActive(true),
+        ] {
+            descrambler.send(command).unwrap();
+        }
+        let mut scrambled = vec![0xA5u8; 188];
+        scrambled[..4].copy_from_slice(&[0x47, (PID >> 8) as u8, PID as u8, 0x90]);
+        let mut buf: Vec<u8> = std::iter::repeat_n(scrambled.clone(), 16)
+            .flatten()
+            .collect();
+        for stage in stages.iter_mut() {
+            stage.process(&mut buf);
+        }
+        let state = hub.lock();
+        let mut fifo = vec![0u8; buf.len()];
+        let mut read = 0;
+        assert_eq!(
+            state.ddci.devices[&1].fifo.pop_offset(&mut fifo, &mut read),
+            buf.len()
+        );
+        for packet in fifo.chunks(188) {
+            assert_eq!(packet, scrambled.as_slice(), "not nulled");
+        }
     }
 }
