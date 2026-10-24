@@ -7,6 +7,8 @@ repository.workspace = true
 
 [features]
 default = []
+# Selects the s2api version in the banner (C++ LINUXDVB builds).
+linux-dvb = []
 # Reflects whether the binary was built with SRT support.
 srt = []
 # Netceiver client (C++ NETCVCLIENT): without it `-n`/`--netceiver` are unknown options.
@@ -15,6 +17,9 @@ netceiver = []
 
 [dependencies]
 ms-log = { path = "../ms-log" }
+
+[build-dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

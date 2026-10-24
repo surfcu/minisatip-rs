@@ -337,10 +337,10 @@ Unvalidated rows must be called out in release notes.
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - #35 CI+ content control is ported behind the `ci-plus` feature (the `openssl`
-    crate, vendored for static musl builds) and validated against `ms-fakecam`;
-    the default build without the feature still forces plain CI, so the size
-    target in §2 is unaffected. Next: a run on real CI+ CAMs (external testers).
+  - Soak with evidence: Part A (this PR) adds the panic hook, `--log-max-size` and
+    the real banner (#38); Part B adds the `diag-log` feature (events, remote
+    sink, flight recorder), validated on the enigma2 box, then the 7-day soak
+    restarts on the main box with it.
   - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
     on the status page.
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
@@ -349,9 +349,11 @@ Unvalidated rows must be called out in release notes.
 - **Blockers:** no SAT>IP server (M8 exit).
 - **CI+ (2026-10-24):** content control runs behind the `ci-plus` feature: a slot
   keeps CI+ when `{cert_dir}/root.pem` exists and `-C` was not given, and CI+ keys
-  are forwarded to the PMT's adapter descrambler. It is experimental and not yet
-  validated on a real CAM; the default build still forces plain CI with a notice,
-  so CI+ CAMs keep working in CI-compatible mode, as validated with the CAM on the
-  user's box.
-- **Tracked issues:** CI+ needs a real-CAM validation run (#35); CA harness scenarios (#36);
-  reconciler not on the runtime path (#37); banner `<build date>`/s2api 0500 (#38).
+  are forwarded to the PMT's adapter descrambler. Validated on 2026-10-24 with the
+  CI+ CAM on the main box (DDCI, static musl build with `ci-plus-vendored`): full
+  handshake, SAC keys every ~12 s, a scrambled service clear with no DEC-ERRORS
+  (#35 closed). The default build still forces plain CI with a notice.
+- **Logging (2026-10-24, Part A):** panic hook through ms-log for -f/-F/-g,
+  `--log-max-size` rotation of the -F file (DEV-279), the banner prints the real
+  build date/time and s2api `050C` (#38).
+- **Tracked issues:** CA harness scenarios (#36); reconciler not on the runtime path (#37).

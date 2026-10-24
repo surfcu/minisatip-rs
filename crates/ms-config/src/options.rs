@@ -423,6 +423,8 @@ pub struct Options {
     pub playlist: Option<String>,
     /// `-F` log file.
     pub log_file: String,
+    /// `--log-max-size` limit for the `-F` file; 0 disables rotation.
+    pub log_max_size: u64,
     /// `-4` toggles this; 1 means IPv4 only.
     pub use_ipv4_only: i32,
     /// `-1` demux device mode.
@@ -581,6 +583,7 @@ impl Default for Options {
             netcv_if: None,
             playlist: None,
             log_file: "/tmp/minisatip.log".into(),
+            log_max_size: 0,
             use_ipv4_only: 1,
             use_demux_device: 0,
             strength_multiplier: 1.0,

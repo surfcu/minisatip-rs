@@ -69,6 +69,41 @@ fn lines(capture: &CaptureLines) -> Vec<String> {
     capture.lock().unwrap().clone()
 }
 
+// A panic line is emitted like any other line, but repeats are never collapsed.
+#[test]
+fn write_panic_skips_repeat_suppression() {
+    set_thread_name("main");
+    let (logger, out, _) = logger(LOG_GENERAL, 0, 0, false);
+    let line = "[05/03 14:07:09.042 main]: PANIC in thread main: x at f:1:1";
+    logger.write_panic("PANIC in thread main: x at f:1:1");
+    logger.write_panic("PANIC in thread main: x at f:1:1");
+    assert_eq!(lines(&out), [line, line]);
+}
+
+// A panic raised while `Logger::write` holds the state lock must not deadlock.
+#[test]
+fn write_panic_while_the_state_lock_is_held_does_not_block() {
+    set_thread_name("main");
+    let (logger, out, _) = logger(LOG_GENERAL, 0, 0, false);
+    let guard = logger.state.lock().unwrap();
+    logger.write_panic("PANIC in thread main: x at f:1:1");
+    drop(guard);
+    assert_eq!(
+        lines(&out),
+        ["[05/03 14:07:09.042 main]: PANIC in thread main: x at f:1:1"]
+    );
+}
+
+// With -g the panic line goes to the syslog sink without a prefix.
+#[test]
+fn write_panic_uses_the_syslog_sink() {
+    set_thread_name("main");
+    let (logger, out, syslog) = logger(LOG_GENERAL, 0, 1, false);
+    logger.write_panic("PANIC in thread main: x at f:1:1");
+    assert!(lines(&out).is_empty());
+    assert_eq!(lines(&syslog), ["PANIC in thread main: x at f:1:1"]);
+}
+
 // logging.cpp:110-117: both failures return the literal "01/01 00:00:20",
 // which has no millisecond field.
 #[test]
@@ -97,9 +132,9 @@ fn file_line_adds_the_source_location() {
     );
 }
 
-// logging.cpp:46-48: stid is " " plus an empty thread name for unnamed threads.
+// An unnamed thread keeps the C++ empty name in the prefix (socketworks.h:138).
 #[test]
-fn unnamed_thread_leaves_the_name_empty() {
+fn unnamed_thread_has_an_empty_prefix_name() {
     let (logger, out, _) = logger(LOG_GENERAL, 0, 0, false);
     let logger = Arc::new(logger);
     let writer = Arc::clone(&logger);
@@ -109,6 +144,26 @@ fn unnamed_thread_leaves_the_name_empty() {
         .join()
         .unwrap();
     assert_eq!(lines(&out), ["[05/03 14:07:09.042 ]: x"]);
+}
+
+// The panic hook flushes a pending repeat line before the panic line, as the
+// next normal line would.
+#[test]
+fn write_panic_flushes_pending_repeats() {
+    set_thread_name("main");
+    let (logger, out, _) = logger(LOG_GENERAL, 0, 0, false);
+    for _ in 0..3 {
+        logger.write("src/pmt.cpp", 1, format_args!("A"));
+    }
+    logger.write_panic("PANIC in thread main: x at f:1:1");
+    assert_eq!(
+        lines(&out),
+        [
+            "[05/03 14:07:09.042 main]: A",
+            "Message repeated 2 times",
+            "[05/03 14:07:09.042 main]: PANIC in thread main: x at f:1:1",
+        ]
+    );
 }
 
 // logging.cpp:66-69,96-100: with slog the prefix is empty and syslog gets the

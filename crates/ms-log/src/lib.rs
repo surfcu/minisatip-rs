@@ -31,7 +31,8 @@
 //!
 //! [`set_thread_name`] replaces C++ `thread_info[].thread_name`; the name is
 //! thread-local. Threads that never call it fall back to the standard thread
-//! name (`"main"` for the main thread, empty when the thread is unnamed).
+//! name (`"main"` for the main thread, empty when the thread is unnamed, as the
+//! C++ empty `thread_name`).
 //!
 //! # Deviations from the C++
 //!
@@ -42,7 +43,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write as _};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod hexdump;
@@ -351,6 +352,52 @@ impl Logger {
         }
     }
 
+    /// Emits a panic line: like [`Logger::write`], but without the repeat
+    /// suppression and never blocking on the state lock.
+    pub fn write_panic(&self, message: &str) {
+        let text = if self.slog != 0 {
+            truncate_bytes(message, MAX_LINE_BYTES).to_owned()
+        } else {
+            let timestamp = self.backend().timestamp();
+            let thread = thread_name();
+            truncate_bytes(
+                &format!("[{timestamp} {thread}]: {message}"),
+                MAX_LINE_BYTES,
+            )
+            .to_owned()
+        };
+        match self.state.try_lock() {
+            // The panic did not hold the state lock: flush a pending repeat
+            // line, as the next normal line would, then emit the panic.
+            Ok(mut state) => {
+                self.flush_repeats(&mut state);
+                self.emit(&text);
+            }
+            Err(TryLockError::Poisoned(error)) => {
+                let mut state = error.into_inner();
+                self.flush_repeats(&mut state);
+                self.emit(&text);
+            }
+            // The panicking thread holds the lock: bypass the logger state.
+            Err(TryLockError::WouldBlock) => {
+                let backend = self.backend();
+                if self.slog != 0 {
+                    backend.syslog(&text);
+                } else {
+                    backend.stdout(&text);
+                }
+            }
+        }
+    }
+
+    /// Emits `Message repeated N times` and resets the counter.
+    fn flush_repeats(&self, state: &mut State) {
+        if state.times > 0 {
+            self.emit(&format!("Message repeated {} times", state.times));
+            state.times = 0;
+        }
+    }
+
     fn prefix(&self, file: &str, line: u32) -> String {
         // `opts.slog` suppresses the timestamp, thread and source entirely.
         if self.slog != 0 {
@@ -438,6 +485,16 @@ pub fn debug_enabled(mask: u32) -> bool {
 /// Port of `_log` for the process-wide logger.
 pub fn write(file: &str, line: u32, args: fmt::Arguments<'_>) {
     logger().write(file, line, args);
+}
+
+/// Emits a panic line through the process-wide logger; never panics.
+pub fn write_panic(message: &str) {
+    logger().write_panic(message);
+}
+
+/// The process-wide logger's `opts.slog` value (`-g` count).
+pub fn slog() -> u32 {
+    logger().slog
 }
 
 thread_local! {

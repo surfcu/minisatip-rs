@@ -242,6 +242,20 @@ fn long_only_options_table() {
         parse(&["--sdt-charset", "latin1"]).sdt_charset,
         ms_config::DVB_CHARSET_LATIN1
     );
+    assert_eq!(parse(&["--log-max-size", "1000"]).log_max_size, 1000);
+}
+
+#[test]
+fn log_max_size_is_an_unsigned_long_only_option() {
+    assert_eq!(parse(&[]).log_max_size, 0);
+    assert_eq!(
+        parse(&["--log-max-size", "4294967296"]).log_max_size,
+        4_294_967_296
+    );
+    assert_eq!(parse(&["--log-max-size", "0"]).log_max_size, 0);
+    // Anything that is not a u64 disables rotation, like an absent option.
+    assert_eq!(parse(&["--log-max-size", "-1"]).log_max_size, 0);
+    assert_eq!(parse(&["--log-max-size", "abc"]).log_max_size, 0);
 }
 
 #[test]
@@ -278,6 +292,7 @@ fn every_long_option_is_recognized() {
         &["--lnb", "0:9750-10600-11700"],
         &["--log", "http"],
         &["--logfile", "/tmp/x.log"],
+        &["--log-max-size", "1000"],
         &["--multiplier", "0:1.0-1.0"],
         &["--no-all-pids"],
         &["--priority", "5"],

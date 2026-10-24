@@ -409,7 +409,7 @@ impl Runtime {
         // minisatip.cpp:1149-1166; read_http refreshes the current time.
         let start = SystemTime::now();
         session.set_web_runtime(RuntimeState {
-            datetime_compile: env!("MINISATIP_DATETIME_COMPILE").to_owned(),
+            datetime_compile: ms_config::BUILD_DATETIME.to_owned(),
             datetime_start: format_asctime(start),
             datetime_current: " ".to_owned(),
             time_running: "0".to_owned(),
@@ -2433,23 +2433,36 @@ mod tests {
         assert_eq!(port16(-1), 65_535);
     }
 
+    /// Splits `__DATE__` ("Mmm dd yyyy", the day space-padded for 1-9).
+    fn date_fields(date: &str) -> Option<(&str, u32, &str)> {
+        let mut fields = date.split_whitespace();
+        let month = fields.next()?;
+        let day = fields.next()?.parse().ok()?;
+        let year = fields.next()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        Some((month, day, year))
+    }
+
     #[test]
     fn datetime_compile_has_the_cpp_date_and_time_format() {
         // minisatip.cpp:1149-1150: `sprintf("%s | %s", __DATE__, __TIME__)`;
         // __DATE__ is "Mmm dd yyyy" and __TIME__ is "hh:mm:ss".
-        let stamp = env!("MINISATIP_DATETIME_COMPILE");
+        let stamp = ms_config::BUILD_DATETIME;
         let (date, time) = stamp.split_once(" | ").expect("date | time");
-        let parts: Vec<&str> = date.split(' ').collect();
-        assert_eq!(parts.len(), 3, "{stamp}");
+        let (month, day, year) = date_fields(date).expect("Mmm dd yyyy");
         assert!(
             [
                 "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
             ]
-            .contains(&parts[0]),
+            .contains(&month),
             "{stamp}"
         );
-        assert!((1..=31).contains(&parts[1].trim().parse::<u32>().unwrap()));
-        assert!(parts[2].len() == 4);
+        assert!((1..=31).contains(&day), "{stamp}");
+        assert_eq!(year.len(), 4, "{stamp}");
+        // A single-digit day is space-padded: "Nov  3 2026".
+        assert_eq!(date_fields("Nov  3 2026"), Some(("Nov", 3, "2026")));
         let clock: Vec<&str> = time.split(':').collect();
         assert_eq!(clock.len(), 3);
         assert!(clock.iter().all(|field| field.len() == 2));

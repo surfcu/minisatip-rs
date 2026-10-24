@@ -10,7 +10,7 @@ default = ["linux-dvb"]
 # Builds with SRT support.
 srt = ["ms-config/srt", "ms-net/srt", "ms-tuner/srt"]
 # Enables the Linux DVB tuner backend and /dev/dvb enumeration.
-linux-dvb = ["ms-tuner/linux-dvb"]
+linux-dvb = ["ms-tuner/linux-dvb", "ms-config/linux-dvb"]
 # DVB-CSA software descrambling through libdvbcsa.
 dvbcsa = ["ms-ca-drivers/dvbcsa"]
 # iCAM CSA: needs a libdvbcsa that exports dvbcsa_bs_key_set_ecm.
