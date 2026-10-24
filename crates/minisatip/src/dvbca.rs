@@ -8,7 +8,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use ms_ca::{CaCaps, CaDriver, CaService, EsStream, Program, ProgramTable, TablesResult};
-use ms_ca_drivers::en50221::device::{CaDevice as CiDevice, CaPmtSink, CaState, HostEvent};
+use ms_ca_drivers::en50221::device::{
+    CaDevice as CiDevice, CaPmtSink, CaState, CcKeyBytes, HostEvent,
+};
 use ms_ca_drivers::en50221::{AdapterInfo, CaOpener, CaRegistry, Clock, InitResult};
 use ms_config::Options;
 
@@ -23,7 +25,7 @@ const TIMER_MS: i64 = 1000;
 const REPLY_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// Per-slot settings from `-3`, `-C` and `-c`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DvbcaSettings {
     pins: BTreeMap<usize, String>,
     force_ci: BTreeSet<usize>,
@@ -31,6 +33,20 @@ pub struct DvbcaSettings {
     channels: BTreeMap<usize, (usize, usize, Vec<u16>)>,
     /// `opts.enigma`: `/dev/ciN` with bare SPDUs.
     enigma: bool,
+    /// `opts.cache_dir` for the CI+ authdata files.
+    cache_dir: String,
+}
+
+impl Default for DvbcaSettings {
+    fn default() -> Self {
+        Self {
+            pins: BTreeMap::new(),
+            force_ci: BTreeSet::new(),
+            channels: BTreeMap::new(),
+            enigma: false,
+            cache_dir: "/var/cache/minisatip".to_owned(),
+        }
+    }
 }
 
 impl DvbcaSettings {
@@ -56,6 +72,7 @@ impl DvbcaSettings {
             );
         }
         settings.enigma = opts.enigma;
+        settings.cache_dir = opts.cache_dir.clone();
         settings
     }
 
@@ -95,6 +112,15 @@ pub enum Notice {
     Released(Vec<i32>),
     /// The device's `ca_sym` fields changed (status page).
     State(usize, DeviceView),
+    /// `send_cw_to_all_pmts`: a CI+ key for these PMT ids. The bytes are never printed.
+    CcKey {
+        pmt_ids: Vec<usize>,
+        parity: u8,
+        key: CcKeyBytes,
+        iv: CcKeyBytes,
+    },
+    /// `disable_cws_for_all_pmts`: stop descrambling these PMTs.
+    DisableCws(Vec<usize>),
 }
 
 /// `ca_devices[i]` fields read by `ca_sym` (ca.cpp:4234-4242).
@@ -145,6 +171,17 @@ impl Dvbca {
     /// Next pending notice.
     pub fn try_notice(&self) -> Option<Notice> {
         self.notices.try_recv().ok()
+    }
+
+    /// A handle over a scripted notice channel, for the control-thread tests.
+    #[cfg(test)]
+    pub(crate) fn from_notices(notices: Receiver<Notice>) -> Self {
+        let (requests, _) = mpsc::channel();
+        Self {
+            requests,
+            notices,
+            thread: None,
+        }
     }
 
     /// Queues `dvbca_process_pmt`; `None` when the worker is gone.
@@ -354,6 +391,21 @@ impl CaDriver for SlotDriver<'_> {
     }
 }
 
+/// Every valid PMT id of the CAPMT slots (`send_cw_to_all_pmts`).
+fn capmt_pmt_ids(capmt: &ms_ca::CaDevice) -> Vec<usize> {
+    let mut ids = Vec::new();
+    for slot in capmt.capmt.iter().take(capmt.max_ca_pmt) {
+        for id in std::iter::once(slot.pmt_id).chain(slot.other_id) {
+            if ms_ca::capmt::pmt_id_is_valid(id)
+                && let Ok(id) = usize::try_from(id)
+            {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
 struct Worker {
     settings: DvbcaSettings,
     registry: CaRegistry,
@@ -381,6 +433,7 @@ impl Worker {
     ) -> Self {
         let mut registry = CaRegistry::new(Arc::clone(&clock));
         registry.enigma = settings.enigma;
+        registry.set_cache_dir(&settings.cache_dir);
         for (id, pin) in &settings.pins {
             registry.device(*id).set_pin(pin.as_bytes());
         }
@@ -693,8 +746,19 @@ impl Worker {
                 HostEvent::CaSessionClosed => capmt.state = ms_ca::CaState::Inactive,
                 // The C++ MMI logs live in APP_MMI_handler (en50221/apps.rs).
                 HostEvent::MmiMenu { .. } | HostEvent::MmiEnquiry { .. } => {}
-                // CI+ key delivery reaches the descrambler in a later milestone.
-                HostEvent::CcKey { .. } | HostEvent::CcDisableCws => {}
+                HostEvent::CcKey { parity, key, iv } => {
+                    let pmt_ids = capmt_pmt_ids(capmt);
+                    let _ = self.notices.send(Notice::CcKey {
+                        pmt_ids,
+                        parity,
+                        key,
+                        iv,
+                    });
+                }
+                HostEvent::CcDisableCws => {
+                    let pmt_ids = capmt_pmt_ids(capmt);
+                    let _ = self.notices.send(Notice::DisableCws(pmt_ids));
+                }
                 HostEvent::CloseRequested => {}
             }
         }
@@ -1179,5 +1243,221 @@ mod pending_tests {
                 pmt_id: 4
             })
         ));
+    }
+}
+
+/// `send_cw_to_all_pmts` end to end: the worker must forward a CI+ key for the
+/// PMTs it has offered to the CAM.
+#[cfg(all(test, feature = "ci-plus"))]
+mod ciplus_worker_tests {
+    use super::*;
+    use ms_ca::{CaDescriptor, StreamPid};
+    use ms_ca_drivers::en50221::link::{CA_CI_LINK, CA_CI_MODULE_PRESENT, CA_CI_MODULE_READY};
+    use ms_ca_drivers::en50221::{CaLink, ManualClock, SlotInfo};
+    use ms_fakecam::tags::CIPLUS_CC;
+    use ms_fakecam::{CamConfig, FakeCam};
+    use std::collections::VecDeque;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    const UNIX: u64 = 1_700_000_000;
+
+    struct CamLink {
+        cam: Arc<Mutex<FakeCam>>,
+        rx: VecDeque<Vec<u8>>,
+    }
+
+    impl CaLink for CamLink {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(msg) = self.rx.pop_front() else {
+                return Err(io::ErrorKind::WouldBlock.into());
+            };
+            assert!(msg.len() <= buf.len(), "R_TPDU fits the host buffer");
+            buf[..msg.len()].copy_from_slice(&msg);
+            Ok(msg.len())
+        }
+
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut cam = self.cam.lock().unwrap();
+            if let Some(reply) = cam.handle_tpdu(buf) {
+                self.rx.push_back(reply);
+            }
+            Ok(buf.len())
+        }
+
+        fn reset(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn slot_info(&mut self) -> io::Result<SlotInfo> {
+            Ok(SlotInfo {
+                kind: CA_CI_LINK,
+                flags: CA_CI_MODULE_PRESENT | CA_CI_MODULE_READY,
+            })
+        }
+
+        fn sleep_ms(&mut self, _: u32) {}
+    }
+
+    struct CiOpener {
+        cam: Arc<Mutex<FakeCam>>,
+        cert_dir: PathBuf,
+    }
+
+    impl CaOpener for CiOpener {
+        fn open(&mut self, _: &str) -> io::Result<Box<dyn CaLink>> {
+            Ok(Box::new(CamLink {
+                cam: Arc::clone(&self.cam),
+                rx: VecDeque::new(),
+            }))
+        }
+
+        fn ciplus_cert_dir(&self) -> String {
+            self.cert_dir.to_string_lossy().into_owned()
+        }
+
+        fn has_ciplus_root_cert(&self) -> bool {
+            true
+        }
+    }
+
+    fn service() -> CaService {
+        CaService {
+            pmt_id: 3,
+            adapter: 0,
+            sid: 0x64,
+            pmt_pid: 0x100,
+            ca: vec![CaDescriptor {
+                caid: 0x0B00,
+                pid: 0x500,
+                private_data: Vec::new(),
+            }],
+            streams: vec![StreamPid {
+                stream_type: 2,
+                pid: 0x101,
+            }],
+            av_pids: vec![0x101],
+            ..CaService::default()
+        }
+    }
+
+    fn drain(rx: &Receiver<Notice>) -> Vec<Notice> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn ciplus_keys_are_forwarded_for_offered_pmts() {
+        let pki = ms_fakecam::ciplus::test_pki::pki("dvbca-worker");
+        let mut config = CamConfig::default();
+        config.resources.push(CIPLUS_CC);
+        config.ciplus = Some(pki.cam.clone());
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            config,
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let clock = Arc::new(ManualClock::new(0, UNIX));
+        let worker_clock: Arc<dyn Clock> = clock.clone();
+        let (tx, rx) = mpsc::channel();
+        let opts = Options {
+            cache_dir: pki.cache_dir.to_string_lossy().into_owned(),
+            ..Options::default()
+        };
+        let mut worker = Worker::new(
+            DvbcaSettings::from_options(&opts),
+            Box::new(CiOpener {
+                cam: Arc::clone(&cam),
+                cert_dir: pki.cert_dir.clone(),
+            }),
+            worker_clock,
+            tx,
+        );
+        worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        worker.service();
+        let _ = drain(&rx);
+
+        let program = program_from_service(&service());
+        let mut offered = false;
+        for _ in 0..10 {
+            let (reply, answers) = mpsc::channel();
+            worker.handle(Request::AddPmt {
+                program: Box::new(program.clone()),
+                update: false,
+                reply,
+            });
+            if answers.recv().ok() == Some(TablesResult::Ok) {
+                offered = true;
+                break;
+            }
+            worker.service();
+        }
+        assert!(offered, "the CAM accepts the offered PMT");
+        let _ = drain(&rx);
+
+        // The handshake already delivered a key in register 0; the update must
+        // prove it is a new one and not a replay of the init key.
+        let init = cam.lock().unwrap().ciplus_status().expect("CI+ CAM");
+        let init_key = init.expected_key.expect("the handshake sent a key");
+        let init_iv = init.expected_iv.expect("the handshake sent an IV");
+        assert_eq!(init.expected_parity, Some(0), "the handshake key register");
+
+        assert!(
+            cam.lock().unwrap().send_sac_key_request(1, false),
+            "the CAM sends a key update"
+        );
+        let mut notices = Vec::new();
+        for _ in 0..5 {
+            clock.advance(1001);
+            worker.service();
+            notices.extend(drain(&rx));
+            if notices.iter().any(
+                |notice| matches!(notice, Notice::CcKey { pmt_ids, .. } if !pmt_ids.is_empty()),
+            ) {
+                break;
+            }
+        }
+
+        let disable = notices
+            .iter()
+            .position(|notice| matches!(notice, Notice::DisableCws(_)))
+            .expect("disable_cws_for_all_pmts");
+        let key_pos = notices
+            .iter()
+            .position(|notice| matches!(notice, Notice::CcKey { .. }))
+            .expect("a CI+ key");
+        assert!(
+            disable < key_pos,
+            "the SAC data request disables descrambling first"
+        );
+        let Notice::CcKey {
+            pmt_ids,
+            parity,
+            key,
+            iv,
+        } = &notices[key_pos]
+        else {
+            panic!("matched above")
+        };
+        assert!(
+            pmt_ids.contains(&(program.id as usize)),
+            "the offered PMT is addressed: {pmt_ids:?}"
+        );
+        let status = cam.lock().unwrap().ciplus_status().expect("CI+ CAM");
+        assert_eq!(
+            *parity, 1,
+            "the forwarded key is the post-init register 1 update"
+        );
+        assert_eq!(*parity, status.expected_parity.expect("parity"));
+        assert!(
+            key.0 == status.expected_key.expect("key"),
+            "the forwarded key matches the CAM"
+        );
+        assert!(
+            iv.0 == status.expected_iv.expect("iv"),
+            "the forwarded IV matches the CAM"
+        );
+        assert_ne!(key.0, init_key, "the forwarded key is fresh");
+        assert_ne!(iv.0, init_iv, "the forwarded IV is fresh");
+        pki.remove();
     }
 }

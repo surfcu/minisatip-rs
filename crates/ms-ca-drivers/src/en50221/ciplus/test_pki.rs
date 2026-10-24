@@ -27,7 +27,6 @@ pub(crate) struct Pki {
     pub host_device_key: PKey<Private>,
     pub cam_brand: X509,
     pub cam_device: X509,
-    pub cam_device_key: PKey<Private>,
     pub other_device: X509,
 }
 
@@ -236,7 +235,6 @@ pub(crate) fn pki() -> &'static Pki {
             host_device_key,
             cam_brand,
             cam_device,
-            cam_device_key,
             other_device,
         }
     })

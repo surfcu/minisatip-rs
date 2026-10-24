@@ -200,8 +200,9 @@ fn force_ci_host_profile_stops_before_ci_plus() {
     assert_eq!(profile.len(), 6 * 4, "CI profile only");
 }
 
-// DEV-151: with CI+ certificates present the slot still runs plain CI, so
+// DEV-151: without the `ci-plus` feature the slot still runs plain CI, so
 // the host profile stops before the CI+ resources.
+#[cfg(not(feature = "ci-plus"))]
 #[test]
 fn force_ci_with_root_cert_still_stops_before_ci_plus() {
     let cam = Arc::new(Mutex::new(FakeCam::new(

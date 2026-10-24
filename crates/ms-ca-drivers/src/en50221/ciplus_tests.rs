@@ -11,6 +11,7 @@ use super::link::{
 };
 use super::registry::authdata_filename;
 use ms_fakecam::ciplus::CiPlusCam;
+use ms_fakecam::ciplus::test_pki::{TestPki, pki_with_device};
 use ms_fakecam::record::{Direction, Event};
 use ms_fakecam::tags::{APPLICATION_INFO, CIPLUS_CC, RESOURCE_MANAGER};
 use ms_fakecam::{CamConfig, FakeCam};
@@ -58,11 +59,14 @@ impl CaLink for CamLink {
     fn sleep_ms(&mut self, _: u32) {}
 }
 
-struct CamOpener {
+/// Opens the fake CAM from an explicit certificate directory.
+struct CertOpener {
     cam: Arc<Mutex<FakeCam>>,
+    root_cert: bool,
+    cert_dir: String,
 }
 
-impl CaOpener for CamOpener {
+impl CaOpener for CertOpener {
     fn open(&mut self, _: &str) -> io::Result<Box<dyn CaLink>> {
         Ok(Box::new(CamLink {
             cam: Arc::clone(&self.cam),
@@ -70,8 +74,12 @@ impl CaOpener for CamOpener {
         }))
     }
 
+    fn ciplus_cert_dir(&self) -> String {
+        self.cert_dir.clone()
+    }
+
     fn has_ciplus_root_cert(&self) -> bool {
-        true
+        self.root_cert
     }
 }
 
@@ -79,38 +87,23 @@ struct Rig {
     cam: Arc<Mutex<FakeCam>>,
     dev: CaDevice,
     cache_dir: PathBuf,
+    /// Keeps the host certificates and the authdata directory alive.
+    _pki: TestPki,
 }
 
-fn cam_ciplus(order: [u8; 4]) -> CiPlusCam {
-    let pki = pki();
-    CiPlusCam {
-        root_pem: cert_pem(&pki.root),
-        brand_cert_der: pki.cam_brand.to_der().unwrap(),
-        device_cert_der: pki.cam_device.to_der().unwrap(),
-        device_key_pem: pki.cam_device_key.private_key_to_pem_pkcs8().unwrap(),
+fn setup(
+    order: [u8; 4],
+    cc_resource: u32,
+    with_device_key: bool,
+    tune: impl FnOnce(&mut CiPlusCam),
+) -> Rig {
+    let pki = pki_with_device("ciplus-tests", with_device_key);
+    let mut ciplus = CiPlusCam {
         element_order: order,
-        ..CiPlusCam::default()
-    }
-}
-
-fn host_cert_dir(with_device: bool) -> PathBuf {
-    let pki = pki();
-    let dir = temp_dir("certs");
-    write_pem(&dir.join("root.pem"), &[&cert_pem(&pki.root)]);
-    write_pem(&dir.join("customer.pem"), &[&cert_pem(&pki.host_brand)]);
-    if with_device {
-        let key = pki.host_device_key.private_key_to_pem_pkcs8().unwrap();
-        write_pem(
-            &dir.join("device.pem"),
-            &[&cert_pem(&pki.host_device), &key],
-        );
-    }
-    dir
-}
-
-fn setup(ciplus: CiPlusCam, cc_resource: u32, with_device_key: bool) -> Rig {
-    let cert_dir = host_cert_dir(with_device_key);
-    let cache_dir = temp_dir("cache");
+        ..pki.cam.clone()
+    };
+    tune(&mut ciplus);
+    let cache_dir = pki.cache_dir.clone();
     let config = CamConfig {
         resources: vec![RESOURCE_MANAGER, APPLICATION_INFO, cc_resource],
         ciplus: Some(ciplus),
@@ -123,7 +116,7 @@ fn setup(ciplus: CiPlusCam, cc_resource: u32, with_device_key: bool) -> Rig {
     let mut dev = CaDevice::new(0, Arc::new(ManualClock::new(0, UNIX)));
     dev.force_ci = false;
     dev.enabled = true;
-    dev.set_ciplus_paths(path_arg(&cert_dir), path_arg(&cache_dir));
+    dev.set_ciplus_paths(path_arg(&pki.cert_dir), path_arg(&cache_dir));
     attach(&mut dev, &cam);
     assert!(dev.init_en50221(), "the fake slot resets ready");
     assert!(dev.service(), "the link stays up");
@@ -131,6 +124,7 @@ fn setup(ciplus: CiPlusCam, cc_resource: u32, with_device_key: bool) -> Rig {
         cam,
         dev,
         cache_dir,
+        _pki: pki,
     }
 }
 
@@ -210,7 +204,7 @@ fn authdata_path(rig: &Rig) -> PathBuf {
 
 #[test]
 fn full_handshake_delivers_key_and_authdata() {
-    let mut rig = setup(cam_ciplus([14, 16, 18, 8]), CIPLUS_CC, true);
+    let mut rig = setup([14, 16, 18, 8], CIPLUS_CC, true, |_| {});
     let events = drain_events(&mut rig.dev);
     let disable = events
         .iter()
@@ -261,9 +255,9 @@ fn full_handshake_delivers_key_and_authdata() {
 
 #[test]
 fn odd_parity_key_goes_to_the_odd_register() {
-    let mut ciplus = cam_ciplus([14, 16, 18, 8]);
-    ciplus.parity = 1;
-    let mut rig = setup(ciplus, CIPLUS_CC, true);
+    let mut rig = setup([14, 16, 18, 8], CIPLUS_CC, true, |ciplus| {
+        ciplus.parity = 1;
+    });
     let keys = cckeys(&drain_events(&mut rig.dev));
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].0, 1);
@@ -283,9 +277,9 @@ fn odd_parity_key_goes_to_the_odd_register() {
 
 #[test]
 fn reconnect_reads_the_cached_akh() {
-    let mut ciplus = cam_ciplus([14, 16, 18, 8]);
-    ciplus.cached_akh_probe = true;
-    let mut rig = setup(ciplus, CIPLUS_CC, true);
+    let mut rig = setup([14, 16, 18, 8], CIPLUS_CC, true, |ciplus| {
+        ciplus.cached_akh_probe = true;
+    });
     drain_events(&mut rig.dev);
     let first = rig.cam.lock().unwrap().ciplus_status().expect("CI+ CAM");
     assert!(first.akh_match && first.key_ok, "first handshake completes");
@@ -308,7 +302,7 @@ fn reconnect_reads_the_cached_akh() {
 fn brand_cert_before_the_device_cert_is_rejected() {
     let lines = captured_lines();
     let start = lines.lock().unwrap().len();
-    let mut rig = setup(cam_ciplus([8, 14, 16, 18]), CIPLUS_CC, true);
+    let mut rig = setup([8, 14, 16, 18], CIPLUS_CC, true, |_| {});
     let events = drain_events(&mut rig.dev);
     let status = rig.cam.lock().unwrap().ciplus_status().expect("CI+ CAM");
     assert!(
@@ -332,7 +326,7 @@ fn brand_cert_before_the_device_cert_is_rejected() {
 
 #[test]
 fn key_register_two_is_rejected_then_zero_is_accepted() {
-    let mut rig = setup(cam_ciplus([14, 16, 18, 8]), CIPLUS_CC, true);
+    let mut rig = setup([14, 16, 18, 8], CIPLUS_CC, true, |_| {});
     drain_events(&mut rig.dev);
     let handshake_key = rig.dev.key;
     let handshake_iv = rig.dev.iv;
@@ -357,7 +351,7 @@ fn key_register_two_is_rejected_then_zero_is_accepted() {
 
 #[test]
 fn broken_mac_and_truncated_data_request_get_no_answer() {
-    let mut rig = setup(cam_ciplus([14, 16, 18, 8]), CIPLUS_CC, true);
+    let mut rig = setup([14, 16, 18, 8], CIPLUS_CC, true, |_| {});
     drain_events(&mut rig.dev);
     let before = host_apdu_count(&rig.cam);
 
@@ -383,7 +377,7 @@ fn broken_mac_and_truncated_data_request_get_no_answer() {
 
 #[test]
 fn zero_request_count_gets_no_data_cnf() {
-    let mut rig = setup(cam_ciplus([14, 16, 18, 8]), CIPLUS_CC, true);
+    let mut rig = setup([14, 16, 18, 8], CIPLUS_CC, true, |_| {});
     drain_events(&mut rig.dev);
     let before = host_apdu_count(&rig.cam);
 
@@ -404,9 +398,9 @@ fn zero_request_count_gets_no_data_cnf() {
 
 #[test]
 fn uri_confirmation_matches_the_host() {
-    let mut ciplus = cam_ciplus([14, 16, 18, 8]);
-    ciplus.uri_step = true;
-    let mut rig = setup(ciplus, CIPLUS_CC, true);
+    let mut rig = setup([14, 16, 18, 8], CIPLUS_CC, true, |ciplus| {
+        ciplus.uri_step = true;
+    });
     let events = drain_events(&mut rig.dev);
     assert!(!cckeys(&events).is_empty());
     let disables = events
@@ -426,7 +420,7 @@ fn uri_confirmation_matches_the_host() {
 
 #[test]
 fn missing_device_pem_forces_plain_ci() {
-    let rig = setup(cam_ciplus([14, 16, 18, 8]), CIPLUS_CC, false);
+    let rig = setup([14, 16, 18, 8], CIPLUS_CC, false, |_| {});
     assert!(rig.dev.force_ci, "no host key means no CI+");
     let status = rig.cam.lock().unwrap().ciplus_status().expect("CI+ CAM");
     assert!(!status.akh_match && !status.key_ok);
@@ -435,9 +429,9 @@ fn missing_device_pem_forces_plain_ci() {
 
 #[test]
 fn uri_mask_follows_the_content_control_resource() {
-    let mut ciplus = cam_ciplus([14, 16, 18, 8]);
-    ciplus.probe_uri_mask = true;
-    let mut rig = setup(ciplus, CIPLUS_CC, true);
+    let mut rig = setup([14, 16, 18, 8], CIPLUS_CC, true, |ciplus| {
+        ciplus.probe_uri_mask = true;
+    });
     drain_events(&mut rig.dev);
     assert_eq!(
         rig.cam
@@ -450,9 +444,14 @@ fn uri_mask_follows_the_content_control_resource() {
         "resource version 1 advertises bitmask 1"
     );
 
-    let mut ciplus = cam_ciplus([14, 16, 18, 8]);
-    ciplus.probe_uri_mask = true;
-    let mut rig = setup(ciplus, CIPLUS_APP_CC_RESOURCEID_TWO, true);
+    let mut rig = setup(
+        [14, 16, 18, 8],
+        CIPLUS_APP_CC_RESOURCEID_TWO,
+        true,
+        |ciplus| {
+            ciplus.probe_uri_mask = true;
+        },
+    );
     drain_events(&mut rig.dev);
     assert_eq!(
         rig.cam
@@ -465,9 +464,14 @@ fn uri_mask_follows_the_content_control_resource() {
         "the version 2 resource advertises bitmask 3"
     );
 
-    let mut ciplus = cam_ciplus([14, 16, 18, 8]);
-    ciplus.probe_uri_mask = true;
-    let mut rig = setup(ciplus, TS103205_APP_CC_RESOURCEID_THREE, true);
+    let mut rig = setup(
+        [14, 16, 18, 8],
+        TS103205_APP_CC_RESOURCEID_THREE,
+        true,
+        |ciplus| {
+            ciplus.probe_uri_mask = true;
+        },
+    );
     drain_events(&mut rig.dev);
     assert_eq!(
         rig.cam
@@ -520,38 +524,81 @@ fn debug_output_hides_key_material() {
     assert!(text.contains("CcKeyBytes(..)"));
     assert!(!text.contains("171"));
 
-    let ciplus = cam_ciplus([14, 16, 18, 8]);
+    let ciplus = CiPlusCam::default();
     let text = format!("{ciplus:?}");
     assert!(text.contains("[redacted]"), "the CAM private key is hidden");
 }
 
-#[test]
-fn registry_still_forces_plain_ci() {
-    let ciplus = cam_ciplus([14, 16, 18, 8]);
-    let config = CamConfig {
-        resources: vec![RESOURCE_MANAGER, APPLICATION_INFO, CIPLUS_CC],
-        ciplus: Some(ciplus),
-        ..CamConfig::default()
-    };
+fn registry_with(tmp: &str) -> (Arc<Mutex<FakeCam>>, super::registry::CaRegistry) {
     let cam = Arc::new(Mutex::new(FakeCam::new(
-        config,
+        CamConfig::default(),
         Arc::new(ms_fakecam::ManualClock::new(0)),
     )));
     let mut registry = super::registry::CaRegistry::new(Arc::new(ManualClock::new(0, UNIX)));
-    let mut opener = CamOpener {
-        cam: Arc::clone(&cam),
+    registry.set_cache_dir(tmp);
+    (cam, registry)
+}
+
+#[test]
+fn registry_keeps_ciplus_when_the_root_cert_is_present() {
+    let lines = captured_lines();
+    let start = lines.lock().unwrap().len();
+    let cache = temp_dir("registry-cache");
+    let certs = temp_dir("registry-certs");
+    let (cam, mut registry) = registry_with(path_arg(&cache));
+    let mut opener = CertOpener {
+        cam,
+        root_cert: true,
+        cert_dir: path_arg(&certs).to_owned(),
     };
     assert_eq!(
         registry.init_dev(&AdapterInfo::dvb(0, 0, 0), &mut opener),
         super::registry::InitResult::Ok
     );
-    let dev = registry.get_mut(0).expect("device allocated");
-    dev.set_ciplus_paths("/nonexistent", "/nonexistent");
-    assert!(dev.force_ci, "the registry keeps plain CI (DEV-151)");
-    assert!(dev.service());
+    assert!(!registry.get(0).unwrap().force_ci, "root.pem keeps CI+");
+    let captured = lines.lock().unwrap();
     assert!(
-        dev.find_session_for_resource(CIPLUS_CC).is_some(),
-        "the session opens even in CI mode"
+        captured[start..]
+            .iter()
+            .any(|line| line.contains("CA 0: CI+ content control enabled (experimental)")),
+        "the init says CI+ is on: {captured:?}"
     );
-    assert!(!dev.key[0].iter().any(|&byte| byte != 0));
+}
+
+#[test]
+fn registry_forces_plain_ci_without_a_root_cert() {
+    let cache = temp_dir("registry-cache");
+    let certs = temp_dir("registry-certs");
+    let (cam, mut registry) = registry_with(path_arg(&cache));
+    let mut opener = CertOpener {
+        cam,
+        root_cert: false,
+        cert_dir: path_arg(&certs).to_owned(),
+    };
+    assert_eq!(
+        registry.init_dev(&AdapterInfo::dvb(0, 0, 0), &mut opener),
+        super::registry::InitResult::Ok
+    );
+    assert!(registry.get(0).unwrap().force_ci, "no root.pem, plain CI");
+}
+
+#[test]
+fn registry_keeps_a_forced_slot_on_plain_ci() {
+    let cache = temp_dir("registry-cache");
+    let certs = temp_dir("registry-certs");
+    let (cam, mut registry) = registry_with(path_arg(&cache));
+    registry.device(0).force_ci = true;
+    let mut opener = CertOpener {
+        cam,
+        root_cert: true,
+        cert_dir: path_arg(&certs).to_owned(),
+    };
+    assert_eq!(
+        registry.init_dev(&AdapterInfo::dvb(0, 0, 0), &mut opener),
+        super::registry::InitResult::Ok
+    );
+    assert!(
+        registry.get(0).unwrap().force_ci,
+        "-C keeps a slot on plain CI"
+    );
 }

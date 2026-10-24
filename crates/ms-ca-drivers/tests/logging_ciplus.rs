@@ -2,6 +2,10 @@
 //!
 //! Lives in its own binary: [`ms_log::init`] may only run once per process.
 
+// Without the `ci-plus` feature every slot stays on plain CI; with it the root
+// certificate keeps CI+ and the notice is not emitted.
+#![cfg(not(feature = "ci-plus"))]
+
 use std::io;
 use std::sync::{Arc, Mutex};
 
