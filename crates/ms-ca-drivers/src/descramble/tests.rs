@@ -906,3 +906,55 @@ fn a_new_pid_becoming_active_starts_from_zero() {
     pass(&mut d, &[(0x100, true)]);
     assert_eq!(d.adapter_decerr(), 1);
 }
+
+// send_cw_to_all_pmts: a CI+ key arrives with its AES-CBC IV.
+#[test]
+fn cw_with_iv_decrypts_aes_cbc_and_is_redacted() {
+    let key = [0xAB; 16];
+    let iv = [0xCD; 16];
+    let (tx, mut stage) = DescramblerStage::with_clock(
+        CipherRegistry::software(),
+        StageConfig::default(),
+        fixed_clock(NOW),
+    );
+    for command in [
+        DescramblerCommand::AddService {
+            pmt_id: 0,
+            pids: vec![0x101],
+        },
+        DescramblerCommand::SetCaActive(true),
+        DescramblerCommand::CwWithIv {
+            pmt_id: 0,
+            algo: CwAlgo::Aes128Cbc,
+            parity: 0,
+            cw: key.to_vec(),
+            iv,
+            expiry_s: 3720,
+            redact: true,
+        },
+    ] {
+        tx.send(command).unwrap();
+    }
+
+    let clear = pes_packet(0x101, 0, true, 0);
+    let mut scrambled = clear;
+    Aes128::new(&key).encrypt_cbc(&iv, &mut scrambled[4..]);
+    scrambled[3] |= 0x80;
+    let mut buf = scrambled.to_vec();
+    stage.process(&mut buf);
+    assert_eq!(buf, clear, "AES-128-CBC from the CI+ IV");
+    assert_eq!(
+        stage.descrambler().stats(0).unwrap().last_decrypt_ok,
+        NOW,
+        "the CW validated"
+    );
+
+    let line = stage
+        .descrambler()
+        .cw_dump_line(0, NOW)
+        .expect("the slot is live");
+    assert!(line.contains("CW: <redacted>"), "{line}");
+    assert!(line.contains("IV: <redacted>"), "{line}");
+    assert!(!line.contains("AB"), "no key bytes: {line}");
+    assert!(!line.contains("CD"), "no IV bytes: {line}");
+}

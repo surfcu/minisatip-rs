@@ -1,9 +1,10 @@
 //! The descrambler as a data-plane stage, driven by messages from the control plane.
 
+use std::fmt;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
-use ms_ca::CaEvent;
+use ms_ca::{CaEvent, CwAlgo};
 use ms_config::DropEncrypted;
 use ms_ts::TsStage;
 
@@ -38,6 +39,23 @@ pub enum DescramblerCommand {
     },
     /// A CA driver event; only `ControlWord` is used.
     Ca(CaEvent),
+    /// A CI+ key with its IV (`send_cw_to_all_pmts`).
+    CwWithIv {
+        /// PMT slot id of the service.
+        pmt_id: usize,
+        /// Descrambling algorithm.
+        algo: CwAlgo,
+        /// 0 = even, 1 = odd.
+        parity: u8,
+        /// Key bytes.
+        cw: Vec<u8>,
+        /// AES-CBC IV.
+        iv: [u8; 16],
+        /// CW lifetime (`expiry_s`).
+        expiry_s: i64,
+        /// Keep the key and IV out of diagnostics.
+        redact: bool,
+    },
     /// Whether a CA serves this adapter (`ad->ca_mask != 0`).
     SetCaActive(bool),
     /// Whether `pids=all` is streamed with `-o ~` (no dropping).
@@ -46,6 +64,66 @@ pub enum DescramblerCommand {
     Query(Sender<DescramblerStats>),
     /// The adapter pid table: pid, active, claiming PMT.
     SetAdapterPids(Vec<AdapterPid>),
+}
+
+impl fmt::Debug for DescramblerCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AddService { pmt_id, pids } => f
+                .debug_struct("AddService")
+                .field("pmt_id", pmt_id)
+                .field("pids", pids)
+                .finish(),
+            Self::UpdatePids { pmt_id, pids } => f
+                .debug_struct("UpdatePids")
+                .field("pmt_id", pmt_id)
+                .field("pids", pids)
+                .finish(),
+            Self::DisableCw { pmt_id } => {
+                f.debug_struct("DisableCw").field("pmt_id", pmt_id).finish()
+            }
+            Self::RemoveService { pmt_id } => f
+                .debug_struct("RemoveService")
+                .field("pmt_id", pmt_id)
+                .finish(),
+            Self::Ca(CaEvent::ControlWord {
+                pmt_id,
+                algo,
+                parity,
+                icam_ecm,
+                ..
+            }) => f
+                .debug_struct("ControlWord")
+                .field("pmt_id", pmt_id)
+                .field("algo", algo)
+                .field("parity", parity)
+                .field("cw", &"<redacted>")
+                .field("icam_ecm", icam_ecm)
+                .finish(),
+            Self::Ca(event) => fmt::Debug::fmt(event, f),
+            Self::CwWithIv {
+                pmt_id,
+                algo,
+                parity,
+                expiry_s,
+                redact,
+                ..
+            } => f
+                .debug_struct("CwWithIv")
+                .field("pmt_id", pmt_id)
+                .field("algo", algo)
+                .field("parity", parity)
+                .field("cw", &"<redacted>")
+                .field("iv", &"<redacted>")
+                .field("expiry_s", expiry_s)
+                .field("redact", redact)
+                .finish(),
+            Self::SetCaActive(active) => f.debug_tuple("SetCaActive").field(active).finish(),
+            Self::SetPidsAll(on) => f.debug_tuple("SetPidsAll").field(on).finish(),
+            Self::Query(_) => f.write_str("Query(..)"),
+            Self::SetAdapterPids(table) => f.debug_tuple("SetAdapterPids").field(table).finish(),
+        }
+    }
 }
 
 /// Decrypt statistics of one adapter.
@@ -144,6 +222,31 @@ impl DescramblerStage {
                     .send_cw(pmt_id, algo, parity, &cw, None, 0, icam_ecm, now);
             }
             DescramblerCommand::Ca(_) => {}
+            DescramblerCommand::CwWithIv {
+                pmt_id,
+                algo,
+                parity,
+                cw,
+                iv,
+                expiry_s,
+                redact,
+            } => {
+                let _ = if redact {
+                    self.descrambler.send_cw_redacted(
+                        pmt_id,
+                        algo,
+                        parity,
+                        &cw,
+                        Some(&iv),
+                        expiry_s,
+                        0,
+                        now,
+                    )
+                } else {
+                    self.descrambler
+                        .send_cw(pmt_id, algo, parity, &cw, Some(&iv), expiry_s, 0, now)
+                };
+            }
             DescramblerCommand::SetCaActive(active) => self.ca_active = active,
             DescramblerCommand::SetPidsAll(on) => self.pids_all = on,
             DescramblerCommand::Query(reply) => {

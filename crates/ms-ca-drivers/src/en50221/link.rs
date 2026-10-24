@@ -141,10 +141,15 @@ impl AdapterInfo {
 /// Opens CA devices and answers the host-file probes of `dvbca_init_dev`.
 pub trait CaOpener {
     fn open(&mut self, path: &str) -> io::Result<Box<dyn CaLink>>;
-    /// `access("/etc/ssl/certs/root.pem")`: plain CI is forced either way (DEV-151);
-    /// with it the slot init logs that CI+ is not supported.
+    /// Directory of `root.pem`, `customer.pem` and `device.pem`.
+    fn ciplus_cert_dir(&self) -> String {
+        "/etc/ssl/certs".to_owned()
+    }
+    /// `access("/etc/ssl/certs/root.pem")` in `dvbca_init_dev`.
     fn has_ciplus_root_cert(&self) -> bool {
-        std::path::Path::new("/etc/ssl/certs/root.pem").exists()
+        std::path::Path::new(&self.ciplus_cert_dir())
+            .join("root.pem")
+            .exists()
     }
     /// Writes a host control file, such as `/proc/stb/tsmux/input0` for the
     /// enigma2 CI routing (`set_tuner_input`, `set_input_ci`).

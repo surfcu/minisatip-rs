@@ -33,10 +33,10 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
 
 ### Known limitations
 
-- CI+ authentication is not implemented (DEV-151). The host always talks plain
-  CI to CAMs; CI+ CAMs work in CI-compatible mode, as with a C++ build without CI+
-  certificates. Channels whose operator requires CI+ protection will not
-  descramble.
+- CI+ content control (DEV-151) is experimental and only built with the `ci-plus`
+  cargo feature; it has not been validated on a real CAM. A default build has no
+  CI+ support and forces plain CI on every slot, so CI+ CAMs work in CI-compatible
+  mode and CI+-protected channels will not descramble.
 - The CA harness scenarios are still missing. CAPMT sequences are compared with
   C++ only by the ported unit tests and by the real-CAM check.
 - The runtime drives `ms_ca::CaDevice` directly; the `Reconciler` and its policies
@@ -93,6 +93,8 @@ Cargo features of the `minisatip` crate:
 | `dvbcsa` | no | software DVB-CSA descrambling; links `libdvbcsa` |
 | `dvbcsa-icam` | no | iCAM CSA (implies `dvbcsa`); needs a `libdvbcsa` with `dvbcsa_bs_key_set_ecm` |
 | `srt` | no | SRT output; links `libsrt` |
+| `ci-plus` | no | CI+ content control (DEV-151); needs OpenSSL (`libssl-dev`) |
+| `ci-plus-vendored` | no | `ci-plus` with a statically built OpenSSL (musl builds) |
 
 ```sh
 cargo build --release -p minisatip --features dvbcsa,srt

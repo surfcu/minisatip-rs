@@ -44,9 +44,9 @@ allocation and PSI processing are each owned by one component.
 ### Explicitly deferred
 - Enigma2-specific paths (was deferred): ported in M9 (2026-10-23/24) and tested on the
   user's enigma2 box, except the CI routing, which needs a CAM in that box
-- CI+ crypto: ported last, behind a cargo feature, marked experimental until
-  validated on real CI+ CAMs. Until then the host forces plain CI on every slot,
-  even when CI+ certificates are installed (DEV-151)
+- CI+ content control: ported behind the `ci-plus` cargo feature, marked
+  experimental until validated on real CI+ CAMs. The default build still forces
+  plain CI on every slot, even when CI+ certificates are installed (DEV-151)
 
 ### Supported / parked / dropped
 
@@ -219,7 +219,8 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 - **Exit:** daily-driver replacement for the user's own setup
 
 ### M10 — Experimental + improvements
-- [ ] CI+ behind `ci-plus` feature; needs external testers with CI+ CAMs
+- [ ] CI+ validated on real CI+ CAMs (port done behind `ci-plus`; experimental,
+  needs external testers)
 - [ ] New CA policies (bandwidth balancing, pre-packing) as documented deviations
 - [ ] Decide on upstream proposal vs separate project
 
@@ -336,20 +337,21 @@ Unvalidated rows must be called out in release notes.
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - #35 CI+ content control, behind the `ci-plus` feature. Decided: the `openssl`
-    crate, vendored for the static musl builds; the size target in §2 applies to
-    the default build without the feature. No CI+ host certificates exist yet, so
-    validation is against `ms-fakecam`, which first needs the CI+ content-control
-    resource (SAC messages, a test certificate chain).
+  - #35 CI+ content control is ported behind the `ci-plus` feature (the `openssl`
+    crate, vendored for static musl builds) and validated against `ms-fakecam`;
+    the default build without the feature still forces plain CI, so the size
+    target in §2 is unaffected. Next: a run on real CI+ CAMs (external testers).
   - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
     on the status page.
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
     is in that box.
   - Resource comparison; finish the soak.
 - **Blockers:** no SAT>IP server (M8 exit).
-- **CI+ (2026-10-23):** plain CI is forced on every slot, even with
-  `/etc/ssl/certs/root.pem`, so the CI+ content-control resources are never
-  advertised and then ignored; a notice is logged once per slot. CI+ CAMs keep
-  working in CI-compatible mode, as validated with the CAM on the user's box.
-- **Tracked issues:** CI+ content control not implemented, plain CI forced (#35); CA harness scenarios (#36);
+- **CI+ (2026-10-24):** content control runs behind the `ci-plus` feature: a slot
+  keeps CI+ when `{cert_dir}/root.pem` exists and `-C` was not given, and CI+ keys
+  are forwarded to the PMT's adapter descrambler. It is experimental and not yet
+  validated on a real CAM; the default build still forces plain CI with a notice,
+  so CI+ CAMs keep working in CI-compatible mode, as validated with the CAM on the
+  user's box.
+- **Tracked issues:** CI+ needs a real-CAM validation run (#35); CA harness scenarios (#36);
   reconciler not on the runtime path (#37); banner `<build date>`/s2api 0500 (#38).

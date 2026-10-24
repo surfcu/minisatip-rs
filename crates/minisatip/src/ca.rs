@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ms_ca::{CaEvent, CaService, FilterId, TablesResult};
+use ms_ca::{CaEvent, CaService, CwAlgo, FilterId, TablesResult};
 use ms_ca_drivers::descramble::{
     AdapterPid, CipherRegistry, DescramblerCommand, DescramblerStage, DescramblerStats, StageConfig,
 };
@@ -391,55 +391,127 @@ impl CaRuntime {
                     && pmt.pid == i32::from(program.pid)
             })
         });
-        while let Some(notice) = state.dvbca.try_notice() {
-            match notice {
-                Notice::State(aid, view) => {
-                    self.ca_views.insert(aid, view);
+        // Drain first: the CI+ arms call `sync_adapter` with `&mut self`.
+        let notices: Vec<Notice> = std::iter::from_fn(|| state.dvbca.try_notice()).collect();
+        for notice in notices {
+            self.handle_dvbca_notice(sched, notice);
+        }
+    }
+
+    /// One worker notice on the control thread.
+    fn handle_dvbca_notice(&mut self, sched: &mut Scheduler, notice: Notice) {
+        let Some(state) = self.dvbca.as_ref() else {
+            return;
+        };
+        let ca_id = state.ca_id;
+        let caids = Rc::clone(&state.caids);
+        match notice {
+            Notice::State(aid, view) => {
+                self.ca_views.insert(aid, view);
+            }
+            Notice::Usable(aid) => {
+                sched.init_ca_for_adapter(aid, ca_id);
+                self.ddci_cam(aid, |cam, _| cam.enabled = true);
+            }
+            Notice::Caids(aid, new_caids) => {
+                // `tables.cpp add_caid_mask` for every supported CAID.
+                let adapter_known = sched.adapter(aid).is_some();
+                if !adapter_known {
+                    ms_log::log!("add_caid_mask: No adapter {} found ", aid);
                 }
-                Notice::Usable(aid) => {
-                    sched.init_ca_for_adapter(aid, state.ca_id);
-                    self.ddci_cam(aid, |cam, _| cam.enabled = true);
-                }
-                Notice::Caids(aid, caids) => {
-                    // `tables.cpp add_caid_mask` for every supported CAID.
-                    let adapter_known = sched.adapter(aid).is_some();
-                    if !adapter_known {
-                        ms_log::log!("add_caid_mask: No adapter {} found ", aid);
+                caids.borrow_mut().insert(aid, new_caids.clone());
+                self.ddci_cam(aid, |cam, masks| {
+                    cam.initialized = true;
+                    *masks = new_caids.iter().map(|c| (*c, 0xFFFF)).collect();
+                });
+                if adapter_known {
+                    for (i, caid) in new_caids.iter().enumerate() {
+                        ms_log::logl!(
+                            ms_log::LOG_TABLES,
+                            "CA {} can handle CAID {:04X} mask {:04X} on adapter {} at position {}",
+                            ca_id,
+                            caid,
+                            0xFFFF,
+                            aid,
+                            i
+                        );
                     }
-                    state.caids.borrow_mut().insert(aid, caids.clone());
-                    self.ddci_cam(aid, |cam, masks| {
-                        cam.initialized = true;
-                        *masks = caids.iter().map(|c| (*c, 0xFFFF)).collect();
-                    });
-                    if adapter_known {
-                        for (i, caid) in caids.iter().enumerate() {
-                            ms_log::logl!(
-                                ms_log::LOG_TABLES,
-                                "CA {} can handle CAID {:04X} mask {:04X} on adapter {} at position {}",
-                                state.ca_id,
-                                caid,
-                                0xFFFF,
-                                aid,
-                                i
-                            );
-                        }
+                }
+            }
+            Notice::Released(ids) => {
+                for pmt_id in ids {
+                    sched.clear_pmt_ca_masks(pmt_id, ca_id, true);
+                    let aid = sched
+                        .pmt(pmt_id)
+                        .and_then(|pmt| usize::try_from(pmt.adapter).ok());
+                    if let Some(ca) = aid.and_then(|aid| self.adapters.get(&aid)) {
+                        let _ = ca.descrambler.send(DescramblerCommand::DisableCw {
+                            pmt_id: pmt_id as usize,
+                        });
                     }
                 }
-                Notice::Released(ids) => {
-                    for pmt_id in ids {
-                        sched.clear_pmt_ca_masks(pmt_id, state.ca_id, true);
-                        let aid = sched
-                            .pmt(pmt_id)
-                            .and_then(|pmt| usize::try_from(pmt.adapter).ok());
-                        if let Some(ca) = aid.and_then(|aid| self.adapters.get(&aid)) {
-                            let _ = ca.descrambler.send(DescramblerCommand::DisableCw {
-                                pmt_id: pmt_id as usize,
-                            });
-                        }
+            }
+            Notice::CcKey {
+                pmt_ids,
+                parity,
+                key,
+                iv,
+            } => {
+                for pmt_id in pmt_ids {
+                    let Some(aid) = sched
+                        .pmt(pmt_id as i32)
+                        .and_then(|pmt| usize::try_from(pmt.adapter).ok())
+                    else {
+                        // `send_cw` (pmt.cpp:830-831): C++ logs the missing PMT.
+                        ms_log::log!("send_cw: pmt not found {}", pmt_id);
+                        continue;
+                    };
+                    self.sync_adapter(sched, aid);
+                    if let Some(ca) = self.adapters.get(&aid) {
+                        let _ = ca.descrambler.send(DescramblerCommand::CwWithIv {
+                            pmt_id,
+                            algo: CwAlgo::Aes128Cbc,
+                            parity,
+                            cw: key.0.to_vec(),
+                            iv: iv.0,
+                            expiry_s: 3720,
+                            redact: true,
+                        });
+                    }
+                }
+            }
+            Notice::DisableCws(pmt_ids) => {
+                for pmt_id in pmt_ids {
+                    let Some(aid) = sched
+                        .pmt(pmt_id as i32)
+                        .and_then(|pmt| usize::try_from(pmt.adapter).ok())
+                    else {
+                        continue;
+                    };
+                    self.sync_adapter(sched, aid);
+                    if let Some(ca) = self.adapters.get(&aid) {
+                        let _ = ca
+                            .descrambler
+                            .send(DescramblerCommand::DisableCw { pmt_id });
                     }
                 }
             }
         }
+    }
+
+    /// Feeds one worker notice through the control-thread path (tests).
+    #[cfg(test)]
+    pub(crate) fn handle_notice_for_test(&mut self, sched: &mut Scheduler, notice: Notice) {
+        self.handle_dvbca_notice(sched, notice);
+    }
+
+    /// One descrambler's current statistics, for the data-plane tests.
+    #[cfg(test)]
+    pub(crate) fn descrambler_stats(&mut self, aid: usize) -> Option<DescramblerStats> {
+        let ca = self.adapters.get(&aid)?;
+        let (tx, rx) = mpsc::channel();
+        ca.descrambler.send(DescramblerCommand::Query(tx)).ok()?;
+        rx.recv_timeout(Duration::from_secs(2)).ok()
     }
 
     /// An adapter joined the scheduler: registered CAs may handle it (`pmt_init_device`).
@@ -1715,6 +1787,107 @@ mod wiring_tests {
         ca.after_scheduler(&mut sched, &[]);
         let dvbapi = ca.dvbapi.as_ref().unwrap();
         assert!(dvbapi.filters.is_empty() && dvbapi.by_id.is_empty());
+    }
+
+    // send_cw_to_all_pmts: the worker's CI+ key reaches the descrambler of the
+    // adapter holding the PMT, with its IV (DDCI CI-side PMTs included).
+    #[test]
+    fn ciplus_keys_reach_the_pmts_adapter_descrambler() {
+        use ms_ca_drivers::en50221::device::CcKeyBytes;
+        let mut sched = sched();
+        let pmt_id = sched.pmt_add(0, 0x64, 0x100);
+        let mut ca = CaRuntime::new(&Options::default());
+        let (tx, rx) = mpsc::channel();
+        ca.adapters.insert(
+            0,
+            AdapterCa {
+                descrambler: tx,
+                services: BTreeMap::new(),
+                ca_active: false,
+                pids_all: false,
+                stats: DescramblerStats::default(),
+                pending_stats: None,
+                pid_table: Vec::new(),
+            },
+        );
+        let (notices, notices_rx) = mpsc::channel();
+        ca.dvbca = Some(DvbcaState {
+            dvbca: Rc::new(Dvbca::from_notices(notices_rx)),
+            caids: Rc::new(RefCell::new(BTreeMap::new())),
+            pending: PendingOffers::default(),
+            ca_id: 0,
+            requested: None,
+        });
+        notices
+            .send(Notice::CcKey {
+                pmt_ids: vec![pmt_id as usize],
+                parity: 1,
+                key: CcKeyBytes([0x11; 16]),
+                iv: CcKeyBytes([0x22; 16]),
+            })
+            .unwrap();
+        ca.dvbca_notices(&mut sched);
+        let commands: Vec<DescramblerCommand> = rx.try_iter().collect();
+        let key = commands.iter().find_map(|command| match command {
+            DescramblerCommand::CwWithIv {
+                pmt_id: id,
+                algo,
+                parity,
+                cw,
+                iv,
+                expiry_s,
+                redact,
+            } => Some((*id, *algo, *parity, cw, iv, *expiry_s, *redact)),
+            _ => None,
+        });
+        let (id, algo, parity, cw, iv, expiry, redact) = key.expect("a CwWithIv command");
+        assert_eq!(id, pmt_id as usize);
+        assert_eq!(algo, CwAlgo::Aes128Cbc);
+        assert_eq!(parity, 1);
+        assert!(cw.as_slice() == [0x11; 16], "the key bytes");
+        assert!(*iv == [0x22; 16], "the IV bytes");
+        assert_eq!(expiry, 3720, "the 62 minute lifetime");
+        assert!(redact, "the CW dump must hide the bytes");
+    }
+
+    // disable_cws_for_all_pmts: a DisableCw for the PMT's adapter descrambler.
+    #[test]
+    fn ciplus_disable_reaches_the_pmts_adapter_descrambler() {
+        let mut sched = sched();
+        let pmt_id = sched.pmt_add(0, 0x64, 0x100);
+        let mut ca = CaRuntime::new(&Options::default());
+        let (tx, rx) = mpsc::channel();
+        ca.adapters.insert(
+            0,
+            AdapterCa {
+                descrambler: tx,
+                services: BTreeMap::new(),
+                ca_active: false,
+                pids_all: false,
+                stats: DescramblerStats::default(),
+                pending_stats: None,
+                pid_table: Vec::new(),
+            },
+        );
+        let (notices, notices_rx) = mpsc::channel();
+        ca.dvbca = Some(DvbcaState {
+            dvbca: Rc::new(Dvbca::from_notices(notices_rx)),
+            caids: Rc::new(RefCell::new(BTreeMap::new())),
+            pending: PendingOffers::default(),
+            ca_id: 0,
+            requested: None,
+        });
+        notices
+            .send(Notice::DisableCws(vec![pmt_id as usize]))
+            .unwrap();
+        ca.dvbca_notices(&mut sched);
+        let commands: Vec<DescramblerCommand> = rx.try_iter().collect();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, DescramblerCommand::DisableCw { pmt_id: id } if *id == pmt_id as usize)),
+            "disable_cws_for_all_pmts"
+        );
     }
 }
 

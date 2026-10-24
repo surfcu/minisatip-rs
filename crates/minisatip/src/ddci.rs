@@ -943,6 +943,107 @@ mod tests {
             ca.descrambler_services(1)
         );
     }
+
+    // send_cw_to_all_pmts on DDCI: a CI+ key for the CI-side PMT goes to the CI
+    // adapter's descrambler, which then decrypts a CAM packet with its IV.
+    #[test]
+    fn ddci_ciplus_key_reaches_the_ci_adapter_descrambler() {
+        use crate::dvbca::Notice;
+        use ms_ca_drivers::descramble::aes::Aes128;
+        use ms_ca_drivers::en50221::device::CcKeyBytes;
+
+        let DdciRun {
+            cam,
+            mut sched,
+            mut ca,
+            hub,
+            // The adapters' data-plane threads stop when the handles drop.
+            handles: _handles,
+            ..
+        } = run_ddci(Options::default(), "ciplus-key");
+        let ci_pmt = sched
+            .get_all_pmt_for_sid(1, i32::from(SID))
+            .expect("CI-side PMT")
+            .id;
+
+        // Key routing only: the PMT pid gets an ES claim so packets on it decrypt;
+        // ES-pid mapping is covered by ca.rs `ci_adapter_decrypts_before_the_fifo`.
+        sched
+            .find_pid_mut(1, i32::from(PMT_PID))
+            .expect("the CI adapter reads the PMT pid")
+            .pmt = ci_pmt as i32;
+
+        // The same path `dvbca_notices` uses for `send_cw_to_all_pmts`.
+        const PARITY: u8 = 0;
+        let key = [0x42u8; 16];
+        let iv = [0xA5u8; 16];
+        ca.handle_notice_for_test(
+            &mut sched,
+            Notice::CcKey {
+                pmt_ids: vec![ci_pmt],
+                parity: PARITY,
+                key: CcKeyBytes(key),
+                iv: CcKeyBytes(iv),
+            },
+        );
+
+        // A scrambled PES packet on the PMT pid: not a CAPMT stream, so the CAM
+        // hands it to the CI adapter untouched. The PES start lets the
+        // descrambler validate the CW.
+        let mut plain = vec![0u8, 0, 1];
+        plain.extend((3..176u8).map(|i| i ^ 0x5A));
+        let mut packet = [0xFFu8; 188];
+        packet[0] = 0x47;
+        packet[1] = 0x40 | (PMT_PID >> 8) as u8; // payload unit start
+        packet[2] = PMT_PID as u8;
+        packet[3] = 0x80; // scrambled, even key, no adaptation field
+        packet[4..4 + plain.len()].copy_from_slice(&plain);
+        Aes128::new(&key).encrypt_cbc(&iv, &mut packet[4..4 + plain.len()]);
+
+        let mut read = hub.lock().ddci.devices[&1].fifo.write_index;
+        let mut captured = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let decrypted = loop {
+            cam.lock().unwrap().write_ts(&packet);
+            std::thread::sleep(Duration::from_millis(20));
+            {
+                let state = hub.lock();
+                let fifo = &state.ddci.devices[&1].fifo;
+                let mut bytes = vec![0u8; (fifo.write_index - read) as usize];
+                let n = fifo.pop_offset(&mut bytes, &mut read);
+                captured.extend_from_slice(&bytes[..n]);
+            }
+            let pid = |p: &[u8]| (u16::from(p[1] & 0x1F) << 8) | u16::from(p[2]);
+            if let Some(p) = captured.as_chunks::<188>().0.iter().copied().find(|p| {
+                p[0] == 0x47 && pid(p) == PMT_PID && p[3] & 0xC0 == 0 && p[4..180] == plain[..]
+            }) {
+                break p.to_vec();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the CI adapter never decrypted the PMT packet"
+            );
+        };
+        assert_eq!(&decrypted[4..180], &plain[..], "the payload is clear again");
+
+        let stats = ca
+            .descrambler_stats(1)
+            .expect("the CI adapter's descrambler answers");
+        let service = stats
+            .services
+            .iter()
+            .find(|service| service.pmt_id == ci_pmt)
+            .expect("the CI-side PMT is a descrambler service");
+        assert_eq!(service.parity, PARITY as i8);
+        assert!(
+            service.cw.is_some(),
+            "the descrambler stored the forwarded CwWithIv"
+        );
+        assert!(
+            service.last_decrypt_ok > 0,
+            "the descrambler decrypted with it"
+        );
+    }
 }
 
 #[cfg(test)]

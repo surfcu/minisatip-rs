@@ -22,6 +22,9 @@ pub struct CaRegistry {
     pub enigma: bool,
     /// Set once any CA device initialised (`has_ci`).
     pub has_ci: bool,
+    /// `opts.cache_dir` for the CI+ authdata files.
+    #[cfg_attr(not(feature = "ci-plus"), allow(dead_code))]
+    cache_dir: String,
 }
 
 fn index(i: i32) -> Option<usize> {
@@ -35,7 +38,13 @@ impl CaRegistry {
             clock,
             enigma: false,
             has_ci: false,
+            cache_dir: "/var/cache/minisatip".to_owned(),
         }
+    }
+
+    /// Sets the directory CI+ authdata is cached in (`opts.cache_dir`).
+    pub fn set_cache_dir(&mut self, dir: &str) {
+        self.cache_dir = dir.to_owned();
     }
 
     pub fn get(&self, i: i32) -> Option<&CaDevice> {
@@ -135,6 +144,12 @@ impl CaRegistry {
         };
         link.flush_input();
         let enigma = self.enigma;
+        #[cfg(feature = "ci-plus")]
+        let cache_dir = self.cache_dir.clone();
+        #[cfg(feature = "ci-plus")]
+        let cert_dir = opener.ciplus_cert_dir();
+        #[cfg(feature = "ci-plus")]
+        let has_root_cert = opener.has_ciplus_root_cert();
         let c = self.device(i);
         c.set_link(Some(link));
         c.id = i;
@@ -151,16 +166,26 @@ impl CaRegistry {
         c.key = [[0; 16]; 2];
         c.iv = [[0; 16]; 2];
         c.push_event(HostEvent::Opened);
-        // CI+ content control is not implemented (DEV-151): plain CI even when
-        // C++ would use the certificates for the SAC protocol.
-        if !c.force_ci {
-            if opener.has_ciplus_root_cert() {
-                ms_log::log!(
-                    "CA {}: CI+ certificates found but CI+ is not supported, using plain CI",
-                    c.id
-                );
+        #[cfg(not(feature = "ci-plus"))]
+        {
+            // DEV-151: CI+ is not built in, so every slot stays on plain CI.
+            if !c.force_ci {
+                if opener.has_ciplus_root_cert() {
+                    ms_log::log!(
+                        "CA {}: CI+ certificates found but CI+ is not supported, using plain CI",
+                        c.id
+                    );
+                }
+                c.force_ci = true;
             }
-            c.force_ci = true;
+        }
+        #[cfg(feature = "ci-plus")]
+        {
+            // ca.cpp:3982-3985: no root certificate means plain CI.
+            if !c.force_ci && !has_root_cert {
+                c.force_ci = true;
+            }
+            c.set_ciplus_paths(&cert_dir, &cache_dir);
         }
         if !enigma && !c.slot_present() {
             ms_log::log!("CA {}: no module in slot, deferring init", c.id);
@@ -177,6 +202,10 @@ impl CaRegistry {
             return InitResult::Retry;
         }
         c.enabled = true;
+        #[cfg(feature = "ci-plus")]
+        if !c.force_ci {
+            ms_log::log!("CA {}: CI+ content control enabled (experimental)", c.id);
+        }
         self.has_ci = true;
         InitResult::Ok
     }

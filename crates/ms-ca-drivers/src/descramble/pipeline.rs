@@ -47,6 +47,8 @@ struct CwSlot {
     pmt: usize,
     parity: u8,
     cipher: Box<dyn Cipher>,
+    /// Never print this slot's key or IV (`<redacted>`).
+    redact: bool,
 }
 
 /// Descrambling state of one service (the `SPMT` decrypt fields).
@@ -207,7 +209,7 @@ fn mark_pcr_only(b: &mut [u8]) {
 /// `cw_to_string`: the human-readable form of one CW slot.
 fn cw_to_string(id: usize, cw: &CwSlot, now: i64) -> String {
     let mut out = format!(
-        "id {}, parity {}, pmt {},{} time {} ms ago, expiry in {} ms, CW: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+        "id {}, parity {}, pmt {},{} time {} ms ago, expiry in {} ms",
         id,
         cw.parity,
         cw.pmt,
@@ -218,6 +220,16 @@ fn cw_to_string(id: usize, cw: &CwSlot, now: i64) -> String {
         },
         now - cw.time,
         cw.expiry - now,
+    );
+    if cw.redact {
+        out.push_str(", CW: <redacted>");
+        if cw.key.iv[0] != 0 {
+            out.push_str(", IV: <redacted>");
+        }
+        return out;
+    }
+    out.push_str(&format!(
+        ", CW: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
         cw.key.cw[0],
         cw.key.cw[1],
         cw.key.cw[2],
@@ -226,7 +238,7 @@ fn cw_to_string(id: usize, cw: &CwSlot, now: i64) -> String {
         cw.key.cw[5],
         cw.key.cw[6],
         cw.key.cw[7]
-    );
+    ));
     if cw.key.iv[0] != 0 {
         out.push_str(&format!(
             ", IV: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
@@ -465,6 +477,13 @@ impl Descrambler {
         }
     }
 
+    /// The `dump_cws` line of a live slot, for tests.
+    #[cfg(test)]
+    pub fn cw_dump_line(&self, id: usize, now: i64) -> Option<String> {
+        let slot = self.slots.get(id)?.as_ref()?;
+        (slot.enabled && slot.expiry > now).then(|| cw_to_string(id, slot, now))
+    }
+
     /// `dump_cws`: logs every live CW slot.
     fn dump_cws(&self, now: i64) {
         if !ms_log::enabled(ms_log::LOG_GENERAL) {
@@ -496,6 +515,38 @@ impl Descrambler {
         iv: Option<&[u8]>,
         expiry_s: i64,
         icam_ecm: u8,
+        now: i64,
+    ) -> Result<usize, SendCwError> {
+        self.send_cw_with(pmt_id, algo, parity, cw, iv, expiry_s, icam_ecm, false, now)
+    }
+
+    /// Like [`Self::send_cw`], but the slot never prints its key or IV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_cw_redacted(
+        &mut self,
+        pmt_id: usize,
+        algo: CwAlgo,
+        parity: u8,
+        cw: &[u8],
+        iv: Option<&[u8]>,
+        expiry_s: i64,
+        icam_ecm: u8,
+        now: i64,
+    ) -> Result<usize, SendCwError> {
+        self.send_cw_with(pmt_id, algo, parity, cw, iv, expiry_s, icam_ecm, true, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_cw_with(
+        &mut self,
+        pmt_id: usize,
+        algo: CwAlgo,
+        parity: u8,
+        cw: &[u8],
+        iv: Option<&[u8]>,
+        expiry_s: i64,
+        icam_ecm: u8,
+        redact: bool,
         now: i64,
     ) -> Result<usize, SendCwError> {
         if !self.services.contains_key(&pmt_id) {
@@ -595,6 +646,7 @@ impl Descrambler {
             pmt: pmt_id,
             parity,
             cipher: factory(),
+            redact,
         });
         if slot.enabled {
             slot.cipher.stop_cw(&slot.key);
@@ -611,6 +663,7 @@ impl Descrambler {
         slot.algo = algo;
         slot.pmt = pmt_id;
         slot.parity = parity;
+        slot.redact = redact;
         slot.cipher.set_context(pmt_id, parity, &pids);
         slot.cipher.set_cw(&slot.key);
         slot.enabled = true;

@@ -16,9 +16,9 @@ dvbcsa = ["ms-ca-drivers/dvbcsa"]
 # iCAM CSA: needs a libdvbcsa that exports dvbcsa_bs_key_set_ecm.
 dvbcsa-icam = ["dvbcsa", "ms-ca-drivers/dvbcsa-icam"]
 # CI+ content control support in the EN 50221 host.
-ci-plus = ["ms-ca-drivers/ci-plus"]
+ci-plus = ["ms-ca-drivers/ci-plus", "ms-fakecam/ci-plus"]
 # CI+ with a statically built OpenSSL (musl builds).
-ci-plus-vendored = ["ms-ca-drivers/ci-plus-vendored"]
+ci-plus-vendored = ["ci-plus", "ms-ca-drivers/ci-plus-vendored"]
 
 [dependencies]
 libc = "0.2"

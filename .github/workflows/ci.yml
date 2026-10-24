@@ -60,11 +60,15 @@ jobs:
         run: cargo check -p minisatip --features ci-plus
 
       - name: Clippy
-        run: cargo clippy -p ms-ca-drivers --all-targets --features ci-plus,ms-fakecam/ci-plus -- -D warnings
+        run: |
+          cargo clippy -p ms-ca-drivers --all-targets --features ci-plus,ms-fakecam/ci-plus -- -D warnings
+          cargo clippy -p minisatip --all-targets --features ci-plus,ms-fakecam/ci-plus -- -D warnings
 
       # The CI+ protocol tests need the fake CAM's ci-plus feature too; both are always passed.
       - name: Tests
-        run: cargo test -p ms-ca-drivers --features ci-plus,ms-fakecam/ci-plus
+        run: |
+          cargo test -p ms-ca-drivers --features ci-plus,ms-fakecam/ci-plus
+          cargo test -p minisatip --features ci-plus,ms-fakecam/ci-plus
 
   dvbcsa:
     name: Tests with dvbcsa (CSA descrambling, ca_e2e)
