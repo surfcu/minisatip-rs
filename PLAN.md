@@ -42,7 +42,8 @@ allocation and PSI processing are each owned by one component.
 - Full CLI option compatibility (`opts.cpp`)
 
 ### Explicitly deferred
-- Enigma2-specific paths: until after M9, only if someone can test them
+- Enigma2-specific paths (was deferred): ported in M9 (2026-10-23/24) and tested on the
+  user's enigma2 box, except the CI routing, which needs a CAM in that box
 - CI+ crypto: ported last, behind a cargo feature, marked experimental until
   validated on real CI+ CAMs. Until then the host forces plain CI on every slot,
   even when CI+ certificates are installed (DEV-151)
@@ -211,12 +212,10 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 - [ ] All C++ tests ported and passing; full harness suite clean
 - [ ] Soak test on the box: 7 days as tvheadend backend, no regressions
 - [ ] Memory/CPU/binary size comparison vs C++ documented
-- [ ] `-k` (`emulate_pids_all`) for enigma2 boxes: no `set_pid(8192)` when emulating
-  (adapter.cpp:997), feed PID 0 packets to filters on 8192 (pmt.cpp:1505-1509),
-  the enigma2 auto-detect when `/etc/enigma2/settings` exists, which also switches the
-  demux mode (minisatip.cpp:631-632, 688-690), then wire `opts.emulate_pids_all` to
-  the existing `PmtTables::set_emulate_pids_all`; check `pids=all` on the
-  user's enigma2 box, where C++ v2.0.160 returned only PSI and null packets
+- [x] `-k` (`emulate_pids_all`) and the enigma2 path: pids=all emulation (#45), demux
+  modes 1-3 (#46), enigma2 detection, FBC and `DMX_SET_SOURCE` (#47), CI routing
+  (#48), log fixes (#50, #52); FTA and pids=all verified on the enigma2 box; CI routing
+  untested (no CAM in that box)
 - **Exit:** daily-driver replacement for the user's own setup
 
 ### M10 — Experimental + improvements
@@ -236,7 +235,8 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 | Unicable/JESS | — | tests + external testers |
 | CI+ | — | external testers |
 | SAT>IP client | TBD | real server if available |
-| Netceiver (parked), hw descrambler, Enigma2 | — | tests only |
+| Enigma2 (armv7, demux mode 3, `-k`) | user's enigma2 box | real: FTA and pids=all over HTTP (2026-10-23/24); CI routing untested (no CAM in that box) |
+| Netceiver (parked), hw descrambler | — | tests only |
 
 Unvalidated rows must be called out in release notes.
 
@@ -282,30 +282,39 @@ Unvalidated rows must be called out in release notes.
 
 - **Current milestone:** M9 (parity hardening). M0–M8 items are in place except the
   M8 status API item; the open exit criteria are listed below.
-- **Last session:** 2026-10-22 — hardware bring-up behind tvheadend on the user's box
-  (8 DVB-S2 tuners, DuoFlex CI with an Irdeto CAM). Fixed and merged:
+- **Deployed (2026-10-24):** minisatip-rs replaces the C++ build on both boxes.
+  - The main box (8 DVB-S2 tuners, DuoFlex CI) runs it as a systemd unit behind
+    tvheadend since 02:37; this starts the 7-day soak (M9).
+  - The enigma2 box (armv7) runs it with `-E -g` since 02:05.
+  - Logs from both boxes and tvheadend go to a central Loki/Grafana host.
+- **Last sessions (2026-10-23/24):** merged and verified:
+  - #43 real-capture harness scenarios and the `pmt_scan` wiring; #44 PLAN.
+  - #45 `-k` pids=all emulation; #46 demux-device modes 1-3; #47 enigma2 detection,
+    FBC and `DMX_SET_SOURCE`; #48 enigma2 CI routing; #50 local time before the
+    logger starts and the adapter id in the `DMX_SET_SOURCE` log.
+  - #49 plain CI forced until CI+ content control exists (#35).
+  - #51 a status byte without data is no longer an "unhandled tpdu_tag".
+  - #52 local-time syslog on musl builds.
+  - Harness: 15 synthetic scenarios (C++ vs Rust, goldens) and 3 real-capture
+    scenarios, all passing with `--runs 3`.
+  - M1 determinism (2026-10-24): the C++ reference (upstream `28dfd78` with the
+    replay patch) against itself, all 15 scenarios with `--runs 10` and `--golden`:
+    15/15, no run-to-run or golden diffs. M1's exit criterion is met.
+- **Earlier (2026-10-22):** hardware bring-up behind tvheadend on the main box:
   - #21 hermetic tests (`-N`); #22 `DTV_ENUM_DELSYS` byte layout; #23 LNB kHz units.
-  - #24 DDCI multi-PMT (`-c N:**M`) PID filter; #26 DDCI CAM output may grow the batch
-    (plus harness date masking); #27 blocking RTP socket with the C++ 1.1 s timeout
-    (lost RTP datagrams).
+  - #24 DDCI multi-PMT (`-c N:**M`) PID filter; #26 DDCI CAM output may grow the batch;
+    #27 blocking RTP socket with the C++ 1.1 s timeout.
   - #25 C++ logging port (`-l`, `-v`, `-F`, `-g`).
-  - #28 and #30 port upstream #1518 (no forced CAPMT on a kept-place rejoin) and
-    3d42bee (retry a failed CAPMT write). Upstream baseline is now `28dfd78`.
-  - #29 status page: SDT names, CI adapter type, CA info (DEV-212 withdrawn).
-  - EN 50221 `-c N:**M`: a multiple-PMT CAPMT lists only the ES pids in the
-    adapter's pid table (`added_only`, `find_pid`), fed to the dvbca worker from the
-    same per-tick view as DDCI; a pid added later invalidates the PMT and the CAPMT
-    is re-sent (`dvbca_add_pid`).
-  - Verified on the box: FTA, DDCI descrambling of 3 channels with MTD, rejoin
-    without partner glitches.
-- **Real captures (2026-10-23):** FTA DMAX mux (12015 H), 19-service FTA mux
-  (11425 V) and an Irdeto-scrambled service with ECM/EMM (12073 V, from a second box with `-E`), kept
-  in `~/captures` outside git (README there). `ms-harness run --captures ~/captures
-  harness/scenarios-real`: 3/3 pass C++ against Rust, `--runs 3`. They found that
-  `pmt_scan` never reached the scheduler (unrequested PMTs were not read).
-  Known gap: `-k` (`emulate_pids_all`) is parsed but not wired (M9 item).
+  - #28 and #30 port upstream #1518 and 3d42bee. Upstream baseline is `28dfd78`.
+  - #29 status page: SDT names, CI adapter type, CA info.
+  - EN 50221 `-c N:**M` multiple-PMT CAPMTs from the adapter's pid table.
+  - Verified: FTA, DDCI descrambling of 3 channels with MTD, rejoin without
+    partner glitches.
+- **Real captures (2026-10-23):** an FTA mux (12015 H), a 19-service FTA mux (11425 V)
+  and an Irdeto-scrambled service with ECM/EMM (12073 V), kept in `~/captures`
+  outside git (README there); `ms-harness run --captures ~/captures
+  harness/scenarios-real`.
 - **Open exit criteria:**
-  - M1: C++-against-itself determinism run (10 runs) not recorded.
   - M2: 1 h fuzz run not recorded.
   - M3: tvheadend via the replay tuner not tried (tvheadend works on real tuners).
   - M4: all 8 adapters exercised and zapping compared with C++.
@@ -321,13 +330,22 @@ Unvalidated rows must be called out in release notes.
   - M8: satipc against a real SAT>IP server. Status API: SAT>IP client adapters
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).
-  - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak; resource comparison.
+  - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak running since
+    2026-10-24 02:37 on the main box; resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
-- **Next:** status page check on the box (#29); report the SAT>IP adapter type;
-  port `test_utils.cpp`; CA scenarios in the harness; second CI (adapter 9) once a CAM is in; start the 7-day soak;
-  `-k` for enigma2 boxes (M9).
+- **Next:**
+  - #35 CI+ content control, behind the `ci-plus` feature. Decided: the `openssl`
+    crate, vendored for the static musl builds; the size target in §2 applies to
+    the default build without the feature. No CI+ host certificates exist yet, so
+    validation is against `ms-fakecam`, which first needs the CI+ content-control
+    resource (SAC messages, a test certificate chain).
+  - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
+    on the status page.
+  - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
+    is in that box.
+  - Resource comparison; finish the soak.
 - **Blockers:** no SAT>IP server (M8 exit).
 - **CI+ (2026-10-23):** plain CI is forced on every slot, even with
   `/etc/ssl/certs/root.pem`, so the CI+ content-control resources are never
