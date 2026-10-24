@@ -1,10 +1,27 @@
 //! Help text, reproduced from the C++ `usage()`.
 
+/// Build date stamped by `build.rs`, in C++ `__DATE__` form ("Mmm dd yyyy").
+pub const BUILD_DATE: &str = env!("MS_BUILD_DATE");
+
+/// Build time stamped by `build.rs`, in C++ `__TIME__` form ("HH:MM:SS").
+pub const BUILD_TIME: &str = env!("MS_BUILD_TIME");
+
+/// `BUILD_DATE | BUILD_TIME`, the `datetime_compile` value (minisatip.cpp:1149-1150).
+pub const BUILD_DATETIME: &str = concat!(env!("MS_BUILD_DATE"), " | ", env!("MS_BUILD_TIME"));
+
+/// `DVBAPIVERSION` as `%04X` (`dvb.h:19`): `DVB_API_VERSION << 8 | MINOR`.
+pub const S2API_VERSION: &str = env!("MS_S2API_VERSION");
+
 /// Version and build banner printed by `--version` and at the top of `--help`.
 pub const VERSION_BANNER: &str = concat!(
     "minisatip version ",
     env!("CARGO_PKG_VERSION"),
-    ", compiled on <build date>, with s2api version: 0500"
+    ", compiled on ",
+    env!("MS_BUILD_DATE"),
+    " ",
+    env!("MS_BUILD_TIME"),
+    ", with s2api version: ",
+    env!("MS_S2API_VERSION")
 );
 
 /// Build features, one line each (`built_info` in the C++ source).
@@ -25,7 +42,13 @@ pub const BUILT_INFO: [&str; 10] = [
 pub const USAGE: &str = concat!(
     "minisatip version ",
     env!("CARGO_PKG_VERSION"),
-    ", compiled on <build date>, with s2api version: 0500\n",
+    ", compiled on ",
+    env!("MS_BUILD_DATE"),
+    " ",
+    env!("MS_BUILD_TIME"),
+    ", with s2api version: ",
+    env!("MS_S2API_VERSION"),
+    "\n",
     "Built with dvbcsa\n",
     "Built with CI\n",
     "Built with dvbapi\n",
@@ -107,6 +130,8 @@ Help
 * -f foreground: otherwise run in background
 
 * -F --logfile log_file: output the debug/log information to  log_file when running in background (option -f not used), default /tmp/minisatip.log
+
+* --log-max-size bytes: rotate the -F log file to log_file.1 when the next line would make it larger than bytes; 0 disables rotation (default 0)
 
 * -g --syslog: use syslog instead stdout for logging, multiple -g - print to stderr as well
 
@@ -314,4 +339,90 @@ pub fn usage_text() -> String {
             .replace(NETCEIVER_HELP, "");
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DVB_API_VERSION, DVB_API_VERSION_MINOR};
+
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    /// Splits "Mmm dd yyyy" and returns the fields when the shape is right.
+    fn date_fields(date: &str) -> Option<(String, u32, String)> {
+        let fields: Vec<&str> = date.split_whitespace().collect();
+        if fields.len() != 3 || !MONTHS.contains(&fields[0]) || fields[2].len() != 4 {
+            return None;
+        }
+        Some((
+            fields[0].to_owned(),
+            fields[1].parse().ok()?,
+            fields[2].to_owned(),
+        ))
+    }
+
+    fn is_time(time: &str) -> bool {
+        let fields: Vec<&str> = time.split(':').collect();
+        fields.len() == 3
+            && fields
+                .iter()
+                .all(|field| field.len() == 2 && field.chars().all(|c| c.is_ascii_digit()))
+            && fields[0].parse::<u32>().is_ok_and(|hour| hour < 24)
+            && fields[1].parse::<u32>().is_ok_and(|minute| minute < 60)
+            && fields[2].parse::<u32>().is_ok_and(|second| second < 60)
+    }
+
+    // minisatip.cpp:1155: "%s version %s, compiled on %s %s, with s2api version: %04X".
+    #[test]
+    fn version_banner_has_the_cpp_shape() {
+        let rest = VERSION_BANNER
+            .strip_prefix("minisatip version ")
+            .expect("banner prefix");
+        let (version, rest) = rest.split_once(", compiled on ").expect("compiled on");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        let (stamp, s2api) = rest
+            .split_once(", with s2api version: ")
+            .expect("s2api suffix");
+        let (date, time) = stamp.rsplit_once(' ').expect("date and time");
+        let (_, day, year) = date_fields(date).expect("Mmm dd yyyy");
+        assert!((1..=31).contains(&day), "{date}");
+        assert!(year.parse::<i32>().is_ok());
+        assert!(is_time(time), "{time}");
+        #[cfg(feature = "linux-dvb")]
+        assert_eq!(s2api, "050C");
+        #[cfg(not(feature = "linux-dvb"))]
+        assert_eq!(s2api, "0000");
+    }
+
+    // The banner and /state.json share one stamp: `__DATE__ | __TIME__`.
+    #[test]
+    fn build_stamp_has_the_cpp_date_and_time_format() {
+        assert_eq!(BUILD_DATETIME, format!("{BUILD_DATE} | {BUILD_TIME}"));
+        let (_, day, year) = date_fields(BUILD_DATE).expect("Mmm dd yyyy");
+        assert!((1..=31).contains(&day), "{BUILD_DATE}");
+        assert!(year.parse::<i32>().is_ok());
+        assert!(is_time(BUILD_TIME), "{BUILD_TIME}");
+    }
+
+    #[test]
+    fn s2api_version_comes_from_the_ported_uapi() {
+        assert_eq!(
+            format!("{DVB_API_VERSION:02X}{DVB_API_VERSION_MINOR:02X}"),
+            "050C"
+        );
+        #[cfg(feature = "linux-dvb")]
+        assert_eq!(S2API_VERSION, "050C");
+        #[cfg(not(feature = "linux-dvb"))]
+        assert_eq!(S2API_VERSION, "0000");
+    }
+
+    #[test]
+    fn usage_has_log_max_size_after_the_logfile_entry() {
+        let logfile = USAGE.find("* -F --logfile").expect("-F entry");
+        let max_size = USAGE.find("* --log-max-size bytes:").expect("new option");
+        assert!(max_size > logfile, "the option follows -F");
+        assert!(USAGE[max_size..].contains("0 disables rotation"));
+    }
 }

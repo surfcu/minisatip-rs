@@ -17,4 +17,13 @@ pub use options::{
 pub use parse::{
     Host, ParseOutcome, parse_args, parse_args_on, parse_dvbapi_opt, parse_sdt_charset_opt,
 };
-pub use usage::{BUILT_INFO, USAGE, VERSION_BANNER, built_info, usage_text};
+pub use usage::{
+    BUILD_DATE, BUILD_DATETIME, BUILD_TIME, BUILT_INFO, S2API_VERSION, USAGE, VERSION_BANNER,
+    built_info, usage_text,
+};
+
+/// `DVB_API_VERSION` (`linux/dvb/version.h`) of the uapi ms-tuner was ported from.
+pub const DVB_API_VERSION: u8 = 5;
+
+/// `DVB_API_VERSION_MINOR` (`linux/dvb/version.h`) of that uapi.
+pub const DVB_API_VERSION_MINOR: u8 = 12;

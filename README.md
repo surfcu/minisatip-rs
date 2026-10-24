@@ -45,7 +45,6 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   their SNR as DVB (DEV-053).
 - Netceiver is parked (PLAN §3): the `ms-tuner` backend exists but the binary does
   not use it, and `-n` is an unknown option, as in a C++ build without NETCVCLIENT.
-- The demux-device modes are not supported; the DVR device is always used (DEV-072).
 
 ## Layout
 

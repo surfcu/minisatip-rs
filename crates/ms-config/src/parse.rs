@@ -25,6 +25,7 @@ enum OptId {
     Log,
     Debug,
     LogFile,
+    LogMaxSize,
     Help,
     Playlist,
     Adapters,
@@ -268,6 +269,12 @@ const OPTIONS: &[OptSpec] = &[
         short: Some('F'),
         kind: ArgKind::Required,
         id: OptId::LogFile,
+    },
+    OptSpec {
+        long: "log-max-size",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::LogMaxSize,
     },
     OptSpec {
         long: "multiplier",
@@ -766,6 +773,7 @@ impl Parser<'_> {
             }
             OptId::Syslog => self.opts.slog += 1,
             OptId::LogFile => self.opts.log_file = value.into(),
+            OptId::LogMaxSize => self.opts.log_max_size = value.parse::<u64>().unwrap_or(0),
             OptId::Help => self.opts.help = true,
             OptId::Version => self.opts.version = true,
             OptId::HttpPort => self.opts.http_port = c_atoi(value) as u32,

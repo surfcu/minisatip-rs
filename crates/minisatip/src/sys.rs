@@ -3,12 +3,11 @@
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
-#[cfg_attr(not(target_env = "musl"), allow(unused_imports))]
-use std::io::Write;
+use std::io::Write as _;
 use std::os::unix::net::UnixDatagram;
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
 use ms_log::{Backend, Timestamp};
 
@@ -184,28 +183,54 @@ pub fn become_daemon(log_file: &str) -> Result<(), String> {
         return Err("cannot open /dev/null as stdin".to_owned());
     }
 
-    let Ok(path) = CString::new(log_file) else {
+    redirect_to_log_file(log_file)
+}
+
+/// Opens `path` and duplicates it onto stdout and stderr (`becomeDaemon`,
+/// utils.cpp:315-340).
+pub fn redirect_to_log_file(path: &str) -> Result<(), String> {
+    let Ok(cpath) = CString::new(path) else {
         return Err("invalid log file name".to_owned());
     };
-    let flags = if std::fs::metadata(log_file).is_ok() {
+    let flags = if std::fs::metadata(path).is_ok() {
         libc::O_RDWR | libc::O_APPEND
     } else {
         libc::O_RDWR | libc::O_CREAT
     };
-    // SAFETY: `path` is NUL-terminated and the mode is only used with O_CREAT.
-    let log_fd = unsafe { libc::open(path.as_ptr(), flags, 0o666 as libc::c_uint) };
+    // SAFETY: `cpath` is NUL-terminated and the mode is only used with O_CREAT.
+    let log_fd = unsafe { libc::open(cpath.as_ptr(), flags, 0o666 as libc::c_uint) };
+    if log_fd < 0 {
+        return Err(format!("cannot open {path} as stdout"));
+    }
     if log_fd != libc::STDOUT_FILENO {
-        if log_fd >= 0 {
-            // SAFETY: log_fd is owned here.
-            unsafe { libc::close(log_fd) };
+        // SAFETY: log_fd is owned here and dup2 leaves it open.
+        let duplicated = unsafe { libc::dup2(log_fd, libc::STDOUT_FILENO) };
+        // SAFETY: log_fd is still owned here.
+        unsafe { libc::close(log_fd) };
+        if duplicated != libc::STDOUT_FILENO {
+            return Err("dup2 failed".to_owned());
         }
-        return Err(format!("cannot open {log_file} as stdout"));
     }
     // SAFETY: dup2 duplicates the now-open stdout onto stderr.
     if unsafe { libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO) } != libc::STDERR_FILENO {
         return Err("dup2 failed".to_owned());
     }
     Ok(())
+}
+
+/// Whether stderr is a different open file than stdout (`fstat` comparison).
+pub fn stderr_differs_from_stdout() -> bool {
+    // SAFETY: fstat writes only into the stack `stat` values.
+    unsafe {
+        let mut out: libc::stat = std::mem::zeroed();
+        let mut err: libc::stat = std::mem::zeroed();
+        if libc::fstat(libc::STDOUT_FILENO, &mut out) != 0
+            || libc::fstat(libc::STDERR_FILENO, &mut err) != 0
+        {
+            return true;
+        }
+        out.st_dev != err.st_dev || out.st_ino != err.st_ino
+    }
 }
 
 /// If the pid file names a live process running this executable, sends it
@@ -240,19 +265,208 @@ fn kill_previous_instance() {
     }
 }
 
-/// The real backend: local time through `localtime_r` and lines through
-/// syslog when `-g` is active.
+/// Where `-g` lines go: the C library on glibc, a `/dev/log` datagram on musl.
+enum SyslogTarget {
+    #[cfg_attr(target_env = "musl", allow(dead_code))]
+    Libc,
+    Datagram(PathBuf),
+}
+
+/// The real backend: local time through `localtime_r`, lines through syslog
+/// when `-g` is active, and `--log-max-size` rotation for the `-F` file.
 ///
 /// On musl, lines go straight to /dev/log; otherwise `openlog` runs lazily,
 /// and again after `become_daemon` closed it (minisatip.cpp:1919-1923).
 pub struct SysLogBackend {
     perror: bool,
+    target: SyslogTarget,
+    rotation: LogRotation,
 }
 
 impl SysLogBackend {
     /// `slog` is `opts.slog`: more than one `-g` also mirrors lines to stderr.
     pub fn new(slog: u32) -> Self {
-        Self { perror: slog > 1 }
+        #[cfg(target_env = "musl")]
+        let target = SyslogTarget::Datagram(PathBuf::from(SYSLOG_PATH));
+        #[cfg(not(target_env = "musl"))]
+        let target = SyslogTarget::Libc;
+        Self {
+            perror: slog > 1,
+            target,
+            rotation: LogRotation::default(),
+        }
+    }
+
+    /// A datagram writer at `path`, so tests can run on every unix target.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_socket_path(slog: u32, path: impl Into<PathBuf>) -> Self {
+        Self {
+            perror: slog > 1,
+            target: SyslogTarget::Datagram(path.into()),
+            rotation: LogRotation::default(),
+        }
+    }
+
+    /// Handle used by `main` to arm rotation after the `-F` redirect.
+    pub fn rotation(&self) -> LogRotation {
+        self.rotation.clone()
+    }
+
+    /// Datagram output used on musl and by tests.
+    #[cfg_attr(not(target_env = "musl"), allow(dead_code))]
+    fn syslog_datagram(&self, path: &Path, line: &str) {
+        SYSLOG_OPEN.store(true, Ordering::SeqCst);
+        let timestamp = local_timestamp();
+        let text = syslog_line(
+            SYSLOG_PRI,
+            timestamp.month,
+            timestamp.day,
+            timestamp.hour,
+            timestamp.minute,
+            timestamp.second,
+            std::process::id(),
+            line,
+        );
+        if self.perror {
+            // glibc's LOG_PERROR ignores write errors and adds a missing newline.
+            let message: String = line.chars().filter(|c| *c != '\0').collect();
+            let end = if message.ends_with('\n') { "" } else { "\n" };
+            let _ = write!(
+                std::io::stderr().lock(),
+                "{APP_NAME}[{}]: {message}{end}",
+                std::process::id()
+            );
+        }
+        syslog_send(path, &SYSLOG_SOCKET, text.as_bytes());
+    }
+
+    /// Production glibc output through the C library.
+    #[cfg_attr(target_env = "musl", allow(dead_code))]
+    fn syslog_libc(&self, line: &str) {
+        if !SYSLOG_OPEN.swap(true, Ordering::SeqCst) {
+            let options = libc::LOG_NDELAY
+                | libc::LOG_NOWAIT
+                | libc::LOG_PID
+                | if self.perror { libc::LOG_PERROR } else { 0 };
+            // SAFETY: the identifier is a static NUL-terminated C string;
+            // openlog keeps the pointer, which stays valid for the process.
+            unsafe { libc::openlog(c"minisatip".as_ptr(), options, libc::LOG_DAEMON) };
+        }
+        let clean: String = line.chars().filter(|c| *c != '\0').collect();
+        let Ok(message) = CString::new(clean) else {
+            return;
+        };
+        // SAFETY: "%s" is a static NUL-terminated format string and `message`
+        // is NUL-terminated; syslog copies both before returning.
+        unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), message.as_ptr()) };
+    }
+}
+
+/// Rotation state for `--log-max-size`, shared with the logger backend.
+#[derive(Clone, Default)]
+pub struct LogRotation(Arc<Mutex<Option<Rotation>>>);
+
+struct Rotation {
+    path: PathBuf,
+    limit: u64,
+    written: u64,
+}
+
+impl LogRotation {
+    /// Starts counting at the current size of `path` (after the `-F` redirect).
+    pub fn start(&self, path: &str, limit: u64) {
+        let written = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Rotation {
+            path: PathBuf::from(path),
+            limit,
+            written,
+        });
+    }
+
+    /// Rotates before `line` when it would pass the limit, then counts it.
+    ///
+    /// Never blocks: a panic can arrive while the logger holds this lock, and
+    /// the hook must not deadlock. If the lock is busy the line is written
+    /// without being counted (and so not rotated).
+    fn before_line(&self, line: &str) {
+        let mut state = match self.0.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        let Some(rotation) = state.as_mut() else {
+            return;
+        };
+        let len = line.len() as u64 + 1;
+        if rotation.limit > 0 && rotation.written > 0 && rotation.written + len > rotation.limit {
+            match rotate_log_file(&rotation.path) {
+                Ok(()) => rotation.written = 0,
+                Err(error) => {
+                    // Stop retrying so a failing rotate emits one line, not one per write.
+                    rotation.limit = 0;
+                    write_error_line(&format!("log rotation failed: {error}"));
+                }
+            }
+        }
+        rotation.written += len;
+    }
+}
+
+/// `rename(path, path.1)`, then a fresh `path` on fds 1 and 2.
+fn rotate_log_file(path: &Path) -> Result<(), String> {
+    let backup = PathBuf::from(format!("{}.1", path.display()));
+    std::fs::rename(path, &backup)
+        .map_err(|error| format!("rename {} to {}: {error}", path.display(), backup.display()))?;
+    let Ok(cpath) = CString::new(path.as_os_str().as_encoded_bytes()) else {
+        let _ = std::fs::rename(&backup, path);
+        return Err("invalid log file name".to_owned());
+    };
+    // SAFETY: `cpath` is NUL-terminated and the mode is only used with O_CREAT.
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT,
+            0o666 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        let _ = std::fs::rename(&backup, path);
+        return Err(format!(
+            "cannot open {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: dup2 duplicates the freshly opened file onto stdout and stderr.
+    let stdout_duplicated = unsafe { libc::dup2(fd, libc::STDOUT_FILENO) } == libc::STDOUT_FILENO;
+    if !stdout_duplicated {
+        if fd != libc::STDOUT_FILENO {
+            // SAFETY: fd is owned here and dup2 left the target unchanged.
+            unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::rename(&backup, path);
+        return Err("dup2 failed".to_owned());
+    }
+    // SAFETY: fd is still owned here; stdout now names the fresh file.
+    let stderr_duplicated = unsafe { libc::dup2(fd, libc::STDERR_FILENO) } == libc::STDERR_FILENO;
+    if fd != libc::STDOUT_FILENO {
+        // SAFETY: fd is owned here and the duplicates keep the file open.
+        unsafe { libc::close(fd) };
+    }
+    if !stderr_duplicated {
+        // fd 1 already points at the fresh file, so renaming the backup back
+        // would leave stdout on an unlinked path. Keep it there and report.
+        return Err("dup2 failed".to_owned());
+    }
+    Ok(())
+}
+
+/// Writes a rotation failure straight to fd 2; the logger mutex is held here.
+fn write_error_line(message: &str) {
+    let text = format!("{message}\n");
+    // SAFETY: write(2) only reads `text` and writes to the stderr descriptor.
+    unsafe {
+        let _ = libc::write(libc::STDERR_FILENO, text.as_ptr().cast(), text.len());
     }
 }
 
@@ -303,9 +517,21 @@ fn syslog_line(
 }
 
 /// Sends one datagram, connecting lazily and reconnecting once on failure.
+///
+/// Never blocks: a panic can arrive while the logger holds this lock, so a
+/// busy lock falls back to a one-shot datagram (the line is never dropped).
 #[cfg_attr(not(target_env = "musl"), allow(dead_code))]
 fn syslog_send(path: &Path, state: &Mutex<Option<UnixDatagram>>, line: &[u8]) {
-    let mut socket = state.lock().unwrap_or_else(|error| error.into_inner());
+    let mut socket = match state.try_lock() {
+        Ok(socket) => socket,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            if let Some(socket) = syslog_connect(path) {
+                let _ = socket.send(line);
+            }
+            return;
+        }
+    };
     if socket.is_none() {
         *socket = syslog_connect(path);
     }
@@ -337,53 +563,18 @@ impl Backend for SysLogBackend {
     }
 
     fn syslog(&self, line: &str) {
-        // C++ passes the line to "%s", which stops at a NUL; strip any so the
-        // whole line reaches syslog.
-        #[cfg(target_env = "musl")]
-        {
-            SYSLOG_OPEN.store(true, Ordering::SeqCst);
-            let timestamp = local_timestamp();
-            let text = syslog_line(
-                SYSLOG_PRI,
-                timestamp.month,
-                timestamp.day,
-                timestamp.hour,
-                timestamp.minute,
-                timestamp.second,
-                std::process::id(),
-                line,
-            );
-            if self.perror {
-                // glibc's LOG_PERROR ignores write errors and adds a missing newline.
-                let message: String = line.chars().filter(|c| *c != '\0').collect();
-                let end = if message.ends_with('\n') { "" } else { "\n" };
-                let _ = write!(
-                    std::io::stderr().lock(),
-                    "{APP_NAME}[{}]: {message}{end}",
-                    std::process::id()
-                );
-            }
-            syslog_send(Path::new(SYSLOG_PATH), &SYSLOG_SOCKET, text.as_bytes());
+        // C++ passes the line to "%s", which stops at a NUL; both sinks strip any.
+        match &self.target {
+            SyslogTarget::Datagram(path) => self.syslog_datagram(path, line),
+            SyslogTarget::Libc => self.syslog_libc(line),
         }
-        #[cfg(not(target_env = "musl"))]
-        {
-            if !SYSLOG_OPEN.swap(true, Ordering::SeqCst) {
-                let options = libc::LOG_NDELAY
-                    | libc::LOG_NOWAIT
-                    | libc::LOG_PID
-                    | if self.perror { libc::LOG_PERROR } else { 0 };
-                // SAFETY: the identifier is a static NUL-terminated C string;
-                // openlog keeps the pointer, which stays valid for the process.
-                unsafe { libc::openlog(c"minisatip".as_ptr(), options, libc::LOG_DAEMON) };
-            }
-            let clean: String = line.chars().filter(|c| *c != '\0').collect();
-            let Ok(message) = CString::new(clean) else {
-                return;
-            };
-            // SAFETY: "%s" is a static NUL-terminated format string and `message`
-            // is NUL-terminated; syslog copies both before returning.
-            unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), message.as_ptr()) };
-        }
+    }
+
+    fn stdout(&self, line: &str) {
+        self.rotation.before_line(line);
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
     }
 }
 
