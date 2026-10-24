@@ -1313,6 +1313,15 @@ impl SessionManager {
         (s2, t, c)
     }
 
+    /// Streams the status page counts as active (enabled slots).
+    pub fn active_streams(&self) -> usize {
+        self.streams
+            .iter()
+            .flatten()
+            .filter(|stream| stream.enabled)
+            .count()
+    }
+
     /// Captures adapter, stream and runtime values for the web endpoints.
     pub fn web_snapshot(&self) -> WebSnapshot {
         let mut snapshot = WebSnapshot::new();

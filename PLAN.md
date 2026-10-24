@@ -62,7 +62,7 @@ items back in without the user's explicit go-ahead.
   cleanly and never applied (DEV-080).
 
 ### Non-goals
-- New features before parity (exception: anything needed by the harness)
+- New features before parity (exceptions: anything needed by the harness; `diag-log` for soak and glitch hunting, approved 2026-10-24)
 - Changing the web UI or wire protocols
 
 ## 4. Architecture

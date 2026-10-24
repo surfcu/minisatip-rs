@@ -425,6 +425,12 @@ pub struct Options {
     pub log_file: String,
     /// `--log-max-size` limit for the `-F` file; 0 disables rotation.
     pub log_max_size: u64,
+    /// `--log-remote` TCP syslog sink address.
+    pub log_remote: Option<String>,
+    /// `--log-remote-queue` queue depth for the remote sink.
+    pub log_remote_queue: usize,
+    /// `--log-ring` flight-recorder capacity; 0 disables it.
+    pub log_ring: usize,
     /// `-4` toggles this; 1 means IPv4 only.
     pub use_ipv4_only: i32,
     /// `-1` demux device mode.
@@ -584,6 +590,9 @@ impl Default for Options {
             playlist: None,
             log_file: "/tmp/minisatip.log".into(),
             log_max_size: 0,
+            log_remote: None,
+            log_remote_queue: 10_000,
+            log_ring: 20_000,
             use_ipv4_only: 1,
             use_demux_device: 0,
             strength_multiplier: 1.0,

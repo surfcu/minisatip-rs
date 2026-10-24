@@ -86,6 +86,22 @@ pub fn asctime_now() -> String {
     }
 }
 
+/// The machine hostname (`gethostname`), or an empty string when it fails.
+/// The remote sink then writes the RFC 5424 NILVALUE `-`.
+pub fn hostname() -> String {
+    let mut buffer = [0u8; 256];
+    // SAFETY: `buffer` is writable and its length is passed to gethostname.
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return String::new();
+    }
+    let end = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
 /// Numeric user id (`getuid`).
 pub fn run_user() -> i32 {
     // SAFETY: getuid(2) has no preconditions.
@@ -576,6 +592,51 @@ impl Backend for SysLogBackend {
         let _ = writeln!(out, "{line}");
         let _ = out.flush();
     }
+
+    fn rfc3339_now(&self) -> String {
+        local_rfc3339()
+    }
+}
+
+/// Local time as RFC 3339 with milliseconds and a numeric UTC offset.
+#[allow(clippy::useless_conversion)] // `tm_gmtoff` is i32 on 32-bit targets.
+fn local_rfc3339() -> String {
+    // SAFETY: gettimeofday only writes into the provided timeval.
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    // SAFETY: `tv` is a valid, writable timeval.
+    if unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) } != 0 {
+        return String::new();
+    }
+    // SAFETY: localtime_r only reads the time_t and writes into `tm`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `tm` is valid and writable; `tv.tv_sec` is its time_t.
+    if unsafe { libc::localtime_r(&tv.tv_sec, &mut tm) }.is_null() {
+        return String::new();
+    }
+    rfc3339_text(
+        [tm.tm_year + 1900, (tm.tm_mon + 1).max(0), tm.tm_mday.max(0)],
+        [
+            tm.tm_hour.max(0) as u32,
+            tm.tm_min.max(0) as u32,
+            tm.tm_sec.max(0) as u32,
+            u32::try_from(tv.tv_usec / 1000).unwrap_or(0),
+        ],
+        i64::from(tm.tm_gmtoff),
+    )
+}
+
+/// Formats RFC 3339 local time; `offset_secs` is east of UTC.
+fn rfc3339_text(date: [i32; 3], time: [u32; 4], offset_secs: i64) -> String {
+    let [year, month, day] = date;
+    let [hour, minute, second, millis] = time;
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let offset = offset_secs.unsigned_abs();
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}\
+         {sign}{:02}:{:02}",
+        offset / 3_600,
+        offset % 3_600 / 60
+    )
 }
 
 /// Writes a diagnostic through the logger (`LOG0` for runtime failures).
@@ -600,7 +661,7 @@ pub fn elapsed_string(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SYSLOG_PRI, elapsed_string, syslog_line, syslog_send};
+    use super::{SYSLOG_PRI, elapsed_string, rfc3339_text, syslog_line, syslog_send};
     use std::os::unix::net::UnixDatagram;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -612,6 +673,18 @@ mod tests {
         assert_eq!(elapsed_string(0), "00:00:00");
         assert_eq!(elapsed_string(61), "00:01:01");
         assert_eq!(elapsed_string(3 * 86_400 + 3_661), "3d 01:01:01");
+    }
+
+    #[test]
+    fn rfc3339_keeps_millis_and_offset() {
+        assert_eq!(
+            rfc3339_text([2026, 10, 24], [19, 5, 41, 7], 7_200),
+            "2026-10-24T19:05:41.007+02:00"
+        );
+        assert_eq!(
+            rfc3339_text([2026, 1, 2], [3, 4, 5, 999], -19_800),
+            "2026-01-02T03:04:05.999-05:30"
+        );
     }
 
     #[test]

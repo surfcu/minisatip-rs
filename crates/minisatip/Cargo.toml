@@ -19,6 +19,8 @@ dvbcsa-icam = ["dvbcsa", "ms-ca-drivers/dvbcsa-icam"]
 ci-plus = ["ms-ca-drivers/ci-plus", "ms-fakecam/ci-plus"]
 # CI+ with a statically built OpenSSL (musl builds).
 ci-plus-vendored = ["ci-plus", "ms-ca-drivers/ci-plus-vendored"]
+# Diagnostics: remote syslog sink, flight recorder, heartbeat.
+diag-log = ["ms-log/diag-log", "ms-config/diag-log"]
 
 [dependencies]
 libc = "0.2"

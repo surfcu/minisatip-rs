@@ -1066,7 +1066,7 @@ fn emm_len(b: &[u8]) -> usize {
         i += ((usize::from(b[i + 1] & 0xF) << 8) | usize::from(b[i + 2])) + 3;
         emms += 1;
     }
-    ms_log::debugm!(
+    ms_log::debugm_hot!(
         "returning EMM len {} ({:X}) from {}, found {} emms",
         i,
         i,
@@ -1099,7 +1099,7 @@ impl SectionRouter {
             if b[1] & 0x40 != 0 {
                 state.matched =
                     !emm && match_filter(id, f.pid, &f.filter, &f.mask, f.flags, &b[5..]);
-                ms_log::debugm!(
+                ms_log::debugm_hot!(
                     "matching pid {}, filter {}, match {}, flags {}, isEMM {}",
                     pid,
                     id,
@@ -1116,7 +1116,7 @@ impl SectionRouter {
             } else {
                 state.assembler.assemble_packet(b)
             };
-            ms_log::debugm!(
+            ms_log::debugm_hot!(
                 "assemble_packet returned {} for pid {}",
                 assembled.map_or(0, |section| section.len()),
                 pid
@@ -1142,7 +1142,7 @@ impl SectionRouter {
                 let end = (i + len).min(section.len());
                 let matched =
                     match_filter(id, f.pid, &f.filter, &f.mask, f.flags, &section[i..end]);
-                ms_log::debugm!(
+                ms_log::debugm_hot!(
                     "EMM: match {} id: {} len: {}: {:02X} {:02X} {:02X} {:02X} {:02X}",
                     u8::from(matched),
                     id,
@@ -1191,7 +1191,7 @@ fn match_filter(
         let idx = if i == 0 { 0 } else { i + 2 };
         let want = filter[i] & mask[i];
         if b.get(idx).is_none_or(|&byte| byte & mask[i] != want) {
-            ms_log::debugm!(
+            ms_log::debugm_hot!(
                 "filter {}, pid {}, index {} did not match: {:02X} & {:02X} != {:02X} inital filter: {:02X}",
                 id,
                 pid,
@@ -1208,7 +1208,7 @@ fn match_filter(
     if flags & FILTER_REVERSE != 0 {
         matched = !matched;
     }
-    ms_log::debugm!(
+    ms_log::debugm_hot!(
         "filter {}match: id {}: pid {}, flags {}, mask_len {}, filter -> {:02X} {:02X} {:02X} {:02X} {:02X}, mask ->{:02X} {:02X} {:02X} {:02X} {:02X} -> data {:02X} [{:02x} {:02x}] {:02X} {:02X} {:02X} {:02X}",
         if matched { "" } else { "not " },
         id,

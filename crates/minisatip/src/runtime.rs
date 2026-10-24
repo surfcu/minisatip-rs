@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -202,6 +202,14 @@ impl AdapterTuner for UnavailableTuner {
     fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
         Err(TuneError::Hardware)
     }
+}
+
+/// Enabled stream slots, refreshed by the control loop for the heartbeat.
+static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
+
+/// Active streams as the status page counts them.
+pub fn active_streams() -> u64 {
+    ACTIVE_STREAMS.load(Ordering::Relaxed) as u64
 }
 
 struct Runtime {
@@ -405,6 +413,10 @@ impl Runtime {
             features: ApiFeatures::default(),
         })
         .with_identity(identity);
+        let mut web = web;
+        if cfg!(feature = "diag-log") && opts.log_ring > 0 {
+            web = web.with_debug_log(ms_log::diag::ring_dump, ms_log::diag::ring_capacity());
+        }
         session.set_web(web);
         // minisatip.cpp:1149-1166; read_http refreshes the current time.
         let start = SystemTime::now();
@@ -455,6 +467,7 @@ impl Runtime {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             self.expire_streams();
+            ACTIVE_STREAMS.store(self.session.active_streams(), Ordering::Relaxed);
             self.drain_events();
             self.poll_satip_xml();
             self.ca.tick(self.session.scheduler_mut(), &self.handles);

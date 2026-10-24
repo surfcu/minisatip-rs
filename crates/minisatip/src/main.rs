@@ -88,6 +88,7 @@ fn main() {
             rotation.start(&opts.log_file, opts.log_max_size);
         }
     }
+    start_diagnostics(&opts);
     install_panic_hook();
     ms_log::log!(
         "Running mode: {}",
@@ -113,6 +114,18 @@ fn main() {
         sys::remove_pid_file();
         std::process::exit(1);
     }
+}
+
+/// Starts the diagnostics sinks once the logger and daemonising are done.
+fn start_diagnostics(opts: &ms_config::Options) {
+    ms_log::diag::start(|| ms_log::diag::StartConfig {
+        remote: opts.log_remote.clone(),
+        remote_queue: opts.log_remote_queue,
+        ring: opts.log_ring,
+        ring_exclude: ms_log::LOG_DMX,
+        hostname: sys::hostname(),
+        streams: runtime::active_streams,
+    });
 }
 
 /// The panic line names an unnamed thread `<unnamed>`, as std's own hook does;
@@ -162,12 +175,33 @@ fn install_panic_hook() {
             let _ = writeln!(std::io::stderr().lock(), "{line}");
         }
         ms_log::write_panic(&line);
-        dump_flight_recorder();
+        dump_flight_recorder(&line);
     }));
 }
 
-/// Part B dumps the flight recorder from the panic hook here.
-fn dump_flight_recorder() {}
+/// Writes the flight recorder directly to stdout and queues its tail plus the
+/// panic line for the remote sink.
+///
+/// The ring lines already carry their prefix; they bypass the logger so `-g`
+/// does not route them to syslog and no second prefix is added. The panic line
+/// is published even with the ring off, so the sink still gets the crash.
+fn dump_flight_recorder(panic_line: &str) {
+    let active = ms_log::diag::ring_active();
+    let ring = if active {
+        ms_log::diag::ring_dump(usize::MAX)
+    } else {
+        Vec::new()
+    };
+    if active {
+        ms_log::write_direct(&format!("flight recorder: {} lines", ring.len()));
+        for line in &ring {
+            ms_log::write_direct(line);
+        }
+        ms_log::write_direct("flight recorder end");
+    }
+    let tail: Vec<String> = ring.iter().rev().take(200).rev().cloned().collect();
+    ms_log::diag::panic_publish(panic_line, &tail);
+}
 
 /// `get_command_line_string` joins all of argv with spaces, argv[0] included
 /// (minisatip.cpp:591-606, 635).
@@ -192,6 +226,10 @@ fn fbc_host() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diag-log")]
+    use std::io::Read;
+    #[cfg(feature = "diag-log")]
+    use std::net::TcpListener;
     use std::os::unix::net::UnixDatagram;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -204,6 +242,7 @@ mod tests {
     const CHILD_MODE: &str = "MINISATIP_LOG_TEST_MODE";
     const CHILD_FILE: &str = "MINISATIP_LOG_TEST_FILE";
     const CHILD_SOCKET: &str = "MINISATIP_LOG_TEST_SOCKET";
+    const CHILD_REMOTE: &str = "MINISATIP_LOG_TEST_REMOTE";
     const CHILD_LIMIT: &str = "MINISATIP_LOG_TEST_LIMIT";
     const CHILD_TEST: &str = "tests::log_test_child";
     const PANIC_THREAD: &str = "AD3";
@@ -253,6 +292,29 @@ mod tests {
                 let path = std::env::var(CHILD_SOCKET).expect("child syslog socket");
                 ms_log::set_thread_name("main");
                 init_logger(sys::SysLogBackend::with_socket_path(1, path.as_str()), 1);
+            }
+            "remote-panic" => {
+                let address = std::env::var(CHILD_REMOTE).expect("child remote address");
+                ms_log::set_thread_name("main");
+                init_logger(sys::SysLogBackend::new(0), 0);
+                assert!(ms_log::diag::remote::start(
+                    &format!("tcp://{address}"),
+                    "testhost",
+                    100
+                ));
+            }
+            "syslog-ring" => {
+                let path = std::env::var(CHILD_SOCKET).expect("child syslog socket");
+                ms_log::set_thread_name("main");
+                init_logger(sys::SysLogBackend::with_socket_path(1, path.as_str()), 1);
+                ms_log::diag::ring::start(10);
+                ms_log::write_masked(
+                    ms_log::LOG_GENERAL,
+                    ms_log::Level::Debug,
+                    "child.rs",
+                    7,
+                    format_args!("ring line"),
+                );
             }
             "rotate" => {
                 run_rotation_child();
@@ -388,6 +450,117 @@ mod tests {
         let text = std::fs::read_to_string(&merged).expect("merged output");
         assert_panic_line(&text);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // The panic line reaches the sink even when the ring is off: the dump must
+    // not return before publishing the crit line.
+    #[cfg(feature = "diag-log")]
+    #[test]
+    fn panic_with_the_ring_off_reaches_the_remote_sink() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("local address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read timeout");
+            read_frame(&mut stream)
+        });
+        let mut command = child("remote-panic");
+        command.env(CHILD_REMOTE, address.to_string());
+        let output = command.output().expect("run the child");
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let frame = server.join().expect("server thread");
+        assert!(frame.starts_with("<26>1 "), "{frame}");
+        assert!(
+            frame.contains("kind=\"log\"] [AD3]: PANIC in thread AD3:"),
+            "{frame}"
+        );
+        assert!(frame.contains(PANIC_MESSAGE), "{frame}");
+        assert!(!frame.contains("flight recorder"), "{frame}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("flight recorder"), "{stdout}");
+    }
+
+    // Under -g the flight-recorder dump goes straight to stdout with the ring's
+    // own prefixes; syslog receives only the crit panic line.
+    #[cfg(feature = "diag-log")]
+    #[test]
+    fn panic_dump_goes_to_stdout_with_prefixes_under_syslog() {
+        let dir = unique_dir("panic-ring-syslog");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("log");
+        let socket = UnixDatagram::bind(&path).expect("bind the syslog socket");
+        let mut command = child("syslog-ring");
+        command.env(CHILD_SOCKET, &path);
+        let output = command.output().expect("run the child");
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("flight recorder: 1 lines"), "{stdout}");
+        let line = stdout
+            .lines()
+            .find(|line| line.contains("ring line"))
+            .unwrap_or_else(|| panic!("no ring line in:\n{stdout}"));
+        assert!(line.starts_with('['), "no ring prefix: {line}");
+        assert!(line.contains("main]: ring line"), "{line}");
+        assert_eq!(line.matches('[').count(), 1, "double prefix: {line}");
+        assert!(stdout.contains("flight recorder end"), "{stdout}");
+
+        let datagrams = receive_all(&socket);
+        assert_eq!(datagrams.len(), 1, "{datagrams:?}");
+        assert!(
+            datagrams[0].contains(&format!("PANIC in thread {PANIC_THREAD}:")),
+            "{datagrams:?}"
+        );
+        for datagram in &datagrams {
+            assert!(!datagram.contains("ring line"), "{datagram}");
+            assert!(!datagram.contains("flight recorder"), "{datagram}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Reads one octet-counted frame: `<length> <message>`.
+    #[cfg(feature = "diag-log")]
+    fn read_frame(reader: &mut impl Read) -> String {
+        let mut length = 0usize;
+        for _ in 0..6 {
+            let mut byte = [0u8; 1];
+            reader.read_exact(&mut byte).expect("frame length");
+            if byte[0] == b' ' {
+                let mut message = vec![0u8; length];
+                reader.read_exact(&mut message).expect("frame body");
+                return String::from_utf8(message).expect("utf-8 frame");
+            }
+            let digit = byte[0]
+                .checked_sub(b'0')
+                .filter(|digit| *digit < 10)
+                .unwrap_or_else(|| panic!("non-digit in frame length"));
+            length = length * 10 + digit as usize;
+        }
+        panic!("frame length too long");
+    }
+
+    /// Every datagram already queued on `socket`, stopping on the read timeout.
+    #[cfg(feature = "diag-log")]
+    fn receive_all(socket: &UnixDatagram) -> Vec<String> {
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("read timeout");
+        let mut datagrams = Vec::new();
+        let mut buffer = [0u8; 8192];
+        while let Ok(len) = socket.recv(&mut buffer) {
+            datagrams.push(String::from_utf8_lossy(&buffer[..len]).into_owned());
+        }
+        datagrams
     }
 
     #[test]

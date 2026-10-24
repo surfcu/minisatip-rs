@@ -699,6 +699,53 @@ fn end_to_end_fake_oscam_aes_ecb() {
     assert_eq!(stage.descrambler().dec_err(), 1);
 }
 
+// Key-material lines (CA_SET_DESCR, the chosen CW) stay on the local outputs:
+// a descramble pass with a known CW leaves nothing key-bearing in the ring.
+#[test]
+fn descramble_pass_never_puts_cw_material_in_the_ring() {
+    let lines = crate::test_log::captured_lines();
+    ms_log::diag::ring::start(4096);
+    ms_log::diag::ring::push("sentinel");
+
+    let mut client = oscam_client();
+    let (tx, mut stage) = e2e_stage();
+    let cw = [0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93];
+    deliver(
+        &mut client,
+        &tx,
+        &ca_set_descr_mode(0, proto::CW_ALGO_AES128, proto::CW_ALGO_MODE_ECB),
+    );
+    deliver(&mut client, &tx, &ca_set_descr(0, 1, cw));
+    let (clear, scrambled) = scrambled_aes(0x101, true, 0, cw, 1);
+    let mut buf = scrambled.to_vec();
+    stage.process(&mut buf);
+    assert_clear(&buf, &[clear]);
+
+    let printed = lines.lock().unwrap().join("\n");
+    assert!(
+        printed.contains("31 41 59 26 53 58 97 93"),
+        "the CW line was not printed locally: {printed}"
+    );
+
+    let ring = ms_log::diag::ring::dump(usize::MAX);
+    assert!(
+        ring.iter().any(|line| line == "sentinel"),
+        "the ring is not collecting: {ring:?}"
+    );
+    for line in &ring {
+        let compact: String = line
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_uppercase();
+        assert!(
+            !compact.contains("3141592653589793"),
+            "the ring captured the CW: {line}"
+        );
+    }
+    ms_log::diag::ring::stop();
+}
+
 #[cfg(feature = "dvbcsa")]
 #[test]
 fn end_to_end_fake_oscam_csa() {

@@ -46,9 +46,21 @@ use std::io::{self, Write as _};
 use std::sync::{Mutex, OnceLock, PoisonError, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod diag;
 mod hexdump;
 
 pub use hexdump::{crc_32, dump_packets, hexdump};
+
+/// Which gate produced a line; diagnostics use it to route hot lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Normal level (`log!` and friends).
+    Log,
+    /// Debug level (`debugm!`/`debugl!`).
+    Debug,
+    /// High-rate debug line, never kept by the flight recorder.
+    Hot,
+}
 
 /// `LOG_GENERAL` (`logging.h:27`).
 pub const LOG_GENERAL: u32 = 1;
@@ -230,6 +242,12 @@ pub trait Backend: Send + Sync {
         let _ = writeln!(out, "{line}");
         let _ = out.flush();
     }
+
+    /// Current time as RFC 3339 in UTC; the binary overrides this with local
+    /// time and a UTC offset.
+    fn rfc3339_now(&self) -> String {
+        utc_rfc3339_now()
+    }
 }
 
 /// Logger configuration installed by [`init`].
@@ -321,18 +339,107 @@ impl Logger {
         // deadlock on the logger mutex.
         let message = args.to_string();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // The timestamp is taken under the lock so it follows output order.
+        let timestamp = self.backend().timestamp();
+        self.commit(&mut state, timestamp, file, line, &message, None);
+    }
+
+    /// Port of `_log` that also feeds the diagnostics ring and remote sink.
+    ///
+    /// `mask == 0` is the unconditional `LOG0` case. A line that only the ring
+    /// wants is recorded without touching the outputs or the repeat state.
+    pub fn write_masked(
+        &self,
+        mask: u32,
+        level: Level,
+        file: &str,
+        line: u32,
+        args: fmt::Arguments<'_>,
+    ) {
+        let to_outputs = mask == 0
+            || match level {
+                Level::Log => self.log & mask != 0,
+                Level::Debug | Level::Hot => self.debug & mask != 0,
+            };
+        let to_ring = diag::ring_wants(mask, level);
+        if !to_outputs && !to_ring {
+            return;
+        }
+        let message = args.to_string();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // The timestamp is taken under the lock so it follows output order.
+        let timestamp = self.backend().timestamp();
+        if to_ring {
+            // The ring keeps the full prefix the stdout format would use, even
+            // under -g, so the panic dump stays readable.
+            let mut ring_line = self.ring_prefix(timestamp, file, line);
+            ring_line.push_str(&message);
+            diag::ring::push(truncate_bytes(&ring_line, MAX_LINE_BYTES));
+        }
+        if to_outputs {
+            self.commit(
+                &mut state,
+                timestamp,
+                file,
+                line,
+                &message,
+                Some((mask, level)),
+            );
+        }
+    }
+
+    /// Like [`Logger::write`], but never recorded by the diagnostics ring or
+    /// sent to the remote sink: key material and high-rate lines.
+    pub fn write_unrecorded(&self, file: &str, line: u32, args: fmt::Arguments<'_>) {
+        self.write(file, line, args);
+    }
+
+    /// Emits `message` through the local outputs, bypassing masks and repeat
+    /// suppression. Used for structured events and sink state changes.
+    pub fn write_local(&self, message: &str) {
+        let prefix = if self.slog != 0 {
+            String::new()
+        } else {
+            format!("[{} {}]: ", self.backend().timestamp(), thread_name())
+        };
+        let mut text = prefix;
+        text.push_str(message);
+        self.emit(truncate_bytes(&text, MAX_LINE_BYTES));
+    }
+
+    /// Writes an already-formatted line straight to stdout, never to syslog.
+    ///
+    /// The flight-recorder dump uses this: its lines carry their own prefix and
+    /// must not be duplicated through the `-g` route.
+    pub fn write_direct(&self, line: &str) {
+        self.backend().stdout(truncate_bytes(line, MAX_LINE_BYTES));
+    }
+
+    /// Applies repeat suppression and emits the prefixed line.
+    ///
+    /// `sink` is the `(mask, level)` to forward every emitted line to; the
+    /// remote sink follows repeat suppression exactly like the local outputs.
+    fn commit(
+        &self,
+        state: &mut State,
+        timestamp: Timestamp,
+        file: &str,
+        line: u32,
+        message: &str,
+        sink: Option<(u32, Level)>,
+    ) {
+        let prefix = self.prefix(timestamp, file, line);
+        let prefix_len = prefix.len().min(MAX_LINE_BYTES);
+        let mut text = prefix;
+        text.push_str(message);
+        let text = truncate_bytes(&text, MAX_LINE_BYTES);
+
         // C++ alternates the buffers: `idx = 1 - idx` (`logging.cpp:54`).
         let idx = 1 - state.idx;
         state.idx = idx;
 
-        let prefix = self.prefix(file, line);
-        let mut text = prefix.clone();
-        text.push_str(&message);
-        let text = truncate_bytes(&text, MAX_LINE_BYTES);
-
         // C++ compares the text after the prefix, using the current prefix
         // length as the offset into both buffers (`logging.cpp:78`).
-        let prefix_len = prefix.len().min(MAX_LINE_BYTES);
         let current = text.get(prefix_len..).unwrap_or("").as_bytes();
         let other = state.output[1 - idx].get(prefix_len..).unwrap_or_default();
         let same = current == other;
@@ -341,14 +448,23 @@ impl Logger {
             state.times += 1;
         } else {
             if state.times > 0 {
-                self.emit(&format!("Message repeated {} times", state.times));
+                let repeated = format!("Message repeated {} times", state.times);
+                self.emit_and_send(&repeated, &repeated, sink);
             }
             state.times = 0;
         }
 
         state.output[idx] = text.as_bytes().to_vec();
         if state.times == 0 {
-            self.emit(text);
+            self.emit_and_send(text, message, sink);
+        }
+    }
+
+    /// Emits one line locally, then forwards its message to the remote sink.
+    fn emit_and_send(&self, line: &str, message: &str, sink: Option<(u32, Level)>) {
+        self.emit(line);
+        if let Some((mask, level)) = sink {
+            diag::remote::send_log(mask, level, message);
         }
     }
 
@@ -398,12 +514,20 @@ impl Logger {
         }
     }
 
-    fn prefix(&self, file: &str, line: u32) -> String {
+    fn prefix(&self, timestamp: Timestamp, file: &str, line: u32) -> String {
         // `opts.slog` suppresses the timestamp, thread and source entirely.
         if self.slog != 0 {
             return String::new();
         }
-        let timestamp = self.backend().timestamp();
+        self.prefix_text(timestamp, file, line)
+    }
+
+    /// The stdout prefix, also used by the flight recorder under `-g`.
+    fn ring_prefix(&self, timestamp: Timestamp, file: &str, line: u32) -> String {
+        self.prefix_text(timestamp, file, line)
+    }
+
+    fn prefix_text(&self, timestamp: Timestamp, file: &str, line: u32) -> String {
         let thread = thread_name();
         if self.file_line {
             format!("[{timestamp} {thread}] {file}:{line}: ")
@@ -487,6 +611,31 @@ pub fn write(file: &str, line: u32, args: fmt::Arguments<'_>) {
     logger().write(file, line, args);
 }
 
+/// [`Logger::write_masked`] for the process-wide logger.
+pub fn write_masked(mask: u32, level: Level, file: &str, line: u32, args: fmt::Arguments<'_>) {
+    logger().write_masked(mask, level, file, line, args);
+}
+
+/// [`Logger::write_unrecorded`] for the process-wide logger.
+pub fn write_unrecorded(file: &str, line: u32, args: fmt::Arguments<'_>) {
+    logger().write_unrecorded(file, line, args);
+}
+
+/// [`Logger::write_local`] for the process-wide logger.
+pub fn write_local(message: &str) {
+    logger().write_local(message);
+}
+
+/// [`Logger::write_direct`] for the process-wide logger.
+pub fn write_direct(line: &str) {
+    logger().write_direct(line);
+}
+
+/// Current time as RFC 3339, from the installed backend.
+pub fn rfc3339_now() -> String {
+    logger().backend().rfc3339_now()
+}
+
 /// Emits a panic line through the process-wide logger; never panics.
 pub fn write_panic(message: &str) {
     logger().write_panic(message);
@@ -552,6 +701,24 @@ fn utc_now() -> Timestamp {
     )
 }
 
+/// The system clock as RFC 3339 UTC with milliseconds (`...Z`).
+fn utc_rfc3339_now() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX);
+    let (year, month, day) = civil_from_days(days);
+    let second_of_day = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        second_of_day / 3_600,
+        second_of_day % 3_600 / 60,
+        second_of_day % 60,
+        now.subsec_millis()
+    )
+}
+
 /// Days since 1970-01-01 to a Gregorian date, as in `gmtime` (Howard Hinnant's
 /// `civil_from_days`).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -572,7 +739,13 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 macro_rules! logl {
     ($mask:expr, $($arg:tt)*) => {{
         if $crate::enabled($mask) {
-            $crate::write(file!(), line!(), format_args!($($arg)*));
+            $crate::write_masked(
+                $mask,
+                $crate::Level::Log,
+                file!(),
+                line!(),
+                format_args!($($arg)*),
+            );
         }
     }};
 }
@@ -590,17 +763,32 @@ macro_rules! log {
 macro_rules! logm {
     ($($arg:tt)*) => {{
         if $crate::enabled(DEFAULT_LOG) {
-            $crate::write(file!(), line!(), format_args!($($arg)*));
+            $crate::write_masked(
+                DEFAULT_LOG,
+                $crate::Level::Log,
+                file!(),
+                line!(),
+                format_args!($($arg)*),
+            );
         }
     }};
 }
 
-/// `DEBUGL(level, ...)`: formats only when `mask` is in `opts.debug`.
+/// `DEBUGL(level, ...)`: formats when `mask` is in `opts.debug`, or when the
+/// flight recorder wants it.
 #[macro_export]
 macro_rules! debugl {
     ($mask:expr, $($arg:tt)*) => {{
-        if $crate::debug_enabled($mask) {
-            $crate::write(file!(), line!(), format_args!($($arg)*));
+        if $crate::debug_enabled($mask)
+            || $crate::diag::ring_wants($mask, $crate::Level::Debug)
+        {
+            $crate::write_masked(
+                $mask,
+                $crate::Level::Debug,
+                file!(),
+                line!(),
+                format_args!($($arg)*),
+            );
         }
     }};
 }
@@ -609,8 +797,48 @@ macro_rules! debugl {
 #[macro_export]
 macro_rules! debugm {
     ($($arg:tt)*) => {{
+        if $crate::debug_enabled(DEFAULT_LOG)
+            || $crate::diag::ring_wants(DEFAULT_LOG, $crate::Level::Debug)
+        {
+            $crate::write_masked(
+                DEFAULT_LOG,
+                $crate::Level::Debug,
+                file!(),
+                line!(),
+                format_args!($($arg)*),
+            );
+        }
+    }};
+}
+
+/// `DEBUGM` for a high-rate line: identical outputs, never kept by the ring.
+#[macro_export]
+macro_rules! debugm_hot {
+    ($($arg:tt)*) => {{
         if $crate::debug_enabled(DEFAULT_LOG) {
-            $crate::write(file!(), line!(), format_args!($($arg)*));
+            $crate::write_masked(
+                DEFAULT_LOG,
+                $crate::Level::Hot,
+                file!(),
+                line!(),
+                format_args!($($arg)*),
+            );
+        }
+    }};
+}
+
+/// `DEBUGL` for a high-rate line: identical outputs, never kept by the ring.
+#[macro_export]
+macro_rules! debugl_hot {
+    ($mask:expr, $($arg:tt)*) => {{
+        if $crate::debug_enabled($mask) {
+            $crate::write_masked(
+                $mask,
+                $crate::Level::Hot,
+                file!(),
+                line!(),
+                format_args!($($arg)*),
+            );
         }
     }};
 }
@@ -619,7 +847,33 @@ macro_rules! debugm {
 #[macro_export]
 macro_rules! log0 {
     ($($arg:tt)*) => {{
-        $crate::write(file!(), line!(), format_args!($($arg)*));
+        $crate::write_masked(
+            0,
+            $crate::Level::Log,
+            file!(),
+            line!(),
+            format_args!($($arg)*),
+        );
+    }};
+}
+
+/// `LOG` variant whose line never enters the ring or the remote sink.
+#[macro_export]
+macro_rules! log_unrecorded {
+    ($($arg:tt)*) => {{
+        if $crate::enabled($crate::LOG_GENERAL) {
+            $crate::write_unrecorded(file!(), line!(), format_args!($($arg)*));
+        }
+    }};
+}
+
+/// `LOGM` variant whose line never enters the ring or the remote sink.
+#[macro_export]
+macro_rules! logm_unrecorded {
+    ($($arg:tt)*) => {{
+        if $crate::enabled(DEFAULT_LOG) {
+            $crate::write_unrecorded(file!(), line!(), format_args!($($arg)*));
+        }
     }};
 }
 

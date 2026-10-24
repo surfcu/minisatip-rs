@@ -70,6 +70,30 @@ jobs:
           cargo test -p ms-ca-drivers --features ci-plus,ms-fakecam/ci-plus
           cargo test -p minisatip --features ci-plus,ms-fakecam/ci-plus
 
+      - name: Tests with diag-log
+        run: cargo test -p minisatip --features diag-log,ci-plus
+
+  diag-log:
+    name: Tests with diag-log
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Build
+        run: cargo build -p minisatip --features diag-log
+
+      - name: Clippy
+        run: cargo clippy -p minisatip -p ms-log -p ms-config --all-targets --features minisatip/diag-log -- -D warnings
+
+      - name: Tests
+        run: cargo test -p ms-log -p ms-config -p ms-net -p minisatip --features ms-log/diag-log,ms-config/diag-log
+
   dvbcsa:
     name: Tests with dvbcsa (CSA descrambling, ca_e2e)
     # libdvbcsa-dev has this name on Ubuntu 24.04 and 26.04.
@@ -163,6 +187,11 @@ jobs:
       - name: Build (stable targets)
         if: ${{ !matrix.build_std }}
         run: cross build --release -p minisatip --target ${{ matrix.target }}
+
+      # The diagnostics code must also compile for the 32-bit target.
+      - name: Check diag-log (armv7)
+        if: ${{ matrix.target == 'armv7-unknown-linux-musleabihf' }}
+        run: cargo check -p minisatip --features diag-log --target armv7-unknown-linux-musleabihf
 
       - name: Build (tier-3 target, nightly + build-std)
         if: ${{ matrix.build_std }}

@@ -9,6 +9,8 @@ repository.workspace = true
 default = []
 # Selects the s2api version in the banner (C++ LINUXDVB builds).
 linux-dvb = []
+# Diagnostics options: --log-remote, --log-remote-queue and --log-ring.
+diag-log = ["ms-log/diag-log"]
 # Reflects whether the binary was built with SRT support.
 srt = []
 # Netceiver client (C++ NETCVCLIENT): without it `-n`/`--netceiver` are unknown options.

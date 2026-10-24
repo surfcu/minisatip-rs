@@ -544,7 +544,7 @@ impl StreamOutput {
             );
         }
         // stream.cpp:845 (`DEBUGM`; `sock_id` is the socket-table index).
-        ms_log::debugm!(
+        ms_log::debugm_hot!(
             "flush_stream: sent {} bytes for sid {}, handle {}, sock_id {}, seq {} => {}:{}",
             rv,
             self.stream_id,
@@ -638,7 +638,7 @@ impl StreamOutput {
         self.rtcp_wtime_ms = ctime_ms;
         let (host, port) = self.remote_parts();
         // stream.cpp:785 (`DEBUGM`; `handle` is `sid->rsock`).
-        ms_log::debugm!(
+        ms_log::debugm_hot!(
             "send_rtcp: sent {} bytes for sid {}, handle {} seq {} => {}:{}",
             packet.len(),
             self.stream_id,

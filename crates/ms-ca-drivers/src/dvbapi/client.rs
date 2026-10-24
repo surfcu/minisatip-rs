@@ -636,7 +636,7 @@ impl DvbapiClient {
         let i = self.wire_key(raw_key);
         if i.is_none() || !(0..2).contains(&parity) {
             // C++ `%p`: normalized to the slot id, 0 for a missing key.
-            ms_log::log!(
+            ms_log::log_unrecorded!(
                 "dvbapi: invalid DVBAPI_CA_SET_DESCR, key {} parity {}, k 0x{:x}, index {}, CW: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
                 key_id,
                 parity,
@@ -660,7 +660,7 @@ impl DvbapiClient {
         // C++ stores 8 bytes for every CA_SET_DESCR, even in AES mode.
         k.key_len = 8;
         k.cw[parity as usize][..8].copy_from_slice(&cw);
-        ms_log::log!(
+        ms_log::log_unrecorded!(
             "dvbapi: received DVBAPI_CA_SET_DESCR, key {} parity {}, index {}, algo {}, CW {}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
             key_id,
             parity,

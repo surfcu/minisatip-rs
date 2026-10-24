@@ -25,6 +25,10 @@ pub const DESC_XML_PATH: &str = "/desc.xml";
 pub const STATE_JSON_PATH: &str = "/state.json";
 /// Bandwidth counters endpoint.
 pub const BANDWIDTH_JSON_PATH: &str = "/bandwidth.json";
+/// Flight-recorder dump endpoint (registered only with diagnostics).
+pub const DEBUG_LOG_PATH: &str = "/debug/log";
+/// `GET /debug/log` default line count.
+const DEBUG_LOG_LINES: usize = 1000;
 /// Bytes C++ keeps for `/desc.xml` (`char buf[2000]`, minisatip.cpp:1462).
 const DESC_XML_MAX: usize = 1999;
 /// DVBAPI key slots (`MAX_KEYS`, dvbapi.h:56).
@@ -601,6 +605,7 @@ impl TunerCounts {
 pub struct WebService {
     config: WebConfig,
     identity: Option<SharedIdentity>,
+    debug_log: Option<DebugLog>,
 }
 
 impl WebService {
@@ -609,7 +614,16 @@ impl WebService {
         Self {
             config,
             identity: None,
+            debug_log: None,
         }
+    }
+
+    /// Serves `GET /debug/log?lines=N` from `callback`, which returns the last
+    /// N lines oldest first. `capacity` is the ring size used to cap `N`.
+    /// Without a callback the path is a 404.
+    pub fn with_debug_log(mut self, callback: fn(usize) -> Vec<String>, capacity: usize) -> Self {
+        self.debug_log = Some((callback, capacity));
+        self
     }
 
     /// Serves DEVICEID/BOOTID/UUID from `identity` instead of the static config,
@@ -638,13 +652,32 @@ impl WebService {
 
     /// Routes an HTTP request; unhandled paths become 404 like C++ `read_http`.
     pub fn route(&self, request: &Request, state: &WebSnapshot) -> Option<HttpRoute> {
-        let route = match request.uri.as_str() {
+        let path = request.uri.split('?').next().unwrap_or("");
+        let route = match path {
             DESC_XML_PATH => self.desc_route(state),
             STATE_JSON_PATH => json_route(self.state_json_bytes(state)),
             BANDWIDTH_JSON_PATH => json_route(self.bandwidth_json(state).into_bytes()),
-            uri => self.static_route(uri, request.is_method("HEAD"), state),
+            DEBUG_LOG_PATH => self.debug_log_route(&request.uri),
+            _ => self.static_route(&request.uri, request.is_method("HEAD"), state),
         };
         Some(route)
+    }
+
+    /// Flight-recorder dump: plain text, oldest line first, newest last.
+    fn debug_log_route(&self, uri: &str) -> HttpRoute {
+        let Some((callback, capacity)) = self.debug_log else {
+            return HttpRoute::new(404, Vec::new());
+        };
+        let mut body = String::new();
+        for line in callback(debug_log_lines(uri, capacity)) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+        HttpRoute::new(200, body.into_bytes()).with_headers(vec![
+            "Cache-Control: no-cache".to_owned(),
+            "Content-Type: text/plain; charset=utf-8".to_owned(),
+            "Connection: close".to_owned(),
+        ])
     }
 
     /// Effective tuner counts: `-a` nonzero entries pin the DVBS2/DVBT/DVBC
@@ -880,6 +913,22 @@ fn content_type_headers(fn_name: &str) -> Vec<String> {
         .split("\r\n")
         .map(str::to_owned)
         .collect()
+}
+
+/// Flight-recorder callback and its ring capacity.
+type DebugLog = (fn(usize) -> Vec<String>, usize);
+
+/// Requested line count from `?lines=N`, defaulting to 1000, capped at the
+/// ring size and never below 1.
+fn debug_log_lines(uri: &str, capacity: usize) -> usize {
+    let requested = uri
+        .split_once('?')
+        .into_iter()
+        .flat_map(|(_, query)| query.split('&'))
+        .find_map(|pair| pair.strip_prefix("lines="))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEBUG_LOG_LINES);
+    requested.clamp(1, capacity.max(1))
 }
 
 fn json_route(body: Vec<u8>) -> HttpRoute {

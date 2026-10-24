@@ -6,3 +6,6 @@ pub mod descramble;
 pub mod dvbapi;
 pub mod en50221;
 pub mod hw_descrambler;
+
+#[cfg(test)]
+mod test_log;

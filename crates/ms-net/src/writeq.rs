@@ -345,7 +345,7 @@ fn write_chunks<W: Write + ?Sized>(
 ) -> io::Result<Option<usize>> {
     let len: usize = chunks.iter().map(|chunk| chunk.len()).sum();
     // socketworks.cpp:1304-1305.
-    ms_log::debugl!(
+    ms_log::debugl_hot!(
         ms_log::LOG_SOCKET,
         "start writev handle {}, iiov {}, len {}",
         log_handle,
@@ -363,7 +363,7 @@ fn write_chunks<W: Write + ?Sized>(
         Ok(written) => {
             if written != len {
                 // socketworks.cpp:1324-1329. errno is stale on a short write.
-                ms_log::debugl!(
+                ms_log::debugl_hot!(
                     ms_log::LOG_SOCKET,
                     "writev handle {}, iiov {}, len {}, rv {}, errno {}",
                     log_handle,
@@ -374,7 +374,7 @@ fn write_chunks<W: Write + ?Sized>(
                 );
             }
             // socketworks.cpp:1352-1353.
-            ms_log::debugl!(
+            ms_log::debugl_hot!(
                 ms_log::LOG_SOCKET,
                 "writev returned {} handle {}, iiov {}, len {} (took {} ms)",
                 written,
@@ -387,7 +387,7 @@ fn write_chunks<W: Write + ?Sized>(
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             // socketworks.cpp:1324-1329, then the early -EWOULDBLOCK return.
-            ms_log::debugl!(
+            ms_log::debugl_hot!(
                 ms_log::LOG_SOCKET,
                 "writev handle {}, iiov {}, len {}, rv {}, errno {}",
                 log_handle,
@@ -401,7 +401,7 @@ fn write_chunks<W: Write + ?Sized>(
         Err(error) => {
             let errno = ms_log::errno(&error);
             // socketworks.cpp:1324-1329.
-            ms_log::debugl!(
+            ms_log::debugl_hot!(
                 ms_log::LOG_SOCKET,
                 "writev handle {}, iiov {}, len {}, rv {}, errno {}",
                 log_handle,
@@ -431,7 +431,7 @@ fn write_chunks<W: Write + ?Sized>(
                 ms_log::strerror(&error)
             );
             // socketworks.cpp:1352-1353.
-            ms_log::debugl!(
+            ms_log::debugl_hot!(
                 ms_log::LOG_SOCKET,
                 "writev returned {} handle {}, iiov {}, len {} (took {} ms)",
                 -1,
