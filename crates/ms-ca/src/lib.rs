@@ -11,7 +11,7 @@ pub mod program;
 pub mod reconciler;
 
 pub use capmt::{BuiltCapmt, Capmt, CapmtError, capmt_content_hash, create_capmt};
-pub use device::{CaDevice, CaState, SendOutcome};
+pub use device::{CaDevice, CaState, SendCmd, SendOutcome};
 pub use program::{CaDescriptor, EsStream, Program, ProgramTable, RawDescriptor, SdtInfo};
 pub use reconciler::{CaPolicy, CppCompatible, Reconciler, Step};
 

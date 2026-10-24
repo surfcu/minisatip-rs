@@ -47,17 +47,19 @@ impl Fifo {
     }
 
     /// Copies up to `dst.len()` bytes from `read_index`, advancing it.
-    pub fn pop_offset(&self, dst: &mut [u8], read_index: &mut u64) -> usize {
+    pub fn pop_offset(&self, dst: &mut [u8], read_index: &mut u64, adapter: i64) -> usize {
         let cap = self.data.len() as u64;
         if *read_index + cap < self.write_index {
             // fifo.cpp:91-97
             if *read_index > 0 {
+                let lost = self.write_index - cap - *read_index;
                 ms_log::log!(
                     "Lost {} bytes in fifo created at {}:{}",
-                    self.write_index - cap - *read_index,
+                    lost,
                     self.origin_file,
                     self.origin_line
                 );
+                ms_log::diag::count_fifo_overflow(adapter, lost);
             }
             *read_index = self.write_index - cap;
         }

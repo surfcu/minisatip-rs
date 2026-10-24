@@ -274,6 +274,8 @@ struct State {
     output: [Vec<u8>; 2],
     idx: usize,
     times: u32,
+    /// Sink routing of the last emitted line, used when a panic flushes repeats.
+    last_sink: Option<(u32, Level)>,
 }
 
 impl State {
@@ -282,6 +284,7 @@ impl State {
             output: [Vec::new(), Vec::new()],
             idx: 0,
             times: 0,
+            last_sink: None,
         }
     }
 }
@@ -339,8 +342,13 @@ impl Logger {
         // deadlock on the logger mutex.
         let message = args.to_string();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        // The timestamp is taken under the lock so it follows output order.
-        let timestamp = self.backend().timestamp();
+        // The timestamp is taken under the lock so it follows output order; with
+        // -g the prefix is empty and the clock is not read.
+        let timestamp = if self.slog != 0 {
+            Timestamp::fallback()
+        } else {
+            self.backend().timestamp()
+        };
         self.commit(&mut state, timestamp, file, line, &message, None);
     }
 
@@ -367,8 +375,13 @@ impl Logger {
         }
         let message = args.to_string();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        // The timestamp is taken under the lock so it follows output order.
-        let timestamp = self.backend().timestamp();
+        // The timestamp is taken under the lock so it follows output order; with
+        // -g and no ring line it is not used and the clock is not read.
+        let timestamp = if self.slog != 0 && !to_ring {
+            Timestamp::fallback()
+        } else {
+            self.backend().timestamp()
+        };
         if to_ring {
             // The ring keeps the full prefix the stdout format would use, even
             // under -g, so the panic dump stays readable.
@@ -449,12 +462,13 @@ impl Logger {
         } else {
             if state.times > 0 {
                 let repeated = format!("Message repeated {} times", state.times);
-                self.emit_and_send(&repeated, &repeated, sink);
+                self.emit_and_send(&repeated, &repeated, state.last_sink);
             }
             state.times = 0;
         }
 
         state.output[idx] = text.as_bytes().to_vec();
+        state.last_sink = sink;
         if state.times == 0 {
             self.emit_and_send(text, message, sink);
         }
@@ -506,11 +520,14 @@ impl Logger {
         }
     }
 
-    /// Emits `Message repeated N times` and resets the counter.
+    /// Emits `Message repeated N times`, forwarding it to the sink routing of
+    /// the last emitted line, and resets the counter.
     fn flush_repeats(&self, state: &mut State) {
         if state.times > 0 {
-            self.emit(&format!("Message repeated {} times", state.times));
+            let repeated = format!("Message repeated {} times", state.times);
+            let sink = state.last_sink;
             state.times = 0;
+            self.emit_and_send(&repeated, &repeated, sink);
         }
     }
 

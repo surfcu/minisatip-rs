@@ -337,6 +337,7 @@ impl<A: McliReceiverApi> Tuner for NetceiverTuner<A> {
             locked: s.status & FE_HAS_LOCK != 0,
             strength: s.strength,
             snr: s.snr,
+            ber: s.ber,
         }
     }
 

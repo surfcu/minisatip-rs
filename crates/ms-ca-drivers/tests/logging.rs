@@ -96,5 +96,15 @@ fn session_lines_match_ca_cpp() {
         format!("{prefix}Found session_number -1 for resource 123456, name none, status F0"),
         format!("{prefix}Requesting CA 2 close"),
     ];
-    assert_eq!(*lines.lock().unwrap(), expected);
+    // A diag-log build adds events on the same output; the C++ log lines are
+    // still matched exactly.
+    let captured = lines.lock().unwrap();
+    let log_lines: Vec<&String> = captured
+        .iter()
+        .filter(|line| !line.contains("\"kind\":\"event\""))
+        .collect();
+    assert_eq!(log_lines.len(), expected.len(), "{captured:?}");
+    for (line, want) in log_lines.iter().zip(&expected) {
+        assert_eq!(*line, want);
+    }
 }

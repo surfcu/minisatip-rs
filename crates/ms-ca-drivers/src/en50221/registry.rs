@@ -206,7 +206,9 @@ impl CaRegistry {
         if !c.force_ci {
             ms_log::log!("CA {}: CI+ content control enabled (experimental)", c.id);
         }
+        let (ca, mode) = (i64::try_from(i).unwrap_or(0), c.mode_name());
         self.has_ci = true;
+        ms_log::diag::events::cam_state(ca, "init", mode);
         InitResult::Ok
     }
 

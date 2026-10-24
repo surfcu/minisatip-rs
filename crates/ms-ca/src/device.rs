@@ -50,6 +50,15 @@ impl SendOutcome {
     }
 }
 
+/// CAPMT command byte and the reason reported by the `capmt` event.
+#[derive(Clone, Copy)]
+pub struct SendCmd {
+    /// One of the `CMD_ID_*` constants.
+    pub command: u8,
+    /// `join`, `update`, `rejoin` or `leave`; a failed send reports `retry`.
+    pub diag_reason: &'static str,
+}
+
 /// CAPMT state of one CAM (`ca_device_t`, CAPMT part).
 #[derive(Clone, Debug)]
 pub struct CaDevice {
@@ -240,11 +249,16 @@ impl CaDevice {
         &mut self,
         slot: usize,
         listmgmt: u8,
-        reason: u8,
+        cmd: SendCmd,
         force: bool,
         programs: &ProgramTable,
         driver: &mut dyn CaDriver,
     ) -> SendOutcome {
+        let diag_reason = if self.capmt[slot].diag_retry {
+            "retry"
+        } else {
+            cmd.diag_reason
+        };
         let added_only = self.multiple_pmt > 0;
         let filter = self.caid_filter.clone();
         let ctx = BuildCtx {
@@ -252,7 +266,7 @@ impl CaDevice {
             caid_filter: &filter,
         };
         let c = &mut self.capmt[slot];
-        let Ok(probe) = create_capmt(c, listmgmt, 8192, reason, added_only, true, ctx) else {
+        let Ok(probe) = create_capmt(c, listmgmt, 8192, cmd.command, added_only, true, ctx) else {
             ms_log::log!("create_capmt failed");
             return SendOutcome::BuildFailed;
         };
@@ -264,26 +278,43 @@ impl CaDevice {
                 c.pmts_str(),
                 hash
             );
+            c.diag_retry = false;
+            self.diag_capmt(slot, diag_reason, || hash, true);
             return SendOutcome::Unchanged;
         }
         c.compact();
         c.version = (c.version + 1) & 0xF;
-        let Ok(built) = create_capmt(c, listmgmt, 8192, reason, added_only, false, ctx) else {
+        let Ok(built) = create_capmt(c, listmgmt, 8192, cmd.command, added_only, false, ctx) else {
             ms_log::log!("create_capmt failed");
             return SendOutcome::BuildFailed;
         };
         if !driver.has_ca_session() {
             c.forget_sent();
+            c.diag_retry = true;
             ms_log::log!("Unable to find CA session for device {}", self.id);
+            self.diag_capmt(
+                slot,
+                diag_reason,
+                || capmt_content_hash(&built.bytes),
+                false,
+            );
             return SendOutcome::NoSession;
         }
         ms_log::hexdump!("CAPMT: ", &built.bytes);
         if !driver.send_ca_pmt(&built.bytes) {
             c.forget_sent();
+            c.diag_retry = true;
             ms_log::log!("CA {}: CAPMT write failed", self.id);
+            self.diag_capmt(
+                slot,
+                diag_reason,
+                || capmt_content_hash(&built.bytes),
+                false,
+            );
             return SendOutcome::WriteFailed;
         }
-        c.capmt_hash = capmt_content_hash(&built.bytes);
+        let hash = capmt_content_hash(&built.bytes);
+        c.capmt_hash = hash;
         c.capmt_hash_valid = true;
         for (place, &(start, len)) in built.spans.iter().enumerate() {
             c.sent_es[place].clear();
@@ -291,7 +322,23 @@ impl CaDevice {
                 c.sent_es[place].extend_from_slice(&built.bytes[start..start + len]);
             }
         }
+        c.diag_retry = false;
+        self.diag_capmt(slot, diag_reason, || hash, false);
         SendOutcome::Sent
+    }
+
+    /// Emits `capmt` for one send attempt; the hash and PMT list are built
+    /// only when the event is actually emitted.
+    fn diag_capmt(&self, slot: usize, reason: &str, hash: impl FnOnce() -> u32, skipped: bool) {
+        let c = &self.capmt[slot];
+        let version = i64::from(c.version);
+        ms_log::diag::events::capmt(i64::from(self.id), hash, version, reason, skipped, || {
+            (0..MAX_PMT_PER_CAPMT)
+                .map(|place| c.place(place))
+                .filter(|id| pmt_id_is_valid(*id))
+                .map(|id| u64::try_from(id).unwrap_or(0))
+                .collect()
+        });
     }
 
     /// `dvbca_process_pmt` without the enigma CI routing and CI+ key push.
@@ -375,15 +422,19 @@ impl CaDevice {
         }
         // Only a new join forces the send; an update or a kept-place rejoin
         // sends only when the built CAPMT changed, decided in send_capmt.
+        let diag_reason = if update {
+            "update"
+        } else if rejoined {
+            "rejoin"
+        } else {
+            "join"
+        };
+        let cmd = SendCmd {
+            command: CMD_ID_OK_DESCRAMBLING,
+            diag_reason,
+        };
         let rc = self
-            .send_capmt(
-                slot,
-                listmgmt,
-                CMD_ID_OK_DESCRAMBLING,
-                !update && !rejoined,
-                programs,
-                driver,
-            )
+            .send_capmt(slot, listmgmt, cmd, !update && !rejoined, programs, driver)
             .result();
         if rc != TablesResult::Ok {
             // A failed add keeps no place, so a channel closed before the
@@ -414,7 +465,10 @@ impl CaDevice {
                 .send_capmt(
                     slot,
                     CLM_UPDATE,
-                    CMD_ID_NOT_SELECTED,
+                    SendCmd {
+                        command: CMD_ID_NOT_SELECTED,
+                        diag_reason: "leave",
+                    },
                     true,
                     programs,
                     driver,

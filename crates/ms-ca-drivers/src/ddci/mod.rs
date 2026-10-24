@@ -1316,7 +1316,13 @@ impl Ddci {
                 continue;
             }
             let ri = &mut d.read_index[usize::from(ad.id)];
-            let n = d.fifo.pop_offset(&mut ad.buf[i..i + DVB_FRAME], ri);
+            // R13: report the DDCI device id (the device map key), not the
+            // adapter index that reads the FIFO.
+            let n = d.fifo.pop_offset(
+                &mut ad.buf[i..i + DVB_FRAME],
+                ri,
+                i64::try_from(dev).unwrap_or(i64::MAX),
+            );
             if n == 0 {
                 break;
             }

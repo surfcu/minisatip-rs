@@ -319,6 +319,41 @@ fn sink_follows_local_repeat_suppression() {
     remote::stop();
 }
 
+// A panic flushes a pending repeat line, and that line reaches the sink like
+// the line it repeated.
+#[test]
+fn panic_flush_sends_the_pending_repeat_to_the_sink() {
+    let _guard = diag_lock();
+    ms_log::set_thread_name("worker");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            frames.push(read_frame(&mut stream).unwrap());
+        }
+        frames
+    });
+
+    assert!(start(address, 100));
+    let logger = logger();
+    push(&logger, "same");
+    push(&logger, "same");
+    logger.write_panic("PANIC in thread worker: test at diag.rs:1:1");
+
+    let frames = server.join().unwrap();
+    assert!(frames[0].contains("] [worker]: same"), "{frames:?}");
+    assert!(
+        frames[1].contains("] [worker]: Message repeated 1 times"),
+        "{frames:?}"
+    );
+    remote::stop();
+}
+
 // A producer that keeps the queue busy still gets the drop report as soon as
 // the queue drains, without waiting for a 100 ms idle timeout.
 #[test]
@@ -336,7 +371,20 @@ fn reports_drops_when_a_busy_queue_drains() {
     }
     assert_eq!(remote::stats(), (4, 16));
 
-    let listener = TcpListener::bind(address).unwrap();
+    // The probe address can linger in TIME_WAIT; retry the rebind briefly.
+    let rebind_started = Instant::now();
+    let listener = loop {
+        match TcpListener::bind(address) {
+            Ok(listener) => break listener,
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrInUse
+                    && rebind_started.elapsed() < Duration::from_secs(2) =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("rebind {address}: {error}"),
+        }
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let producer_stop = Arc::clone(&stop);
     let producer = thread::spawn(move || {

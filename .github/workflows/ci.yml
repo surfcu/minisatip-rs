@@ -71,7 +71,9 @@ jobs:
           cargo test -p minisatip --features ci-plus,ms-fakecam/ci-plus
 
       - name: Tests with diag-log
-        run: cargo test -p minisatip --features diag-log,ci-plus
+        run: |
+          cargo test -p ms-ca-drivers --features ci-plus,ms-fakecam/ci-plus,ms-ca-drivers/diag-log
+          cargo test -p minisatip --features diag-log,ci-plus
 
   diag-log:
     name: Tests with diag-log
@@ -89,10 +91,14 @@ jobs:
         run: cargo build -p minisatip --features diag-log
 
       - name: Clippy
-        run: cargo clippy -p minisatip -p ms-log -p ms-config --all-targets --features minisatip/diag-log -- -D warnings
+        run: |
+          cargo clippy -p minisatip -p ms-log -p ms-config -p ms-net -p ms-sched -p ms-ca-drivers --all-targets --features ms-log/diag-log,ms-config/diag-log,ms-net/diag-log,ms-ca-drivers/diag-log,minisatip/diag-log -- -D warnings
 
+      # The call-site tests live in several crates; each crate's own feature
+      # enables the tests that check its events.
       - name: Tests
-        run: cargo test -p ms-log -p ms-config -p ms-net -p minisatip --features ms-log/diag-log,ms-config/diag-log
+        run: |
+          cargo test -p ms-log -p ms-config -p ms-net -p ms-sched -p ms-ca-drivers -p minisatip --features ms-log/diag-log,ms-config/diag-log,ms-net/diag-log,ms-ca-drivers/diag-log,minisatip/diag-log
 
   dvbcsa:
     name: Tests with dvbcsa (CSA descrambling, ca_e2e)

@@ -143,6 +143,8 @@ pub struct StreamOutput {
     rtp: RtpState,
     queue: WriteQueue,
     udp_dropped: u64,
+    /// Queue drop total already reported as a `send_drops` event.
+    reported_queue_drops: u64,
     wtime_ms: i64,
     rtcp_wtime_ms: i64,
     sp: u32,
@@ -287,6 +289,7 @@ impl StreamOutput {
             rtp: RtpState::new(config.ssrc, config.seq),
             queue: WriteQueue::new(config.fifo_size),
             udp_dropped: 0,
+            reported_queue_drops: 0,
             wtime_ms: now_ms,
             rtcp_wtime_ms: now_ms,
             sp: 0,
@@ -345,6 +348,38 @@ impl StreamOutput {
             Some(addr) => (RemoteHost::Addr(addr.ip()), addr.port()),
             None => (RemoteHost::Empty, 0),
         }
+    }
+
+    /// `send_drops` kind for this transport.
+    fn drop_kind(&self) -> &'static str {
+        match self.stream_type {
+            StreamType::RtspUdp => "rtp",
+            StreamType::Http => "http",
+            _ => "tcp",
+        }
+    }
+
+    /// Reports queue drops since the previous call; the client is built lazily.
+    fn report_queue_drops(&mut self) {
+        let dropped = self.queue.diag_dropped();
+        let count = dropped - self.reported_queue_drops;
+        if count == 0 {
+            return;
+        }
+        self.reported_queue_drops = dropped;
+        let session = i64::from(self.stream_id);
+        let kind = self.drop_kind();
+        let this = &*self;
+        ms_log::diag::count_send_drop(
+            || {
+                this.remote_addr()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default()
+            },
+            session,
+            kind,
+            count,
+        );
     }
 
     /// Follows the RTP session id (`set_session_id` assigns `sid->ssrc`;
@@ -475,6 +510,7 @@ impl StreamOutput {
                     // send timeout the rest of the batch is dropped, not retried.
                     if timed_out {
                         self.udp_dropped += datagram.len() as u64;
+                        count_udp_drop(rtp, self.stream_id, datagram.len());
                         continue;
                     }
                     match rtp.send(&datagram) {
@@ -483,6 +519,7 @@ impl StreamOutput {
                             self.failed_writes = self.failed_writes.wrapping_add(1);
                             if error.kind() == io::ErrorKind::WouldBlock {
                                 self.udp_dropped += datagram.len() as u64;
+                                count_udp_drop(rtp, self.stream_id, datagram.len());
                                 timed_out = true;
                             } else if matches!(
                                 error.kind(),
@@ -531,6 +568,7 @@ impl StreamOutput {
                 sent as i32
             }
         };
+        self.report_queue_drops();
         let (host, port) = self.remote_parts();
         if rv > 0 && !self.started {
             // stream.cpp:838.
@@ -623,6 +661,7 @@ impl StreamOutput {
                     self.failed_writes = self.failed_writes.wrapping_add(1);
                     if error.kind() == io::ErrorKind::WouldBlock {
                         self.udp_dropped += packet.len() as u64;
+                        count_udp_drop(rtcp, self.stream_id, packet.len());
                     }
                     // socketworks.cpp:1334-1335: RTCP sockets are not force-closed.
                 }
@@ -635,6 +674,7 @@ impl StreamOutput {
             #[cfg(feature = "srt")]
             Transport::Srt { .. } => {}
         }
+        self.report_queue_drops();
         self.rtcp_wtime_ms = ctime_ms;
         let (host, port) = self.remote_parts();
         // stream.cpp:785 (`DEBUGM`; `handle` is `sid->rsock`).
@@ -650,18 +690,17 @@ impl StreamOutput {
         Ok(())
     }
     pub fn write_priority(&mut self, data: &[u8]) -> io::Result<i32> {
-        match &mut self.transport {
-            Transport::Tcp { sink, .. } => {
-                let rv = self.queue.write(sink.as_mut(), data, true);
-                if rv < 0 {
-                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
-                }
-                Ok(rv)
-            }
-            Transport::Udp { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        let rv = match &mut self.transport {
+            Transport::Tcp { sink, .. } => self.queue.write(sink.as_mut(), data, true),
+            Transport::Udp { .. } => return Err(io::Error::from(io::ErrorKind::Unsupported)),
             #[cfg(feature = "srt")]
-            Transport::Srt { .. } => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            Transport::Srt { .. } => return Err(io::Error::from(io::ErrorKind::Unsupported)),
+        };
+        self.report_queue_drops();
+        if rv < 0 {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
         }
+        Ok(rv)
     }
 
     /// Requests that queued data be dropped up to the next RTSP header
@@ -672,18 +711,17 @@ impl StreamOutput {
 
     /// Flushes queued TCP data (`flush_socket`); UDP never queues.
     pub fn flush_queue(&mut self) -> io::Result<i32> {
-        match &mut self.transport {
-            Transport::Tcp { sink, .. } => {
-                let rv = self.queue.flush(sink.as_mut());
-                if rv < 0 {
-                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
-                }
-                Ok(rv)
-            }
-            Transport::Udp { .. } => Ok(0),
+        let rv = match &mut self.transport {
+            Transport::Tcp { sink, .. } => self.queue.flush(sink.as_mut()),
+            Transport::Udp { .. } => 0,
             #[cfg(feature = "srt")]
-            Transport::Srt { .. } => Ok(0),
+            Transport::Srt { .. } => 0,
+        };
+        self.report_queue_drops();
+        if rv < 0 {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
         }
+        Ok(rv)
     }
 
     /// Whether the queue holds data waiting to be flushed.
@@ -710,6 +748,21 @@ const RTP_SOCKET_TIMEOUT: Duration = Duration::from_millis(1100);
 
 fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
     SocketAddr::new(addr.ip(), port)
+}
+
+/// Counts a dropped UDP datagram or RTCP packet; the peer is read lazily.
+fn count_udp_drop(socket: &UdpSocket, session: StreamId, count: usize) {
+    ms_log::diag::count_send_drop(
+        || {
+            socket
+                .peer_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_default()
+        },
+        i64::from(session),
+        "rtp",
+        count as u64,
+    );
 }
 
 /// Binds and connects the RTP and RTCP sockets of `decode_transport`

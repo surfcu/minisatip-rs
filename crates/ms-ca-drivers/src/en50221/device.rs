@@ -319,9 +319,19 @@ impl CaDevice {
         self.events.pop_front()
     }
 
+    /// `cam_state` mode: plain CI or CI+.
+    pub fn mode_name(&self) -> &'static str {
+        if self.force_ci { "ci" } else { "ci+" }
+    }
+
     /// `ca_request_close`.
     pub fn request_close(&mut self) {
         ms_log::log!("Requesting CA {} close", self.id);
+        ms_log::diag::events::cam_state(
+            i64::try_from(self.id).unwrap_or(0),
+            "reset",
+            self.mode_name(),
+        );
         self.close_requested = true;
         self.push_event(HostEvent::CloseRequested);
     }

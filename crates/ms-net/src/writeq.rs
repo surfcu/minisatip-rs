@@ -13,6 +13,7 @@ pub struct WriteQueue {
     prio_data: Vec<u8>,
     flush_enqueued_data: bool,
     overflow: u64,
+    diag_dropped: u64,
     buffered_bytes: u64,
     force_close: bool,
     max_prio_data: usize,
@@ -30,6 +31,7 @@ impl WriteQueue {
             prio_data: Vec::new(),
             flush_enqueued_data: false,
             overflow: 0,
+            diag_dropped: 0,
             buffered_bytes: 0,
             force_close: false,
             max_prio_data: MAX_PRIO_DATA,
@@ -83,6 +85,11 @@ impl WriteQueue {
         self.overflow
     }
 
+    /// Bytes dropped by the send paths, for the `send_drops` diagnostics.
+    pub fn diag_dropped(&self) -> u64 {
+        self.diag_dropped
+    }
+
     /// Total bytes copied into the FIFO over the queue's lifetime.
     pub fn buffered_bytes(&self) -> u64 {
         self.buffered_bytes
@@ -110,6 +117,7 @@ impl WriteQueue {
                 len,
                 pos
             );
+            self.diag_dropped = self.diag_dropped.saturating_add(len as u64);
             return -1;
         }
         for chunk in chunks {
@@ -174,6 +182,7 @@ impl WriteQueue {
                 );
             }
             self.overflow = self.overflow.saturating_add((len - offset) as u64);
+            self.diag_dropped = self.diag_dropped.saturating_add((len - offset) as u64);
             return 0;
         }
         if copied + offset != len {

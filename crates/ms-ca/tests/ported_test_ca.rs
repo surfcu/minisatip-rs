@@ -699,6 +699,43 @@ fn test_capmt_joins_send_at_once() {
     assert_eq!(cam.read_capmts().0, 0, "the timeout sends no CAPMT");
 }
 
+// A retryable failure marks only the CAPMT slot that failed, so the next
+// send on another slot (including a leave) is not reported as a retry.
+#[test]
+fn retry_is_tracked_per_capmt_slot() {
+    let mut t = ProgramTable::new();
+    t.track_requested_pids();
+    let mut dev = CaDevice::new(0, 2, 0);
+    let mut drv = RecordingDriver::default();
+    let p1 = t.add(0, 0x2301, 0x301);
+    let p2 = t.add(0, 0x2302, 0x302);
+    for (id, pid) in [(p1, 0x401), (p2, 0x402)] {
+        let p = t.get_mut(id).unwrap();
+        p.add_caid(0x0B00, 0x570, &[]);
+        p.add_stream(pid, 2, false, true);
+    }
+
+    assert_eq!(dev.process_pmt(p1, false, &t, &mut drv), TablesResult::Ok);
+    drv.no_session = true;
+    assert_eq!(
+        dev.process_pmt(p2, false, &t, &mut drv),
+        TablesResult::Retry
+    );
+    assert!(!dev.capmt[0].diag_retry, "the sent slot is not marked");
+    assert!(dev.capmt[1].diag_retry, "the failed slot is marked");
+
+    drv.no_session = false;
+    dev.del_pmt(p1, &t, &mut drv);
+    assert!(
+        !dev.capmt[0].diag_retry,
+        "a leave on another slot is not a retry"
+    );
+    assert!(
+        dev.capmt[1].diag_retry,
+        "only a send on slot 1 clears its flag"
+    );
+}
+
 // Ported from tests/test_ca.cpp:2148
 #[test]
 fn test_capmt_partner_leave_is_lazy() {
