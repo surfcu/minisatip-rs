@@ -39,6 +39,32 @@ jobs:
       - name: Check iCAM CSA feature
         run: cargo check -p minisatip --features dvbcsa-icam
 
+  test-ci-plus:
+    name: Tests with CI+ content control
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Check CI+ feature
+        run: cargo check -p minisatip --features ci-plus
+
+      - name: Clippy
+        run: cargo clippy -p ms-ca-drivers --all-targets --features ci-plus -- -D warnings
+
+      - name: Tests
+        run: cargo test -p ms-ca-drivers --features ci-plus
+
   dvbcsa:
     name: Tests with dvbcsa (CSA descrambling, ca_e2e)
     # libdvbcsa-dev has this name on Ubuntu 24.04 and 26.04.
@@ -138,6 +164,13 @@ jobs:
         run: >-
           cross +nightly build -Zbuild-std=std,panic_abort
           --release -p minisatip --target ${{ matrix.target }}
+
+      # Static OpenSSL for the CI+ crypto known-answer tests.
+      - name: Test CI+ crypto (musl)
+        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
+        run: >-
+          cross test -p ms-ca-drivers --features ci-plus-vendored
+          --target x86_64-unknown-linux-musl ciplus::certs
 
       - name: Report stripped binary size
         run: |

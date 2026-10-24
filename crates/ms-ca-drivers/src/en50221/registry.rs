@@ -240,12 +240,22 @@ impl CaRegistry {
     }
 }
 
-/// `get_authdata_filename`: CI+ auth cache file, blanks replaced by underscores.
-pub fn authdata_filename(cache_dir: &str, slot: u32, ci_name: &str) -> String {
+/// `get_authdata_filename`: CI+ auth cache file; the name ends at NUL, and `/`
+/// and bytes outside printable ASCII become `_` so it stays in `cache_dir`.
+pub fn authdata_filename(cache_dir: &str, slot: u32, ci_name: &[u8]) -> String {
     let name: String = ci_name
-        .chars()
+        .iter()
         .take(CI_NAME_MAX)
-        .map(|c| if c == ' ' { '_' } else { c })
+        .take_while(|&&b| b != 0)
+        .map(|&b| {
+            if b == b' ' {
+                '_'
+            } else if (0x21..=0x7e).contains(&b) && b != b'/' {
+                b as char
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("{cache_dir}/ci_auth_{name}_{slot}.bin")
 }

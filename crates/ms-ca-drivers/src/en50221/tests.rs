@@ -98,8 +98,16 @@ fn session(number: u16, resource: u32) -> Option<Session> {
 #[test]
 fn get_authdata_filename() {
     assert_eq!(
-        authdata_filename("/tmp", 4, "Conax CSP CIPLUS CAM"),
-        "/tmp/ci_auth_Conax_CSP_CIPLUS_CAM_4.bin"
+        authdata_filename("/tmp", 4, b"CI PLUS CAM"),
+        "/tmp/ci_auth_CI_PLUS_CAM_4.bin"
+    );
+}
+
+#[test]
+fn get_authdata_filename_never_leaves_cache_dir() {
+    assert_eq!(
+        authdata_filename("/tmp", 1, b"a/b\xffc\0d"),
+        "/tmp/ci_auth_a_b_c_1.bin"
     );
 }
 

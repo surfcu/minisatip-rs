@@ -4,6 +4,8 @@
 pub mod apps;
 pub mod asn1;
 pub mod capmt;
+#[cfg(feature = "ci-plus")]
+pub mod ciplus;
 pub mod clock;
 pub mod consts;
 pub mod device;
