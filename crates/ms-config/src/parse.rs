@@ -64,6 +64,7 @@ enum OptId {
     DeviceId,
     DemuxDev,
     Ci,
+    CiPlusRecovery,
     CaPin,
     Ipv6,
     NoPidsAll,
@@ -454,6 +455,12 @@ const OPTIONS: &[OptSpec] = &[
         id: OptId::Ci,
     },
     OptSpec {
+        long: "ci-plus-recovery",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::CiPlusRecovery,
+    },
+    OptSpec {
         long: "ca-channels",
         short: Some('c'),
         kind: ArgKind::Required,
@@ -490,6 +497,7 @@ fn compiled_options() -> impl Iterator<Item = &'static OptSpec> {
                     spec.id,
                     OptId::LogRemote | OptId::LogRemoteQueue | OptId::LogRing
                 ))
+            && (cfg!(feature = "ci-plus") || !matches!(spec.id, OptId::CiPlusRecovery))
     })
 }
 
@@ -922,6 +930,9 @@ impl Parser<'_> {
             OptId::DisablePmtScan => self.opts.pmt_scan = 1 - self.opts.pmt_scan,
             OptId::CaPin => self.parse_ca_pins(value),
             OptId::Ci => self.parse_force_ci(value),
+            OptId::CiPlusRecovery => {
+                self.opts.ci_plus_recovery = parse_int(value, 0).max(0);
+            }
             OptId::CaChannels => self.parse_ca_channels(value),
             OptId::HwDescrambler => self.opts.hw_descrambler = true,
             OptId::SdtCharset => {

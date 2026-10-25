@@ -25,6 +25,8 @@ pub struct CaRegistry {
     /// `opts.cache_dir` for the CI+ authdata files.
     #[cfg_attr(not(feature = "ci-plus"), allow(dead_code))]
     cache_dir: String,
+    /// `--ci-plus-recovery` in ms, applied to every slot (0 disables it).
+    ci_plus_recovery_ms: i64,
 }
 
 fn index(i: i32) -> Option<usize> {
@@ -39,12 +41,21 @@ impl CaRegistry {
             enigma: false,
             has_ci: false,
             cache_dir: "/var/cache/minisatip".to_owned(),
+            ci_plus_recovery_ms: 0,
         }
     }
 
     /// Sets the directory CI+ authdata is cached in (`opts.cache_dir`).
     pub fn set_cache_dir(&mut self, dir: &str) {
         self.cache_dir = dir.to_owned();
+    }
+
+    /// Sets `--ci-plus-recovery` for every slot, existing or allocated later.
+    pub fn set_ci_plus_recovery_ms(&mut self, ms: i64) {
+        self.ci_plus_recovery_ms = ms;
+        for dev in self.iter_mut() {
+            dev.recovery_timeout_ms = ms;
+        }
     }
 
     pub fn get(&self, i: i32) -> Option<&CaDevice> {
@@ -58,7 +69,10 @@ impl CaRegistry {
     /// The device of slot `i`, allocated on first use (`alloc_ca_device`).
     pub fn device(&mut self, i: usize) -> &mut CaDevice {
         let clock = Arc::clone(&self.clock);
-        self.devices[i].get_or_insert_with(|| CaDevice::new(i, clock))
+        let recovery = self.ci_plus_recovery_ms;
+        let dev = self.devices[i].get_or_insert_with(|| CaDevice::new(i, clock));
+        dev.recovery_timeout_ms = recovery;
+        dev
     }
 
     /// `set_ca_channels`: the `-c` CAIDs, appended to each slot and kept over the CAM's.
@@ -78,8 +92,9 @@ impl CaRegistry {
         }
     }
 
-    pub fn insert(&mut self, dev: CaDevice) {
+    pub fn insert(&mut self, mut dev: CaDevice) {
         let i = dev.id;
+        dev.recovery_timeout_ms = self.ci_plus_recovery_ms;
         self.devices[i] = Some(dev);
     }
 
@@ -163,6 +178,8 @@ impl CaRegistry {
         c.pending_tag = 0;
         c.pending_session = 0;
         c.pending_since = -1;
+        c.mmi_error_since = -1;
+        c.last_key_ms = -1;
         c.key = [[0; 16]; 2];
         c.iv = [[0; 16]; 2];
         c.push_event(HostEvent::Opened);

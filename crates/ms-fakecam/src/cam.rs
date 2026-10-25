@@ -203,6 +203,30 @@ impl FakeCam {
         }
     }
 
+    /// Shows an MMI enquiry (tests): not blind, no answer length, `text` as the prompt.
+    pub fn send_mmi_enquiry(&mut self, text: &str) -> bool {
+        let text = &text.as_bytes()[..text.len().min(255)];
+        let mut body = vec![0, 0];
+        body.extend_from_slice(text);
+        self.send_to_resource(MMI, TAG_ENQUIRY, &body)
+    }
+
+    /// Shows an MMI menu (tests): title, subtitle, bottom line, then the items.
+    pub fn send_mmi_menu(&mut self, lines: &[&str]) -> bool {
+        let choices = lines.len().saturating_sub(3);
+        let mut body = vec![if choices == 0 {
+            0xFF
+        } else {
+            choices.saturating_sub(1) as u8
+        }];
+        for line in lines {
+            let text = &line.as_bytes()[..line.len().min(255)];
+            body.extend_from_slice(&[0x9F, 0x88, 0x03, text.len() as u8]);
+            body.extend_from_slice(text);
+        }
+        self.send_to_resource(MMI, TAG_MENU_LAST, &body)
+    }
+
     fn send_apdu(&mut self, session: u16, tag: u32, body: &[u8]) {
         let resource = self.sessions.get(&session).copied().unwrap_or(0);
         self.record(

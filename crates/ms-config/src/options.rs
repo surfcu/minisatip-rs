@@ -501,6 +501,8 @@ pub struct Options {
     pub emulate_pids_all: bool,
     /// `-z` cache directory.
     pub cache_dir: String,
+    /// `--ci-plus-recovery` seconds; 0 disables the key watchdog (CI+ builds only).
+    pub ci_plus_recovery: i32,
     /// `-h`/`--help` was requested; parsing stopped there.
     pub help: bool,
     /// `--version` was requested; parsing stopped there.
@@ -628,6 +630,7 @@ impl Default for Options {
             pmt_scan: 1,
             emulate_pids_all: false,
             cache_dir: "/var/cache/minisatip".into(),
+            ci_plus_recovery: 0,
             help: false,
             version: false,
             unicable: Vec::new(),
