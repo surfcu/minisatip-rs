@@ -331,14 +331,14 @@ Unvalidated rows must be called out in release notes.
   - M8: satipc against a real SAT>IP server. Status API: SAT>IP client adapters
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).
-  - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak running since
-    2026-10-25 14:30:15 +03 on the main box (see "Soak"); resource comparison.
+  - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak on the main box delayed
+    to Friday 2026-10-30 (see "Soak"); resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - Soak with evidence: the 7-day soak runs on the main box with the `diag-log`
-    build in plain CI since 2026-10-25 14:30 +03 (see "Soak" below); the enigma2 box runs the
+  - Soak with evidence: the 7-day soak on the main box (`diag-log` build, plain CI)
+    starts again on Friday 2026-10-30 (see "Soak" below); the enigma2 box runs the
     armv7 `diag-log` build since 2026-10-25 09:08 +03 and passed its 12 h validation
     (see "Logging ... Part B").
   - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
@@ -373,7 +373,12 @@ Unvalidated rows must be called out in release notes.
     watchdog resetting the two empty CI slots as in C++ (ca.cpp:3679-3693), plus 60
     heartbeats and the stream events. The -F file reached 2.2 MB, so it did not
     rotate.
-- **Soak (M9), restarted 2026-10-25 14:30:15 +03 on the main box in plain CI:** git
+- **Soak (M9), delayed to Friday 2026-10-30:** the run started 2026-10-25 14:30:15 +03
+  was stopped at about 16:36 +03, when the main box's tuner card overheated (I2C
+  errors, tuners stuck); the soak was delayed, and the 16:49 driver reload restarted
+  minisatip-rs. The soak and the load generator start again together on Friday, with
+  the load cut to at most 2 busy main-box tuners (all clients) and no exhaustion run;
+  the box still runs the same build and command line. The 14:30 run used: git
   `752c02b` (code as `86464d4`), static x86_64 musl with feature `diag-log` (no
   `ci-plus`, so the slot forces plain CI). The 13:53 start with `ci-plus-vendored` was
   ended after 37 min, when plain CI was chosen for the soak: in CI+ mode a CAM MMI error
@@ -382,15 +387,15 @@ Unvalidated rows must be called out in release notes.
   --log-remote tcp://<logging host>:6514`. The soak started 2026-10-24 02:37 was ended
   for the 13:53 start; it had in fact already been restarted by the later deploys
   (#54, the CI+ test build, two restarts to clear a CAM error message).
-  - Load: a load generator on the logging host opens streams through tvheadend's
-    HTTP API: 2-3 long steady streams (FTA and scrambled), channel zapping every
-    30-120 s (scrambled changes at least 30 s apart), leave-and-return on a
-    scrambled service, up to 3 parallel scrambled services (the CAM's limit),
-    FTA streams spread over both boxes, an exhaustion run at most every
-    6 h (100 s with more streams than tuners), and quiet hours 00:00-07:00 with one
-    steady stream and one idle hour. While another client is subscribed or a
-    recording starts within 10 min, it runs steady streams only (at most 3 loadgen
-    streams on the main box; enigma2 streams do not count). Every
+  - Load (14:30 run; reduced for Friday as above): a load generator on the logging
+    host opens streams through tvheadend's HTTP API: 2-3 long steady streams (FTA and
+    scrambled), channel zapping every 30-120 s (scrambled changes at least 30 s
+    apart), leave-and-return on a scrambled service, up to 3 parallel scrambled
+    services (the CAM's limit), FTA streams spread over both boxes, an exhaustion run
+    at most every 6 h (100 s with more streams than tuners), and quiet hours
+    00:00-07:00 with one steady stream and one idle hour. While another client is
+    subscribed or a recording starts within 10 min, it runs steady streams only (at
+    most 3 loadgen streams on the main box; enigma2 streams do not count). Every
     stream is checked with TSDuck (CC errors, bitrate, time to first packet and to
     clear picture).
   - tvheadend adapter priorities (higher first): main #1 6, enigma2 #1 5, main #2 4,
