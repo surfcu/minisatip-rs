@@ -332,13 +332,13 @@ Unvalidated rows must be called out in release notes.
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).
   - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak running since
-    2026-10-25 13:53:31 +03 on the main box (see "Soak"); resource comparison.
+    2026-10-25 14:30:15 +03 on the main box (see "Soak"); resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
   - Soak with evidence: the 7-day soak runs on the main box with the `diag-log`
-    build since 2026-10-25 13:53 +03 (see "Soak" below); the enigma2 box runs the
+    build in plain CI since 2026-10-25 14:30 +03 (see "Soak" below); the enigma2 box runs the
     armv7 `diag-log` build since 2026-10-25 07:08 (its 12 h validation is pending).
   - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
     on the status page.
@@ -361,11 +361,14 @@ Unvalidated rows must be called out in release notes.
   HTTP `pids=all` replay of the FTA and the scrambled capture (no key loaded): 4.25-4.45% of one core in the default build, at most +0.12
   points with the ring and the sink; RSS +1.4 MB with the sink; about 5 event lines
   per minute on an idle replay (heartbeat, session, tune, lock). armv7: Phase 3.
-- **Soak (M9), restarted 2026-10-25 13:53:31 +03 on the main box:** git `86464d4`,
-  static x86_64 musl with features `diag-log,ci-plus-vendored`, command line
+- **Soak (M9), restarted 2026-10-25 14:30:15 +03 on the main box in plain CI:** git
+  `752c02b` (code as `86464d4`), static x86_64 musl with feature `diag-log` (no
+  `ci-plus`, so the slot forces plain CI). The 13:53 start with `ci-plus-vendored` was
+  ended after 37 min, when plain CI was chosen for the soak: in CI+ mode a CAM MMI error
+  message leaves the CAM blocked until a restart, while plain CI recovers by itself (#63). Command line
   `/usr/local/bin/minisatip-rs -f -c 8:**2 -d *:*1-0 -R /usr/src/minisatip/html -l pmt,ca,ddci
   --log-remote tcp://<logging host>:6514`. The soak started 2026-10-24 02:37 was ended
-  for this restart; it had in fact already been restarted by the later deploys
+  for the 13:53 start; it had in fact already been restarted by the later deploys
   (#54, the CI+ test build, two restarts to clear a CAM error message).
   - Load: a load generator on the logging host opens streams through tvheadend's
     HTTP API: 2-3 long steady streams (FTA and scrambled), channel zapping every
@@ -383,4 +386,5 @@ Unvalidated rows must be called out in release notes.
   - Evidence: heartbeats, events and panics in Loki, a soak dashboard and a daily
     report script (private homelab notes). Known: CC errors right after a scrambled
     service starts come from the CAM.
-- **Tracked issues:** CA harness scenarios (#36); reconciler not on the runtime path (#37).
+- **Tracked issues:** CA harness scenarios (#36); reconciler not on the runtime path (#37);
+  CI+ CAM blocked after a CAM MMI error message until restart (#63).
