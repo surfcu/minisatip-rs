@@ -464,6 +464,7 @@ impl CaRuntime {
                 parity,
                 key,
                 iv,
+                expiry_s,
             } => {
                 for pmt_id in pmt_ids {
                     let Some(aid) = sched
@@ -482,7 +483,7 @@ impl CaRuntime {
                             parity,
                             cw: key.0.to_vec(),
                             iv: iv.0,
-                            expiry_s: 3720,
+                            expiry_s,
                             redact: true,
                         });
                         ms_log::diag::events::cw(
@@ -1867,6 +1868,7 @@ mod wiring_tests {
                 parity: 1,
                 key: CcKeyBytes([0x11; 16]),
                 iv: CcKeyBytes([0x22; 16]),
+                expiry_s: 3720,
             })
             .unwrap();
         ca.dvbca_notices(&mut sched);

@@ -122,6 +122,8 @@ pub enum Notice {
         parity: u8,
         key: CcKeyBytes,
         iv: CcKeyBytes,
+        /// CW lifetime: 3720 s for a new key, 3600 s for a replay on join.
+        expiry_s: i64,
     },
     /// `disable_cws_for_all_pmts`: stop descrambling these PMTs.
     DisableCws(Vec<usize>),
@@ -561,6 +563,23 @@ impl Worker {
         }
         self.programs.insert(program);
         let result = capmt.process_pmt(pmt_id, update, &self.programs, &mut SlotDriver(dev));
+        // ca.cpp:1330-1335: a PMT that got its CAPMT also gets the stored CI+ keys.
+        if result == TablesResult::Ok
+            && let Ok(id) = usize::try_from(pmt_id)
+        {
+            for parity in 0..2u8 {
+                let slot = usize::from(parity);
+                if dev.key[slot][0] != 0 {
+                    let _ = self.notices.send(Notice::CcKey {
+                        pmt_ids: vec![id],
+                        parity,
+                        key: CcKeyBytes(dev.key[slot]),
+                        iv: CcKeyBytes(dev.iv[slot]),
+                        expiry_s: 3600,
+                    });
+                }
+            }
+        }
         // ca.cpp:1265,1276: a PMT that found no place puts the CI back.
         if result == TablesResult::Retry && capmt.slot_of(pmt_id).is_none() {
             self.restore_ci_link(device, adapter as i32, prev_linked);
@@ -774,6 +793,7 @@ impl Worker {
                         parity,
                         key,
                         iv,
+                        expiry_s: 3720,
                     });
                 }
                 HostEvent::CcDisableCws => {
@@ -1491,7 +1511,7 @@ mod ciplus_worker_tests {
             worker.service();
         }
         assert!(offered, "the CAM accepts the offered PMT");
-        let _ = drain(&rx);
+        let joined = drain(&rx);
 
         // The handshake already delivered a key in register 0; the update must
         // prove it is a new one and not a replay of the init key.
@@ -1499,6 +1519,47 @@ mod ciplus_worker_tests {
         let init_key = init.expected_key.expect("the handshake sent a key");
         let init_iv = init.expected_iv.expect("the handshake sent an IV");
         assert_eq!(init.expected_parity, Some(0), "the handshake key register");
+
+        // ca.cpp:1330: the joining PMT gets the stored key at once, not at the next rotation.
+        let replay = joined
+            .iter()
+            .find_map(|notice| match notice {
+                Notice::CcKey {
+                    pmt_ids,
+                    parity: 0,
+                    key,
+                    iv,
+                    expiry_s,
+                } if pmt_ids == &[program.id as usize] => Some((key.0, iv.0, *expiry_s)),
+                _ => None,
+            })
+            .expect("the stored key is replayed to the joining PMT");
+        assert!(replay.0 == init_key, "the replayed key is the stored one");
+        assert!(replay.1 == init_iv, "the replayed IV is the stored one");
+        assert_eq!(replay.2, 3600, "a replayed key lives 3600 s");
+        assert!(
+            !joined
+                .iter()
+                .any(|notice| matches!(notice, Notice::CcKey { parity: 1, .. })),
+            "register 1 is still empty, so nothing is replayed for it"
+        );
+
+        // ca.cpp:993-996: an unchanged update is not re-sent but still counts as sent.
+        let (reply, answers) = mpsc::channel();
+        worker.handle(Request::AddPmt {
+            program: Box::new(program.clone()),
+            update: true,
+            reply,
+        });
+        assert_eq!(answers.recv().ok(), Some(TablesResult::Ok));
+        assert!(
+            drain(&rx).iter().any(|notice| matches!(
+                notice,
+                Notice::CcKey { pmt_ids, parity: 0, expiry_s: 3600, .. }
+                    if pmt_ids == &[program.id as usize]
+            )),
+            "an unchanged update replays the stored key too"
+        );
 
         assert!(
             cam.lock().unwrap().send_sac_key_request(1, false),
@@ -1533,6 +1594,7 @@ mod ciplus_worker_tests {
             parity,
             key,
             iv,
+            expiry_s,
         } = &notices[key_pos]
         else {
             panic!("matched above")
@@ -1557,6 +1619,7 @@ mod ciplus_worker_tests {
         );
         assert_ne!(key.0, init_key, "the forwarded key is fresh");
         assert_ne!(iv.0, init_iv, "the forwarded IV is fresh");
+        assert_eq!(*expiry_s, 3720, "a new key lives 3720 s");
 
         #[cfg(feature = "diag-log")]
         {
