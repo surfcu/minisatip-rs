@@ -285,7 +285,7 @@ Unvalidated rows must be called out in release notes.
   M8 status API item; the open exit criteria are listed below.
 - **Deployed (2026-10-24):** minisatip-rs replaces the C++ build on both boxes.
   - The main box (8 DVB-S2 tuners, DuoFlex CI) runs it as a systemd unit behind
-    tvheadend since 02:37; this starts the 7-day soak (M9).
+    tvheadend since 02:37; this started a 7-day soak (M9), later ended (see "Soak").
   - The enigma2 box (armv7) runs it with `-E -g` since 02:05.
   - Logs from both boxes and tvheadend go to a central Loki/Grafana host.
 - **Last sessions (2026-10-23/24):** merged and verified:
@@ -312,7 +312,7 @@ Unvalidated rows must be called out in release notes.
   - Verified: FTA, DDCI descrambling of 3 channels with MTD, rejoin without
     partner glitches.
 - **Real captures (2026-10-23):** an FTA mux (12015 H), a 19-service FTA mux (11425 V)
-  and an Irdeto-scrambled service with ECM/EMM (12073 V), kept in `~/captures`
+  and a scrambled service with ECM/EMM (12073 V), kept in `~/captures`
   outside git (README there); `ms-harness run --captures ~/captures
   harness/scenarios-real`.
 - **Open exit criteria:**
@@ -332,14 +332,14 @@ Unvalidated rows must be called out in release notes.
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).
   - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak running since
-    2026-10-24 02:37 on the main box; resource comparison.
+    2026-10-25 13:53:31 +03 on the main box (see "Soak"); resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - Soak with evidence: validate the `diag-log` build on the enigma2 box (12 h, Loki
-    labels, heartbeats, dropped lines, armv7 CPU/RSS), then restart the 7-day soak
-    on the main box with it.
+  - Soak with evidence: the 7-day soak runs on the main box with the `diag-log`
+    build since 2026-10-25 13:53 +03 (see "Soak" below); the enigma2 box runs the
+    armv7 `diag-log` build since 2026-10-25 07:08 (its 12 h validation is pending).
   - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
     on the status page.
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
@@ -361,5 +361,26 @@ Unvalidated rows must be called out in release notes.
   HTTP `pids=all` replay of the FTA and the scrambled capture (no key loaded): 4.25-4.45% of one core in the default build, at most +0.12
   points with the ring and the sink; RSS +1.4 MB with the sink; about 5 event lines
   per minute on an idle replay (heartbeat, session, tune, lock). armv7: Phase 3.
-- **Tracked issues:** CA harness scenarios (#36); reconciler not on the runtime path (#37);
-  flaky UDP port helper in the DDCI tests (#59).
+- **Soak (M9), restarted 2026-10-25 13:53:31 +03 on the main box:** git `86464d4`,
+  static x86_64 musl with features `diag-log,ci-plus-vendored`, command line
+  `/usr/local/bin/minisatip-rs -f -c 8:**2 -d *:*1-0 -R /usr/src/minisatip/html -l pmt,ca,ddci
+  --log-remote tcp://<logging host>:6514`. The soak started 2026-10-24 02:37 was ended
+  for this restart; it had in fact already been restarted by the later deploys
+  (#54, the CI+ test build, two restarts to clear a CAM error message).
+  - Load: a load generator on the logging host opens streams through tvheadend's
+    HTTP API: 2-3 long steady streams (FTA and scrambled), channel zapping every
+    30-120 s (scrambled changes at least 30 s apart), leave-and-return on a
+    scrambled service, up to 3 parallel scrambled services (the CAM's limit),
+    FTA streams spread over both boxes, an exhaustion run at most every
+    6 h (100 s with more streams than tuners), and quiet hours 00:00-07:00 with one
+    steady stream and one idle hour. While another client is subscribed or a
+    recording starts within 10 min, it runs steady streams only (at most 3 loadgen
+    streams on the main box; enigma2 streams do not count). Every
+    stream is checked with TSDuck (CC errors, bitrate, time to first packet and to
+    clear picture).
+  - tvheadend adapter priorities (higher first): main #1 6, enigma2 #1 5, main #2 4,
+    enigma2 #2 3, main #3-#8 2.
+  - Evidence: heartbeats, events and panics in Loki, a soak dashboard and a daily
+    report script (private homelab notes). Known: CC errors right after a scrambled
+    service starts come from the CAM.
+- **Tracked issues:** CA harness scenarios (#36); reconciler not on the runtime path (#37).
