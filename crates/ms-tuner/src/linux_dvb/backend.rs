@@ -256,6 +256,7 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
             locked: self.state.status & FE_HAS_LOCK != 0,
             strength: self.state.strength,
             snr: self.state.snr,
+            ber: self.state.ber,
         };
     }
 }

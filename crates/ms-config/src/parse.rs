@@ -26,6 +26,9 @@ enum OptId {
     Debug,
     LogFile,
     LogMaxSize,
+    LogRemote,
+    LogRemoteQueue,
+    LogRing,
     Help,
     Playlist,
     Adapters,
@@ -277,6 +280,24 @@ const OPTIONS: &[OptSpec] = &[
         id: OptId::LogMaxSize,
     },
     OptSpec {
+        long: "log-remote",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::LogRemote,
+    },
+    OptSpec {
+        long: "log-remote-queue",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::LogRemoteQueue,
+    },
+    OptSpec {
+        long: "log-ring",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::LogRing,
+    },
+    OptSpec {
         long: "multiplier",
         short: Some('M'),
         kind: ArgKind::Required,
@@ -462,9 +483,14 @@ struct Parser<'a> {
 /// The options of this build: without NETCVCLIENT the C++ `long_options` table,
 /// and the short options built from it, have no `netceiver` (minisatip.cpp:206).
 fn compiled_options() -> impl Iterator<Item = &'static OptSpec> {
-    OPTIONS
-        .iter()
-        .filter(|spec| cfg!(feature = "netceiver") || !matches!(spec.id, OptId::Netceiver))
+    OPTIONS.iter().filter(|spec| {
+        (cfg!(feature = "netceiver") || !matches!(spec.id, OptId::Netceiver))
+            && (cfg!(feature = "diag-log")
+                || !matches!(
+                    spec.id,
+                    OptId::LogRemote | OptId::LogRemoteQueue | OptId::LogRing
+                ))
+    })
 }
 
 /// Result of [`parse_args`]: the parsed options, the getopt diagnostics that
@@ -774,6 +800,11 @@ impl Parser<'_> {
             OptId::Syslog => self.opts.slog += 1,
             OptId::LogFile => self.opts.log_file = value.into(),
             OptId::LogMaxSize => self.opts.log_max_size = value.parse::<u64>().unwrap_or(0),
+            OptId::LogRemote => self.opts.log_remote = Some(value.into()),
+            OptId::LogRemoteQueue => {
+                self.opts.log_remote_queue = value.parse::<usize>().unwrap_or(0).max(1);
+            }
+            OptId::LogRing => self.opts.log_ring = value.parse::<usize>().unwrap_or(0),
             OptId::Help => self.opts.help = true,
             OptId::Version => self.opts.version = true,
             OptId::HttpPort => self.opts.http_port = c_atoi(value) as u32,

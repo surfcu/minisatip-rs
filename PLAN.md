@@ -62,7 +62,7 @@ items back in without the user's explicit go-ahead.
   cleanly and never applied (DEV-080).
 
 ### Non-goals
-- New features before parity (exception: anything needed by the harness)
+- New features before parity (exceptions: anything needed by the harness; `diag-log` for soak and glitch hunting, approved 2026-10-24)
 - Changing the web UI or wire protocols
 
 ## 4. Architecture
@@ -337,10 +337,9 @@ Unvalidated rows must be called out in release notes.
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - Soak with evidence: Part A (this PR) adds the panic hook, `--log-max-size` and
-    the real banner (#38); Part B adds the `diag-log` feature (events, remote
-    sink, flight recorder), validated on the enigma2 box, then the 7-day soak
-    restarts on the main box with it.
+  - Soak with evidence: validate the `diag-log` build on the enigma2 box (12 h, Loki
+    labels, heartbeats, dropped lines, armv7 CPU/RSS), then restart the 7-day soak
+    on the main box with it.
   - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
     on the status page.
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
@@ -356,4 +355,11 @@ Unvalidated rows must be called out in release notes.
 - **Logging (2026-10-24, Part A):** panic hook through ms-log for -f/-F/-g,
   `--log-max-size` rotation of the -F file (DEV-279), the banner prints the real
   build date/time and s2api `050C` (#38).
-- **Tracked issues:** CA harness scenarios (#36); reconciler not on the runtime path (#37).
+- **Logging (2026-10-25, Part B):** the `diag-log` feature (off by default, DEV-280):
+  JSON events with fixed fields, an RFC 5424 TCP sink (`--log-remote`), a flight
+  recorder (`--log-ring`, `GET /debug/log`) and a 60 s heartbeat. x86_64, 60 Mbit/s
+  HTTP `pids=all` replay of the FTA and the scrambled capture (no key loaded): 4.25-4.45% of one core in the default build, at most +0.12
+  points with the ring and the sink; RSS +1.4 MB with the sink; about 5 event lines
+  per minute on an idle replay (heartbeat, session, tune, lock). armv7: Phase 3.
+- **Tracked issues:** CA harness scenarios (#36); reconciler not on the runtime path (#37);
+  flaky UDP port helper in the DDCI tests (#59).

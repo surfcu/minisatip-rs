@@ -128,6 +128,9 @@ impl TsStage for DdciStage {
                     .process_ts(&mut ts, dev, &mut state.programs, writer.as_mut());
             }
         }
+        if ts.rlen > rlen {
+            ms_log::diag::count_batch_growth(i64::from(self.aid), ts.rlen as u64);
+        }
         let mut data = ts.buf;
         data.truncate(ts.rlen);
         *buf = data;
@@ -1010,7 +1013,7 @@ mod tests {
                 let state = hub.lock();
                 let fifo = &state.ddci.devices[&1].fifo;
                 let mut bytes = vec![0u8; (fifo.write_index - read) as usize];
-                let n = fifo.pop_offset(&mut bytes, &mut read);
+                let n = fifo.pop_offset(&mut bytes, &mut read, 0);
                 captured.extend_from_slice(&bytes[..n]);
             }
             let pid = |p: &[u8]| (u16::from(p[1] & 0x1F) << 8) | u16::from(p[2]);

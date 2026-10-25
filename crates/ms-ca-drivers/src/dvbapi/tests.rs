@@ -967,6 +967,46 @@ fn icam_ecm_names_the_cw_algorithm() {
     oscam.drain(&mut client);
 }
 
+// DEV-151: the CW event reports how long the ECM section took to become a key.
+#[cfg(feature = "diag-log")]
+#[test]
+fn cw_event_reports_the_ecm_delay() {
+    // Initialise the capture before the client emits anything.
+    let _ = crate::test_log::captured_lines();
+    let (mut client, mut oscam) = setup(0);
+    client
+        .add_service(&service(77, 0, 100, 48), false, 900)
+        .unwrap();
+    oscam.drain(&mut client);
+    oscam.feed(&mut client, &set_filter_bytes(0, 0, 0, 0x1CB6, 0, 0));
+    oscam.feed(&mut client, &set_filter_bytes(0, 0, 1, 0x0001, 0, 0));
+    let ids = filter_ids(&mut client);
+    let id = ids[&0x1CB6];
+    let cat = ids[&0x0001];
+
+    // The ECM section is forwarded at 900, then a non-ECM CAT section at 950;
+    // the key arrives at 1000. R10: the delay is measured from the ECM, so the
+    // CAT must not reset it.
+    client.deliver_section(id, &build_ecm(0x80, 4), false, 900);
+    oscam.drain(&mut client);
+    const CAT: [u8; 18] = [
+        0x01, 0xB0, 0x0F, 0xFF, 0xFF, 0xC1, 0x00, 0x00, 0x09, 0x04, 0x09, 0x8C, 0xE0, 0xCC, 0x11,
+        0x22, 0x33, 0x44,
+    ];
+    client.deliver_section(cat, &CAT, false, 950);
+    oscam.drain(&mut client);
+    client.on_data(&ca_set_descr(0, 0, [9; 8]), 1_000);
+
+    let captured = crate::test_log::events("cw");
+    let event = captured
+        .iter()
+        .find(|line| line.contains("\"pmt\":77"))
+        .unwrap_or_else(|| panic!("no cw event: {captured:?}"));
+    assert!(event.contains("\"parity\":0"), "{event}");
+    assert!(event.contains("\"ecm_ms\":100"), "{event}");
+    assert!(event.contains("\"source\":\"dvbapi\""), "{event}");
+}
+
 #[test]
 fn partial_reads_are_buffered() {
     let (mut client, mut oscam) = setup(0);

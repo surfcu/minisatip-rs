@@ -952,6 +952,8 @@ impl Tuner for SatipcTuner {
             locked: client.status,
             strength: u16::try_from(client.strength.clamp(0, 255)).unwrap_or(0),
             snr: u16::try_from(client.snr.clamp(0, 255)).unwrap_or(0),
+            // SAT>IP status carries no BER.
+            ber: 0,
         }
     }
 

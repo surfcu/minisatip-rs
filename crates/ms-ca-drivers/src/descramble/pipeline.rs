@@ -489,13 +489,13 @@ impl Descrambler {
         if !ms_log::enabled(ms_log::LOG_GENERAL) {
             return;
         }
-        ms_log::log!("List of CWs:");
+        ms_log::log_unrecorded!("List of CWs:");
         for (i, slot) in self.slots.iter().enumerate() {
             if let Some(s) = slot
                 && s.enabled
                 && s.expiry > now
             {
-                ms_log::log!("* CW {}: {}", i, cw_to_string(i, s, now));
+                ms_log::log_unrecorded!("* CW {}: {}", i, cw_to_string(i, s, now));
             }
         }
     }
@@ -581,12 +581,9 @@ impl Descrambler {
         }
         if let Some(i) = duplicate {
             let desc = cw_to_string(i, self.slots[i].as_ref().expect("matched slot"), now);
-            ms_log::log_and_return!(
-                Err(SendCwError::Duplicate),
-                "cw already exist at position {}: {} ",
-                i,
-                desc
-            );
+            // The description carries the key: keep it on the local outputs.
+            ms_log::log_unrecorded!("cw already exist at position {}: {} ", i, desc);
+            return Err(SendCwError::Duplicate);
         }
 
         let free = (0..MAX_CW).find(|&i| match self.slots.get(i) {
@@ -709,7 +706,7 @@ impl Descrambler {
             }
             if validated {
                 if test_decrypt_packets(s.cipher.as_mut(), &s.key, &starts) {
-                    ms_log::logm!(
+                    ms_log::logm_unrecorded!(
                         "correct CW found (len {}): {}",
                         starts.len(),
                         cw_to_string(i, s, now)
@@ -722,11 +719,11 @@ impl Descrambler {
             // Unverifiable (parity change without PUSI): the newest CW wins.
             match found {
                 None => {
-                    ms_log::logm!("candidate CW {}", cw_to_string(i, s, now));
+                    ms_log::logm_unrecorded!("candidate CW {}", cw_to_string(i, s, now));
                     found = Some((i, s.time));
                 }
                 Some((_, time)) if time < s.time => {
-                    ms_log::logm!("New candidate found: {}", cw_to_string(i, s, now));
+                    ms_log::logm_unrecorded!("New candidate found: {}", cw_to_string(i, s, now));
                     found = Some((i, s.time));
                 }
                 _ => {}
@@ -758,7 +755,7 @@ impl Descrambler {
                     && s.set_time > 0
                 {
                     s.expiry = now + REPLACED_CW_EXPIRY;
-                    ms_log::log!(
+                    ms_log::log_unrecorded!(
                         "Expiring CW {} for pmt {}: {}",
                         i,
                         pmt_id,
@@ -812,7 +809,7 @@ impl Descrambler {
             if pmt == NO_PMT {
                 // `p ? p->pmt : -3`: `pid_pmt` keeps no entry for untracked
                 // pids, so the C++ default is what remains.
-                ms_log::debugm!(
+                ms_log::debugm_hot!(
                     "PMT not found for pid {}, id {}, packet {}, pos {}",
                     pid,
                     -3,
@@ -872,7 +869,7 @@ impl Descrambler {
             }
             // `opts.debug & (DEFAULT_LOG | LOG_DMX)`.
             if ms_log::debug_enabled(DEFAULT_LOG | ms_log::LOG_DMX) {
-                ms_log::log!(
+                ms_log::log_unrecorded!(
                     "Marking PID {} packet {} pos {} as NULL",
                     pid,
                     packet,

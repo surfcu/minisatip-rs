@@ -206,13 +206,15 @@ fn tune_is_recorded_and_status_is_configurable() {
         SignalStatus {
             locked: true,
             strength: 120,
-            snr: 200
+            snr: 200,
+            ber: 0
         }
     );
     let unlocked = SignalStatus {
         locked: false,
         strength: 1,
         snr: 2,
+        ber: 1,
     };
     tuner.set_status(unlocked);
     assert_eq!(tuner.status(), unlocked);

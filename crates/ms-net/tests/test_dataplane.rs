@@ -413,6 +413,7 @@ impl Tuner for ScriptedTuner {
             locked: true,
             strength: 255,
             snr: 15,
+            ber: 0,
         }
     }
 

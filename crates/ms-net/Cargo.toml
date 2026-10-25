@@ -9,6 +9,8 @@ repository.workspace = true
 default = []
 # SRT output support; links libsrt (through ms-srt) only when enabled.
 srt = ["dep:ms-srt", "ms-srt/srt"]
+# Diagnostic events; enables the call-site tests that check them.
+diag-log = ["ms-log/diag-log"]
 
 [dependencies]
 libc = "0.2"

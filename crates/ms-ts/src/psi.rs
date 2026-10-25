@@ -34,7 +34,7 @@ pub fn buffer_to_ts(dest: &mut [u8], src: &[u8], cc: &mut i16, pid: u16) -> isiz
         b[4 + left..].fill(0xFF);
         // utils.cpp:724-726
         if ms_log::debug_enabled(ms_log::LOG_UTILS) {
-            ms_log::log!("pid {}, left -> {}, len {}, cc {}", pid, left, len, *cc);
+            ms_log::log_unrecorded!("pid {}, left -> {}, len {}, cc {}", pid, left, len, *cc);
             ms_log::hexdump!("packet -> ", b);
         }
         pos += left;

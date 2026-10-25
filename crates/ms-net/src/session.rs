@@ -153,6 +153,8 @@ pub struct Stream {
     pub srt_streamid: String,
     /// Whether the stream was touched since creation.
     pub touched: bool,
+    /// Whether `session_open` was emitted and `session_close` is still due.
+    opened: bool,
 }
 
 impl Stream {
@@ -187,6 +189,15 @@ impl Stream {
             srt_sock: -1,
             srt_streamid: String::new(),
             touched: false,
+            opened: false,
+        }
+    }
+
+    /// Protocol name used by `session_open`/`session_close`.
+    fn diag_proto(&self) -> &'static str {
+        match self.stream_type {
+            StreamType::Http => "http",
+            _ => "rtsp",
         }
     }
 }
@@ -711,6 +722,7 @@ impl SessionManager {
                 if let Some(stream) = self.streams[index].as_mut() {
                     stream.do_play = true;
                 }
+                self.diag_open(index);
                 // stream.cpp:286.
                 ms_log::log_and_return!(
                     Ok(()),
@@ -756,7 +768,10 @@ impl SessionManager {
             self.disable_stream(*close);
         }
         match outcome.result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.diag_open(index);
+                Ok(())
+            }
             Err(TuneError::OutOfRange) => {
                 self.set_play_error(index, "Out-of-Range: freq");
                 Err(PlayError::new(403, "Out-of-Range: freq".to_owned()))
@@ -785,11 +800,47 @@ impl SessionManager {
         }
     }
 
+    /// Emits `session_open` once playback starts.
+    fn diag_open(&mut self, index: usize) {
+        let Some(stream) = self.streams[index].as_mut() else {
+            return;
+        };
+        if stream.opened {
+            return;
+        }
+        stream.opened = true;
+        let session = i64::from(stream.id);
+        let adapter = i64::from(stream.adapter);
+        let proto = stream.diag_proto();
+        ms_log::diag::events::session_open(session, proto, adapter, || {
+            format!("{}:{}", stream.remote_host, stream.remote_port)
+        });
+    }
+
+    /// Emits `session_close` when a live session ends.
+    fn diag_close(&mut self, index: usize) {
+        let Some(stream) = self.streams[index].as_mut() else {
+            return;
+        };
+        if !stream.opened {
+            return;
+        }
+        stream.opened = false;
+        let session = i64::from(stream.id);
+        let adapter = i64::from(stream.adapter);
+        let proto = stream.diag_proto();
+        ms_log::diag::events::session_close(session, proto, adapter, || {
+            format!("{}:{}", stream.remote_host, stream.remote_port)
+        });
+    }
+
     /// Disables a stream whose adapter was already released by the scheduler.
     fn disable_stream(&mut self, id: StreamId) {
-        if let Some(index) = self.slot_index(id)
-            && let Some(stream) = self.streams[index].as_mut()
-        {
+        let Some(index) = self.slot_index(id) else {
+            return;
+        };
+        self.diag_close(index);
+        if let Some(stream) = self.streams[index].as_mut() {
             stream.enabled = false;
             stream.adapter = -1;
             stream.do_play = false;
@@ -803,6 +854,7 @@ impl SessionManager {
         let Some(index) = self.slot_index(id) else {
             return;
         };
+        self.diag_close(index);
         let adapter = self.streams[index].as_ref().expect("checked slot").adapter;
         #[cfg(feature = "srt")]
         let srt_socket = self.streams[index].as_ref().and_then(|stream| {
@@ -1311,6 +1363,15 @@ impl SessionManager {
             }
         }
         (s2, t, c)
+    }
+
+    /// Streams the status page counts as active (enabled slots).
+    pub fn active_streams(&self) -> usize {
+        self.streams
+            .iter()
+            .flatten()
+            .filter(|stream| stream.enabled)
+            .count()
     }
 
     /// Captures adapter, stream and runtime values for the web endpoints.

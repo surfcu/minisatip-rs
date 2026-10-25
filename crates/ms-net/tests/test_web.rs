@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ms_net::bandwidth::BandwidthSnapshot;
@@ -587,4 +588,52 @@ fn bandwidth_json_prints_the_folded_counters() {
             "}"
         )
     );
+}
+
+static DEBUG_REQUESTED: AtomicUsize = AtomicUsize::new(0);
+
+fn debug_tail(lines: usize) -> Vec<String> {
+    DEBUG_REQUESTED.store(lines, Ordering::SeqCst);
+    vec!["older".to_owned(), "newest".to_owned()]
+}
+
+#[test]
+fn debug_log_route_returns_text_tail() {
+    let service = WebService::new(config(PathBuf::from("html"))).with_debug_log(debug_tail, 3);
+    let route = service
+        .route(&get("/debug/log?lines=2"), &WebSnapshot::new())
+        .expect("route");
+    assert_eq!(route.status, 200);
+    assert_eq!(DEBUG_REQUESTED.load(Ordering::SeqCst), 2);
+    assert!(
+        route
+            .headers
+            .contains(&"Content-Type: text/plain; charset=utf-8".to_owned())
+    );
+    assert_eq!(route.body, b"older\nnewest\n");
+
+    let default = service
+        .route(&get("/debug/log"), &WebSnapshot::new())
+        .expect("route");
+    // The default 1000 is capped at the ring size.
+    assert_eq!(DEBUG_REQUESTED.load(Ordering::SeqCst), 3);
+    assert_eq!(default.body, b"older\nnewest\n");
+
+    let over = service
+        .route(&get("/debug/log?lines=99"), &WebSnapshot::new())
+        .expect("route");
+    assert_eq!(DEBUG_REQUESTED.load(Ordering::SeqCst), 3);
+    assert_eq!(over.body, b"older\nnewest\n");
+
+    let zero = service
+        .route(&get("/debug/log?lines=0"), &WebSnapshot::new())
+        .expect("route");
+    assert_eq!(DEBUG_REQUESTED.load(Ordering::SeqCst), 1);
+    assert_eq!(zero.body, b"older\nnewest\n");
+
+    let plain = WebService::new(config(PathBuf::from("html")));
+    let missing = plain
+        .route(&get("/debug/log"), &WebSnapshot::new())
+        .expect("route");
+    assert_eq!(missing.status, 404);
 }

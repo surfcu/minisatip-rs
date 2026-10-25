@@ -659,6 +659,11 @@ impl Worker {
                 continue;
             };
             if dev.has_link() && !dev.service() {
+                ms_log::diag::events::cam_state(
+                    i64::try_from(*id).unwrap_or(0),
+                    "removed",
+                    dev.mode_name(),
+                );
                 dev.teardown();
             }
             if dev.take_close_request() {
@@ -748,6 +753,17 @@ impl Worker {
                 HostEvent::MmiMenu { .. } | HostEvent::MmiEnquiry { .. } => {}
                 HostEvent::CcKey { parity, key, iv } => {
                     let pmt_ids = capmt_pmt_ids(capmt);
+                    ms_log::diag::events::ciplus_key(
+                        i64::try_from(id).unwrap_or(0),
+                        i64::from(parity),
+                        || {
+                            pmt_ids
+                                .iter()
+                                .filter_map(|pmt_id| self.programs.get(*pmt_id as i32))
+                                .map(|program| u64::from(program.adapter))
+                                .collect()
+                        },
+                    );
                     let _ = self.notices.send(Notice::CcKey {
                         pmt_ids,
                         parity,
@@ -957,6 +973,79 @@ mod tests {
             .map(|p| p.number())
             .collect();
         assert_eq!(programs, [0x64]);
+    }
+
+    // DEV-151: a join, an unchanged update and a leave each emit one event.
+    #[cfg(feature = "diag-log")]
+    #[test]
+    fn capmt_events_report_join_skip_and_leave() {
+        let lines = super::diag_capture::lines();
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let mut opts = Options::default();
+        opts.ca_pins.push(ms_config::CaPin {
+            adapter: 0,
+            pin: "1234".to_owned(),
+        });
+        let dvbca = Rc::new(
+            Dvbca::spawn(
+                DvbcaSettings::from_options(&opts),
+                Box::new(CamOpener(Arc::clone(&cam))),
+                Arc::new(ManualClock::new(0, 1_700_000_000)),
+            )
+            .unwrap(),
+        );
+        dvbca.init_dev(AdapterInfo::dvb(0, 0, 0));
+        assert!(wait_notice(&dvbca, |n| *n == Notice::Usable(0)));
+        assert!(wait_notice(&dvbca, |n| *n == Notice::Caids(0, vec![0x0B00])));
+        let caids = Rc::new(RefCell::new(BTreeMap::from([(0, vec![0x0B00])])));
+        let mut sink = DvbcaSink::new(Rc::clone(&dvbca), caids, Rc::default());
+
+        // PMT 21 is not used by the other unit tests in this binary, so their
+        // CAPMT events cannot be mistaken for these.
+        let mut program = service(0x0B00);
+        program.pmt_id = 21;
+        let ours = |line: &String| {
+            line.contains("\"event\":\"capmt\"") && line.contains("\"pmt_ids\":[21]")
+        };
+
+        let start = lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(sink.add_pmt(&program, false), TablesResult::Ok);
+        assert_eq!(sink.add_pmt(&program, true), TablesResult::Ok);
+        assert_eq!(sink.del_pmt(&program), TablesResult::Ok);
+
+        // `del_pmt` is asynchronous: wait for the worker to emit its event.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let captured = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if captured[start..].iter().filter(|line| ours(line)).count() == 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "not all capmt events: {captured:?}"
+            );
+            drop(captured);
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let captured = lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let events: Vec<&String> = captured[start..].iter().filter(|line| ours(line)).collect();
+        assert_eq!(events.len(), 3, "join, skipped update, leave: {events:?}");
+        assert!(events[0].contains("\"reason\":\"join\""), "{}", events[0]);
+        assert!(events[0].contains("\"skipped\":false"), "{}", events[0]);
+        assert!(events[1].contains("\"reason\":\"update\""), "{}", events[1]);
+        assert!(events[1].contains("\"skipped\":true"), "{}", events[1]);
+        assert!(events[2].contains("\"reason\":\"leave\""), "{}", events[2]);
     }
 
     /// Records the host control files the worker writes; no CI device opens.
@@ -1348,6 +1437,9 @@ mod ciplus_worker_tests {
 
     #[test]
     fn ciplus_keys_are_forwarded_for_offered_pmts() {
+        // Initialise the capture before the worker emits anything.
+        #[cfg(feature = "diag-log")]
+        let _ = super::diag_capture::lines();
         let pki = ms_fakecam::ciplus::test_pki::pki("dvbca-worker");
         let mut config = CamConfig::default();
         config.resources.push(CIPLUS_CC);
@@ -1458,6 +1550,73 @@ mod ciplus_worker_tests {
         );
         assert_ne!(key.0, init_key, "the forwarded key is fresh");
         assert_ne!(iv.0, init_iv, "the forwarded IV is fresh");
+
+        #[cfg(feature = "diag-log")]
+        {
+            let captured = super::diag_capture::events("ciplus_key");
+            let event = captured
+                .last()
+                .unwrap_or_else(|| panic!("no ciplus_key event: {captured:?}"));
+            assert!(event.contains("\"ca\":0"), "{event}");
+            assert!(event.contains("\"parity\":1"), "{event}");
+            assert!(event.contains("\"target_adapters\":[0]"), "{event}");
+        }
         pki.remove();
+    }
+}
+
+/// Captures diagnostic events for the unit tests (one `init` per process).
+#[cfg(all(test, feature = "diag-log"))]
+mod diag_capture {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use ms_log::Backend;
+
+    /// Lines for `event` emitted by the current test thread, so parallel tests
+    /// cannot hide this test's event.
+    #[cfg(feature = "ci-plus")]
+    pub(crate) fn events(event: &str) -> Vec<String> {
+        let thread = std::thread::current().name().unwrap_or_default().to_owned();
+        let event = format!("\"event\":\"{event}\"");
+        let thread = format!("\"thread\":\"{thread}\"");
+        lines()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|line| line.contains(&event) && line.contains(&thread))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn lines() -> &'static Arc<Mutex<Vec<String>>> {
+        static LINES: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+        LINES.get_or_init(|| {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            ms_log::init(ms_log::Config {
+                log: ms_log::ALL_LOG_MODULES | ms_log::LOG_GENERAL,
+                debug: 0,
+                slog: 0,
+                file_line: false,
+                backend: Box::new(Capture(Arc::clone(&lines))),
+            });
+            lines
+        })
+    }
+
+    struct Capture(Arc<Mutex<Vec<String>>>);
+
+    impl Backend for Capture {
+        fn timestamp(&self) -> ms_log::Timestamp {
+            ms_log::Timestamp::new(1, 1, 0, 0, 0, 0)
+        }
+
+        fn syslog(&self, _line: &str) {}
+
+        fn stdout(&self, line: &str) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line.to_owned());
+        }
     }
 }

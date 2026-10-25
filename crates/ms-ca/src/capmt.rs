@@ -54,6 +54,9 @@ pub struct Capmt {
     pub capmt_hash_valid: bool,
     /// Stream loops last sent per place; empty means nothing kept.
     pub sent_es: [Vec<u8>; MAX_PMT_PER_CAPMT],
+    /// Set after a retryable send failure on this slot; the next attempt
+    /// reports `retry`.
+    pub diag_retry: bool,
 }
 
 impl Default for Capmt {
@@ -67,6 +70,7 @@ impl Default for Capmt {
             capmt_hash: u32::MAX,
             capmt_hash_valid: true,
             sent_es: Default::default(),
+            diag_retry: false,
         }
     }
 }
@@ -87,6 +91,7 @@ impl Capmt {
             capmt_hash: 0,
             capmt_hash_valid: false,
             sent_es: Default::default(),
+            diag_retry: false,
         }
     }
 

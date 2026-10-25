@@ -139,6 +139,8 @@ pub struct Key {
     pub pmt_pid: u16,
     /// Last ECM forwarded (ms).
     pub last_ecm: i64,
+    /// Last ECM *section* forwarded (ms); non-ECM sends do not bump it.
+    pub last_ecm_sent: i64,
     /// Last DMX_STOP or (re)send (ms), 0 for never.
     pub last_dmx_stop: i64,
     /// ECM_INFO hops.
@@ -471,7 +473,7 @@ impl DvbapiClient {
                 index,
                 parity,
                 cw,
-            } => self.set_descr(key, index, parity, cw),
+            } => self.set_descr(key, index, parity, cw, now),
             ServerMsg::CaSetDescrAes { data } => log_unknown_operation(&data),
             ServerMsg::CaSetDescrMode {
                 key, algo, mode, ..
@@ -631,12 +633,12 @@ impl DvbapiClient {
         k.last_dmx_stop = now;
     }
 
-    fn set_descr(&mut self, raw_key: u8, index: i32, parity: i32, cw: [u8; 8]) {
+    fn set_descr(&mut self, raw_key: u8, index: i32, parity: i32, cw: [u8; 8], now: i64) {
         let key_id = raw_key as i32 - self.cfg.offset;
         let i = self.wire_key(raw_key);
         if i.is_none() || !(0..2).contains(&parity) {
             // C++ `%p`: normalized to the slot id, 0 for a missing key.
-            ms_log::log!(
+            ms_log::log_unrecorded!(
                 "dvbapi: invalid DVBAPI_CA_SET_DESCR, key {} parity {}, k 0x{:x}, index {}, CW: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
                 key_id,
                 parity,
@@ -660,7 +662,7 @@ impl DvbapiClient {
         // C++ stores 8 bytes for every CA_SET_DESCR, even in AES mode.
         k.key_len = 8;
         k.cw[parity as usize][..8].copy_from_slice(&cw);
-        ms_log::log!(
+        ms_log::log_unrecorded!(
             "dvbapi: received DVBAPI_CA_SET_DESCR, key {} parity {}, index {}, algo {}, CW {}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
             key_id,
             parity,
@@ -675,6 +677,13 @@ impl DvbapiClient {
             cw[5],
             cw[6],
             cw[7]
+        );
+        let ecm_ms = (k.last_ecm_sent > 0).then(|| now.saturating_sub(k.last_ecm_sent));
+        ms_log::diag::events::cw(
+            i64::try_from(k.pmt_id).unwrap_or(0),
+            i64::from(parity),
+            ecm_ms,
+            "dvbapi",
         );
         let algo = if k.is_icam { CwAlgo::CsaIcam } else { k.algo };
         self.events.push_back(CaEvent::ControlWord {
@@ -762,6 +771,7 @@ impl DvbapiClient {
         k.ver = -1;
         k.ecms = 0;
         k.last_dmx_stop = 0;
+        k.last_ecm_sent = 0;
         k.onid = 0;
         k.tsid = 0;
         k.icam_ecm = 0;
@@ -1059,6 +1069,9 @@ impl DvbapiClient {
         }
         if let Some(msg) = proto::filter_data(demux as u8, filter as u8, &b[..len]) {
             self.write(msg);
+            if is_ecm && let Some(k) = self.keys.get_mut(i) {
+                k.last_ecm_sent = now;
+            }
         }
     }
 

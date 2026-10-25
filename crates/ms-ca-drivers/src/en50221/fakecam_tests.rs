@@ -279,6 +279,36 @@ fn registry_init_dev_drives_the_fake_cam() {
     assert!(reg.has_ci);
 }
 
+// DEV-151: a successful slot init emits `cam_state` with the slot's mode.
+#[cfg(feature = "diag-log")]
+#[test]
+fn registry_init_emits_cam_state() {
+    // Initialise the capture before the registry emits anything.
+    let _ = crate::test_log::captured_lines();
+    let cam = Arc::new(Mutex::new(FakeCam::new(
+        CamConfig::default(),
+        Arc::new(ms_fakecam::ManualClock::new(0)),
+    )));
+    let mut reg = CaRegistry::new(Arc::new(ManualClock::new(0, UNIX)));
+    let mut opener = CamOpener {
+        cam: Arc::clone(&cam),
+        root_cert: false,
+    };
+    assert_eq!(
+        reg.init_dev(&AdapterInfo::dvb(0, 0, 0), &mut opener),
+        InitResult::Ok
+    );
+
+    let captured = crate::test_log::events("cam_state");
+    let event = captured
+        .iter()
+        .find(|line| line.contains("\"state\":\"init\""))
+        .unwrap_or_else(|| panic!("no cam_state event: {captured:?}"));
+    assert!(event.contains("\"ca\":0"), "{event}");
+    assert!(event.contains("\"state\":\"init\""), "{event}");
+    assert!(event.contains("\"mode\":\"ci\""), "{event}");
+}
+
 #[test]
 fn datetime_resends_on_the_configured_interval() {
     let config = CamConfig {

@@ -26,7 +26,7 @@ use ms_net::web::{CaDeviceState, KeyChannel, KeyState};
 use ms_sched::pmt::{
     CaSink, FILTER_ADD_REMOVE, FILTER_CRC, FILTER_EMM, FILTER_REVERSE, FilterTarget, PmtState,
 };
-use ms_sched::{MAX_ADAPTERS, PidState, Scheduler};
+use ms_sched::{AdapterType, MAX_ADAPTERS, PidState, Scheduler};
 use ms_ts::{SectionAssembler, TsStage, crc32_mpeg2};
 use ms_tuner::PidSet;
 use std::collections::BTreeSet;
@@ -40,6 +40,8 @@ const DVBAPI_POLL_MS: i64 = 1000;
 const WATCHDOG_MS: i64 = 100;
 /// How often every descrambler is asked for its statistics (`ad_decerr`).
 const STATS_MS: i64 = 1000;
+/// Period of the `ci_decrypt` diagnostics.
+const DIAG_DECRYPT_MS: i64 = 10_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 /// PID that requests the whole transport stream.
@@ -80,6 +82,10 @@ pub struct CaRuntime {
     next_poll: i64,
     next_watchdog: i64,
     next_stats: i64,
+    /// Next `ci_decrypt` window (ms).
+    diag_next_decrypt: i64,
+    /// Cumulative `dec_err` already reported per adapter.
+    diag_dec_err: BTreeMap<usize, u64>,
 }
 
 impl CaRuntime {
@@ -109,6 +115,8 @@ impl CaRuntime {
             next_poll: 0,
             next_watchdog: 0,
             next_stats: 0,
+            diag_next_decrypt: 0,
+            diag_dec_err: BTreeMap::new(),
         }
     }
 
@@ -477,6 +485,12 @@ impl CaRuntime {
                             expiry_s: 3720,
                             redact: true,
                         });
+                        ms_log::diag::events::cw(
+                            i64::try_from(pmt_id).unwrap_or(0),
+                            i64::from(parity),
+                            None,
+                            "ci+",
+                        );
                     }
                 }
             }
@@ -648,6 +662,10 @@ impl CaRuntime {
         let now = self.now();
         self.set_driver_time(now);
         self.collect_stats();
+        if cfg!(feature = "diag-log") && now >= self.diag_next_decrypt {
+            self.diag_next_decrypt = now + DIAG_DECRYPT_MS;
+            self.diag_decrypt(sched);
+        }
         self.dvbca_notices(sched);
         if let Some(dvbapi) = self.dvbapi.as_mut() {
             dvbapi.service_socket(now);
@@ -872,6 +890,31 @@ impl CaRuntime {
         }
     }
 
+    /// Emits `ci_decrypt` per CI adapter when keys or errors were seen.
+    fn diag_decrypt(&mut self, sched: &Scheduler) {
+        let aids: Vec<usize> = self.adapters.keys().copied().collect();
+        for aid in aids {
+            let is_ci = sched
+                .adapter(aid)
+                .is_some_and(|adapter| adapter.config.adapter_type == AdapterType::Ci);
+            if !is_ci {
+                continue;
+            }
+            let Some(ca) = self.adapters.get(&aid) else {
+                continue;
+            };
+            let keys = ca.stats.services.iter().filter(|s| s.cw.is_some()).count();
+            let total = ca.stats.dec_err;
+            let previous = self.diag_dec_err.insert(aid, total).unwrap_or(0);
+            let errors = total.saturating_sub(previous);
+            if keys == 0 && errors == 0 {
+                continue;
+            }
+            let period_s = (DIAG_DECRYPT_MS / 1000) as u64;
+            ms_log::diag::events::ci_decrypt(aid as i64, keys as u64, errors, period_s);
+        }
+    }
+
     fn sync(&mut self, sched: &Scheduler, handles: &[Option<AdapterHandle>]) {
         let aids: Vec<usize> = self.adapters.keys().copied().collect();
         for aid in aids {
@@ -1066,7 +1109,7 @@ fn emm_len(b: &[u8]) -> usize {
         i += ((usize::from(b[i + 1] & 0xF) << 8) | usize::from(b[i + 2])) + 3;
         emms += 1;
     }
-    ms_log::debugm!(
+    ms_log::debugm_hot!(
         "returning EMM len {} ({:X}) from {}, found {} emms",
         i,
         i,
@@ -1099,7 +1142,7 @@ impl SectionRouter {
             if b[1] & 0x40 != 0 {
                 state.matched =
                     !emm && match_filter(id, f.pid, &f.filter, &f.mask, f.flags, &b[5..]);
-                ms_log::debugm!(
+                ms_log::debugm_hot!(
                     "matching pid {}, filter {}, match {}, flags {}, isEMM {}",
                     pid,
                     id,
@@ -1116,7 +1159,7 @@ impl SectionRouter {
             } else {
                 state.assembler.assemble_packet(b)
             };
-            ms_log::debugm!(
+            ms_log::debugm_hot!(
                 "assemble_packet returned {} for pid {}",
                 assembled.map_or(0, |section| section.len()),
                 pid
@@ -1142,7 +1185,7 @@ impl SectionRouter {
                 let end = (i + len).min(section.len());
                 let matched =
                     match_filter(id, f.pid, &f.filter, &f.mask, f.flags, &section[i..end]);
-                ms_log::debugm!(
+                ms_log::debugm_hot!(
                     "EMM: match {} id: {} len: {}: {:02X} {:02X} {:02X} {:02X} {:02X}",
                     u8::from(matched),
                     id,
@@ -1191,7 +1234,7 @@ fn match_filter(
         let idx = if i == 0 { 0 } else { i + 2 };
         let want = filter[i] & mask[i];
         if b.get(idx).is_none_or(|&byte| byte & mask[i] != want) {
-            ms_log::debugm!(
+            ms_log::debugm_hot!(
                 "filter {}, pid {}, index {} did not match: {:02X} & {:02X} != {:02X} inital filter: {:02X}",
                 id,
                 pid,
@@ -1208,7 +1251,7 @@ fn match_filter(
     if flags & FILTER_REVERSE != 0 {
         matched = !matched;
     }
-    ms_log::debugm!(
+    ms_log::debugm_hot!(
         "filter {}match: id {}: pid {}, flags {}, mask_len {}, filter -> {:02X} {:02X} {:02X} {:02X} {:02X}, mask ->{:02X} {:02X} {:02X} {:02X} {:02X} -> data {:02X} [{:02x} {:02x}] {:02X} {:02X} {:02X} {:02X}",
         if matched { "" } else { "not " },
         id,
@@ -1960,7 +2003,7 @@ mod ci_stage_tests {
         let device = &state.ddci.devices[&1];
         let mut fifo = vec![0u8; buf.len()];
         let mut read = 0;
-        assert_eq!(device.fifo.pop_offset(&mut fifo, &mut read), buf.len());
+        assert_eq!(device.fifo.pop_offset(&mut fifo, &mut read, 0), buf.len());
         for packet in fifo.chunks(188) {
             assert_eq!(
                 packet,
@@ -2003,7 +2046,9 @@ mod ci_stage_tests {
         let mut fifo = vec![0u8; buf.len()];
         let mut read = 0;
         assert_eq!(
-            state.ddci.devices[&1].fifo.pop_offset(&mut fifo, &mut read),
+            state.ddci.devices[&1]
+                .fifo
+                .pop_offset(&mut fifo, &mut read, 0),
             buf.len()
         );
         for packet in fifo.chunks(188) {

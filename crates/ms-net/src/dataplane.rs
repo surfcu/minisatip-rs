@@ -8,7 +8,7 @@ use crate::output::{OutputStats, STREAM_TIMER_MS, StreamOutput};
 use crate::rtp::DVB_FRAME;
 use ms_sched::{AdapterTuner, TuneError};
 use ms_ts::TsStage;
-use ms_tuner::{PID_ALL, PidSet, TsBuf, TuneParams, Tuner, TunerError};
+use ms_tuner::{PID_ALL, PidSet, SignalStatus, TsBuf, TuneParams, Tuner, TunerError};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::UdpSocket;
@@ -31,6 +31,12 @@ pub const FORCE_SEND_MS: i64 = 40;
 pub const NEW_TRANSPONDER_WINDOW_MS: i64 = 200;
 /// Minimum interval between continuity-error reports to the control plane.
 const CC_REPORT_MS: i64 = 1000;
+/// Signal change that triggers a `signal` event (5% of the 0..255 range).
+const DIAG_SIGNAL_STEP: u16 = 13;
+/// Minimum interval between `signal` events for one adapter.
+const DIAG_SIGNAL_PERIOD_MS: i64 = 10_000;
+/// DVB frontend status bit the tuner abstraction can report.
+const DIAG_FE_HAS_LOCK: i64 = 0x10;
 /// Command poll interval while the tuner has no data.
 const IDLE_POLL: Duration = Duration::from_millis(5);
 /// Null-packet PID skipped by `check_cc` (stream.cpp:905).
@@ -231,6 +237,7 @@ impl ContinuityCounter {
         let error = expected != cc;
         if error {
             self.errors += 1;
+            ms_log::diag::count_cc(i64::from(self.adapter_id), pid);
             // stream.cpp:937 (`LOG`, general module).
             ms_log::log!(
                 "PID Continuity error (adapter {}, pos {}): pid: {:03}, Expected CC: {:X}, Actual CC: {:X}, CC Before {:X} {}",
@@ -677,6 +684,14 @@ struct DataPlane {
     section_pids: PidSet,
     tune_generation: Arc<Mutex<u64>>,
     keep_reading: bool,
+    /// Whether a tune was applied; lock events start after it.
+    diag_tuned: bool,
+    /// Last reported lock state (`None` before the first poll after a tune).
+    diag_lock: Option<bool>,
+    /// Last reported signal values.
+    diag_signal: Option<(u16, u16, u32)>,
+    /// Time of the last `signal` event.
+    diag_signal_ms: i64,
 }
 
 impl DataPlane {
@@ -715,6 +730,35 @@ impl DataPlane {
             section_pids: PidSet::new(),
             tune_generation: Arc::new(Mutex::new(0)),
             keep_reading: false,
+            diag_tuned: false,
+            diag_lock: None,
+            diag_signal: None,
+            diag_signal_ms: 0,
+        }
+    }
+
+    /// Emits `lock` on a change and `signal` beyond the threshold, at most
+    /// once per adapter per 10 s.
+    fn diag_status(&mut self, signal: &SignalStatus, now: i64) {
+        let adapter = i64::from(self.config.adapter_id);
+        if self.diag_tuned && self.diag_lock != Some(signal.locked) {
+            self.diag_lock = Some(signal.locked);
+            // Only the lock bit is known to the tuner abstraction.
+            let status = if signal.locked { DIAG_FE_HAS_LOCK } else { 0 };
+            ms_log::diag::events::lock(adapter, signal.locked, status);
+        }
+        let current = (signal.strength, signal.snr, signal.ber);
+        let Some(previous) = self.diag_signal else {
+            self.diag_signal = Some(current);
+            return;
+        };
+        let changed = previous.0.abs_diff(current.0) >= DIAG_SIGNAL_STEP
+            || previous.1.abs_diff(current.1) >= DIAG_SIGNAL_STEP
+            || previous.2 != current.2;
+        if changed && now - self.diag_signal_ms >= DIAG_SIGNAL_PERIOD_MS {
+            self.diag_signal = Some(current);
+            self.diag_signal_ms = now;
+            ms_log::diag::events::signal(adapter, current.0, current.1, current.2);
         }
     }
 
@@ -773,6 +817,9 @@ impl DataPlane {
                 self.cc_checked = 0;
                 self.wait_new_stream = true;
                 self.tune_time_ms = Some(self.mono_us() / 1000);
+                // The first poll after a tune reports the lock state.
+                self.diag_tuned = true;
+                self.diag_lock = None;
                 self.update_tuner_pids();
             }
             Command::StartOutput {
@@ -1098,6 +1145,7 @@ impl DataPlane {
         let now = mono / 1000;
         let wall = SystemTime::now();
         let signal = self.tuner.status();
+        self.diag_status(&signal, now);
         let mut closed = Vec::new();
         for (stream_id, subscriber) in &mut self.outputs {
             // stream.cpp:1337-1340: a failed send (`sid->timeout = 1`) closes now.
@@ -1206,6 +1254,72 @@ impl DataPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_tuner::Result as TunerResult;
+
+    struct LockTuner;
+
+    impl Tuner for LockTuner {
+        fn tune(&mut self, _params: &TuneParams) -> TunerResult<()> {
+            Ok(())
+        }
+
+        fn set_pids(&mut self, _pids: &PidSet) -> TunerResult<()> {
+            Ok(())
+        }
+
+        fn status(&self) -> SignalStatus {
+            SignalStatus::default()
+        }
+
+        fn read(&mut self, _buf: &mut TsBuf) -> TunerResult<usize> {
+            Ok(0)
+        }
+    }
+
+    fn data_plane() -> DataPlane {
+        let (_commands_tx, commands) = mpsc::channel::<Command>();
+        let (events, _events_rx) = mpsc::channel::<Event>();
+        DataPlane::new(
+            Box::new(LockTuner),
+            DataPlaneConfig::default(),
+            commands,
+            events,
+            None,
+        )
+    }
+
+    #[test]
+    fn lock_events_start_with_the_first_poll_after_a_tune() {
+        let mut plane = data_plane();
+        let unlocked = SignalStatus {
+            locked: false,
+            strength: 0,
+            snr: 0,
+            ber: 0,
+        };
+        // No tune yet: the poll is not reported.
+        plane.diag_status(&unlocked, 0);
+        plane.diag_status(&unlocked, 10);
+        assert_eq!(plane.diag_lock, None, "untuned adapters stay quiet");
+
+        // The first poll after a tune reports the state, even unlocked.
+        plane.handle(Command::Tune {
+            params: Box::new(TuneParams::default()),
+            reply: None,
+        });
+        plane.diag_status(&unlocked, 20);
+        assert_eq!(plane.diag_lock, Some(false));
+
+        // Then only a change emits.
+        let locked = SignalStatus {
+            locked: true,
+            ..unlocked
+        };
+        plane.diag_status(&locked, 30);
+        assert_eq!(plane.diag_lock, Some(true));
+        plane.diag_status(&locked, 40);
+        assert_eq!(plane.diag_lock, Some(true));
+    }
 
     fn pat(tsid: u16) -> [u8; DVB_FRAME] {
         let mut packet = [0xff; DVB_FRAME];

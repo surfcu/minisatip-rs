@@ -299,6 +299,8 @@ pub struct SignalStatus {
     pub strength: u16,
     /// Signal-to-noise ratio, 0..255.
     pub snr: u16,
+    /// Bit error rate (`ber`), 0 when the backend does not report it.
+    pub ber: u32,
 }
 
 impl Default for SignalStatus {
@@ -307,6 +309,7 @@ impl Default for SignalStatus {
             locked: true,
             strength: 255,
             snr: 255,
+            ber: 0,
         }
     }
 }
@@ -318,6 +321,7 @@ impl SignalStatus {
             locked: true,
             strength,
             snr,
+            ber: 0,
         }
     }
 }

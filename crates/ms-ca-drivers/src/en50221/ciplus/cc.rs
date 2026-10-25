@@ -139,6 +139,11 @@ impl CcState {
         self.ci_name = ci_name;
     }
 
+    /// Emits one CI+ SAC handshake state.
+    fn sac_state(&self, state: &str) {
+        ms_log::diag::events::ciplus_sac(i64::from(self.slot_id), state);
+    }
+
     fn authdata_path(&self) -> std::path::PathBuf {
         Path::new(&authdata_filename(
             &self.cache_dir,
@@ -160,6 +165,7 @@ impl CcState {
         match tag {
             CIPLUS_TAG_CC_OPEN_REQ => {
                 self.data_initialize();
+                self.sac_state("open");
                 ms_log::logm!("SEND ------------ CC_OPEN_CNF----------- ");
                 vec![CcAction::Apdu {
                     tag: CIPLUS_TAG_CC_OPEN_CNF,
@@ -440,6 +446,7 @@ impl CcState {
     /// missing element 25 hashes as empty, like the C++ pointer result.
     fn generate_uri_confirm(&mut self) {
         let uri = self.elements.get(25).unwrap_or(&[]);
+        ms_log::diag::events::ciplus_uri(i64::from(self.slot_id), uri.len() as u64);
         let confirm = uri_confirm(uri, &self.sak);
         self.elements.set(27, &confirm);
     }
@@ -488,11 +495,19 @@ impl CcState {
         match id {
             8 => {
                 if self.check_ci_certificates() == 0 {
-                    self.check_dh_challenge();
+                    let state = if self.check_dh_challenge() == 1 {
+                        "dh_ok"
+                    } else {
+                        "auth_failed"
+                    };
+                    self.sac_state(state);
+                } else {
+                    self.sac_state("auth_failed");
                 }
             }
             19 => {
                 if self.restart_dh_challenge() != 0 {
+                    self.sac_state("auth_failed");
                     actions.push(CcAction::ForceCi);
                 }
             }
@@ -621,6 +636,7 @@ impl CcState {
     /// `ci_ccmgr_cc_sac_send`: pads, seals and writes one SAC APDU.
     fn sac_send(&self, tag: u32, mut data: Vec<u8>) -> Option<CcAction> {
         if data.len() < 8 {
+            self.sac_state("sac_failed");
             return None;
         }
         add_padding(&mut data, 8, 16);
@@ -631,6 +647,7 @@ impl CcState {
         data.extend_from_slice(&mac);
         // The header stays clear; cipher and MAC cover everything after it.
         sac_crypt(&self.sek, &mut data[8..], true);
+        self.sac_state("sac_ok");
         Some(CcAction::Apdu { tag, body: data })
     }
 
@@ -639,14 +656,17 @@ impl CcState {
         let mut actions = Vec::new();
         // DEV-273: C++ only checks len < 10 and then feeds CBC partial blocks.
         if body.len() < 10 || !(body.len() - 8).is_multiple_of(16) {
+            self.sac_state("sac_failed");
             return actions;
         }
         let mut data = WipeBuffer(body.to_vec());
         sac_crypt(&self.sek, &mut data[8..], false);
         if !sac_check_auth(&self.sak, &data) {
             ms_log::log!("check_auth of message failed");
+            self.sac_state("auth_failed");
             return actions;
         }
+        self.sac_state("auth_ok");
 
         ms_log::logm!(
             "serial sac data req: {}",
@@ -658,16 +678,19 @@ impl CcState {
         let id_bitmask = data[8];
         let send_count = usize::from(data[9]);
         let Some(consumed) = self.data_get_loop(&data[10..], send_count, &mut actions) else {
+            self.sac_state("sac_failed");
             return actions;
         };
         let mut rp = 10 + consumed;
         if data.len() < rp + 1 {
+            self.sac_state("sac_failed");
             return actions;
         }
         let req_count = data[rp];
         rp += 1;
         let Some(items) = self.data_req_loop(&data[rp..], usize::from(req_count)) else {
             ms_log::log!("cannot req data");
+            self.sac_state("sac_failed");
             return actions;
         };
 
@@ -689,6 +712,7 @@ impl CcState {
         let mut actions = Vec::new();
         // DEV-273: C++ reads the serial without any length check.
         if body.len() < 8 {
+            self.sac_state("sac_failed");
             return actions;
         }
         let serial = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);

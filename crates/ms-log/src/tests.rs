@@ -339,3 +339,215 @@ fn hexdump_through(logger: &Logger, desc: Option<&str>, data: &[u8]) {
 fn dump_through(logger: &Logger, message: &str, data: &[u8], offset: i64) {
     super::hexdump::dump_packets_into(logger, message, data, offset);
 }
+
+/// Serializes tests that touch the process-wide ring and sink.
+static DIAG_LOCK: Mutex<()> = Mutex::new(());
+
+fn diag_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = DIAG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    diag::reset_for_tests();
+    guard
+}
+
+// Hot and Debug are the same line for the normal outputs; Hot only opts out of
+// the ring, which is off here.
+#[test]
+fn hot_and_debug_produce_identical_output_with_the_ring_off() {
+    let _guard = diag_guard();
+    set_thread_name("main");
+    let (debug_logger, debug_out, _) = logger(0, LOG_GENERAL, 0, false);
+    debug_logger.write_masked(
+        LOG_GENERAL,
+        Level::Debug,
+        "src/a.rs",
+        7,
+        format_args!("packet {}", 1),
+    );
+    let (hot_logger, hot_out, _) = logger(0, LOG_GENERAL, 0, false);
+    hot_logger.write_masked(
+        LOG_GENERAL,
+        Level::Hot,
+        "src/a.rs",
+        7,
+        format_args!("packet {}", 1),
+    );
+    assert_eq!(lines(&debug_out), lines(&hot_out));
+    assert_eq!(lines(&hot_out), ["[05/03 14:07:09.042 main]: packet 1"]);
+    assert!(!diag::ring_active());
+}
+
+// The ring takes Debug but never Hot.
+#[cfg(feature = "diag-log")]
+#[test]
+fn the_ring_skips_hot_lines() {
+    let _guard = diag_guard();
+    set_thread_name("main");
+    diag::ring::start(10);
+    let (logger, out, _) = logger(LOG_GENERAL, LOG_GENERAL, 0, false);
+    logger.write_masked(
+        LOG_GENERAL,
+        Level::Hot,
+        "src/a.rs",
+        1,
+        format_args!("hot line"),
+    );
+    assert_eq!(lines(&out), ["[05/03 14:07:09.042 main]: hot line"]);
+    assert!(diag::ring_dump(10).is_empty());
+
+    logger.write_masked(
+        LOG_GENERAL,
+        Level::Debug,
+        "src/a.rs",
+        2,
+        format_args!("debug line"),
+    );
+    assert_eq!(
+        diag::ring_dump(10),
+        ["[05/03 14:07:09.042 main]: debug line"]
+    );
+}
+
+// A line only the ring wants stays out of the outputs and does not feed the
+// repeat-suppression state.
+#[cfg(feature = "diag-log")]
+#[test]
+fn ring_only_lines_skip_outputs_and_repeat_suppression() {
+    let _guard = diag_guard();
+    set_thread_name("main");
+    diag::ring::start(10);
+    let (logger, out, _) = logger(0, 0, 0, false);
+    for _ in 0..2 {
+        logger.write_masked(
+            LOG_GENERAL,
+            Level::Debug,
+            "src/a.rs",
+            1,
+            format_args!("ring only"),
+        );
+    }
+    assert!(lines(&out).is_empty());
+    assert_eq!(
+        diag::ring_dump(10),
+        [
+            "[05/03 14:07:09.042 main]: ring only",
+            "[05/03 14:07:09.042 main]: ring only"
+        ]
+    );
+    assert!(!diag::ring_wants(LOG_DMX, Level::Debug));
+    assert!(!diag::ring_wants(LOG_GENERAL, Level::Hot));
+    assert!(diag::ring_wants(LOG_GENERAL, Level::Debug));
+}
+
+// The recorder keeps its capacity and overwrites the oldest line first.
+#[test]
+fn the_ring_keeps_the_newest_lines_up_to_capacity() {
+    let _guard = diag_guard();
+    diag::ring::start(2);
+    assert_eq!(diag::ring::capacity(), 2);
+    assert!(diag::ring::is_active());
+    diag::ring::push("a");
+    diag::ring::push("b");
+    diag::ring::push("c");
+    assert_eq!(diag::ring::dump(10), ["b", "c"]);
+    assert_eq!(diag::ring::dump(1), ["c"]);
+    assert_eq!(diag::ring::dump(0), Vec::<String>::new());
+    diag::ring::stop();
+    assert!(!diag::ring::is_active());
+    assert!(diag::ring::dump(10).is_empty());
+}
+
+// Lines that may carry key material use the unrecorded path: outputs only.
+#[cfg(feature = "diag-log")]
+#[test]
+fn unrecorded_lines_never_reach_the_ring() {
+    let _guard = diag_guard();
+    set_thread_name("main");
+    diag::ring::start(10);
+    let (logger, out, _) = logger(LOG_GENERAL, 0, 0, false);
+    logger.write_unrecorded("src/a.rs", 1, format_args!("key [01 02]"));
+    logger.write_masked(
+        LOG_GENERAL,
+        Level::Log,
+        "src/a.rs",
+        2,
+        format_args!("normal"),
+    );
+    assert_eq!(
+        lines(&out),
+        [
+            "[05/03 14:07:09.042 main]: key [01 02]",
+            "[05/03 14:07:09.042 main]: normal"
+        ]
+    );
+    assert_eq!(diag::ring_dump(10), ["[05/03 14:07:09.042 main]: normal"]);
+}
+
+// Events bypass -l masks and repeat suppression entirely.
+#[test]
+fn write_local_bypasses_masks_and_repeat_suppression() {
+    set_thread_name("main");
+    let (logger, out, _) = logger(0, 0, 0, false);
+    let event = "{\"kind\":\"event\",\"event\":\"heartbeat\"}";
+    logger.write_local(event);
+    logger.write_local(event);
+    assert_eq!(
+        lines(&out),
+        [
+            "[05/03 14:07:09.042 main]: {\"kind\":\"event\",\"event\":\"heartbeat\"}",
+            "[05/03 14:07:09.042 main]: {\"kind\":\"event\",\"event\":\"heartbeat\"}"
+        ]
+    );
+}
+
+// Fixed heartbeat fields render in this exact order and shape.
+#[test]
+fn heartbeat_json_has_the_documented_shape() {
+    let heartbeat = diag::Heartbeat {
+        uptime_s: 61,
+        rss_kb: 2048,
+        threads: 7,
+        sockets: 3,
+        streams: 2,
+        sink_queue: 5,
+        sink_dropped: 9,
+    };
+    assert_eq!(
+        diag::heartbeat_json(&heartbeat, "2026-10-24T10:20:30.400+00:00", "heartbeat"),
+        concat!(
+            r#"{"kind":"event","event":"heartbeat","ts":"2026-10-24T10:20:30.400+00:00","#,
+            r#""thread":"heartbeat","uptime_s":61,"rss_kb":2048,"threads":7,"#,
+            r#""sockets":3,"streams":2,"sink_queue":5,"sink_dropped":9}"#
+        )
+    );
+}
+
+// Event strings are capped at 256 bytes, lists at 16 entries, and JSON is
+// escaped.
+#[test]
+fn event_fields_are_capped_and_escaped() {
+    let long = "x".repeat(300);
+    let items = vec!["i"; 20];
+    let mut fields = diag::Fields::new();
+    fields.string("long", &long);
+    fields.string("weird", "a\"b\\c\nd\te\u{1}");
+    fields.list("list", &items);
+    let json = diag::event_json("evt", "ts", "th", &fields);
+    assert!(
+        json.starts_with("{\"kind\":\"event\",\"event\":\"evt\",\"ts\":\"ts\",\"thread\":\"th\"")
+    );
+    assert!(json.contains(&format!("\"long\":\"{}\"", "x".repeat(256))));
+    assert!(json.contains(r#""weird":"a\"b\\c\nd\te\u0001""#));
+    assert_eq!(json.matches("\"i\"").count(), 16);
+}
+
+// The cap respects UTF-8 character boundaries.
+#[test]
+fn event_strings_cap_on_a_character_boundary() {
+    let long = "é".repeat(200);
+    let mut fields = diag::Fields::new();
+    fields.string("s", &long);
+    let json = diag::event_json("evt", "ts", "th", &fields);
+    assert!(json.contains(&format!("\"s\":\"{}\"", "é".repeat(128))));
+}

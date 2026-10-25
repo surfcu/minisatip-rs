@@ -338,8 +338,21 @@ pub fn usage_text() -> String {
             .replace("Built with netceiver\n", "Built without netceiver\n")
             .replace(NETCEIVER_HELP, "");
     }
+    if cfg!(feature = "diag-log") {
+        text.push_str(DIAG_USAGE);
+    }
     text
 }
+
+/// Help lines for the `diag-log` options, appended only in that build.
+const DIAG_USAGE: &str = "\
+* --log-remote tcp://host:port: send logs and events to a syslog receiver over TCP (RFC 5424, octet counted)
+
+* --log-remote-queue lines: queue depth for --log-remote; lines are dropped when the receiver cannot keep up (default 10000)
+
+* --log-ring lines: keep the last lines in memory for crash dumps and GET /debug/log; 0 disables the ring (default 20000)
+
+";
 
 #[cfg(test)]
 mod tests {

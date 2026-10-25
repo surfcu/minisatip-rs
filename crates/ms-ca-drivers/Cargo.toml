@@ -15,6 +15,8 @@ dvbcsa-icam = ["dvbcsa"]
 ci-plus = ["dep:openssl", "dep:openssl-sys"]
 # CI+ with a statically built OpenSSL (musl builds).
 ci-plus-vendored = ["ci-plus", "openssl/vendored"]
+# Diagnostic events; enables the call-site tests that check them.
+diag-log = ["ms-log/diag-log"]
 
 [dependencies]
 openssl = { version = "0.10", optional = true }

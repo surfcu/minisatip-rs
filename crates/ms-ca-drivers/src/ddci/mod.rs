@@ -1316,7 +1316,13 @@ impl Ddci {
                 continue;
             }
             let ri = &mut d.read_index[usize::from(ad.id)];
-            let n = d.fifo.pop_offset(&mut ad.buf[i..i + DVB_FRAME], ri);
+            // R13: report the DDCI device id (the device map key), not the
+            // adapter index that reads the FIFO.
+            let n = d.fifo.pop_offset(
+                &mut ad.buf[i..i + DVB_FRAME],
+                ri,
+                i64::try_from(dev).unwrap_or(i64::MAX),
+            );
             if n == 0 {
                 break;
             }
@@ -1325,7 +1331,7 @@ impl Ddci {
             let dpid = mapping[usize::from(pid)];
             if dpid == 0 {
                 // Not mapped to this adapter: drop it and reuse the slot.
-                ms_log::debugm!(
+                ms_log::debugm_hot!(
                     "Skipping pid {}, ddci_pid {} on adapter {} DDCI {}",
                     pid,
                     dpid,
@@ -1339,7 +1345,7 @@ impl Ddci {
             if i >= ad.rlen {
                 ad.rlen = i + DVB_FRAME;
             }
-            ms_log::debugm!(
+            ms_log::debugm_hot!(
                 "DDCI {} pid {} -> AD {} pid {}, pos {}, len {}, left {} [ri {}]",
                 d.id,
                 pid,
@@ -1353,7 +1359,7 @@ impl Ddci {
             ms_log::dump_packets!("DDCI -> AD", &ad.buf[i..i + DVB_FRAME], i as i64);
             i += DVB_FRAME;
         }
-        ms_log::debugm!(
+        ms_log::debugm_hot!(
             "popped {} bytes from fifo up to index {}, rlen {}, lbuf {}, left in fifo {}",
             popped,
             i,
@@ -1387,7 +1393,7 @@ impl Ddci {
             ad_dd[usize::from(m.pid)] = m.ddci_pid as u16;
             dd_ad[(m.ddci_pid as usize) & 0x1FFF] = m.pid;
             ec += 1;
-            ms_log::debugm!(
+            ms_log::debugm_hot!(
                 "Using pid {} in adapter {} as pid {} in DDCI {}",
                 m.pid,
                 ad.id,
@@ -1418,7 +1424,7 @@ impl Ddci {
                         Some((s, l)) if *s + *l == i => *l += DVB_FRAME,
                         _ => runs.push((i, DVB_FRAME)),
                     }
-                    ms_log::debugm!(
+                    ms_log::debugm_hot!(
                         "pos {} of {}, mapping pid {} to {}, buf pos {}",
                         runs.len() - 1,
                         ad.rlen / DVB_FRAME,
@@ -1443,7 +1449,7 @@ impl Ddci {
             }
             iov.push(&null_tail);
             let bytes: usize = iov.iter().map(|s| s.len()).sum();
-            ms_log::debugm!(
+            ms_log::debugm_hot!(
                 "writing {} bytes to DDCI device {}, fd {}, sock {}",
                 bytes,
                 dev_id,
@@ -1502,7 +1508,7 @@ impl Ddci {
             if left == 0 {
                 ms_log::log!("dropping {} bytes for ddci_adapter {}", left, d.id);
             }
-            ms_log::debugm!(
+            ms_log::debugm_hot!(
                 "pushed {} bytes to the adapter buffer from {} [write_index {}]",
                 left,
                 ts.len(),

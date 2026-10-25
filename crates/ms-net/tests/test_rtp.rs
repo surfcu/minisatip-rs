@@ -363,6 +363,7 @@ fn describe_signal_defaults_and_clamps() {
         locked: false,
         strength: 300,
         snr: 10,
+        ber: 0,
     };
     input.signal = Some(unlocked);
     assert!(describe_adapter(&input).starts_with("ver=1.0;src=1;tuner=3,1,0,10,"));

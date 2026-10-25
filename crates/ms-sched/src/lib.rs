@@ -1145,6 +1145,18 @@ impl Scheduler {
             if let Some(adapter) = self.adapters[index].as_mut() {
                 result = adapter.tuner.tune(&params);
             }
+            ms_log::diag::events::tune(
+                i64::from(aid),
+                if result.is_ok() { "ok" } else { "error" },
+                || {
+                    (
+                        u64::try_from(params.freq).unwrap_or(0),
+                        i64::from(params.pol_number()),
+                        u64::try_from(params.sr_value()).unwrap_or(0),
+                        i64::from(params.sys_number()),
+                    )
+                },
+            );
             // C++ closes the slaves before post_tune, so their PIDs are gone first.
             for slave in &slaves {
                 self.close_adapter_for_stream(*slave, aid);
