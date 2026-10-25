@@ -213,6 +213,9 @@ impl CaDevice {
                         self.key[slot] = key;
                         self.iv[slot] = iv;
                         self.parity = parity;
+                        // A key arrived: the slot is alive and any MMI recovery is off.
+                        self.last_key_ms = self.now();
+                        self.mmi_error_since = -1;
                         self.push_event(HostEvent::CcKey {
                             parity,
                             key: CcKeyBytes(key),
@@ -361,6 +364,8 @@ impl CaDevice {
                 }
             }
             TAG_ENQUIRY if data.len() >= 2 => {
+                #[cfg(feature = "ci-plus")]
+                self.note_mmi_error();
                 let blind = data[0] & 0x01 != 0;
                 let answer_len = data[1];
                 let text_bytes = &data[2..data.len().min(2 + 255)];
@@ -386,6 +391,8 @@ impl CaDevice {
                 self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
             }
             TAG_LIST_LAST | TAG_MENU_LAST => {
+                #[cfg(feature = "ci-plus")]
+                self.note_mmi_error();
                 let lines = mmi_menu_lines(self.id, data);
                 self.push_event(HostEvent::MmiMenu { lines });
                 self.write_apdu(idx, TAG_MENU_ANSWER, &[0x01]);
@@ -399,6 +406,20 @@ impl CaDevice {
                 tag
             ),
         }
+    }
+
+    /// Arms CI+ key recovery when a CI+ CAM reports an MMI error, not on plain CI
+    /// and not before the first key. No C++ equivalent.
+    #[cfg(feature = "ci-plus")]
+    fn note_mmi_error(&mut self) {
+        if self.force_ci
+            || self.recovery_timeout_ms <= 0
+            || self.mmi_error_since >= 0
+            || self.last_key_ms < 0
+        {
+            return;
+        }
+        self.mmi_error_since = self.now();
     }
 
     fn oprf_apdu(&mut self, idx: usize, tag: u32, data: &[u8]) {

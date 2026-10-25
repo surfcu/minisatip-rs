@@ -150,6 +150,12 @@ pub struct CaDevice {
     pub pending_tag: u32,
     pub pending_session: u16,
     pub pending_since: i64,
+    /// MMI message anchor of the CI+ key watchdog (ms; -1 unarmed).
+    pub mmi_error_since: i64,
+    /// Last CI+ key delivery (ms; -1 before the first key).
+    pub last_key_ms: i64,
+    /// CI+ key watchdog timeout (ms; 0 disables it). No C++ equivalent.
+    pub recovery_timeout_ms: i64,
     close_requested: bool,
     events: VecDeque<HostEvent>,
     apdu_log: Option<Vec<ApduRecord>>,
@@ -190,6 +196,9 @@ impl CaDevice {
             pending_tag: 0,
             pending_session: 0,
             pending_since: -1,
+            mmi_error_since: -1,
+            last_key_ms: -1,
+            recovery_timeout_ms: 0,
             close_requested: false,
             events: VecDeque::new(),
             apdu_log: None,
@@ -358,6 +367,8 @@ impl CaDevice {
         self.pending_tag = 0;
         self.pending_session = 0;
         self.pending_since = -1;
+        self.mmi_error_since = -1;
+        self.last_key_ms = -1;
         self.link = None;
         self.sock = None;
         self.close_requested = false;
@@ -414,6 +425,8 @@ impl CaDevice {
         self.write_tpdu(T_CREATE_TC, &[]);
         self.new_sock();
         self.pending_since = self.now();
+        self.mmi_error_since = -1;
+        self.last_key_ms = -1;
         true
     }
 
@@ -421,6 +434,8 @@ impl CaDevice {
     pub(super) fn init_enigma(&mut self) -> bool {
         let sock = self.new_sock();
         self.pending_since = self.now();
+        self.mmi_error_since = -1;
+        self.last_key_ms = -1;
         ms_log::log!("initializing CA {} fd {} sock {}", self.id, -1, sock);
         true
     }
@@ -874,6 +889,7 @@ impl CaDevice {
         }
         let now = self.now();
         self.cmd_watchdog(now);
+        self.mmi_recovery_watchdog(now);
     }
 
     /// `ca_cmd_watchdog`: resets a CAM that leaves a command or its initialization hanging.
@@ -899,6 +915,33 @@ impl CaDevice {
         }
         self.clear_pending();
         self.pending_since = -1;
+        self.request_close();
+    }
+
+    /// CI+ recovery: a CAM that sent an MMI message and then stopped delivering
+    /// keys is wedged; reset it. No C++ equivalent, disabled unless configured.
+    pub fn mmi_recovery_watchdog(&mut self, now: i64) {
+        if self.mmi_error_since < 0 {
+            return;
+        }
+        if self.last_key_ms > self.mmi_error_since {
+            self.mmi_error_since = -1;
+            return;
+        }
+        if now - self.mmi_error_since < self.recovery_timeout_ms {
+            return;
+        }
+        ms_log::log!(
+            "CA {}: no CI+ key {} ms after a CAM MMI message, resetting the CAM (CI+ recovery)",
+            self.id,
+            now - self.mmi_error_since
+        );
+        ms_log::diag::events::cam_state(
+            i64::try_from(self.id).unwrap_or(0),
+            "mmi_recovery",
+            self.mode_name(),
+        );
+        self.mmi_error_since = -1;
         self.request_close();
     }
 }

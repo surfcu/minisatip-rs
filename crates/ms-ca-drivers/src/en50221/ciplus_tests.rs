@@ -3,7 +3,7 @@
 use super::ciplus::authdata::RECORD_LEN;
 use super::ciplus::cc::{CcAction, CcState};
 use super::ciplus::test_pki::*;
-use super::clock::ManualClock;
+use super::clock::{Clock, ManualClock};
 use super::consts::*;
 use super::device::{CaDevice, CcKeyBytes, HostEvent};
 use super::link::{
@@ -13,7 +13,7 @@ use super::registry::authdata_filename;
 use ms_fakecam::ciplus::CiPlusCam;
 use ms_fakecam::ciplus::test_pki::{TestPki, pki_with_device};
 use ms_fakecam::record::{Direction, Event};
-use ms_fakecam::tags::{APPLICATION_INFO, CIPLUS_CC, RESOURCE_MANAGER};
+use ms_fakecam::tags::{APPLICATION_INFO, CA_SUPPORT, CIPLUS_CC, MMI, RESOURCE_MANAGER};
 use ms_fakecam::{CamConfig, FakeCam};
 use std::collections::VecDeque;
 use std::io;
@@ -86,6 +86,7 @@ impl CaOpener for CertOpener {
 struct Rig {
     cam: Arc<Mutex<FakeCam>>,
     dev: CaDevice,
+    clock: ManualClock,
     cache_dir: PathBuf,
     /// Keeps the host certificates and the authdata directory alive.
     _pki: TestPki,
@@ -105,7 +106,7 @@ fn setup(
     tune(&mut ciplus);
     let cache_dir = pki.cache_dir.clone();
     let config = CamConfig {
-        resources: vec![RESOURCE_MANAGER, APPLICATION_INFO, cc_resource],
+        resources: vec![RESOURCE_MANAGER, APPLICATION_INFO, cc_resource, MMI],
         ciplus: Some(ciplus),
         ..CamConfig::default()
     };
@@ -113,7 +114,8 @@ fn setup(
         config,
         Arc::new(ms_fakecam::ManualClock::new(0)),
     )));
-    let mut dev = CaDevice::new(0, Arc::new(ManualClock::new(0, UNIX)));
+    let clock = ManualClock::new(0, UNIX);
+    let mut dev = CaDevice::new(0, Arc::new(clock.clone()));
     dev.force_ci = false;
     dev.enabled = true;
     dev.set_ciplus_paths(path_arg(&pki.cert_dir), path_arg(&cache_dir));
@@ -123,6 +125,7 @@ fn setup(
     Rig {
         cam,
         dev,
+        clock,
         cache_dir,
         _pki: pki,
     }
@@ -572,4 +575,195 @@ fn registry_keeps_a_forced_slot_on_plain_ci() {
         registry.get(0).unwrap().force_ci,
         "-C keeps a slot on plain CI"
     );
+}
+
+/// A CI+ session that delivered its handshake key, then stops sending keys.
+fn wedged_rig(cc_resource: u32) -> Rig {
+    let mut rig = setup([14, 16, 18, 8], cc_resource, true, |_| {});
+    let events = drain_events(&mut rig.dev);
+    assert!(!cckeys(&events).is_empty(), "the handshake delivered a key");
+    // The CI+ fixture has no CA support session, so clear the init anchor that
+    // would otherwise let cmd_watchdog fire before these tests' own deadlines.
+    rig.dev.pending_since = -1;
+    rig
+}
+
+/// A CAM with MMI but no CI+ content control: no key was ever seen.
+fn plain_mmi_rig() -> (Arc<Mutex<FakeCam>>, CaDevice, ManualClock) {
+    let config = CamConfig {
+        resources: vec![RESOURCE_MANAGER, APPLICATION_INFO, CA_SUPPORT, MMI],
+        ..CamConfig::default()
+    };
+    let cam = Arc::new(Mutex::new(FakeCam::new(
+        config,
+        Arc::new(ms_fakecam::ManualClock::new(0)),
+    )));
+    let clock = ManualClock::new(0, UNIX);
+    let mut dev = CaDevice::new(0, Arc::new(clock.clone()));
+    dev.enabled = true;
+    attach(&mut dev, &cam);
+    assert!(dev.init_en50221());
+    assert!(dev.service());
+    (cam, dev, clock)
+}
+
+#[test]
+fn mmi_recovery_resets_a_wedged_cam() {
+    let lines = captured_lines();
+    let start = lines.lock().unwrap().len();
+    let mut rig = wedged_rig(CIPLUS_CC);
+    rig.dev.recovery_timeout_ms = 10_000;
+
+    assert!(
+        rig.cam
+            .lock()
+            .unwrap()
+            .send_mmi_menu(&["Title", "Subtitle", "Bottom", "Item"])
+    );
+    pump(&mut rig.dev);
+    assert_eq!(rig.dev.mmi_error_since, 0, "the MMI message arms recovery");
+    assert!(
+        drain_events(&mut rig.dev)
+            .iter()
+            .any(|event| matches!(event, HostEvent::MmiMenu { .. }))
+    );
+
+    rig.clock.advance(9_999);
+    pump(&mut rig.dev);
+    assert!(!rig.dev.take_close_request(), "not before the timeout");
+
+    rig.clock.advance(1);
+    pump(&mut rig.dev);
+    assert!(rig.dev.take_close_request(), "the CAM is reset");
+    assert_eq!(rig.dev.mmi_error_since, -1, "the watchdog disarms");
+    assert!(
+        drain_events(&mut rig.dev).contains(&HostEvent::CloseRequested),
+        "the owner sees the close request"
+    );
+
+    {
+        let captured = lines.lock().unwrap();
+        assert!(
+            captured[start..].iter().any(|line| line.contains(
+                "no CI+ key 10000 ms after a CAM MMI message, resetting the CAM (CI+ recovery)"
+            )),
+            "the recovery is logged: {captured:?}"
+        );
+    }
+    #[cfg(feature = "diag-log")]
+    {
+        let events = crate::test_log::events("cam_state");
+        assert!(
+            events
+                .iter()
+                .any(|line| line.contains("\"state\":\"mmi_recovery\"")
+                    && line.contains("\"ca\":0")
+                    && line.contains("\"mode\":\"ci+\"")),
+            "the recovery event is emitted: {events:?}"
+        );
+    }
+
+    // The owner closes the socket, then the reconnect poller opens and re-auths.
+    let sock = rig.dev.sock().expect("open socket");
+    assert!(rig.dev.close(sock));
+    assert!(rig.dev.reconnect_due(rig.clock.tick_ms()));
+    attach(&mut rig.dev, &rig.cam);
+    assert!(rig.dev.init_en50221());
+    assert!(rig.dev.service());
+    assert!(
+        rig.dev.find_session_for_resource(CIPLUS_CC).is_some(),
+        "the content control session is back after the reset"
+    );
+    // No second reset without a new key and message; the init anchor is cleared
+    // as in wedged_rig so cmd_watchdog cannot close it either.
+    rig.dev.pending_since = -1;
+    rig.clock.advance(20_000);
+    rig.dev.timeout();
+    assert!(!rig.dev.take_close_request(), "no second reset");
+}
+
+#[test]
+fn mmi_recovery_is_disarmed_by_a_late_key() {
+    let mut rig = wedged_rig(CIPLUS_CC);
+    rig.dev.recovery_timeout_ms = 10_000;
+
+    assert!(rig.cam.lock().unwrap().send_mmi_enquiry("Enter PIN"));
+    pump(&mut rig.dev);
+    assert_eq!(rig.dev.mmi_error_since, 0, "the enquiry arms recovery");
+
+    rig.clock.advance(5_000);
+    assert!(rig.cam.lock().unwrap().send_sac_key_request(0, false));
+    pump(&mut rig.dev);
+    assert_eq!(rig.dev.mmi_error_since, -1, "a key disarms recovery");
+    assert_eq!(rig.dev.last_key_ms, 5_000);
+
+    rig.clock.advance(20_000);
+    pump(&mut rig.dev);
+    assert!(
+        !rig.dev.take_close_request(),
+        "a key arrived before the deadline"
+    );
+}
+
+#[test]
+fn mmi_recovery_is_off_by_default() {
+    let mut rig = wedged_rig(CIPLUS_CC);
+    assert_eq!(rig.dev.recovery_timeout_ms, 0, "the knob defaults to off");
+
+    assert!(
+        rig.cam
+            .lock()
+            .unwrap()
+            .send_mmi_menu(&["Title", "Subtitle", "Bottom", "Item"])
+    );
+    pump(&mut rig.dev);
+    assert_eq!(rig.dev.mmi_error_since, -1, "off means never armed");
+
+    rig.clock.advance(60_000);
+    pump(&mut rig.dev);
+    assert!(!rig.dev.take_close_request());
+}
+
+#[test]
+fn mmi_recovery_stays_off_on_plain_ci() {
+    let mut rig = wedged_rig(CIPLUS_CC);
+    rig.dev.recovery_timeout_ms = 10_000;
+    rig.dev.force_ci = true;
+
+    assert!(
+        rig.cam
+            .lock()
+            .unwrap()
+            .send_mmi_menu(&["Title", "Subtitle", "Bottom", "Item"])
+    );
+    pump(&mut rig.dev);
+    assert_eq!(rig.dev.mmi_error_since, -1, "plain CI is not armed");
+
+    rig.clock.advance(20_000);
+    pump(&mut rig.dev);
+    assert!(!rig.dev.take_close_request());
+}
+
+#[test]
+fn mmi_recovery_waits_for_a_first_key() {
+    let (cam, mut dev, clock) = plain_mmi_rig();
+    dev.recovery_timeout_ms = 10_000;
+    assert_eq!(dev.last_key_ms, -1, "no key was delivered");
+
+    assert!(
+        cam.lock()
+            .unwrap()
+            .send_mmi_menu(&["Title", "Subtitle", "Bottom", "Item"])
+    );
+    dev.timeout();
+    assert!(dev.service());
+    assert_eq!(
+        dev.mmi_error_since, -1,
+        "a CAM that never descrambled is not armed"
+    );
+
+    clock.advance(20_000);
+    dev.timeout();
+    assert!(dev.service());
+    assert!(!dev.take_close_request());
 }

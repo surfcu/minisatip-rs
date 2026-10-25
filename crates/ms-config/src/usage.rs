@@ -341,8 +341,17 @@ pub fn usage_text() -> String {
     if cfg!(feature = "diag-log") {
         text.push_str(DIAG_USAGE);
     }
+    if cfg!(feature = "ci-plus") {
+        text.push_str(CI_PLUS_USAGE);
+    }
     text
 }
+
+/// Help line for `--ci-plus-recovery`, printed only in CI+ builds.
+const CI_PLUS_USAGE: &str = "\
+* --ci-plus-recovery seconds: reset a CAM that sends no CI+ key after an MMI message; 0 disables it (default 0)
+
+";
 
 /// Help lines for the `diag-log` options, appended only in that build.
 const DIAG_USAGE: &str = "\

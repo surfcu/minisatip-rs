@@ -13,6 +13,8 @@ linux-dvb = []
 diag-log = ["ms-log/diag-log"]
 # Reflects whether the binary was built with SRT support.
 srt = []
+# CI+ content control: without it `--ci-plus-recovery` is an unknown option.
+ci-plus = []
 # Netceiver client (C++ NETCVCLIENT): without it `-n`/`--netceiver` are unknown options.
 # Netceiver is parked (PLAN §3), so the binary never enables it.
 netceiver = []

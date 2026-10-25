@@ -37,6 +37,8 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   cargo feature; it has not been validated on a real CAM. A default build has no
   CI+ support and forces plain CI on every slot, so CI+ CAMs work in CI-compatible
   mode and CI+-protected channels will not descramble.
+- In `ci-plus` builds, `--ci-plus-recovery seconds` (off by default) resets a CAM
+  that stops delivering CI+ keys after an MMI message (DEV-281).
 - The CA harness scenarios are still missing. CAPMT sequences are compared with
   C++ only by the ported unit tests and by the real-CAM check.
 - The runtime drives `ms_ca::CaDevice` directly; the `Reconciler` and its policies

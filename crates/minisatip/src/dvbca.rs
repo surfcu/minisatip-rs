@@ -35,6 +35,8 @@ pub struct DvbcaSettings {
     enigma: bool,
     /// `opts.cache_dir` for the CI+ authdata files.
     cache_dir: String,
+    /// `--ci-plus-recovery` in ms; 0 disables the CI+ key watchdog.
+    ci_plus_recovery_ms: i64,
 }
 
 impl Default for DvbcaSettings {
@@ -45,6 +47,7 @@ impl Default for DvbcaSettings {
             channels: BTreeMap::new(),
             enigma: false,
             cache_dir: "/var/cache/minisatip".to_owned(),
+            ci_plus_recovery_ms: 0,
         }
     }
 }
@@ -73,6 +76,7 @@ impl DvbcaSettings {
         }
         settings.enigma = opts.enigma;
         settings.cache_dir = opts.cache_dir.clone();
+        settings.ci_plus_recovery_ms = i64::from(opts.ci_plus_recovery).max(0) * 1000;
         settings
     }
 
@@ -434,6 +438,7 @@ impl Worker {
         let mut registry = CaRegistry::new(Arc::clone(&clock));
         registry.enigma = settings.enigma;
         registry.set_cache_dir(&settings.cache_dir);
+        registry.set_ci_plus_recovery_ms(settings.ci_plus_recovery_ms);
         for (id, pin) in &settings.pins {
             registry.device(*id).set_pin(pin.as_bytes());
         }
@@ -1243,12 +1248,14 @@ mod option_tests {
             max_ca_pmt: 3,
             caids: vec![0x0B00, 0x1702],
         });
+        opts.ci_plus_recovery = 7;
         let settings = DvbcaSettings::from_options(&opts);
         assert_eq!(settings.pins.get(&1).map(String::as_str), Some("0000"));
         assert!(settings.force_ci.contains(&2));
         assert_eq!(settings.limits(1), (3, 2));
         assert_eq!(settings.limits(0), (DEFAULT_CA_PMT, 0));
         assert_eq!(settings.channels[&1].2, vec![0x0B00, 0x1702]);
+        assert_eq!(settings.ci_plus_recovery_ms, 7000, "seconds become ms");
     }
 }
 
