@@ -527,12 +527,16 @@ mod tests {
         std::fs::write(path, data).unwrap();
     }
 
-    fn udp_pair() -> (UdpSocket, u16) {
+    /// A client RTP socket plus its RTCP neighbour, both kept bound so no other
+    /// test can take the port the server sends RTCP to.
+    fn udp_pair() -> (UdpSocket, UdpSocket, u16) {
         loop {
             let first = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
             let port = first.local_addr().unwrap().port();
-            if port < u16::MAX && UdpSocket::bind(("127.0.0.1", port + 1)).is_ok() {
-                return (first, port);
+            if port < u16::MAX
+                && let Ok(rtcp) = UdpSocket::bind(("127.0.0.1", port + 1))
+            {
+                return (first, rtcp, port);
             }
         }
     }
@@ -546,6 +550,29 @@ mod tests {
                 return port;
             }
         }
+    }
+
+    /// The server's RTP/RTCP output to `client_port`. Another test can take the
+    /// probed pair before it is bound, so a bind collision picks a new pair.
+    fn bind_server_output(client_port: u16) -> StreamOutput {
+        for _ in 0..50 {
+            let target = UdpTarget {
+                local: (std::net::Ipv4Addr::LOCALHOST, free_server_port()).into(),
+                dest: (std::net::Ipv4Addr::LOCALHOST, client_port).into(),
+                ttl: None,
+            };
+            let config = OutputConfig {
+                ssrc: 1,
+                seq: 0,
+                fifo_size: 1 << 20,
+            };
+            match StreamOutput::udp(target, config, 0) {
+                Ok(output) => return output,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("binding the server output: {error}"),
+            }
+        }
+        panic!("no free RTP/RTCP port pair after 50 tries");
     }
 
     // `-c 1:*1` on the DDCI CA: the CAPMT for the CI-side PMT lists the pids DDCI
@@ -828,24 +855,11 @@ mod tests {
             sched.mark_pid_add(0, 0, pid);
         }
         sched.post_tune_adapter(0);
-        let (client, client_port) = udp_pair();
+        let (client, _client_rtcp, client_port) = udp_pair();
         client
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
-        let output = StreamOutput::udp(
-            UdpTarget {
-                local: (std::net::Ipv4Addr::LOCALHOST, free_server_port()).into(),
-                dest: (std::net::Ipv4Addr::LOCALHOST, client_port).into(),
-                ttl: None,
-            },
-            OutputConfig {
-                ssrc: 1,
-                seq: 0,
-                fifo_size: 1 << 20,
-            },
-            0,
-        )
-        .unwrap();
+        let output = bind_server_output(client_port);
         let pids = PidSet::from_pids([0, PMT_PID, VIDEO_PID]);
         handles[0].as_ref().unwrap().start_output(0, output, pids);
         ca.after_scheduler(&mut sched, &handles);
