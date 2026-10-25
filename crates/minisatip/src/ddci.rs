@@ -1001,6 +1001,7 @@ mod tests {
                 parity: PARITY,
                 key: CcKeyBytes(key),
                 iv: CcKeyBytes(iv),
+                expiry_s: 3720,
             },
         );
 
