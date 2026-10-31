@@ -22,7 +22,8 @@ if [ -d "$src/.git" ] && ! git -C "$src" rev-parse -q --verify HEAD >/dev/null &
     [ "$(git -C "$src" remote get-url origin 2>/dev/null)" = "$repo" ]; then
     rm -rf "$src"
 fi
-if [ -e "$src" ] && ! git -C "$src" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+# `$src/.git` is required: git -C would otherwise find an enclosing repository.
+if [ -e "$src" ] && { [ ! -e "$src/.git" ] || ! git -C "$src" rev-parse -q --verify HEAD >/dev/null 2>&1; }; then
     echo "$src exists but is not a minisatip checkout; remove it or pass another SRC_DIR" >&2
     exit 1
 fi
