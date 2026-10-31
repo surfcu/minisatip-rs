@@ -254,6 +254,21 @@ impl Runtime {
         let mut ca = CaRuntime::new(opts);
 
         if let Some(path) = replay {
+            // DEV-283: replay adapters get a fake CAM only through MINISATIP_REPLAY_CA.
+            #[cfg(unix)]
+            let replay_ca = std::env::var("MINISATIP_REPLAY_CA")
+                .ok()
+                .filter(|template| !template.is_empty());
+            #[cfg(unix)]
+            if let Some(template) = &replay_ca {
+                let dvbca = crate::dvbca::Dvbca::spawn(
+                    crate::dvbca::DvbcaSettings::from_options(opts),
+                    Box::new(crate::replay_ca::ReplayCaOpener::new(template.clone())),
+                    Arc::new(ms_ca_drivers::en50221::SystemClock::default()),
+                )
+                .map_err(|error| format!("cannot start the CA thread: {error}"))?;
+                ca.attach_dvbca(&mut scheduler, dvbca);
+            }
             for aid in adapter_ids {
                 let tuner = FileReplayTuner::open(
                     &path,
@@ -275,6 +290,13 @@ impl Runtime {
                 // 1-based `fe=` -> adapter number, as for DVB adapters below.
                 scheduler.set_fe_map_entry(aid, aid as i16);
                 handles[aid] = Some(handle);
+                // A replay adapter is adapterN/ca0 (pa = N, fn = 0 in the C++ patch).
+                #[cfg(unix)]
+                if replay_ca.is_some() {
+                    ca.dvbca_init_dev(ms_ca_drivers::en50221::AdapterInfo::dvb(
+                        aid as i32, aid as u32, 0,
+                    ));
+                }
             }
         }
         #[cfg(all(feature = "linux-dvb", target_os = "linux"))]

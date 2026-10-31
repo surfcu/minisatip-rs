@@ -4,6 +4,8 @@ mod ca;
 mod ddci;
 mod dvbca;
 mod hw;
+#[cfg(unix)]
+mod replay_ca;
 mod runtime;
 mod sys;
 

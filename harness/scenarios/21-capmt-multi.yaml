@@ -1,0 +1,37 @@
+name: capmt-multi
+description: Three CA services with two CAPMTs (-c 0:**2), so two services share one CAPMT; joins and leaves; a PMT leaving a shared CAPMT sends no update (NO UPDATE)
+capture: ca
+fast: true
+cam: true
+args: ["-c", "0:**2"]
+steps:
+  - capmt: { until: "00400041 st=00", timeout_ms: 8000 }
+  - udp: u1
+  - udp: u2
+  - udp: u3
+  - rtsp:
+      conn: c1
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,256,257,258"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c1, method: PLAY, url: "{base}/stream={stream:c1}", session: true }
+  - capmt: { until: "ca_pmt", timeout_ms: 8000 }
+  - rtsp:
+      conn: c2
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,512,513,514"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u2}-{rtcp:u2}" }
+  - rtsp: { conn: c2, method: PLAY, url: "{base}/stream={stream:c2}", session: true }
+  - capmt: { until: "ca_pmt", timeout_ms: 8000 }
+  - rtsp:
+      conn: c3
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,768,769,770"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u3}-{rtcp:u3}" }
+  - rtsp: { conn: c3, method: PLAY, url: "{base}/stream={stream:c3}", session: true }
+  - capmt: { until: "ca_pmt", timeout_ms: 8000 }
+  - rtsp: { conn: c2, method: TEARDOWN, url: "{base}/stream={stream:c2}", session: true }
+  - capmt: { until: "ca_pmt", timeout_ms: 8000 }
+  - rtsp: { conn: c1, method: TEARDOWN, url: "{base}/stream={stream:c1}", session: true }
+  - rtsp: { conn: c3, method: TEARDOWN, url: "{base}/stream={stream:c3}", session: true }
+  - capmt: { until: "ca_pmt", timeout_ms: 8000 }

@@ -6,6 +6,8 @@
 pub mod analysis;
 pub mod client;
 pub mod diff;
+#[cfg(unix)]
+pub mod fakecam;
 pub mod fakeoscam;
 pub mod normalize;
 pub mod runner;

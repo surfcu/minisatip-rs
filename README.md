@@ -14,8 +14,9 @@ ported. The binary runs as a tvheadend SAT>IP backend on real hardware, but it
 has not yet passed the 7-day soak test, so it is not a recommended replacement yet.
 
 - Upstream baseline: `catalinii/minisatip` `28dfd78`.
-- The C++ test suites are ported, except `test_utils.cpp`.
-- The differential harness matches the C++ binary on 12 RTSP/HTTP/RTP scenarios.
+- The C++ test suites are ported; `test_utils.cpp` 9 of its 12 tests (DEV-282).
+- The differential harness matches the C++ binary on 21 scenarios: RTSP/HTTP/RTP,
+  DVBAPI against a fake OSCam, and EN50221 CAPMTs through a fake CAM.
 - Intentional differences from C++ are listed in [docs/deviations.md](docs/deviations.md).
 
 ### Hardware validation
@@ -39,8 +40,8 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   mode and CI+-protected channels will not descramble.
 - In `ci-plus` builds, `--ci-plus-recovery seconds` (off by default) resets a CAM
   that stops delivering CI+ keys after an MMI message (DEV-281).
-- The CA harness scenarios are still missing. CAPMT sequences are compared with
-  C++ only by the ported unit tests and by the real-CAM check.
+- DDCI CAPMTs are not in the harness yet (#36 phase C); they are compared with C++
+  by the ported unit tests and by the real-CAM check.
 - The runtime drives `ms_ca::CaDevice` directly; the `Reconciler` and its policies
   are covered by tests only, so there are no alternative CA policies yet.
 - Netceiver is parked (PLAN §3): the `ms-tuner` backend exists but the binary does

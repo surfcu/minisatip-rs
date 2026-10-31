@@ -427,7 +427,11 @@ struct Worker {
     /// zero-allocates the device, so a CI starts linked to adapter 0.
     linked: BTreeMap<usize, i32>,
     notices: Sender<Notice>,
+    /// The reconnect poller's 1 s timer (ca.cpp:4093).
     next_timer: i64,
+    /// Each open CA socket's `ca_timeout` deadline: 1 s idle (`sockets_timeout(.., 1000)`,
+    /// ca.cpp:3829), counted from link-up, the last read with data or the last timeout.
+    next_timeout: BTreeMap<usize, i64>,
 }
 
 impl Worker {
@@ -465,6 +469,7 @@ impl Worker {
             linked: BTreeMap::new(),
             notices,
             next_timer: 0,
+            next_timeout: BTreeMap::new(),
         }
     }
 
@@ -694,15 +699,26 @@ impl Worker {
                 dev.teardown();
             }
         }
+        for id in &ids {
+            let Some(dev) = self.registry.get_mut(*id as i32) else {
+                continue;
+            };
+            if !dev.has_link() {
+                self.next_timeout.remove(id);
+                continue;
+            }
+            let due = self.next_timeout.entry(*id).or_insert(now + TIMER_MS);
+            // socketworks.cpp:896, 988: a read with data re-arms the idle timer.
+            if dev.last_rx_ms >= 0 {
+                *due = (*due).max(dev.last_rx_ms + TIMER_MS);
+            }
+            if now >= *due {
+                *due = now + TIMER_MS;
+                dev.timeout();
+            }
+        }
         if now >= self.next_timer {
             self.next_timer = now + TIMER_MS;
-            for id in &ids {
-                if let Some(dev) = self.registry.get_mut(*id as i32)
-                    && dev.has_link()
-                {
-                    dev.timeout();
-                }
-            }
             let adapters = self.adapters.clone();
             self.registry
                 .reconnect(|i| adapters.get(&i).copied(), self.opener.as_mut());
@@ -1224,6 +1240,80 @@ mod tests {
         worker.capmt.get_mut(&2).unwrap().capmt[0].pmt_id = 7;
         assert_eq!(worker.device_with_pmt(7), Some(2));
         assert_eq!(worker.device_with_pmt(8), None);
+    }
+
+    // ca.cpp:3829: the first ca_timeout comes 1 s after the init, so a CAM that
+    // answers T_CREATE_TC within that second never sees a second one.
+    #[test]
+    fn first_keepalive_waits_a_second_after_init() {
+        struct Silent(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl CaLink for Silent {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn reset(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn slot_info(&mut self) -> io::Result<SlotInfo> {
+                Ok(SlotInfo {
+                    kind: CA_CI_LINK,
+                    flags: CA_CI_MODULE_PRESENT | CA_CI_MODULE_READY,
+                })
+            }
+            fn sleep_ms(&mut self, _: u32) {}
+        }
+        struct SilentOpener(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl CaOpener for SilentOpener {
+            fn open(&mut self, _: &str) -> io::Result<Box<dyn CaLink>> {
+                Ok(Box::new(Silent(Arc::clone(&self.0))))
+            }
+            fn has_ciplus_root_cert(&self) -> bool {
+                false
+            }
+        }
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(ManualClock::new(5_000, 0));
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            DvbcaSettings::from_options(&Options::default()),
+            Box::new(SilentOpener(Arc::clone(&writes))),
+            clock.clone(),
+            tx,
+        );
+        worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        let create_tc = || {
+            writes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|tpdu| tpdu.get(2) == Some(&0x82))
+                .count()
+        };
+        worker.service();
+        assert_eq!(create_tc(), 1, "no keepalive right after the init");
+        clock.advance(999);
+        worker.service();
+        assert_eq!(create_tc(), 1, "still inside the first second");
+        clock.advance(1);
+        worker.service();
+        assert_eq!(
+            create_tc(),
+            2,
+            "the inactive link is polled with T_CREATE_TC after 1 s"
+        );
+        // socketworks.cpp:896: data read 500 ms later moves the next poll to 1 s after it.
+        clock.advance(500);
+        worker.registry.get_mut(0).expect("device").last_rx_ms = 6_500;
+        clock.advance(999);
+        worker.service();
+        assert_eq!(create_tc(), 2, "a read re-arms the idle timer");
+        clock.advance(1);
+        worker.service();
+        assert_eq!(create_tc(), 3, "1 s after the last read");
     }
 
     #[test]

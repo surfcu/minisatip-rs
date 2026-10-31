@@ -30,6 +30,8 @@ pub struct Launch<'a> {
     pub args: &'a [String],
     pub html: &'a Path,
     pub workdir: &'a Path,
+    /// Fake CAM socket for `MINISATIP_REPLAY_CA`.
+    pub ca_socket: Option<&'a Path>,
 }
 
 /// A running server; stopped on drop.
@@ -94,7 +96,12 @@ impl Server {
             },
         ];
         args.extend(launch.args.iter().cloned());
-        let mut child = Command::new(&binary.path)
+        let mut command = Command::new(&binary.path);
+        match launch.ca_socket {
+            Some(path) => command.env("MINISATIP_REPLAY_CA", path),
+            None => command.env_remove("MINISATIP_REPLAY_CA"),
+        };
+        let mut child = command
             .args(&args)
             .current_dir(launch.workdir)
             .env("MINISATIP_REPLAY", launch.capture)

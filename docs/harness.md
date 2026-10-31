@@ -13,7 +13,8 @@ scripts/build-cpp-reference.sh          # prints the binary path last
 
 The script clones `catalinii/minisatip` (or reuses `target/upstream/minisatip`),
 applies `harness/cpp-replay.patch` and builds with the replay adapter enabled. The
-patch is the only C++ change: it adds a file-backed tuner and is off unless
+patch is the only C++ change: it adds a file-backed tuner and, for those adapters, a
+fake-CAM socket in place of the CA device (`MINISATIP_REPLAY_CA`); it is off unless
 `REPLAY=ON`. Like the Rust replay adapters, the C++ ones advertise DVB-S2/DVB-S,
 carry no frontend name and replace the local DVB adapters while a replay is set.
 
@@ -27,6 +28,7 @@ Both binaries take the capture from the same environment variables:
 | `MINISATIP_REPLAY` | TS file to loop |
 | `MINISATIP_REPLAY_ADAPTERS` | Adapter count (the harness passes the scenario's `adapters`) |
 | `MINISATIP_REPLAY_BITRATE` | Fixed replay rate in bit/s (see DEV-120) |
+| `MINISATIP_REPLAY_CA` | Unix datagram socket of a fake CAM for replay adapters (`%d` = adapter, else adapter 0 only); unset, replay adapters have no CA device (DEV-283) |
 
 ## Commands
 
@@ -53,7 +55,7 @@ C++ binary in slot A, so `--record` writes the oracle transcript. `--golden DIR`
 checks every run of both sides against `DIR/<scenario>.txt`; `--record` writes only
 the first run of A.
 
-The fast subset is all eighteen scenarios in `harness/scenarios/`; CI runs it ten
+The fast subset is all twenty-one scenarios in `harness/scenarios/`; CI runs it ten
 times Rust-vs-Rust. The `cpp-reference` CI job builds the reference with the
 script above, uploads it, and runs every scenario three times C++-vs-Rust and
 against `harness/golden` (recorded from C++). If upstream no longer builds or
@@ -62,8 +64,8 @@ takes the patch, that job warns and skips the comparison.
 ## Scenario format
 
 A scenario is one YAML file with `name`, `description`, `capture` (generator
-profile: `fta`, `multi`, `pmtver` or `ca`), `adapters` (default 1), `bitrate` (default
-2 000 000), optional extra `args`, `fast`, `oscam`, and a list of `steps`.
+profile: `fta`, `multi`, `pmtver` or `ca`), `adapters` (default 1), `bitrate`
+(default 2 000 000), optional extra `args`, `fast`, `oscam`, `cam`, and a list of `steps`.
 
 The `ca` profile has the three `multi` services (without its extra PIDs 0x1ff and
 0x1fff), each with a program-level CA descriptor (CAID 0x0100), and one ECM section per cycle on PIDs 0x1f1-0x1f3. The ES stays clear: both
@@ -77,6 +79,16 @@ cmd_id, descriptors, ES list), `ca_stop` (demux, 255 for all), the first
 `filter_data` after each filter is set, and `disconnect`. Repeated filter data is
 dropped, as its count depends on run length. An unknown opcode is logged and ends
 the connection. The listener lives until the harness exits.
+
+`cam: true` gives replay adapter 0 an `ms-fakecam` CAM (CAID 0x0100) on a unix
+datagram socket under `/tmp/msh-<pid>-<n>/`, passed in `MINISATIP_REPLAY_CA`. Both
+binaries then run the Linux CA device path on it (TPDU framing; the slot reports a
+ready CI_LINK). The log is the CAM's APDU record without times, one line per
+transport, session or APDU event, with the DATE_TIME body masked. Scenarios wait
+for the CAM init (`00400041 st=00`, the last session) before the first SETUP, as
+its last session open would otherwise race the first CA_PMT. A PMT version change is
+not a CAPMT scenario: which version a join sees depends on where in the loop it
+lands, so the CAPMT update is left to the ported unit tests.
 
 ```yaml
 name: fta-single
@@ -110,6 +122,7 @@ session and stream ids stay available after a `close` step.
 | `close` | Closes a connection or stream |
 | `sleep` | Waits `ms` |
 | `dvbapi` | Waits up to `timeout_ms` (5000) for a fake-OSCam line containing `until`, then records the lines since the previous `dvbapi` step up to that one; later lines stay for the next step |
+| `capmt` | The same for the fake CAM's log |
 
 ## Capture summaries
 
@@ -173,6 +186,5 @@ digit run; `body: length` keeps only the length and an FNV-1a hash.
 
 ## Known difference
 
-`http-state` fails C++-vs-Rust only on `/state.json`: Rust emits the M3 symbol
-subset and different absent values, which is DEV-051 and arrives with later
-milestones. Rust-vs-Rust and C++-vs-C++ are green for all fifteen scenarios.
+None at present: all twenty-one scenarios pass C++-vs-Rust against `harness/golden`,
+Rust-vs-Rust and C++-vs-C++ (with the reference built from the current patch).
