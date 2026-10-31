@@ -32,6 +32,8 @@ pub struct Launch<'a> {
     pub workdir: &'a Path,
     /// Fake CAM socket for `MINISATIP_REPLAY_CA`.
     pub ca_socket: Option<&'a Path>,
+    /// Ports already taken by harness helpers (the fake OSCam), kept out of the RTP range.
+    pub reserved: &'a [u16],
 }
 
 /// A running server; stopped on drop.
@@ -69,7 +71,9 @@ impl Server {
         fs::create_dir_all(&cache)?;
         let (rtsp_port, http_port) = free_tcp_pair()?;
         // TCP and UDP numbers can coincide; keep them apart so placeholders are unique.
-        let rtp_lease = free_udp_range(RTP_RANGE, &[rtsp_port, http_port])?;
+        let mut taken = vec![rtsp_port, http_port];
+        taken.extend_from_slice(launch.reserved);
+        let rtp_lease = free_udp_range(RTP_RANGE, &taken)?;
         let start_rtp = rtp_lease.base();
         let log = launch.workdir.join(format!("{}.log", binary.label));
         let log_file = fs::File::create(&log)?;

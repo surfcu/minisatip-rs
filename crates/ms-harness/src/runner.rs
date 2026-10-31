@@ -129,6 +129,7 @@ pub fn run_once(
     if let Some(oscam) = &oscam {
         args.extend(["-o".to_owned(), format!("127.0.0.1:{}", oscam.port)]);
     }
+    let reserved: Vec<u16> = oscam.iter().map(|oscam| oscam.port).collect();
     let launch = Launch {
         capture: &capture,
         adapters: scenario.adapters,
@@ -140,6 +141,7 @@ pub fn run_once(
         ca_socket: cam.as_ref().map(|cam| cam.path.as_path()),
         #[cfg(not(unix))]
         ca_socket: None,
+        reserved: &reserved,
     };
     let server = Server::start(binary, &launch).map_err(|error| error.to_string())?;
     let mut norm = Normalizer::default();

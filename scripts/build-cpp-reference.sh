@@ -11,11 +11,16 @@ if [ "${1:-}" = "--full" ]; then
 fi
 src=${1:-$root/target/upstream/minisatip}
 repo=${MINISATIP_REPO:-https://github.com/catalinii/minisatip.git}
-ref=${MINISATIP_REF:-master}
+# The port's baseline (README); upstream master moves on and stops taking the patch.
+ref=${MINISATIP_REF:-28dfd7820159ef22333af51ea0d5ef5bc56014b7}
 patch=$root/harness/cpp-replay.patch
 
 if [ ! -d "$src/.git" ]; then
-    git clone --depth 1 --branch "$ref" "$repo" "$src"
+    # A fetch by name takes a branch, a tag or a full commit id.
+    git init -q "$src"
+    git -C "$src" remote add origin "$repo"
+    git -C "$src" fetch -q --depth 1 origin "$ref"
+    git -C "$src" checkout -q FETCH_HEAD
 fi
 cd "$src"
 

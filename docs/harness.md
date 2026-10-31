@@ -11,7 +11,9 @@ and every repeated run produces the same transcript as run 1.
 scripts/build-cpp-reference.sh          # prints the binary path last
 ```
 
-The script clones `catalinii/minisatip` (or reuses `target/upstream/minisatip`),
+The script fetches `catalinii/minisatip` at the port's baseline commit `28dfd78`
+(`MINISATIP_REF` takes another branch, tag or full commit id; an existing
+`target/upstream/minisatip` is reused),
 applies `harness/cpp-replay.patch` and builds with the replay adapter enabled. The
 patch is the only C++ change: it adds a file-backed tuner and, for those adapters, a
 fake-CAM socket in place of the CA device (`MINISATIP_REPLAY_CA`); it is off unless
