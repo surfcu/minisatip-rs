@@ -331,7 +331,7 @@ Unvalidated rows must be called out in release notes.
   - M8: satipc against a real SAT>IP server. Status API: SAT>IP client adapters
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).
-  - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak running since
+  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); 7-day soak running since
     2026-10-31 16:04:56 +03 on the main box (see "Soak"); resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
@@ -341,7 +341,7 @@ Unvalidated rows must be called out in release notes.
     CI) since 2026-10-31 16:04:56 +03 (see "Soak" below); the enigma2 box runs the
     armv7 `diag-log` build since 2026-10-25 09:08 +03 and passed its 12 h validation
     (see "Logging ... Part B").
-  - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
+  - CA scenarios in the harness (#36); the SAT>IP adapter type
     on the status page.
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
     is in that box.

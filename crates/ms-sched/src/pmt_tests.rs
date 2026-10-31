@@ -2780,3 +2780,27 @@ fn update_pids_sends_section_pids_before_the_pid_set() {
     assert_eq!(log[last - 1], ("sections", vec![0, 17, 0x100]));
     assert!(log[last].1.contains(&0x100), "{log:?}");
 }
+
+// Ported from tests/test_utils.cpp:237 (test_find_new_id) on pmt_add, the
+// find_new_id user (pmt.cpp:1533); the threaded cases are not ported (DEV-282).
+#[test]
+fn test_find_new_id() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    for expected in 0..4 {
+        assert_eq!(
+            sched.pmt_add(0, 100 + expected, 200),
+            expected,
+            "slot gets id {expected}"
+        );
+    }
+    sched.pmt_del(1);
+    assert_eq!(sched.pmt_add(0, 300, 200), 1, "freed slot is reused");
+    for expected in 4..MAX_PMT as i32 {
+        assert_eq!(
+            sched.pmt_add(0, 300, 200),
+            expected,
+            "slot gets id {expected}"
+        );
+    }
+    assert_eq!(sched.pmt_add(0, 300, 200), -1, "full table returns -1");
+}
