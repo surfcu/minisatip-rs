@@ -15,14 +15,27 @@ repo=${MINISATIP_REPO:-https://github.com/catalinii/minisatip.git}
 ref=${MINISATIP_REF:-28dfd7820159ef22333af51ea0d5ef5bc56014b7}
 patch=$root/harness/cpp-replay.patch
 
+# A checkout without a commit is left over from a failed fetch: start again.
+if [ -d "$src/.git" ] && ! git -C "$src" rev-parse -q --verify HEAD >/dev/null; then
+    rm -rf "$src"
+fi
 if [ ! -d "$src/.git" ]; then
     # A fetch by name takes a branch, a tag or a full commit id.
     git init -q "$src"
     git -C "$src" remote add origin "$repo"
-    git -C "$src" fetch -q --depth 1 origin "$ref"
+    if ! git -C "$src" fetch -q --depth 1 origin "$ref"; then
+        rm -rf "$src"
+        echo "cannot fetch $ref from $repo" >&2
+        exit 1
+    fi
     git -C "$src" checkout -q FETCH_HEAD
 fi
 cd "$src"
+# An older checkout (e.g. of upstream master) is reused as it is; say so.
+head=$(git rev-parse HEAD)
+if [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && [ "$head" != "$ref" ]; then
+    echo "warning: $src is at $head, not $ref; remove it to fetch the baseline" >&2
+fi
 
 # The patch adds src/replay.cpp and a REPLAY CMake option (off by default).
 # A tree carrying an older revision of the patch fails here; reset it first.

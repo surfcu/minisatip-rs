@@ -235,11 +235,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential libssl-dev libdvbcsa-dev libxml2-dev zlib1g-dev cmake
 
-      # Upstream master plus harness/cpp-replay.patch, as built locally. If
-      # upstream no longer builds or takes the patch, the comparison is skipped.
+      # The baseline commit plus harness/cpp-replay.patch, as built locally. The
+      # ref is pinned, so a patch that does not apply is a bug here and fails the job.
       - name: Build C++ reference
         id: cpp
-        continue-on-error: true
         run: scripts/build-cpp-reference.sh target/upstream/minisatip
 
       - name: Report skipped comparison
