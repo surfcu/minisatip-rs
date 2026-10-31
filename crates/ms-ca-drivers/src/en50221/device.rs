@@ -158,6 +158,8 @@ pub struct CaDevice {
     pub last_rx_ms: i64,
     /// CI+ key watchdog timeout (ms; 0 disables it). No C++ equivalent.
     pub recovery_timeout_ms: i64,
+    /// This slot's `cam_state` changes; kept across reconnects.
+    cam_states: ms_log::diag::events::CamStateFilter,
     close_requested: bool,
     events: VecDeque<HostEvent>,
     apdu_log: Option<Vec<ApduRecord>>,
@@ -202,6 +204,7 @@ impl CaDevice {
             last_key_ms: -1,
             last_rx_ms: -1,
             recovery_timeout_ms: 0,
+            cam_states: Default::default(),
             close_requested: false,
             events: VecDeque::new(),
             apdu_log: None,
@@ -336,14 +339,16 @@ impl CaDevice {
         if self.force_ci { "ci" } else { "ci+" }
     }
 
+    /// Sends a `cam_state` change for this slot (diagnostics only).
+    pub fn report_state(&mut self, state: &str) {
+        let (ca, mode) = (i64::try_from(self.id).unwrap_or(0), self.mode_name());
+        self.cam_states.send(ca, state, mode);
+    }
+
     /// `ca_request_close`.
     pub fn request_close(&mut self) {
         ms_log::log!("Requesting CA {} close", self.id);
-        ms_log::diag::events::cam_state(
-            i64::try_from(self.id).unwrap_or(0),
-            "reset",
-            self.mode_name(),
-        );
+        self.report_state("reset");
         self.close_requested = true;
         self.push_event(HostEvent::CloseRequested);
     }
@@ -945,11 +950,7 @@ impl CaDevice {
             self.id,
             now - self.mmi_error_since
         );
-        ms_log::diag::events::cam_state(
-            i64::try_from(self.id).unwrap_or(0),
-            "mmi_recovery",
-            self.mode_name(),
-        );
+        self.report_state("mmi_recovery");
         self.mmi_error_since = -1;
         self.request_close();
     }
