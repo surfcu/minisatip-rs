@@ -1,0 +1,17 @@
+name: capmt-join-leave
+description: One CA service over RTSP with a fake CAM on the CI path; CA_PMT on join and not_selected on TEARDOWN
+capture: ca
+fast: true
+cam: true
+steps:
+  - capmt: { until: "00400041 st=00", timeout_ms: 8000 }
+  - udp: u1
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,256,257,258"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - capmt: { until: "ca_pmt", timeout_ms: 8000 }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }
+  - capmt: { until: "ca_pmt", timeout_ms: 8000 }

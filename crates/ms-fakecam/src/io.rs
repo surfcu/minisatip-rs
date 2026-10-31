@@ -52,6 +52,29 @@ pub fn serve_datagram(
     }
 }
 
+/// Serves TPDUs on a bound datagram socket, answering each sender at its own
+/// address (the hosts bind a client path and connect); an empty datagram ends it.
+#[cfg(unix)]
+pub fn serve_datagram_listener(
+    cam: &Mutex<FakeCam>,
+    sock: &std::os::unix::net::UnixDatagram,
+) -> io::Result<()> {
+    let mut buf = [0u8; MAX_MESSAGE];
+    loop {
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok((0, _)) => return Ok(()),
+            Ok(received) => received,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let reply = lock(cam).handle_tpdu(&buf[..n]);
+        if let Some(reply) = reply {
+            // A host that went away is not an error for the CAM.
+            let _ = sock.send_to_addr(&reply, &from);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

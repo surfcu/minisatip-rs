@@ -49,6 +49,9 @@ struct Context<'a> {
     closed: HashMap<String, (Option<String>, Option<String>)>,
     /// The fake OSCam log and how many of its lines are already recorded.
     dvbapi: Option<(Log, usize)>,
+    /// The fake CAM and how many of its lines are already recorded.
+    #[cfg(unix)]
+    capmt: Option<(&'a crate::fakecam::HarnessCam, usize)>,
     out: Vec<String>,
 }
 
@@ -110,6 +113,18 @@ pub fn run_once(
     } else {
         None
     };
+    // Declared before the server, so the server stops first (a closed datagram
+    // peer is not signalled to the host).
+    #[cfg(unix)]
+    let cam = if scenario.cam {
+        Some(crate::fakecam::HarnessCam::start().map_err(|error| format!("fake cam: {error}"))?)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    if scenario.cam {
+        return Err("cam: true needs unix sockets".to_owned());
+    }
     let mut args = scenario.args.clone();
     if let Some(oscam) = &oscam {
         args.extend(["-o".to_owned(), format!("127.0.0.1:{}", oscam.port)]);
@@ -121,6 +136,10 @@ pub fn run_once(
         args: &args,
         html: &options.html,
         workdir: &workdir,
+        #[cfg(unix)]
+        ca_socket: cam.as_ref().map(|cam| cam.path.as_path()),
+        #[cfg(not(unix))]
+        ca_socket: None,
     };
     let server = Server::start(binary, &launch).map_err(|error| error.to_string())?;
     let mut norm = Normalizer::default();
@@ -146,6 +165,8 @@ pub fn run_once(
         streams: HashMap::new(),
         closed: HashMap::new(),
         dvbapi: oscam.map(|oscam| (oscam.log, 0)),
+        #[cfg(unix)]
+        capmt: cam.as_ref().map(|cam| (cam, 0)),
         out: vec![format!("# scenario {}", scenario.name)],
     };
     for (number, step) in scenario.steps.iter().enumerate() {
@@ -211,6 +232,10 @@ impl Context<'_> {
                 Ok(())
             }
             Step::Dvbapi(wait) => self.dvbapi(number, wait),
+            #[cfg(unix)]
+            Step::Capmt(wait) => self.capmt(number, wait),
+            #[cfg(not(unix))]
+            Step::Capmt(_) => Err("capmt steps need unix sockets".to_owned()),
         }
     }
 
@@ -218,32 +243,24 @@ impl Context<'_> {
     /// `until`; later lines wait for the next step, so their timing stays out of the diff.
     fn dvbapi(&mut self, number: usize, step: &LogStep) -> Result<(), String> {
         let (log, cursor) = self.dvbapi.as_mut().ok_or("no fake oscam")?;
-        let deadline = Instant::now() + Duration::from_millis(step.timeout_ms);
-        let end = loop {
-            let found = {
-                let lines = log.lock().unwrap_or_else(|e| e.into_inner());
-                lines[*cursor..]
-                    .iter()
-                    .position(|line| line.contains(&step.until))
-                    .map(|offset| {
-                        (
-                            *cursor + offset + 1,
-                            lines[*cursor..*cursor + offset + 1].to_vec(),
-                        )
-                    })
-            };
-            if let Some(found) = found {
-                break found;
-            }
-            if Instant::now() >= deadline {
-                return Err(format!("dvbapi: no line with {:?}", step.until));
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        *cursor = end.0;
+        let lines = wait_log(step, cursor, || {
+            log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        })?;
         self.out
             .push(format!("== {number} dvbapi until {}", step.until));
-        self.out.extend(end.1);
+        self.out.extend(lines);
+        Ok(())
+    }
+
+    /// The same for the fake CAM's APDU log.
+    #[cfg(unix)]
+    fn capmt(&mut self, number: usize, step: &LogStep) -> Result<(), String> {
+        let (cam, cursor) = self.capmt.as_mut().ok_or("no fake cam")?;
+        let cam = *cam;
+        let lines = wait_log(step, cursor, || cam.lines())?;
+        self.out
+            .push(format!("== {number} capmt until {}", step.until));
+        self.out.extend(lines);
         Ok(())
     }
 
@@ -514,6 +531,32 @@ impl Context<'_> {
         self.out.push(format!("== {number} capture {}", step.from));
         self.out.extend(lines);
         Ok(())
+    }
+}
+
+/// Waits up to `timeout_ms` for a line containing `until` past `cursor`, returns
+/// the lines up to it and moves the cursor past it.
+fn wait_log(
+    step: &LogStep,
+    cursor: &mut usize,
+    lines: impl Fn() -> Vec<String>,
+) -> Result<Vec<String>, String> {
+    let deadline = Instant::now() + Duration::from_millis(step.timeout_ms);
+    loop {
+        let all = lines();
+        if let Some(offset) = all[*cursor..]
+            .iter()
+            .position(|line| line.contains(&step.until))
+        {
+            let end = *cursor + offset + 1;
+            let found = all[*cursor..end].to_vec();
+            *cursor = end;
+            return Ok(found);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("no log line with {:?}", step.until));
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 

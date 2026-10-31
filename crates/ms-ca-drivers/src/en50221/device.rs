@@ -154,6 +154,8 @@ pub struct CaDevice {
     pub mmi_error_since: i64,
     /// Last CI+ key delivery (ms; -1 before the first key).
     pub last_key_ms: i64,
+    /// Last read that returned data (ms; -1 none), the socket's `rtime`.
+    pub last_rx_ms: i64,
     /// CI+ key watchdog timeout (ms; 0 disables it). No C++ equivalent.
     pub recovery_timeout_ms: i64,
     close_requested: bool,
@@ -198,6 +200,7 @@ impl CaDevice {
             pending_since: -1,
             mmi_error_since: -1,
             last_key_ms: -1,
+            last_rx_ms: -1,
             recovery_timeout_ms: 0,
             close_requested: false,
             events: VecDeque::new(),
@@ -369,6 +372,7 @@ impl CaDevice {
         self.pending_since = -1;
         self.mmi_error_since = -1;
         self.last_key_ms = -1;
+        self.last_rx_ms = -1;
         self.link = None;
         self.sock = None;
         self.close_requested = false;
@@ -427,6 +431,7 @@ impl CaDevice {
         self.pending_since = self.now();
         self.mmi_error_since = -1;
         self.last_key_ms = -1;
+        self.last_rx_ms = -1;
         true
     }
 
@@ -436,6 +441,7 @@ impl CaDevice {
         self.pending_since = self.now();
         self.mmi_error_since = -1;
         self.last_key_ms = -1;
+        self.last_rx_ms = -1;
         ms_log::log!("initializing CA {} fd {} sock {}", self.id, -1, sock);
         true
     }
@@ -699,7 +705,10 @@ impl CaDevice {
                 LinkMode::Enigma => self.read_enigma(false),
             };
             match r {
-                ReadOutcome::Data(d) if !d.is_empty() => self.handle_spdu(&d),
+                ReadOutcome::Data(d) if !d.is_empty() => {
+                    self.last_rx_ms = self.now();
+                    self.handle_spdu(&d);
+                }
                 ReadOutcome::Data(_) => {}
                 ReadOutcome::Again => return true,
                 ReadOutcome::Eof => return false,

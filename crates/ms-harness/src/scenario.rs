@@ -35,6 +35,9 @@ pub struct Scenario {
     /// Starts a fake OSCam and adds `-o 127.0.0.1:<port>` (DVBAPI).
     #[serde(default)]
     pub oscam: bool,
+    /// Gives replay adapter 0 a fake CAM through `MINISATIP_REPLAY_CA` (EN50221).
+    #[serde(default)]
+    pub cam: bool,
     pub steps: Vec<Step>,
     #[serde(skip)]
     pub path: PathBuf,
@@ -69,6 +72,8 @@ pub enum Step {
     Sleep(u64),
     /// Records the fake OSCam log up to the next line containing `until`.
     Dvbapi(LogStep),
+    /// Records the fake CAM's APDU log up to the next line containing `until`.
+    Capmt(LogStep),
 }
 
 fn value<T: DeserializeOwned, E: de::Error>(value: serde_yaml::Value) -> Result<T, E> {
@@ -92,6 +97,7 @@ impl<'de> Deserialize<'de> for Step {
             "close" => Step::Close(value(body)?),
             "sleep" => Step::Sleep(value(body)?),
             "dvbapi" => Step::Dvbapi(value(body)?),
+            "capmt" => Step::Capmt(value(body)?),
             other => return Err(de::Error::custom(format!("unknown step {other}"))),
         })
     }
@@ -259,6 +265,13 @@ impl Scenario {
             .any(|step| matches!(step, Step::Dvbapi(_)));
         if dvbapi && !scenario.oscam {
             return Err(format!("{}: dvbapi steps need oscam: true", path.display()));
+        }
+        let capmt = scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::Capmt(_)));
+        if capmt && !scenario.cam {
+            return Err(format!("{}: capmt steps need cam: true", path.display()));
         }
         if scenario.adapters == 0 {
             return Err(format!("{}: adapters must be at least 1", path.display()));

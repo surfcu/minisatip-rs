@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+ms-fakecam = { path = "../ms-fakecam" }
 
 [lints]
 workspace = true
