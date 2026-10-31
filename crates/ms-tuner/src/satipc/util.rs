@@ -229,4 +229,84 @@ mod tests {
         ));
         assert!(!is_rtsp_response(b"PLAY x RTSP/1.0\r\n\r\n"));
     }
+
+    // Ported from tests/test_utils.cpp:96 (test_is_rtsp_response); the buffers
+    // keep their NUL as sizeof() does. header4 is in ms-net.
+    #[test]
+    fn test_is_rtsp_response() {
+        assert!(
+            is_rtsp_response(b"RTSP/1.0 200 OK\r\n\r\n\0"),
+            "Expected 1 for header1"
+        );
+        assert!(
+            !is_rtsp_response(b"RTSP/1.0 200 OK\r\nContent-Length: 23\r\n\r\n\0"),
+            "Expected 0 for header2"
+        );
+        assert!(
+            is_rtsp_response(b"RTSP/1.0 200 OK\r\nContent-Length: 4\r\n\r\ntest\0"),
+            "Expected 1 for header3"
+        );
+    }
+
+    // Ported from tests/test_utils.cpp:113 (test_split).
+    #[test]
+    fn test_split() {
+        assert_eq!(split("a,b,c", ','), ["a", "b", "c"], "Expected 3 elements");
+        assert_eq!(
+            split("  a , b \n, c\r", ','),
+            ["a", "b", "c"],
+            "Expected 3 elements after filtering control characters"
+        );
+        assert_eq!(
+            split("a,,b", ','),
+            ["a", "b"],
+            "Expected 2 elements, empty elements ignored"
+        );
+    }
+
+    // Ported from tests/test_utils.cpp:144 (test_parse_int_and_enum_map); the
+    // EnumMap is fe_delsys_map, the case-insensitive table the port has.
+    #[test]
+    fn test_parse_int_and_enum_map() {
+        assert_eq!(parse_int("123", 0), 123, "Expected 123");
+        assert_eq!(parse_int("  -456", 0), -456, "Expected -456");
+        assert_eq!(parse_int("+789", 0), 789, "Expected 789");
+        assert_eq!(parse_int("invalid", 42), 42, "Expected 42 for invalid int");
+
+        assert_eq!(
+            delsys_lookup("dvbs2"),
+            Some(DeliverySystem::DvbS2),
+            "Expected DVBS2"
+        );
+        assert_eq!(
+            delsys_lookup("DVBT"),
+            Some(DeliverySystem::DvbT),
+            "Expected DVBT"
+        );
+        assert_eq!(
+            delsys_lookup("three"),
+            None,
+            "Expected None for invalid key"
+        );
+    }
+
+    // Ported from tests/test_utils.cpp:174 (test_header_parameter).
+    #[test]
+    fn test_header_parameter() {
+        assert_eq!(
+            header_parameter(&["Session:", "12345"], 0),
+            "12345",
+            "Expected '12345'"
+        );
+        assert_eq!(
+            header_parameter(&["Session:54321"], 0),
+            "54321",
+            "Expected '54321'"
+        );
+        assert_eq!(
+            header_parameter(&["Session", ":", "abcde"], 0),
+            "abcde",
+            "Expected 'abcde'"
+        );
+    }
 }

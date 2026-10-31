@@ -1597,6 +1597,8 @@ fn satipc_adapter_config(server: &SatipServer) -> AdapterConfig {
     let [sys0, sys1] = server.systems();
     let mut config = AdapterConfig::new(sys0);
     config.sys[1] = sys1;
+    // satipc.cpp:2027: `ad->type = ADAPTER_SATIP`, read by the status page as ad_type 2.
+    config.adapter_type = ms_sched::AdapterType::Satip;
     config
 }
 
