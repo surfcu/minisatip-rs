@@ -241,12 +241,7 @@ jobs:
         id: cpp
         run: scripts/build-cpp-reference.sh target/upstream/minisatip
 
-      - name: Report skipped comparison
-        if: steps.cpp.outcome != 'success'
-        run: echo "::warning::C++ reference unavailable; C++-vs-Rust scenarios skipped"
-
       - name: Upload binary
-        if: steps.cpp.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: minisatip-cpp-reference
@@ -254,18 +249,15 @@ jobs:
           if-no-files-found: error
 
       - name: Install Rust
-        if: steps.cpp.outcome == 'success'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
 
       - name: Build servers and harness
-        if: steps.cpp.outcome == 'success'
         run: cargo build -p minisatip -p ms-harness
 
       # Every scenario, three runs each, against the oracle and the goldens.
       - name: Run scenarios
-        if: steps.cpp.outcome == 'success'
         run: >-
           cargo run -q -p ms-harness -- run --runs 3 --golden harness/golden
           --cpp target/upstream/minisatip/build-harness/minisatip

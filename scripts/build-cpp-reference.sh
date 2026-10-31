@@ -15,11 +15,18 @@ repo=${MINISATIP_REPO:-https://github.com/catalinii/minisatip.git}
 ref=${MINISATIP_REF:-28dfd7820159ef22333af51ea0d5ef5bc56014b7}
 patch=$root/harness/cpp-replay.patch
 
-# A checkout without a commit is left over from a failed fetch: start again.
-if [ -d "$src/.git" ] && ! git -C "$src" rev-parse -q --verify HEAD >/dev/null; then
+# Only a directory this script made is ever removed: a usable checkout is reused,
+# its own leftover from a failed fetch (only .git, origin $repo, no commit) is redone.
+if [ -d "$src/.git" ] && ! git -C "$src" rev-parse -q --verify HEAD >/dev/null &&
+    [ "$(ls -A "$src")" = ".git" ] &&
+    [ "$(git -C "$src" remote get-url origin 2>/dev/null)" = "$repo" ]; then
     rm -rf "$src"
 fi
-if [ ! -d "$src/.git" ]; then
+if [ -e "$src" ] && ! git -C "$src" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+    echo "$src exists but is not a minisatip checkout; remove it or pass another SRC_DIR" >&2
+    exit 1
+fi
+if [ ! -e "$src" ]; then
     # A fetch by name takes a branch, a tag or a full commit id.
     git init -q "$src"
     git -C "$src" remote add origin "$repo"
