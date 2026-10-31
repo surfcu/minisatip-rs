@@ -2528,6 +2528,191 @@ fn ca_masks_follow_registration_and_restart() {
     assert_eq!(sched.adapter_ca_mask(0), 0);
 }
 
+/// Makes `id` a running service on adapter 0 with claims on `pmt_pid` and `stream_pid`,
+/// the way the tune path starts it; the first `start_active_pmts` offers it to the CA.
+fn run_ca_pmt(sched: &mut Scheduler, id: i32, pmt_pid: i32, stream_pid: i32) {
+    {
+        let adapter = sched.adapter_mut(0).unwrap();
+        adapter.active_pmts = 1;
+        adapter.active_pmt[0] = id;
+    }
+    assert_eq!(sched.mark_pid_add(0, 0, pmt_pid), 0);
+    assert_eq!(sched.mark_pid_add(0, 0, stream_pid), 0);
+    sched.update_pids(0);
+    sched.start_active_pmts(0);
+}
+
+// Ported from tests/test_ca.cpp:884 (PMT pid 0x0201 for the 13-bit 0x2001, stream 0x0202 added,
+// adapter 0): a PMT stopped before its re-send must still be released on its CA (#1442)
+#[test]
+fn test_close_pmt_after_caid_update() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let (ica, log) = register_ca(&mut sched);
+    // PIDs are 13 bit here, so C++ pmt pid 0x2001 is 0x0201.
+    let id = sched.pmt_add(0, 0x2000, 0x0201);
+    assert!(id >= 0, "could not create the PMT");
+    sched.pmt_add_caid(id, 0x0664, 0x1F06, &[]);
+    sched.pmt_add_stream_pid(id, 0x0202, 2, false, true);
+    run_ca_pmt(&mut sched, id, 0x0201, 0x0202);
+    assert_eq!(log.borrow().add_calls, 1, "add_ca did not publish the op");
+    assert_eq!(
+        pmt_ca_mask(&sched, id),
+        1 << ica,
+        "PMT was not sent to the CA"
+    );
+
+    // a new CA descriptor turns up, the PMT is due for a re-send ...
+    sched.pmt_add_caid(id, 0x06EE, 0x1F07, &[]);
+    assert_eq!(
+        pmt_ca_mask(&sched, id),
+        0,
+        "pmt_add_caid() expected to clear ca_mask"
+    );
+
+    // ... but it is stopped before the re-send
+    log.borrow_mut().reset();
+    sched.stop_pmt(id);
+    assert_eq!(
+        log.borrow().del_calls,
+        1,
+        "the CA holding the PMT was not told that it stopped"
+    );
+    assert_eq!(
+        pmt_registered_mask(&sched, id),
+        0,
+        "the CA registration was not cleared"
+    );
+
+    // nothing left to release: a second stop is a no-op, and the close path itself
+    // must not release a registration that is already gone
+    sched.stop_pmt(id);
+    sched.close_pmt_for_cas(0, id);
+    assert_eq!(log.borrow().del_calls, 1, "the PMT was released twice");
+
+    // The literal `ca_mask = 0` (`invalidate`) must be released the same way.
+    sched.start_pmt(id);
+    sched.start_active_pmts(0);
+    assert_eq!(
+        pmt_registered_mask(&sched, id),
+        1 << ica,
+        "the restarted PMT should be registered"
+    );
+    sched.pmt_slot_mut(id).unwrap().ca_mask = 0;
+    assert_eq!(
+        pmt_ca_mask(&sched, id),
+        0,
+        "invalidate() expected to clear ca_mask"
+    );
+    sched.stop_pmt(id);
+    assert_eq!(
+        log.borrow().del_calls,
+        2,
+        "an invalidated PMT was not released"
+    );
+    assert_eq!(
+        pmt_registered_mask(&sched, id),
+        0,
+        "the CA registration was not cleared"
+    );
+
+    sched.del_ca(ica);
+    sched.free_all_pmts();
+}
+
+// Ported from tests/test_pmt.cpp:2816 (the CA update flag tells a re-send from a first add)
+#[test]
+fn test_ca_update_flag_distinguishes_resend() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let (ica, log) = register_ca(&mut sched);
+    let id = sched.pmt_add(0, 100, 48);
+    assert!(id >= 0, "could not create the PMT");
+    let fid = sched.add_filter(0, 48, FilterTarget::Pmt(Some(id as usize)), 0);
+    assert!(fid >= 0, "could not add the PMT filter");
+    sched.pmt_slot_mut(id).unwrap().filter = fid;
+    assert_eq!(sched.mark_pid_add(0, 0, 48), 0);
+    assert_eq!(sched.mark_pid_add(0, 0, 3301), 0);
+    sched.update_pids(0);
+
+    let sec = build_pmt(100, 1, 3301, 0x0B00, 0x0C00, &[2], &[3301]);
+    assert_eq!(sched.process_pmt(fid, &sec), 0, "v1 to parse");
+    log.borrow_mut().reset();
+    sched.start_active_pmts(0);
+    assert_eq!(log.borrow().add_calls, 1, "PMT should be sent to the CA");
+    assert_eq!(log.borrow().last_add_update, 0, "first send is an add");
+    assert_eq!(pmt_ca_mask(&sched, id), 1 << ica, "PMT holds its CA slot");
+
+    let sec = build_pmt(100, 2, 3301, 0x0B00, 0x0C00, &[2], &[3301]);
+    log.borrow_mut().reset();
+    assert_eq!(sched.process_pmt(fid, &sec), 0, "v2 to parse");
+    assert_eq!(
+        pmt_ca_mask(&sched, id),
+        0,
+        "cosmetic bump clears the send mask"
+    );
+    sched.start_active_pmts(0);
+    assert_eq!(
+        log.borrow().add_calls,
+        1,
+        "cosmetic bump still informs the CA"
+    );
+    assert_eq!(log.borrow().last_add_update, 1, "re-send is an update");
+
+    let sec = build_pmt(100, 3, 3301, 0x0B00, 0x0C00, &[2, 3], &[3301, 3401]);
+    log.borrow_mut().reset();
+    assert_eq!(sched.process_pmt(fid, &sec), 0, "v3 to parse");
+    assert_eq!(
+        pmt_ca_mask(&sched, id),
+        0,
+        "content change clears the send mask"
+    );
+    sched.start_active_pmts(0);
+    assert_eq!(log.borrow().add_calls, 1, "content change re-sends");
+    assert_eq!(log.borrow().last_add_update, 1, "re-send is an update");
+
+    sched.del_ca(ica);
+    sched.del_filter(fid);
+    sched.free_all_pmts();
+}
+
+// Ported from tests/test_pmt.cpp:3206 (PMT run state lives outside the CA layer)
+#[test]
+fn test_resend_rejected_releases_ca() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let (ica, log) = register_ca(&mut sched);
+    let id = sched.pmt_add(0, 100, 48);
+    assert!(id >= 0, "could not create the PMT");
+    sched.pmt_add_caid(id, 0x0B00, 0x0C00, &[]);
+    sched.pmt_add_stream_pid(id, 3301, 2, false, true);
+    run_ca_pmt(&mut sched, id, 48, 3301);
+    assert_eq!(
+        pmt_registered_mask(&sched, id),
+        1 << ica,
+        "PMT should be registered"
+    );
+
+    // update clears the send mask; the re-send is rejected this time
+    sched.pmt_slot_mut(id).unwrap().ca_mask = 0;
+    log.borrow_mut().reset();
+    log.borrow_mut().fail_next = true;
+    sched.send_pmt_to_cas(0, id);
+    assert_eq!(log.borrow().add_calls, 1, "the re-send was offered");
+    assert_eq!(log.borrow().last_add_update, 1, "the re-send is an update");
+    assert_eq!(log.borrow().del_calls, 1, "stale registration should close");
+    assert_eq!(pmt_registered_mask(&sched, id), 0, "registration is gone");
+    assert_eq!(
+        sched.pmt_slot(id).unwrap().disabled_ca_mask,
+        1 << ica,
+        "CA should be disabled"
+    );
+
+    log.borrow_mut().reset();
+    sched.send_pmt_to_cas(0, id);
+    assert_eq!(log.borrow().add_calls, 0, "a disabled CA is not retried");
+
+    sched.del_ca(ica);
+    sched.free_all_pmts();
+}
+
 #[test]
 fn ca_service_carries_pcr_and_av_pids() {
     let mut sched = test_sched(AdapterType::Dvb);

@@ -983,7 +983,7 @@ impl DvbapiClient {
         self.services.remove(&pmt_id);
     }
 
-    // close_pmt_for_ca(): drop the key and let the reconciler resend.
+    // close_pmt_for_ca(): drop the key; the scheduler resends on the next offer.
     fn restart_service(&mut self, pmt_id: usize, now: i64) {
         if let Some(i) = self.opaque.remove(&pmt_id) {
             self.keys_del(i, now);

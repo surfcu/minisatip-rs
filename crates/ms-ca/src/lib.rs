@@ -1,19 +1,13 @@
-//! Desired/actual CA state reconciler, CAPMT building and the driver-facing interface.
-//!
-//! The reconciler side ([`capmt`], [`device`], [`program`], [`reconciler`]) drives
-//! CAMs through [`CaDriver::has_ca_session`]/[`CaDriver::send_ca_pmt`]; network CA
-//! backends such as DVBAPI receive a [`CapmtDiff`] through [`CaDriver::apply`] and
-//! report [`CaEvent`]s.
+//! CAPMT building and the driver-facing interface for CA backends.
+//! CAMs get one PMT per [`CaDevice::process_pmt`]/[`CaDevice::del_pmt`] call; DVBAPI gets a [`CapmtDiff`] via [`CaDriver::apply`].
 
 pub mod capmt;
 pub mod device;
 pub mod program;
-pub mod reconciler;
 
 pub use capmt::{BuiltCapmt, Capmt, CapmtError, capmt_content_hash, create_capmt};
 pub use device::{CaDevice, CaState, SendCmd, SendOutcome};
 pub use program::{CaDescriptor, EsStream, Program, ProgramTable, RawDescriptor, SdtInfo};
-pub use reconciler::{CaPolicy, CppCompatible, Reconciler, Step};
 
 /// Most CA descriptors kept per service, like the C++ `MAX_CAID`.
 pub const MAX_CAID: usize = 20;
@@ -126,7 +120,7 @@ pub enum CapmtOp {
     },
 }
 
-/// Ordered list of ops produced by the reconciler.
+/// Ordered list of ops a network backend applies in [`CaDriver::apply`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CapmtDiff {
     /// Ops applied in order.
@@ -224,7 +218,7 @@ pub enum CaEvent {
         /// Filter id from `SetFilter`.
         id: FilterId,
     },
-    /// The driver dropped a service; the reconciler should send it again.
+    /// The driver dropped a service; the scheduler should send it again.
     Restart {
         /// PMT slot id of the service.
         pmt_id: usize,
@@ -251,7 +245,7 @@ impl std::fmt::Display for CaError {
 
 impl std::error::Error for CaError {}
 
-/// A CA backend driven by the reconciler or by a CAPMT diff.
+/// A CA backend, driven by per-PMT `process_pmt`/`del_pmt` calls or by a CAPMT diff.
 ///
 /// CAM transports implement `has_ca_session`/`send_ca_pmt`; network drivers
 /// implement `apply` and report events. Methods a backend does not use keep

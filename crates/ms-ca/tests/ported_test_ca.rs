@@ -1,9 +1,7 @@
 //! CAPMT building and packing tests ported from tests/test_ca.cpp.
 
 use ms_ca::capmt::*;
-use ms_ca::{
-    CaDevice, CaDriver, CaPolicy, CaState, ProgramTable, Reconciler, RecordingDriver, TablesResult,
-};
+use ms_ca::{CaDevice, CaState, ProgramTable, RecordingDriver, TablesResult};
 
 fn ctx(t: &ProgramTable) -> BuildCtx<'_> {
     BuildCtx {
@@ -1007,96 +1005,4 @@ fn test_capmt_zap_back_keeps_places() {
         assert!(cam.dev.capmt[1].has_pmt(ch4), "channel 4 back in CAPMT 1");
         assert_eq!(cam.read_capmts().0, 0, "zapping back sends nothing");
     }
-}
-
-/// A CA that counts how often a PMT is sent to and released on it (`fake_ca_op` of test_ca.cpp:860).
-#[derive(Default)]
-struct ReleaseCountingCa {
-    add_calls: usize,
-    del_calls: usize,
-}
-
-impl CaPolicy for ReleaseCountingCa {
-    fn join(
-        &mut self,
-        _dev: &mut CaDevice,
-        _pmt_id: i32,
-        _update: bool,
-        _programs: &ProgramTable,
-        _driver: &mut dyn CaDriver,
-    ) -> TablesResult {
-        self.add_calls += 1;
-        TablesResult::Ok
-    }
-
-    fn leave(
-        &mut self,
-        _dev: &mut CaDevice,
-        _pmt_id: i32,
-        _programs: &ProgramTable,
-        _driver: &mut dyn CaDriver,
-    ) {
-        self.del_calls += 1;
-    }
-}
-
-// Ported from tests/test_ca.cpp:884 (no add_ca/del_ca: the reconciler owns its CA, so
-// "add_ca did not publish the op" becomes "the reconciled CA got the PMT")
-//
-// pmt_add_caid() clears ca_mask to force a re-send. A PMT stopped before that
-// re-send happens must still be released on the CA that holds it (#1442)
-#[test]
-fn test_close_pmt_after_caid_update() {
-    let mut t = ProgramTable::new();
-    let mut drv = RecordingDriver::default();
-    let mut ca = Reconciler::new(ReleaseCountingCa::default(), CaDevice::new(5, 1, 0));
-
-    let id = t.add(5, 0x2000, 0x2001);
-    assert!(id >= 0, "could not create the PMT");
-    t.get_mut(id).unwrap().add_caid(0x0664, 0x1F06, &[]);
-    ca.reconcile(&[id], &t, &mut drv);
-    assert_eq!(ca.policy.add_calls, 1, "add_ca did not publish the op");
-    assert!(ca.is_sent(id, &t), "PMT was not sent to the CA");
-
-    // a new CA descriptor turns up, the PMT is due for a re-send ...
-    t.get_mut(id).unwrap().add_caid(0x06EE, 0x1F07, &[]);
-    assert!(
-        !ca.is_sent(id, &t),
-        "pmt_add_caid() expected to clear ca_mask"
-    );
-
-    // ... but it is stopped before the re-send
-    ca.policy.del_calls = 0;
-    ca.reconcile(&[], &t, &mut drv);
-    assert_eq!(
-        ca.policy.del_calls, 1,
-        "the CA holding the PMT was not told that it stopped"
-    );
-    assert!(
-        ca.actual().is_empty(),
-        "the CA registration was not cleared"
-    );
-
-    // nothing left to release
-    ca.reconcile(&[], &t, &mut drv);
-    assert_eq!(ca.policy.del_calls, 1, "the PMT was released twice");
-
-    // The literal `ca_mask = 0` (`invalidate`) must be released the same way.
-    ca.reconcile(&[id], &t, &mut drv);
-    ca.invalidate(id);
-    assert!(
-        !ca.is_sent(id, &t),
-        "invalidate() expected to clear ca_mask"
-    );
-    ca.reconcile(&[], &t, &mut drv);
-    assert_eq!(
-        ca.policy.del_calls, 2,
-        "an invalidated PMT was not released"
-    );
-    assert!(
-        ca.actual().is_empty(),
-        "the CA registration was not cleared"
-    );
-
-    t.del(id);
 }

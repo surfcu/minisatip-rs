@@ -4,8 +4,8 @@
 //! stored on the scheduler PID table (`PidEntry::pmt`), exactly like
 //! `SPid::pmt`; the PMT and filter slot tables live next to it because they
 //! are adapter state. CAPMT delivery goes through [`CaSink`], whose result
-//! type is [`ms_ca::TablesResult`], so the DVBAPI/CAM device and reconciler
-//! keep ownership of protocol details.
+//! type is [`ms_ca::TablesResult`], so the DVBAPI/CAM device keeps ownership
+//! of protocol details.
 
 use std::collections::BTreeSet;
 
@@ -234,7 +234,7 @@ impl Filter {
 /// CA operation interface used by the PMT tables.
 ///
 /// A production sink forwards to the CAM/DVBAPI layer (`ms_ca::CaDevice` or
-/// a reconciler) for CAPMT add/update/remove and elementary PID
+/// the DVBAPI driver) for CAPMT add/update/remove and elementary PID
 /// announcements; tests use counters. The bridge lives outside this crate so
 /// that ms-sched keeps depending only on the ms-ca interfaces.
 pub trait CaSink {

@@ -1,110 +1,12 @@
-//! CA dispatch tests ported from tests/test_pmt.cpp, run against the reconciler.
+//! CA dispatch tests ported from tests/test_pmt.cpp, run against the CAM path (`CaDevice`).
 
 mod common;
 
 use common::*;
 use ms_ca::capmt::{CLM_ONLY, CLM_UPDATE, CMD_ID_OK_DESCRAMBLING};
-use ms_ca::{
-    CaCaps, CaDevice, CaDriver, CaPolicy, CppCompatible, ProgramTable, Reconciler, RecordingDriver,
-    Step, TablesResult,
-};
+use ms_ca::{CaCaps, CaDevice, ProgramTable, TablesResult};
 use ms_ca_drivers::ddci::{CamInfo, Ddci, DdciDevice};
 use ms_fakecam::CamConfig;
-
-/// `counting_ca_add_pmt` / `failing_ca_add_pmt` / `fake_ca_del_pmt` of test_pmt.cpp:376-731.
-#[derive(Default)]
-struct FakeCa {
-    add_calls: usize,
-    last_update: Option<bool>,
-    del_calls: usize,
-    fail_next_add: bool,
-}
-
-impl CaPolicy for FakeCa {
-    fn join(
-        &mut self,
-        _: &mut CaDevice,
-        _: i32,
-        update: bool,
-        _: &ProgramTable,
-        _: &mut dyn CaDriver,
-    ) -> TablesResult {
-        if std::mem::take(&mut self.fail_next_add) {
-            return TablesResult::NoRetry;
-        }
-        self.add_calls += 1;
-        self.last_update = Some(update);
-        TablesResult::Ok
-    }
-
-    fn leave(&mut self, _: &mut CaDevice, _: i32, _: &ProgramTable, _: &mut dyn CaDriver) {
-        self.del_calls += 1;
-    }
-}
-
-// Ported from tests/test_pmt.cpp:2816
-#[test]
-fn test_ca_update_flag_distinguishes_resend() {
-    let mut t = ProgramTable::new();
-    let mut r = Reconciler::new(FakeCa::default(), CaDevice::default());
-    let mut drv = RecordingDriver::default();
-    let id = t.add(0, 100, 48);
-    feed_pmt(
-        &mut t,
-        id,
-        &build_pmt(100, 1, 3301, 0x0B00, 0x0C00, &[2], &[3301]),
-    );
-    r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(r.policy.add_calls, 1, "PMT should be sent to the CA");
-    assert_eq!(r.policy.last_update, Some(false), "first send is an add");
-
-    r.policy.add_calls = 0;
-    feed_pmt(
-        &mut t,
-        id,
-        &build_pmt(100, 2, 3301, 0x0B00, 0x0C00, &[2], &[3301]),
-    );
-    r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(r.policy.add_calls, 1, "cosmetic bump still informs the CA");
-    assert_eq!(r.policy.last_update, Some(true), "re-send is an update");
-
-    r.policy.add_calls = 0;
-    feed_pmt(
-        &mut t,
-        id,
-        &build_pmt(100, 3, 3301, 0x0B00, 0x0C00, &[2, 3], &[3301, 3401]),
-    );
-    r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(r.policy.add_calls, 1, "content change re-sends");
-    assert_eq!(r.policy.last_update, Some(true), "re-send is an update");
-}
-
-// Ported from tests/test_pmt.cpp:3206 (PMT run state lives outside the CA layer)
-#[test]
-fn test_resend_rejected_releases_ca() {
-    let mut t = ProgramTable::new();
-    let mut r = Reconciler::new(FakeCa::default(), CaDevice::default());
-    let mut drv = RecordingDriver::default();
-    let id = t.add(0, 100, 48);
-    let p = t.get_mut(id).unwrap();
-    p.add_caid(0x0B00, 0x0C00, &[]);
-    p.add_stream(3301, 2, false, true);
-    r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(r.actual(), [id], "PMT should be registered");
-
-    // update clears the send mask; the re-send is rejected this time
-    r.invalidate(id);
-    r.policy.fail_next_add = true;
-    r.policy.add_calls = 0;
-    r.policy.del_calls = 0;
-    let steps = r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(steps, [Step::Updated(id, TablesResult::NoRetry)]);
-    assert_eq!(r.policy.del_calls, 1, "stale registration should close");
-    assert!(r.actual().is_empty(), "registration is gone");
-    assert_eq!(r.rejected(), [id], "CA should be disabled");
-    r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(r.policy.add_calls, 0, "a disabled CA is not retried");
-}
 
 // Ported from tests/test_pmt.cpp:2594 (C++ reuses the CA entry; data is replaced)
 #[test]
@@ -226,7 +128,6 @@ fn test_pmt_update_e2e_single_capmt_update() {
     x.add_caid_mask(0, 0x0B00, 0xFFFF);
     let mut dev = CaDevice::new(8, 4, 0);
     dev.caid_filter.push((0x0B00, 0xFFFF));
-    let mut r = Reconciler::new(CppCompatible, dev);
     let caps = CaCaps {
         max_ca_pmt: 4,
         multiple_pmt: 0,
@@ -257,13 +158,12 @@ fn test_pmt_update_e2e_single_capmt_update() {
             &[314, 870, 873, 3127, 3128, 5100, 6403],
         ),
     );
-    let steps = r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(x.process_pmt(8, &prog(&t, id), false), TablesResult::Ok);
     assert_eq!(
-        steps,
-        [Step::Joined(id, TablesResult::Ok)],
+        dev.process_pmt(id, false, &t, &mut drv),
+        TablesResult::Ok,
         "no stop on first add"
     );
+    assert_eq!(x.process_pmt(8, &prog(&t, id), false), TablesResult::Ok);
     let c = take_capmts(&mut drv, &mut seen);
     assert_eq!(c.len(), 1, "one CAPMT expected");
     assert_eq!(
@@ -316,13 +216,12 @@ fn test_pmt_update_e2e_single_capmt_update() {
             &[314, 870, 873, 3151, 3128, 5100, 6403],
         ),
     );
-    let steps = r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(x.process_pmt(8, &prog(&t, id), true), TablesResult::Ok);
     assert_eq!(
-        steps,
-        [Step::Updated(id, TablesResult::Ok)],
+        dev.process_pmt(id, true, &t, &mut drv),
+        TablesResult::Ok,
         "no stop/start on update"
     );
+    assert_eq!(x.process_pmt(8, &prog(&t, id), true), TablesResult::Ok);
     let c = take_capmts(&mut drv, &mut seen);
     assert_eq!(c.len(), 1, "single UPDATE");
     assert_eq!(
@@ -379,14 +278,12 @@ fn test_pmt_update_e2e_single_capmt_update() {
             &[314, 870, 873, 3151, 3128, 5100, 6403],
         ),
     );
-    r.invalidate(id);
-    let steps = r.reconcile(&[id], &t, &mut drv);
-    assert_eq!(x.process_pmt(8, &prog(&t, id), true), TablesResult::Ok);
     assert_eq!(
-        steps,
-        [Step::Updated(id, TablesResult::Ok)],
+        dev.process_pmt(id, true, &t, &mut drv),
+        TablesResult::Ok,
         "no stop/start on pid add"
     );
+    assert_eq!(x.process_pmt(8, &prog(&t, id), true), TablesResult::Ok);
     assert!(
         take_capmts(&mut drv, &mut seen).is_empty(),
         "identical re-send writes no CAPMT"
