@@ -53,7 +53,7 @@ C++ binary in slot A, so `--record` writes the oracle transcript. `--golden DIR`
 checks every run of both sides against `DIR/<scenario>.txt`; `--record` writes only
 the first run of A.
 
-The fast subset is all fifteen scenarios in `harness/scenarios/`; CI runs it ten
+The fast subset is all eighteen scenarios in `harness/scenarios/`; CI runs it ten
 times Rust-vs-Rust. The `cpp-reference` CI job builds the reference with the
 script above, uploads it, and runs every scenario three times C++-vs-Rust and
 against `harness/golden` (recorded from C++). If upstream no longer builds or
@@ -62,8 +62,21 @@ takes the patch, that job warns and skips the comparison.
 ## Scenario format
 
 A scenario is one YAML file with `name`, `description`, `capture` (generator
-profile: `fta`, `multi` or `pmtver`), `adapters` (default 1), `bitrate` (default
-2 000 000), optional extra `args`, `fast`, and a list of `steps`.
+profile: `fta`, `multi`, `pmtver` or `ca`), `adapters` (default 1), `bitrate` (default
+2 000 000), optional extra `args`, `fast`, `oscam`, and a list of `steps`.
+
+The `ca` profile has the three `multi` services (without its extra PIDs 0x1ff and
+0x1fff), each with a program-level CA descriptor (CAID 0x0100), and one ECM section per cycle on PIDs 0x1f1-0x1f3. The ES stays clear: both
+hosts null scrambled packets once a CA claims the PMT, which would tie RTP counts to
+timing.
+
+`oscam: true` starts a recording fake OSCam and adds `-o 127.0.0.1:<port>`. It answers
+CLIENT_INFO, sets one ECM filter (table 0x80/0xF0) on each CA_PMT's ECM PIDs and logs
+one line per message: `connect`, `client_info`, `ca_pmt` (list management, sid,
+cmd_id, descriptors, ES list), `ca_stop` (demux, 255 for all), the first
+`filter_data` after each filter is set, and `disconnect`. Repeated filter data is
+dropped, as its count depends on run length. An unknown opcode is logged and ends
+the connection. The listener lives until the harness exits.
 
 ```yaml
 name: fta-single
@@ -96,6 +109,7 @@ session and stream ids stay available after a `close` step.
 | `silence` | Records whether the source stays quiet for `ms` |
 | `close` | Closes a connection or stream |
 | `sleep` | Waits `ms` |
+| `dvbapi` | Waits up to `timeout_ms` (5000) for a fake-OSCam line containing `until`, then records the lines since the previous `dvbapi` step up to that one; later lines stay for the next step |
 
 ## Capture summaries
 

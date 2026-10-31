@@ -1,0 +1,28 @@
+name: dvbapi-two-services
+description: Two RTSP sessions on CA services 1 and 2 of one mux; ONLY then ADD, and per-key stops
+capture: ca
+fast: true
+oscam: true
+steps:
+  - udp: u1
+  - udp: u2
+  - rtsp:
+      conn: c1
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,256,257,258"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c1, method: PLAY, url: "{base}/stream={stream:c1}", session: true }
+  - dvbapi: { until: "ca_pmt" }
+  - dvbapi: { until: "filter_data" }
+  - rtsp:
+      conn: c2
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,512,513,514"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u2}-{rtcp:u2}" }
+  - rtsp: { conn: c2, method: PLAY, url: "{base}/stream={stream:c2}", session: true }
+  - dvbapi: { until: "ca_pmt", timeout_ms: 8000 }
+  - dvbapi: { until: "filter_data" }
+  - rtsp: { conn: c1, method: TEARDOWN, url: "{base}/stream={stream:c1}", session: true }
+  - dvbapi: { until: "ca_stop", timeout_ms: 8000 }
+  - rtsp: { conn: c2, method: TEARDOWN, url: "{base}/stream={stream:c2}", session: true }
+  - dvbapi: { until: "ca_stop", timeout_ms: 8000 }

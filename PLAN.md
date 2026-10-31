@@ -322,8 +322,9 @@ Unvalidated rows must be called out in release notes.
   - M5: reworded to fake oscam (2026-10-22, no oscam on the box). `ca_e2e` plays a
     CSA-scrambled replay through RTSP with fake-oscam control words; the CI `dvbcsa`
     job runs it and the CSA tests with libdvbcsa. DVBAPI messages are checked by the
-    ported `test_dvbapi` tests. Open: DVBAPI message diff (no harness scenario).
-  - M6: no CA scenarios in the harness yet, so CAPMT sequences are only diffed by
+    ported `test_dvbapi` tests. The harness diffs the DVBAPI messages against a
+    recording fake OSCam (scenarios 16-18: join/leave, zap, two services, #36).
+  - M6: no CAPMT (EN50221) harness scenarios yet, so CAPMT sequences are only diffed by
     the ported tests; the real-CAM join/leave/rejoin check passed. The runtime drives
     `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
   - M7: APDU diff with the fake CAM needs the same CA harness scenarios; the real CAM

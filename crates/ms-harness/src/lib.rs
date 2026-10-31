@@ -6,6 +6,7 @@
 pub mod analysis;
 pub mod client;
 pub mod diff;
+pub mod fakeoscam;
 pub mod normalize;
 pub mod runner;
 pub mod scenario;

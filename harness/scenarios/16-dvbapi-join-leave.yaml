@@ -1,0 +1,17 @@
+name: dvbapi-join-leave
+description: One CA service over RTSP with a DVBAPI client; CA_PMT on join, ECM filter data, stop on TEARDOWN
+capture: ca
+fast: true
+oscam: true
+steps:
+  - udp: u1
+  - rtsp:
+      conn: c
+      method: SETUP
+      url: "{base}/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,256,257,258"
+      headers: { Transport: "RTP/AVP;unicast;client_port={rtp:u1}-{rtcp:u1}" }
+  - rtsp: { conn: c, method: PLAY, url: "{base}/stream={stream:c}", session: true }
+  - dvbapi: { until: "ca_pmt" }
+  - dvbapi: { until: "filter_data" }
+  - rtsp: { conn: c, method: TEARDOWN, url: "{base}/stream={stream:c}", session: true }
+  - dvbapi: { until: "ca_stop", timeout_ms: 8000 }

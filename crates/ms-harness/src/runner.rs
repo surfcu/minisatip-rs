@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 use crate::analysis::{self, Seams, Units};
 use crate::client::{self, HttpStream, RtspConn, Shared, UdpPair};
 use crate::diff::diff;
+use crate::fakeoscam::{FakeOscam, Log};
 use crate::normalize::{self, Normalizer};
 use crate::scenario::{
-    BodyMode, CaptureMode, CaptureStep, HttpStep, HttpStreamStep, RtspStep, Scenario, Step,
+    BodyMode, CaptureMode, CaptureStep, HttpStep, HttpStreamStep, LogStep, RtspStep, Scenario, Step,
 };
 use crate::server::{Binary, Launch, RTP_RANGE, Server};
 
@@ -46,6 +47,8 @@ struct Context<'a> {
     streams: HashMap<String, HttpStream>,
     /// Session and stream ids of closed RTSP connections.
     closed: HashMap<String, (Option<String>, Option<String>)>,
+    /// The fake OSCam log and how many of its lines are already recorded.
+    dvbapi: Option<(Log, usize)>,
     out: Vec<String>,
 }
 
@@ -102,11 +105,20 @@ pub fn run_once(
     let replay = replay(scenario, &capture)?;
     let workdir = options.workroot.join(&scenario.name).join(&binary.label);
     fs::create_dir_all(&workdir).map_err(|error| error.to_string())?;
+    let oscam = if scenario.oscam {
+        Some(FakeOscam::start().map_err(|error| format!("fake oscam: {error}"))?)
+    } else {
+        None
+    };
+    let mut args = scenario.args.clone();
+    if let Some(oscam) = &oscam {
+        args.extend(["-o".to_owned(), format!("127.0.0.1:{}", oscam.port)]);
+    }
     let launch = Launch {
         capture: &capture,
         adapters: scenario.adapters,
         bitrate: scenario.bitrate,
-        args: &scenario.args,
+        args: &args,
         html: &options.html,
         workdir: &workdir,
     };
@@ -122,6 +134,9 @@ pub fn run_once(
     for offset in 0..RTP_RANGE {
         norm.add_port(server.start_rtp + offset, &format!("SRTP+{offset}"))?;
     }
+    if let Some(oscam) = &oscam {
+        norm.add_port(oscam.port, "OSCAM")?;
+    }
     let mut context = Context {
         server: &server,
         replay,
@@ -130,6 +145,7 @@ pub fn run_once(
         udp: HashMap::new(),
         streams: HashMap::new(),
         closed: HashMap::new(),
+        dvbapi: oscam.map(|oscam| (oscam.log, 0)),
         out: vec![format!("# scenario {}", scenario.name)],
     };
     for (number, step) in scenario.steps.iter().enumerate() {
@@ -194,7 +210,41 @@ impl Context<'_> {
                 thread::sleep(Duration::from_millis(*ms));
                 Ok(())
             }
+            Step::Dvbapi(wait) => self.dvbapi(number, wait),
         }
+    }
+
+    /// Records the DVBAPI lines since the last step, up to the first one containing
+    /// `until`; later lines wait for the next step, so their timing stays out of the diff.
+    fn dvbapi(&mut self, number: usize, step: &LogStep) -> Result<(), String> {
+        let (log, cursor) = self.dvbapi.as_mut().ok_or("no fake oscam")?;
+        let deadline = Instant::now() + Duration::from_millis(step.timeout_ms);
+        let end = loop {
+            let found = {
+                let lines = log.lock().unwrap_or_else(|e| e.into_inner());
+                lines[*cursor..]
+                    .iter()
+                    .position(|line| line.contains(&step.until))
+                    .map(|offset| {
+                        (
+                            *cursor + offset + 1,
+                            lines[*cursor..*cursor + offset + 1].to_vec(),
+                        )
+                    })
+            };
+            if let Some(found) = found {
+                break found;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("dvbapi: no line with {:?}", step.until));
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        *cursor = end.0;
+        self.out
+            .push(format!("== {number} dvbapi until {}", step.until));
+        self.out.extend(end.1);
+        Ok(())
     }
 
     fn expand(&self, template: &str) -> String {
