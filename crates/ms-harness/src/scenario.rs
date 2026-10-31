@@ -32,6 +32,9 @@ pub struct Scenario {
     /// Part of the fast `cargo test` subset.
     #[serde(default)]
     pub fast: bool,
+    /// Starts a fake OSCam and adds `-o 127.0.0.1:<port>` (DVBAPI).
+    #[serde(default)]
+    pub oscam: bool,
     pub steps: Vec<Step>,
     #[serde(skip)]
     pub path: PathBuf,
@@ -64,6 +67,8 @@ pub enum Step {
     Close(String),
     /// Waits for the given number of milliseconds.
     Sleep(u64),
+    /// Records the fake OSCam log up to the next line containing `until`.
+    Dvbapi(LogStep),
 }
 
 fn value<T: DeserializeOwned, E: de::Error>(value: serde_yaml::Value) -> Result<T, E> {
@@ -86,6 +91,7 @@ impl<'de> Deserialize<'de> for Step {
             "silence" => Step::Silence(value(body)?),
             "close" => Step::Close(value(body)?),
             "sleep" => Step::Sleep(value(body)?),
+            "dvbapi" => Step::Dvbapi(value(body)?),
             other => return Err(de::Error::custom(format!("unknown step {other}"))),
         })
     }
@@ -176,6 +182,15 @@ pub enum CaptureMode {
     Sets,
 }
 
+/// Waits for a log line containing `until` and records the lines since the last step.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogStep {
+    pub until: String,
+    #[serde(default = "capture_timeout")]
+    pub timeout_ms: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SilenceStep {
@@ -237,6 +252,13 @@ impl Scenario {
                     return Err(format!("{}: file captures need mode: sets", path.display()));
                 }
             }
+        }
+        let dvbapi = scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::Dvbapi(_)));
+        if dvbapi && !scenario.oscam {
+            return Err(format!("{}: dvbapi steps need oscam: true", path.display()));
         }
         if scenario.adapters == 0 {
             return Err(format!("{}: adapters must be at least 1", path.display()));
@@ -302,6 +324,16 @@ steps:
         assert_eq!(scenario.adapters, 1);
         assert!(matches!(scenario.steps[0], Step::Udp(ref name) if name == "u1"));
         assert!(matches!(scenario.steps[3], Step::Sleep(10)));
+    }
+
+    #[test]
+    fn dvbapi_steps_need_the_fake_oscam() {
+        let steps = "steps: [{ dvbapi: { until: ca_pmt } }]\n";
+        let without = format!("name: d\ncapture: ca\n{steps}");
+        assert!(Scenario::parse(&without, Path::new("d.yaml")).is_err());
+        let with = format!("name: d\ncapture: ca\noscam: true\n{steps}");
+        let scenario = Scenario::parse(&with, Path::new("d.yaml")).expect("parse");
+        assert!(matches!(&scenario.steps[0], Step::Dvbapi(wait) if wait.until == "ca_pmt"));
     }
 
     #[test]

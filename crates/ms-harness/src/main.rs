@@ -22,7 +22,7 @@ usage:
                       (skipped without it; harness/scenarios-real uses them)
       -v              print transcripts of passing scenarios
   ms-harness show --bin BIN SCENARIO.yaml   print one transcript
-  ms-harness gen PROFILE OUT.ts             write a capture (fta, multi, pmtver)
+  ms-harness gen PROFILE OUT.ts             write a capture (fta, multi, pmtver, ca)
   ms-harness list [SCENARIO.yaml|DIR]...
 Scenarios default to harness/scenarios.";
 

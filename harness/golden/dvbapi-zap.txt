@@ -1,0 +1,44 @@
+# scenario dvbapi-zap
+== 2 rtsp c > SETUP rtsp://127.0.0.1:<RTSP>/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,256,257,258 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 1
+Server: minisatip/<VER>
+Transport: RTP/AVP;unicast;destination=127.0.0.1;source=127.0.0.1;client_port=<u1.rtp>-<u1.rtcp>;server_port=<SRTP+0>-<SRTP+1>
+Session: <SESSION1>;timeout=30
+com.ses.streamID: 1
+== 3 rtsp c > PLAY rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION1>
+CSeq: 2
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=1;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 4 dvbapi until ca_pmt
+connect
+client_info proto=2
+ca_pmt lm=ONLY sid=0001 cmd=1 desc=[83:00 84:0100 86:00 87:00 09:010001f1] es=[02:0101 03:0102]
+== 5 dvbapi until filter_data
+filter_data demux=0 filter=0 table=80 len=11
+== 6 rtsp c > PLAY rtsp://127.0.0.1:<RTSP>/stream=1?pids=0,512,513,514 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION1>
+CSeq: 3
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=1;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 7 dvbapi until ca_pmt
+ca_stop demux=255
+ca_pmt lm=ONLY sid=0002 cmd=1 desc=[83:00 84:0200 86:00 87:00 09:010001f2] es=[02:0201 03:0202]
+== 8 dvbapi until filter_data
+filter_data demux=0 filter=0 table=80 len=11
+== 9 rtsp c > TEARDOWN rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 4
+Server: minisatip/<VER>
+Session: <SESSION1>
+== 10 dvbapi until ca_stop
+ca_stop demux=255

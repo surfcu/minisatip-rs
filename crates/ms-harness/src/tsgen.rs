@@ -13,7 +13,9 @@ const ONID: u16 = 0x0001;
 const CYCLES: usize = 32;
 
 /// Names of the built-in capture profiles.
-pub const PROFILES: &[&str] = &["fta", "multi", "pmtver"];
+pub const PROFILES: &[&str] = &["fta", "multi", "pmtver", "ca"];
+/// CA system id of the `ca` profile.
+const CAID: u16 = 0x0100;
 
 struct Service {
     number: u16,
@@ -22,6 +24,8 @@ struct Service {
     name: &'static str,
     /// (stream_type, pid, packets per cycle)
     streams: Vec<(u8, u16, usize)>,
+    /// ECM PID announced by a program-level CA descriptor; the ES stays clear.
+    ecm_pid: Option<u16>,
 }
 
 /// Generates the capture for `profile`, or `None` for an unknown name.
@@ -30,6 +34,7 @@ pub fn generate(profile: &str) -> Option<Vec<u8>> {
         "fta" => Some(build(&[fta_service()], &[], false)),
         "multi" => Some(build(&multi_services(), &[(0x1ff, 1), (0x1fff, 1)], false)),
         "pmtver" => Some(build(&[fta_service()], &[], true)),
+        "ca" => Some(build(&ca_services(), &[], false)),
         _ => None,
     }
 }
@@ -41,6 +46,7 @@ fn fta_service() -> Service {
         pcr_pid: 0x101,
         name: "Harness One",
         streams: vec![(0x02, 0x101, 4), (0x03, 0x102, 1)],
+        ecm_pid: None,
     }
 }
 
@@ -52,6 +58,19 @@ fn multi_services() -> Vec<Service> {
             pcr_pid: 0x100 * n + 1,
             name: ["Harness One", "Harness Two", "Harness Three"][usize::from(n - 1)],
             streams: vec![(0x02, 0x100 * n + 1, 2), (0x03, 0x100 * n + 2, 1)],
+            ecm_pid: None,
+        })
+        .collect()
+}
+
+/// Three services with a CA descriptor each (ECM PIDs 0x1f1-0x1f3); the ES stays
+/// clear, as nulled scrambled packets would tie RTP counts to timing.
+fn ca_services() -> Vec<Service> {
+    multi_services()
+        .into_iter()
+        .map(|service| Service {
+            ecm_pid: Some(0x1f0 + service.number),
+            ..service
         })
         .collect()
 }
@@ -79,6 +98,13 @@ fn build(services: &[Service], extra: &[(u16, usize)], pmt_change: bool) -> Vec<
         }
         if cycle % 2 == 0 {
             push_psi(&mut out, &mut cc, &mut index, 0x11, &sdt);
+        }
+        for service in services {
+            if let Some(pid) = service.ecm_pid {
+                // Short ECM section, table 0x80, 8 bytes of payload.
+                let ecm = [0x80, 0x70, 0x08, 1, 2, 3, 4, 5, 6, 7, service.number as u8];
+                push_psi(&mut out, &mut cc, &mut index, pid, &ecm);
+            }
         }
         for service in services {
             let mut streams = service.streams.clone();
@@ -164,7 +190,15 @@ fn pat_section(services: &[Service]) -> Vec<u8> {
 fn pmt_section(service: &Service, streams: &[(u8, u16, usize)], version: u8) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&(0xe000 | service.pcr_pid).to_be_bytes());
-    body.extend_from_slice(&0xf000u16.to_be_bytes());
+    match service.ecm_pid {
+        Some(ecm) => {
+            body.extend_from_slice(&0xf006u16.to_be_bytes());
+            body.extend_from_slice(&[0x09, 4]);
+            body.extend_from_slice(&CAID.to_be_bytes());
+            body.extend_from_slice(&(0xe000 | ecm).to_be_bytes());
+        }
+        None => body.extend_from_slice(&0xf000u16.to_be_bytes()),
+    }
     for &(stream_type, pid, _) in streams {
         body.push(stream_type);
         body.extend_from_slice(&(0xe000 | pid).to_be_bytes());
