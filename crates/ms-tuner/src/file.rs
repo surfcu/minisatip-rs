@@ -45,6 +45,27 @@ impl Default for FileReplayConfig {
     }
 }
 
+/// Status of a replay adapter: the C++ replay patch (harness/cpp-replay.patch,
+/// `replay_open`) sets strength 255, snr 15 and `FE_HAS_LOCK`, with no dB SNR.
+const REPLAY_STATUS: SignalStatus = SignalStatus {
+    locked: true,
+    strength: 255,
+    snr: 15,
+    ber: 0,
+    db: SignalStatus::DB_UNKNOWN,
+    status_valid: true,
+};
+
+/// Replay status after a tune (adapter.cpp:1092-1097): no valid status, zero strength and SNR.
+const REPLAY_TUNED_STATUS: SignalStatus = SignalStatus {
+    locked: false,
+    strength: 0,
+    snr: 0,
+    ber: 0,
+    db: SignalStatus::DB_UNKNOWN,
+    status_valid: false,
+};
+
 /// Replays a TS file, recording tune parameters and filtering by PID.
 pub struct FileReplayTuner {
     file: File,
@@ -70,7 +91,7 @@ impl FileReplayTuner {
             config,
             pids: PidSet::new(),
             last_tune: None,
-            status: SignalStatus::default(),
+            status: REPLAY_STATUS,
             pacing_start: None,
             pacing_bytes: 0,
             last_pcr: None,
@@ -154,6 +175,10 @@ impl FileReplayTuner {
 impl Tuner for FileReplayTuner {
     fn tune(&mut self, params: &TuneParams) -> Result<()> {
         self.last_tune = Some(params.clone());
+        // adapter.cpp:1092-1097: the first tune resets the status to -1 with
+        // strength and snr 0. The replay adapter has no get_signal (the patch sets
+        // it NULL), so nothing sets the reading again.
+        self.status = REPLAY_TUNED_STATUS;
         Ok(())
     }
 

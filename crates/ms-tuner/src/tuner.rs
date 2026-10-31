@@ -301,6 +301,11 @@ pub struct SignalStatus {
     pub snr: u16,
     /// Bit error rate (`ber`), 0 when the backend does not report it.
     pub ber: u32,
+    /// SNR in dB (`ad->db`); [`SignalStatus::DB_UNKNOWN`] when not measured.
+    pub db: u16,
+    /// `ad->status >= 0`: `false` until a status is read after a tune. The
+    /// SAT>IP DESCRIBE then prints the `255,1,15` placeholder (adapter.cpp:1471).
+    pub status_valid: bool,
 }
 
 impl Default for SignalStatus {
@@ -310,11 +315,16 @@ impl Default for SignalStatus {
             strength: 255,
             snr: 255,
             ber: 0,
+            db: Self::DB_UNKNOWN,
+            status_valid: true,
         }
     }
 }
 
 impl SignalStatus {
+    /// C++ `MAX_DB` (adapter.h:33): the `ad->db` value before a measurement.
+    pub const DB_UNKNOWN: u16 = 65535;
+
     /// Creates a locked status with explicit strength and SNR.
     pub fn locked(strength: u16, snr: u16) -> Self {
         Self {
@@ -322,6 +332,8 @@ impl SignalStatus {
             strength,
             snr,
             ber: 0,
+            db: Self::DB_UNKNOWN,
+            status_valid: true,
         }
     }
 }

@@ -257,6 +257,8 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
             strength: self.state.strength,
             snr: self.state.snr,
             ber: self.state.ber,
+            db: self.state.db,
+            status_valid: self.state.status_valid,
         };
     }
 }
@@ -542,7 +544,10 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
         if ret < 0 {
             return Err(TunerError::Backend(ret));
         }
-        self.status = SignalStatus::default();
+        self.status = SignalStatus {
+            status_valid: false,
+            ..SignalStatus::default()
+        };
         // Sections of the previous transponder are not delivered after a retune.
         self.psi.clear();
         Ok(())

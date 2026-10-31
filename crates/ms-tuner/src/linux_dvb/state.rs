@@ -31,6 +31,8 @@ pub struct AdapterState {
     /// Master adapter id, `-1` when independent.
     pub master_source: i32,
     pub status: i32,
+    /// `ad->status >= 0`: a status has been read since the last tune (dvb.cpp:2356).
+    pub status_valid: bool,
     pub ber: u32,
     pub strength: u16,
     pub snr: u16,
@@ -65,6 +67,7 @@ impl Default for AdapterState {
             sid_cnt: 0,
             master_source: -1,
             status: 0,
+            status_valid: false,
             ber: 0,
             strength: 0,
             snr: 0,
@@ -147,6 +150,8 @@ impl AdapterState {
         self.new_gs = SIGNAL_UNPROBED;
         self.lock_retry_armed = false;
         self.lock_retries = 0;
+        // adapter.cpp:1092: a tune sets ad->status to -1 until a status is read.
+        self.status_valid = false;
         if self.fe < 0 {
             return -500;
         }
@@ -437,6 +442,7 @@ impl AdapterState {
         self.db = raw.db;
         if status_valid {
             self.status = status;
+            self.status_valid = true;
         }
         self.ber = raw.ber;
 

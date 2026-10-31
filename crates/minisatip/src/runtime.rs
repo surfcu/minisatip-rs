@@ -241,6 +241,7 @@ impl Runtime {
         identity: SharedIdentity,
     ) -> Result<Self, String> {
         let mut scheduler = Scheduler::new();
+        apply_enabled_adapters(&mut scheduler, opts);
         // Any `-A` entry enables virtual DiSEqC (adapter.cpp:1816).
         scheduler.set_absolute_switch(!opts.absolute_sources.is_empty());
         scheduler.set_pmt_scan(opts.pmt_scan != 0);
@@ -1171,6 +1172,9 @@ impl Runtime {
                     ms_net::dataplane::Event::ContinuityErrors(errors) => {
                         self.session.set_adapter_ccerr(aid, errors);
                     }
+                    ms_net::dataplane::Event::Signal(signal) => {
+                        self.session.set_adapter_signal(aid, signal);
+                    }
                     ms_net::dataplane::Event::TablePackets {
                         generation,
                         packets,
@@ -1580,6 +1584,24 @@ fn adapter_ids(opts: &Options) -> Vec<usize> {
         .collect()
 }
 
+/// `enable_adapters` (adapter.cpp:1626-1646): with `-e`, every slot not listed
+/// is disabled, including slots without hardware, so `ad_disabled` and the
+/// allocator both see it. Without `-e` no slot is disabled.
+fn apply_enabled_adapters(scheduler: &mut Scheduler, opts: &Options) {
+    let Some(selected) = opts.enabled_adapters.as_deref() else {
+        return;
+    };
+    for aid in 0..MAX_ADAPTERS {
+        scheduler.set_disabled(aid, !selected.contains(&(aid as u8)));
+    }
+}
+
+/// `ad->pa` and `ad->fn` from the `/dev/dvb/adapterN/frontendM` path (dvb.cpp:2418).
+fn set_phy_numbers(config: &mut AdapterConfig, path_adapter: u32, path_frontend: u32) {
+    config.phy_adapter = i32::try_from(path_adapter).unwrap_or(-1);
+    config.phy_frontend = i32::try_from(path_frontend).unwrap_or(-1);
+}
+
 fn adapter_config() -> AdapterConfig {
     let mut config = AdapterConfig {
         enabled: true,
@@ -1767,12 +1789,10 @@ fn spawn_dvb_adapters(
             .enabled_adapters
             .as_ref()
             .is_none_or(|list| list.contains(&(aid as u8)));
-        if !selected {
-            scheduler.set_disabled(aid, true);
-        }
         let diseqc = diseqc_params(opts, aid);
         let mut config = dvb_adapter_config(opts, aid, &frontend.systems, &diseqc);
         config.enabled = selected;
+        set_phy_numbers(&mut config, frontend.path_adapter, frontend.path_frontend);
         let bridge: Box<dyn AdapterTuner> = if selected {
             match LinuxDvbTuner::open_for_adapter(
                 aid as i32,
@@ -1897,11 +1917,13 @@ fn spawn_ddci_adapters(
         // The CAM output is read without client streams (ddci_read_sec_data).
         handle.send(Command::KeepReading(true));
         let bridge = DataPlaneTuner::new(handle.command_sender());
-        let config = AdapterConfig {
+        let mut config = AdapterConfig {
             enabled: true,
             adapter_type: ms_sched::AdapterType::Ci,
             ..AdapterConfig::default()
         };
+        // ddci.cpp:1664-1665 sets ad->pa and ad->fn for each CI device.
+        set_phy_numbers(&mut config, node.pa, node.fe);
         scheduler.add_adapter(aid, config, Box::new(bridge));
         handles[aid] = Some(handle);
         scheduler.post_tune_adapter(aid);
@@ -2578,5 +2600,43 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             "--bind-dev must resolve to its IPv4 address"
         );
+    }
+
+    struct NoopTuner;
+
+    impl AdapterTuner for NoopTuner {
+        fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+            Ok(())
+        }
+    }
+
+    // adapter.cpp:1626-1646 and ad_disabled: without -e nothing is disabled; with
+    // -e every slot not listed is disabled, including slots with no adapter.
+    #[test]
+    fn enabled_list_disables_every_unlisted_slot() {
+        let mut scheduler = Scheduler::new();
+        scheduler.add_adapter(0, AdapterConfig::default(), Box::new(NoopTuner));
+        apply_enabled_adapters(&mut scheduler, &Options::default());
+        assert!(!scheduler.is_disabled(0));
+        assert!(!scheduler.is_disabled(5), "no -e disables nothing");
+
+        let opts = Options {
+            enabled_adapters: Some(vec![0, 1]),
+            ..Options::default()
+        };
+        apply_enabled_adapters(&mut scheduler, &opts);
+        assert!(!scheduler.is_disabled(0));
+        assert!(!scheduler.is_disabled(1), "listed slot without hardware");
+        assert!(scheduler.is_disabled(2), "unlisted slot");
+        assert!(scheduler.is_disabled(99), "every slot up to MAX_ADAPTERS");
+    }
+
+    // dvb.cpp:2418: ad->pa and ad->fn are the /dev/dvb/adapterN/frontendM numbers.
+    #[test]
+    fn dvb_frontend_numbers_become_phy_adapter_and_frontend() {
+        let mut config = AdapterConfig::default();
+        assert_eq!((config.phy_adapter, config.phy_frontend), (0, 0));
+        set_phy_numbers(&mut config, 3, 1);
+        assert_eq!((config.phy_adapter, config.phy_frontend), (3, 1));
     }
 }
