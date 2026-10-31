@@ -332,14 +332,15 @@ Unvalidated rows must be called out in release notes.
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).
   - M9: `test_utils.cpp` (12 tests) not ported; 7-day soak running since
-    2026-10-25 14:30:15 +03 on the main box (see "Soak"); resource comparison.
+    2026-10-31 16:04:56 +03 on the main box (see "Soak"); resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - Soak with evidence: the 7-day soak runs on the main box with the `diag-log`
-    build in plain CI since 2026-10-25 14:30 +03 (see "Soak" below); the enigma2 box runs the
-    armv7 `diag-log` build since 2026-10-25 07:08 (its 12 h validation is pending).
+  - Soak with evidence: the 7-day soak runs on the main box (`diag-log` build, plain
+    CI) since 2026-10-31 16:04:56 +03 (see "Soak" below); the enigma2 box runs the
+    armv7 `diag-log` build since 2026-10-25 09:08 +03 and passed its 12 h validation
+    (see "Logging ... Part B").
   - Port `test_utils.cpp`; CA scenarios in the harness (#36); the SAT>IP adapter type
     on the status page.
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
@@ -360,27 +361,45 @@ Unvalidated rows must be called out in release notes.
   recorder (`--log-ring`, `GET /debug/log`) and a 60 s heartbeat. x86_64, 60 Mbit/s
   HTTP `pids=all` replay of the FTA and the scrambled capture (no key loaded): 4.25-4.45% of one core in the default build, at most +0.12
   points with the ring and the sink; RSS +1.4 MB with the sink; about 5 event lines
-  per minute on an idle replay (heartbeat, session, tune, lock). armv7: Phase 3.
-- **Soak (M9), restarted 2026-10-25 14:30:15 +03 on the main box in plain CI:** git
-  `752c02b` (code as `86464d4`), static x86_64 musl with feature `diag-log` (no
-  `ci-plus`, so the slot forces plain CI). The 13:53 start with `ci-plus-vendored` was
+  per minute on an idle replay (heartbeat, session, tune, lock).
+  - armv7 (enigma2 box, `-E -c 0:*2 -F` with `--log-max-size 5000000` and
+    `--log-remote`), 12 h from 2026-10-25 09:08 +03: one process, no restart and no
+    panic; 719 heartbeats, max gap 60 s (none over 180 s), `sink_dropped` and
+    `sink_queue` 0, no "dropped N lines"; RSS about 6.5 MB in the first hour and
+    9.4-9.7 MB in the last four (it rose with 1-2 streams and stayed flat when idle).
+    No error, fail or timeout log lines, as with the previous `-g` build (6 lines in
+    24 h in total, none matching); the only matches are 238 `cc_errors` events.
+    Events: about 890 `cam_state` per hour (10718 in 12 h), from the 15 s command
+    watchdog resetting the two empty CI slots as in C++ (ca.cpp:3679-3693), plus 60
+    heartbeats and the stream events. The -F file reached 2.2 MB, so it did not
+    rotate.
+- **Soak (M9), restarted 2026-10-31 16:04:56 +03 on the main box in plain CI:** the
+  run started 2026-10-25 14:30:15 +03 was stopped at about 16:36 +03, when the main
+  box's tuner card overheated (I2C errors, tuners stuck), and the 16:49 driver reload
+  restarted minisatip-rs. The planned Friday 2026-10-30 start was skipped (the box was
+  rebooted and ran C++ minisatip on purpose). The new run uses the same build and
+  command line (binary sha `51ebd46d`, banner compile time Oct 25 09:18:47; the remote
+  sink connected and both slots log "using plain CI"), and the load generator started
+  with it, cut to at most 2 busy main-box tuners (all clients) and no exhaustion run.
+  The build: git `752c02b` (code as `86464d4`), static x86_64 musl with feature
+  `diag-log` (no `ci-plus`, so the slot forces plain CI). The 13:53 start with `ci-plus-vendored` was
   ended after 37 min, when plain CI was chosen for the soak: in CI+ mode a CAM MMI error
   message leaves the CAM blocked until a restart, while plain CI recovers by itself (#63). Command line
   `/usr/local/bin/minisatip-rs -f -c 8:**2 -d *:*1-0 -R /usr/src/minisatip/html -l pmt,ca,ddci
   --log-remote tcp://<logging host>:6514`. The soak started 2026-10-24 02:37 was ended
   for the 13:53 start; it had in fact already been restarted by the later deploys
   (#54, the CI+ test build, two restarts to clear a CAM error message).
-  - Load: a load generator on the logging host opens streams through tvheadend's
-    HTTP API: 2-3 long steady streams (FTA and scrambled), channel zapping every
-    30-120 s (scrambled changes at least 30 s apart), leave-and-return on a
-    scrambled service, up to 3 parallel scrambled services (the CAM's limit),
-    FTA streams spread over both boxes, an exhaustion run at most every
-    6 h (100 s with more streams than tuners), and quiet hours 00:00-07:00 with one
-    steady stream and one idle hour. While another client is subscribed or a
-    recording starts within 10 min, it runs steady streams only (at most 3 loadgen
-    streams on the main box; enigma2 streams do not count). Every
-    stream is checked with TSDuck (CC errors, bitrate, time to first packet and to
-    clear picture).
+  - Load (full load of the 2026-10-25 run; this run is reduced as above): a load
+    generator on the logging host opens streams through tvheadend's HTTP API: 2-3 long
+    steady streams (FTA and scrambled), channel zapping every 30-120 s (scrambled
+    changes at least 30 s apart), leave-and-return on a scrambled service, up to 3
+    parallel scrambled services (the CAM's limit), FTA streams spread over both boxes,
+    an exhaustion run at most every 6 h (100 s with more streams than tuners), and
+    quiet hours 00:00-07:00 with one steady stream and one idle hour. While another
+    client is subscribed or a recording starts within 10 min, it runs steady streams
+    only (at most 3 loadgen streams on the main box; enigma2 streams do not count).
+    Every stream is checked with TSDuck (CC errors, bitrate, time to first packet and
+    to clear picture).
   - tvheadend adapter priorities (higher first): main #1 6, enigma2 #1 5, main #2 4,
     enigma2 #2 3, main #3-#8 2.
   - Evidence: heartbeats, events and panics in Loki, a soak dashboard and a daily
