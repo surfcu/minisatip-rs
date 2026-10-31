@@ -186,7 +186,8 @@ impl Server {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no ad_type end"))?;
         Ok(text[start..end]
             .split(',')
-            .filter(|value| value.trim() == "1")
+            // ADAPTER_SATIP (satipc.cpp:2027).
+            .filter(|value| value.trim() == "2")
             .count())
     }
 }

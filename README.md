@@ -43,8 +43,6 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   C++ only by the ported unit tests and by the real-CAM check.
 - The runtime drives `ms_ca::CaDevice` directly; the `Reconciler` and its policies
   are covered by tests only, so there are no alternative CA policies yet.
-- SAT>IP client adapters report `ad_type` 1 on the status page, which scales
-  their SNR as DVB (DEV-053).
 - Netceiver is parked (PLAN §3): the `ms-tuner` backend exists but the binary does
   not use it, and `-n` is an unknown option, as in a C++ build without NETCVCLIENT.
 

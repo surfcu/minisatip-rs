@@ -328,9 +328,8 @@ Unvalidated rows must be called out in release notes.
     `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
   - M7: APDU diff with the fake CAM needs the same CA harness scenarios; the real CAM
     works through the CI path.
-  - M8: satipc against a real SAT>IP server. Status API: SAT>IP client adapters
-    report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
-    instead of /0.15).
+  - M8: satipc against a real SAT>IP server. SAT>IP client adapters report `ad_type` 2
+    (`ADAPTER_SATIP`, DEV-053), so the status page scales their SNR as C++ does.
   - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); 7-day soak running since
     2026-10-31 16:04:56 +03 on the main box (see "Soak"); resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
@@ -341,8 +340,7 @@ Unvalidated rows must be called out in release notes.
     CI) since 2026-10-31 16:04:56 +03 (see "Soak" below); the enigma2 box runs the
     armv7 `diag-log` build since 2026-10-25 09:08 +03 and passed its 12 h validation
     (see "Logging ... Part B").
-  - CA scenarios in the harness (#36); the SAT>IP adapter type
-    on the status page.
+  - CA scenarios in the harness (#36).
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
     is in that box.
   - Resource comparison; finish the soak.
