@@ -186,6 +186,5 @@ digit run; `body: length` keeps only the length and an FNV-1a hash.
 
 ## Known difference
 
-`http-state` fails C++-vs-Rust only on `/state.json`: Rust emits the M3 symbol
-subset and different absent values, which is DEV-051 and arrives with later
-milestones. Rust-vs-Rust and C++-vs-C++ are green for all fifteen scenarios.
+None at present: all twenty-one scenarios pass C++-vs-Rust against `harness/golden`,
+Rust-vs-Rust and C++-vs-C++ (with the reference built from the current patch).
