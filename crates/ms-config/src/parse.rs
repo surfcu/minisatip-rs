@@ -1852,3 +1852,45 @@ fn truncate_bytes(text: &str, max: usize) -> &str {
     }
     &text[..end]
 }
+
+#[cfg(test)]
+mod ported_test_utils {
+    use super::{LOG_LEVELS, log_level};
+
+    // Ported from tests/test_utils.cpp:166 (test_check_strs): `log_level` is
+    // check_strs over the -l names, with None for the default -1.
+    #[test]
+    fn test_check_strs() {
+        assert_eq!(log_level(LOG_LEVELS[1]), Some(1), "Expected index 1");
+        assert_eq!(log_level(LOG_LEVELS[2]), Some(2), "Expected index 2");
+        assert_eq!(log_level("invalid"), None, "Expected default -1");
+    }
+
+    // Ported from tests/test_utils.cpp:135 (test_strip), through check_strs,
+    // which matches the stripped term as a prefix of a name.
+    #[test]
+    fn test_strip() {
+        let leading = format!("  {}", LOG_LEVELS[1]);
+        assert_eq!(
+            log_level(&leading),
+            Some(1),
+            "Expected leading spaces stripped"
+        );
+        let trailing = format!("{}  ", LOG_LEVELS[1]);
+        assert_eq!(
+            log_level(&trailing),
+            None,
+            "Expected trailing spaces not stripped"
+        );
+        assert_eq!(
+            log_level("   "),
+            None,
+            "Expected empty string view for all spaces"
+        );
+        assert_eq!(
+            log_level(""),
+            None,
+            "Expected empty string view for empty input"
+        );
+    }
+}

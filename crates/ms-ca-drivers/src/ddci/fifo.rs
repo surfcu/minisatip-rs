@@ -72,3 +72,24 @@ impl Fifo {
         n
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Fifo;
+
+    // Ported from tests/test_utils.cpp:76 (test_fifo, f3); the push cases test
+    // the output FIFO in ms-net (tests/ported_test_utils.rs).
+    #[test]
+    fn test_fifo_pop_offset() {
+        let mut f3 = Fifo::new(100);
+        f3.push(&[0u8; 50]);
+        let mut offset = 30;
+        let mut out = [0u8; 50];
+        assert_eq!(
+            f3.pop_offset(&mut out, &mut offset, 0),
+            20,
+            "Expected fifo_pop_offset to cap to write_index - offset (20 bytes)"
+        );
+        assert_eq!(offset, 50, "Expected offset to advance to write_index (50)");
+    }
+}
