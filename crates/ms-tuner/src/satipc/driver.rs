@@ -952,8 +952,11 @@ impl Tuner for SatipcTuner {
             locked: client.status,
             strength: u16::try_from(client.strength.clamp(0, 255)).unwrap_or(0),
             snr: u16::try_from(client.snr.clamp(0, 255)).unwrap_or(0),
-            // SAT>IP status carries no BER.
+            // SAT>IP status carries no BER or dB SNR (ad->db stays MAX_DB).
             ber: 0,
+            db: SignalStatus::DB_UNKNOWN,
+            // satipc.cpp:620: `ad->status` is set from every server signal report.
+            status_valid: true,
         }
     }
 

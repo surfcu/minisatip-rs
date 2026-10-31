@@ -338,6 +338,9 @@ impl<A: McliReceiverApi> Tuner for NetceiverTuner<A> {
             strength: s.strength,
             snr: s.snr,
             ber: s.ber,
+            // The netceiver feed carries no dB SNR (ad->db stays MAX_DB).
+            db: SignalStatus::DB_UNKNOWN,
+            status_valid: true,
         }
     }
 

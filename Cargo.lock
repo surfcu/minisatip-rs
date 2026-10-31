@@ -53,7 +53,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "gen-charset"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "hashbrown"
@@ -85,7 +85,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "minisatip"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ms-ca",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "ms-ca"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ms-log",
  "ms-psi",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "ms-ca-drivers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ms-ca",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "ms-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ms-log",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "ms-fakecam"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ms-ts",
  "openssl",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "ms-harness"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ms-fakecam",
  "serde",
@@ -152,11 +152,11 @@ dependencies = [
 
 [[package]]
 name = "ms-log"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "ms-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ms-log",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "ms-psi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ms-log",
  "ms-ts",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "ms-sched"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ms-ca",
  "ms-log",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "ms-srt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ms-log",
@@ -194,14 +194,14 @@ dependencies = [
 
 [[package]]
 name = "ms-ts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ms-log",
 ]
 
 [[package]]
 name = "ms-tuner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ms-log",

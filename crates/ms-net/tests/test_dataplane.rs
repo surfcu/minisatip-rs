@@ -414,6 +414,8 @@ impl Tuner for ScriptedTuner {
             strength: 255,
             snr: 15,
             ber: 0,
+            db: SignalStatus::DB_UNKNOWN,
+            status_valid: true,
         }
     }
 

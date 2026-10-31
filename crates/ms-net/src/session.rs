@@ -5,7 +5,7 @@
 
 use ms_sched::pmt::PmtState as SchedPmtState;
 use ms_sched::{AdapterType, MAX_ADAPTERS, Scheduler, SetParamsError, StreamId, TuneError};
-use ms_tuner::{DeliverySystem, PID_ALL, Polarization, TuneParams};
+use ms_tuner::{DeliverySystem, PID_ALL, Polarization, SignalStatus, TuneParams};
 use std::collections::HashMap;
 use std::io;
 use std::net::UdpSocket;
@@ -246,6 +246,10 @@ pub struct SessionManager {
     clock: Arc<dyn Clock>,
     server_timeout_ms: u32,
     adapter_ccerr: Vec<u64>,
+    /// Last frontend reading per adapter, pushed by the data plane; `None` after a tune.
+    adapter_signal: Vec<Option<SignalStatus>>,
+    /// Last `ad->ber` per adapter; C++ never resets it, so a tune keeps it.
+    adapter_ber: Vec<u32>,
     web: Option<WebService>,
     web_runtime: RuntimeState,
     /// `ca_sym` slots, pushed by the CA runtime.
@@ -294,6 +298,8 @@ impl SessionManager {
             clock,
             server_timeout_ms: DEFAULT_TIMEOUT_MS,
             adapter_ccerr: vec![0; MAX_ADAPTERS],
+            adapter_signal: vec![None; MAX_ADAPTERS],
+            adapter_ber: vec![0; MAX_ADAPTERS],
             web: None,
             web_runtime: RuntimeState::default(),
             web_ca: Vec::new(),
@@ -450,6 +456,18 @@ impl SessionManager {
     pub fn set_adapter_ccerr(&mut self, adapter: usize, errors: u64) {
         if let Some(slot) = self.adapter_ccerr.get_mut(adapter) {
             *slot = errors;
+        }
+    }
+
+    /// Records the frontend reading of one adapter (`None` clears it after a tune).
+    pub fn set_adapter_signal(&mut self, adapter: usize, signal: Option<SignalStatus>) {
+        if let Some(signal) = signal
+            && let Some(ber) = self.adapter_ber.get_mut(adapter)
+        {
+            *ber = signal.ber;
+        }
+        if let Some(slot) = self.adapter_signal.get_mut(adapter) {
+            *slot = signal;
         }
     }
 
@@ -764,6 +782,13 @@ impl SessionManager {
         }
 
         let outcome = self.sched.tune(adapter, id);
+        // adapter.cpp:1086-1097: only a real retune resets the reading; the data
+        // plane's `Signal(None)` follows the same tune.
+        if outcome.tuned
+            && let Ok(index) = usize::try_from(adapter)
+        {
+            self.set_adapter_signal(index, None);
+        }
         for close in &outcome.close_streams {
             self.disable_stream(*close);
         }
@@ -1235,8 +1260,16 @@ impl SessionManager {
             Some(adapter) if use_ad => &adapter.params,
             _ => &stream.params,
         };
-        // No signal source yet: print the C++ values for a tuner without status.
-        let (strength, status, snr) = (255, 1, 15);
+        // adapter.cpp:1471-1487: the live reading when the adapter is in use;
+        // without one (`ad->status < 0`) the placeholder 255,1,15.
+        let signal = if use_ad {
+            usize::try_from(aid)
+                .ok()
+                .and_then(|index| self.adapter_signal.get(index).copied().flatten())
+        } else {
+            None
+        };
+        let (strength, status, snr) = crate::describe::signal_fields(signal);
         let tuner = adapter
             .and_then(|adapter| adapter.params.fe)
             .filter(|fe| *fe > 0)
@@ -1385,6 +1418,18 @@ impl SessionManager {
             };
             let params = &adapter.params;
             let tuned = params.freq > 0 || adapter.master_sid >= 0;
+            // adapter.cpp:440-443 and 1092-1097: strength and snr are 0 and db is
+            // MAX_DB until a reading; a slot that was never initialised keeps db 0.
+            let reading = if tuned {
+                self.adapter_signal.get(aid).copied().flatten()
+            } else {
+                None
+            };
+            let (strength, snr, db) = match reading {
+                Some(signal) => (signal.strength, signal.snr, signal.db),
+                None => (0, 0, SignalStatus::DB_UNKNOWN),
+            };
+            let ber = self.adapter_ber.get(aid).copied().unwrap_or(0);
             snapshot.adapters[aid] = AdapterState {
                 present: true,
                 enabled: adapter.config.enabled,
@@ -1429,6 +1474,12 @@ impl SessionManager {
                     .unwrap_or(0)
                     .min(i32::MAX as u64) as i32,
                 decerr: self.web_decerr.get(aid).copied().unwrap_or(0),
+                strength,
+                snr,
+                db,
+                ber,
+                phy_adapter: adapter.config.phy_adapter,
+                phy_frontend: adapter.config.phy_frontend,
                 pmts: self
                     .sched
                     .active_pmt_ids(aid)

@@ -151,6 +151,8 @@ pub struct TuneOutcome {
     pub result: Result<(), TuneError>,
     /// Streams that must be closed after a master retune.
     pub close_streams: Vec<StreamId>,
+    /// The hardware was retuned (`adapter.cpp:1086-1097` resets the reading only then).
+    pub tuned: bool,
 }
 
 /// Minimal tuner interface needed by the scheduler; hardware lives in M4.
@@ -243,6 +245,10 @@ pub struct AdapterConfig {
     pub max_pids: i32,
     /// Adapter kind; CI adapters accept DDCI's PID subscriptions.
     pub adapter_type: AdapterType,
+    /// `/dev/dvb/adapterN` number (`ad->pa`, `ad_phyad`); 0 when not a DVB device.
+    pub phy_adapter: i32,
+    /// `frontendM` number (`ad->fn`, `ad_phyfd`); 0 when not a DVB device.
+    pub phy_frontend: i32,
 }
 
 impl Default for AdapterConfig {
@@ -257,6 +263,8 @@ impl Default for AdapterConfig {
             lnb_circular: 10_750_000,
             max_pids: 0,
             adapter_type: AdapterType::Unknown,
+            phy_adapter: 0,
+            phy_frontend: 0,
         }
     }
 }
@@ -561,19 +569,24 @@ impl Scheduler {
     }
 
     fn init_hw(&mut self, index: usize) -> bool {
-        if index >= MAX_ADAPTERS || self.disabled[index] {
+        if index >= MAX_ADAPTERS {
             return false;
         }
         let Some(adapter) = self.adapters[index].as_mut() else {
             return false;
         };
-        if !adapter.config.enabled {
-            adapter.config.enabled = true;
-            adapter.master_sid = -1;
-            adapter.sid_cnt = 0;
-            adapter.params = TuneParams::default();
-            adapter.attached.clear();
+        // adapter.cpp:262-264: an enabled adapter succeeds before the disabled check.
+        if adapter.config.enabled {
+            return true;
         }
+        if self.disabled[index] {
+            return false;
+        }
+        adapter.config.enabled = true;
+        adapter.master_sid = -1;
+        adapter.sid_cnt = 0;
+        adapter.params = TuneParams::default();
+        adapter.attached.clear();
         true
     }
 
@@ -1097,15 +1110,18 @@ impl Scheduler {
             return TuneOutcome {
                 result: Err(TuneError::Hardware),
                 close_streams,
+                tuned: false,
             };
         };
         let Some(adapter) = self.enabled_adapter(aid) else {
             return TuneOutcome {
                 result: Err(TuneError::Hardware),
                 close_streams,
+                tuned: false,
             };
         };
         let mut result = Ok(());
+        let mut tuned = false;
         if adapter.master_sid == sid && adapter.do_tune {
             let params = adapter.params.clone();
             let config = adapter.config.clone();
@@ -1142,6 +1158,7 @@ impl Scheduler {
                     master.old_diseqc = diseqc;
                 }
             }
+            tuned = true;
             if let Some(adapter) = self.adapters[index].as_mut() {
                 result = adapter.tuner.tune(&params);
             }
@@ -1183,6 +1200,7 @@ impl Scheduler {
         TuneOutcome {
             result,
             close_streams,
+            tuned,
         }
     }
 
@@ -1621,6 +1639,54 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    // adapter.cpp:262-264: an enabled adapter succeeds before the -e check, so a
+    // disabled slot that is already open (for example a CI adapter) still initialises.
+    #[test]
+    fn init_hw_checks_enabled_before_disabled() {
+        struct Nop;
+        impl AdapterTuner for Nop {
+            fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+                Ok(())
+            }
+        }
+        let mut sched = Scheduler::new();
+        sched.add_adapter(0, AdapterConfig::new(DeliverySystem::DvbS2), Box::new(Nop));
+        sched.set_disabled(0, true);
+        assert!(
+            sched.init_hw(0),
+            "an enabled adapter is already initialised"
+        );
+
+        sched.add_adapter(1, AdapterConfig::default(), Box::new(Nop));
+        sched.set_disabled(1, true);
+        assert!(!sched.init_hw(1), "a disabled, closed slot does not open");
+    }
+
+    // adapter.cpp:1092-1097 resets the reading whatever the tune returns, so a
+    // failed hardware tune still counts as a retune.
+    #[test]
+    fn a_failed_hardware_tune_still_counts_as_a_retune() {
+        struct Failing;
+        impl AdapterTuner for Failing {
+            fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+                Err(TuneError::Hardware)
+            }
+        }
+        let mut sched = Scheduler::new();
+        sched.add_adapter(
+            0,
+            AdapterConfig::new(DeliverySystem::DvbS2),
+            Box::new(Failing),
+        );
+        // A pending tune for stream 0 (the master), as PLAY sets it up.
+        let adapter = sched.adapter_mut(0).expect("adapter exists");
+        adapter.master_sid = 0;
+        adapter.do_tune = true;
+        let outcome = sched.tune(0, 0);
+        assert!(outcome.tuned, "the hardware was called");
+        assert!(outcome.result.is_err());
+    }
 
     struct OkTuner;
 

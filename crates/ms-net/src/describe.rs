@@ -22,14 +22,12 @@ pub struct DescribeInput<'a> {
     pub pids: &'a PidSet,
 }
 
-/// Formats the `ver=...;tuner=...;pids=...` string exactly as C++.
-pub fn describe_adapter(input: &DescribeInput<'_>) -> String {
-    let t = input.tune;
-    let aid = input.adapter_id.max(0);
+/// `(strength, status, snr)` as `describe_adapter` prints them (adapter.cpp:1471-1487).
+/// `None`, or a reading whose status is not valid, is `ad->status < 0`: the
+/// placeholder `255,1,15`.
+pub fn signal_fields(signal: Option<SignalStatus>) -> (i32, i32, i32) {
     let (mut strength, mut status, mut snr) = (255i32, 1i32, 15i32);
-    if input.use_adapter
-        && let Some(signal) = input.signal
-    {
+    if let Some(signal) = signal.filter(|signal| signal.status_valid) {
         strength = i32::from(signal.strength);
         snr = i32::from(signal.snr);
         if snr > 15 {
@@ -43,6 +41,19 @@ pub fn describe_adapter(input: &DescribeInput<'_>) -> String {
             snr = 1;
         }
     }
+    (strength, status, snr)
+}
+
+/// Formats the `ver=...;tuner=...;pids=...` string exactly as C++.
+pub fn describe_adapter(input: &DescribeInput<'_>) -> String {
+    let t = input.tune;
+    let aid = input.adapter_id.max(0);
+    let signal = if input.use_adapter {
+        input.signal
+    } else {
+        None
+    };
+    let (strength, status, snr) = signal_fields(signal);
     let fe = match t.fe {
         Some(fe) if input.use_adapter && fe > 0 => fe,
         _ => aid + 1,

@@ -37,6 +37,8 @@ const DIAG_SIGNAL_STEP: u16 = 13;
 const DIAG_SIGNAL_PERIOD_MS: i64 = 10_000;
 /// DVB frontend status bit the tuner abstraction can report.
 const DIAG_FE_HAS_LOCK: i64 = 0x10;
+/// Minimum interval between `Event::Signal` reports for one adapter.
+const SIGNAL_REPORT_MS: i64 = 1000;
 /// Command poll interval while the tuner has no data.
 const IDLE_POLL: Duration = Duration::from_millis(5);
 /// Null-packet PID skipped by `check_cc` (stream.cpp:905).
@@ -395,6 +397,9 @@ pub enum Event {
     ContinuityErrors(u64),
     /// The tuner failed to tune or read.
     TunerError(String),
+    /// The frontend reading after a tune (`ad->strength`, `snr`, `db`, `ber`,
+    /// `status`); `None` when a new tune clears the previous reading.
+    Signal(Option<SignalStatus>),
     /// Packets of a batch on section PIDs, before the stages ran (`process_filters`).
     TablePackets {
         /// Tunes handled before this batch; older batches belong to a previous mux.
@@ -686,6 +691,12 @@ struct DataPlane {
     keep_reading: bool,
     /// Whether a tune was applied; lock events start after it.
     diag_tuned: bool,
+    /// A tuner read has succeeded since the last tune, so `status()` is a real reading.
+    signal_read: bool,
+    /// Last reading sent as `Event::Signal`; `None` after a tune.
+    reported_signal: Option<SignalStatus>,
+    /// When the last `Event::Signal` was sent.
+    last_signal_ms: Option<i64>,
     /// Last reported lock state (`None` before the first poll after a tune).
     diag_lock: Option<bool>,
     /// Last reported signal values.
@@ -734,7 +745,29 @@ impl DataPlane {
             diag_lock: None,
             diag_signal: None,
             diag_signal_ms: 0,
+            signal_read: false,
+            reported_signal: None,
+            last_signal_ms: None,
         }
+    }
+
+    /// Sends `Event::Signal` for a reading that changed. Untuned adapters and
+    /// readings not yet taken after a tune stay silent (the default status
+    /// is not a measurement), and reports are at most one per
+    /// [`SIGNAL_REPORT_MS`]. A pending change is sent by a later poll.
+    fn report_signal(&mut self, signal: SignalStatus, now: i64) {
+        if !self.diag_tuned || !self.signal_read || self.reported_signal == Some(signal) {
+            return;
+        }
+        if self
+            .last_signal_ms
+            .is_some_and(|last| now - last < SIGNAL_REPORT_MS)
+        {
+            return;
+        }
+        self.reported_signal = Some(signal);
+        self.last_signal_ms = Some(now);
+        let _ = self.events.send(Event::Signal(Some(signal)));
     }
 
     /// Emits `lock` on a change and `signal` beyond the threshold, at most
@@ -820,6 +853,12 @@ impl DataPlane {
                 // The first poll after a tune reports the lock state.
                 self.diag_tuned = true;
                 self.diag_lock = None;
+                // adapter.cpp:1092-1097: a tune resets status, strength, snr and db
+                // until the next reading; the session drops its stored reading too.
+                self.signal_read = false;
+                self.reported_signal = None;
+                self.last_signal_ms = None;
+                let _ = self.events.send(Event::Signal(None));
                 self.update_tuner_pids();
             }
             Command::StartOutput {
@@ -989,7 +1028,11 @@ impl DataPlane {
             self.wait_new_stream = true;
         }
         let read = match self.tuner.read(&mut self.buf) {
-            Ok(read) => read,
+            Ok(read) => {
+                // The tuner refreshes its cached status inside `read`.
+                self.signal_read = true;
+                read
+            }
             Err(error) => {
                 let _ = self.events.send(Event::TunerError(error.to_string()));
                 return false;
@@ -1146,6 +1189,7 @@ impl DataPlane {
         let wall = SystemTime::now();
         let signal = self.tuner.status();
         self.diag_status(&signal, now);
+        self.report_signal(signal, now);
         let mut closed = Vec::new();
         for (stream_id, subscriber) in &mut self.outputs {
             // stream.cpp:1337-1340: a failed send (`sid->timeout = 1`) closes now.
@@ -1296,6 +1340,8 @@ mod tests {
             strength: 0,
             snr: 0,
             ber: 0,
+            db: SignalStatus::DB_UNKNOWN,
+            status_valid: true,
         };
         // No tune yet: the poll is not reported.
         plane.diag_status(&unlocked, 0);
@@ -1319,6 +1365,70 @@ mod tests {
         assert_eq!(plane.diag_lock, Some(true));
         plane.diag_status(&locked, 40);
         assert_eq!(plane.diag_lock, Some(true));
+    }
+
+    fn signal_plane() -> (DataPlane, mpsc::Receiver<Event>) {
+        let (_commands_tx, commands) = mpsc::channel::<Command>();
+        let (events, events_rx) = mpsc::channel::<Event>();
+        let plane = DataPlane::new(
+            Box::new(LockTuner),
+            DataPlaneConfig::default(),
+            commands,
+            events,
+            None,
+        );
+        (plane, events_rx)
+    }
+
+    // ad->strength etc. are reported only from a reading taken after a tune, at
+    // most once per second, and a tune clears the previous reading.
+    #[test]
+    fn signal_events_follow_tunes_and_are_rate_limited() {
+        let (mut plane, events) = signal_plane();
+        let locked = SignalStatus {
+            locked: true,
+            strength: 200,
+            snr: 120,
+            ber: 3,
+            db: 1234,
+            status_valid: true,
+        };
+        let changed = SignalStatus {
+            strength: 90,
+            ..locked
+        };
+
+        // Untuned: a read happens but the status is not a measurement yet.
+        plane.read_once();
+        plane.report_signal(locked, 0);
+        assert!(events.try_recv().is_err(), "no report before a tune");
+
+        plane.handle(Command::Tune {
+            params: Box::new(TuneParams::default()),
+            reply: None,
+        });
+        assert_eq!(events.try_recv(), Ok(Event::Signal(None)), "a tune clears");
+
+        // Tuned but no read since the tune: the cached status is still the default.
+        plane.report_signal(locked, 100);
+        assert!(events.try_recv().is_err(), "no report before a read");
+
+        plane.read_once();
+        plane.report_signal(locked, 100);
+        assert_eq!(events.try_recv(), Ok(Event::Signal(Some(locked))));
+        plane.report_signal(locked, 200);
+        assert!(
+            events.try_recv().is_err(),
+            "an unchanged reading is not repeated"
+        );
+
+        plane.report_signal(changed, 500);
+        assert!(
+            events.try_recv().is_err(),
+            "a change inside one second waits"
+        );
+        plane.report_signal(changed, 1_100);
+        assert_eq!(events.try_recv(), Ok(Event::Signal(Some(changed))));
     }
 
     fn pat(tsid: u16) -> [u8; DVB_FRAME] {

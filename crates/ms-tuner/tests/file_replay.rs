@@ -199,7 +199,24 @@ fn tune_is_recorded_and_status_is_configurable() {
     tuner.tune(&params).unwrap();
     assert_eq!(tuner.last_tune(), Some(&params));
 
-    assert_eq!(tuner.status(), SignalStatus::default());
+    // adapter.cpp:1092-1097: the tune resets the replay status (no valid status, 0/0).
+    let replay = tuner.status();
+    assert_eq!(
+        (
+            replay.locked,
+            replay.strength,
+            replay.snr,
+            replay.status_valid
+        ),
+        (false, 0, 0, false)
+    );
+    // harness/cpp-replay.patch (replay_open) sets 255/15 before any tune.
+    let before_tune =
+        FileReplayTuner::open(&temp.path, FileReplayConfig::default()).expect("open replay");
+    assert_eq!(
+        (before_tune.status().strength, before_tune.status().snr),
+        (255, 15)
+    );
     tuner.set_signal(120, 200);
     assert_eq!(
         tuner.status(),
@@ -207,7 +224,9 @@ fn tune_is_recorded_and_status_is_configurable() {
             locked: true,
             strength: 120,
             snr: 200,
-            ber: 0
+            ber: 0,
+            db: SignalStatus::DB_UNKNOWN,
+            status_valid: true,
         }
     );
     let unlocked = SignalStatus {
@@ -215,6 +234,8 @@ fn tune_is_recorded_and_status_is_configurable() {
         strength: 1,
         snr: 2,
         ber: 1,
+        db: SignalStatus::DB_UNKNOWN,
+        status_valid: true,
     };
     tuner.set_status(unlocked);
     assert_eq!(tuner.status(), unlocked);

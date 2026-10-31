@@ -364,6 +364,8 @@ fn describe_signal_defaults_and_clamps() {
         strength: 300,
         snr: 10,
         ber: 0,
+        db: SignalStatus::DB_UNKNOWN,
+        status_valid: true,
     };
     input.signal = Some(unlocked);
     assert!(describe_adapter(&input).starts_with("ver=1.0;src=1;tuner=3,1,0,10,"));
