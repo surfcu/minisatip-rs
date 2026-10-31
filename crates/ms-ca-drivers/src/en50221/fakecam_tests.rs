@@ -309,6 +309,37 @@ fn registry_init_emits_cam_state() {
     assert!(event.contains("\"mode\":\"ci\""), "{event}");
 }
 
+// A slot that never answers is reset by the command watchdog every 15 s; its
+// init/reset loop is reported once, and a CAM that gets ready is reported again.
+#[cfg(feature = "diag-log")]
+#[test]
+fn an_empty_slot_reports_its_init_reset_loop_once() {
+    let _ = crate::test_log::captured_lines();
+    let mut reg = CaRegistry::new(Arc::new(ManualClock::new(0, UNIX)));
+    // No other test emits cam_state for CA 7, so the shared capture holds only these.
+    let dev = reg.device(7);
+    for _ in 0..3 {
+        dev.report_state("init");
+        dev.request_close();
+    }
+    dev.report_state("init");
+    dev.report_state("ready");
+    let states: Vec<String> = crate::test_log::events("cam_state")
+        .iter()
+        .filter(|line| line.contains("\"ca\":7,"))
+        .filter_map(|line| line.split("\"state\":\"").nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(states, ["init", "reset", "ready"]);
+    // Two muted init/reset pairs and the last init.
+    let ready = crate::test_log::events("cam_state")
+        .into_iter()
+        .find(|line| line.contains("\"ca\":7,") && line.contains("\"state\":\"ready\""))
+        .expect("ready event");
+    assert!(ready.contains("\"suppressed\":5"), "{ready}");
+}
+
 #[test]
 fn datetime_resends_on_the_configured_interval() {
     let config = CamConfig {

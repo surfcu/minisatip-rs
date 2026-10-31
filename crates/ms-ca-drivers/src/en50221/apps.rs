@@ -303,11 +303,7 @@ impl CaDevice {
             return;
         }
         self.state = CaState::Initialized;
-        ms_log::diag::events::cam_state(
-            i64::try_from(self.id).unwrap_or(0),
-            "ready",
-            self.mode_name(),
-        );
+        self.report_state("ready");
         if !self.has_forced_caids {
             let chunks = data.as_chunks::<2>().0;
             if chunks.len() > MAX_CAID {

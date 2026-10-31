@@ -688,11 +688,7 @@ impl Worker {
                 continue;
             };
             if dev.has_link() && !dev.service() {
-                ms_log::diag::events::cam_state(
-                    i64::try_from(*id).unwrap_or(0),
-                    "removed",
-                    dev.mode_name(),
-                );
+                dev.report_state("removed");
                 dev.teardown();
             }
             if dev.take_close_request() {

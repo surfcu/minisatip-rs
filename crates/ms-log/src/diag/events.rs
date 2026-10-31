@@ -180,11 +180,14 @@ pub fn capmt(
     );
 }
 
-fn cam_state_fields(ca: i64, state: &str, mode: &str) -> Fields {
+fn cam_state_fields(ca: i64, state: &str, mode: &str, suppressed: u64) -> Fields {
     let mut fields = Fields::new();
     fields.integer("ca", ca);
     fields.string("state", state);
     fields.string("mode", mode);
+    if suppressed > 0 {
+        fields.int("suppressed", suppressed);
+    }
     fields
 }
 
@@ -193,7 +196,45 @@ pub fn cam_state(ca: i64, state: &str, mode: &str) {
     if !cfg!(feature = "diag-log") {
         return;
     }
-    emit("cam_state", &cam_state_fields(ca, state, mode));
+    emit("cam_state", &cam_state_fields(ca, state, mode, 0));
+}
+
+/// One CA slot's `cam_state` changes: a repeat is dropped; a reset right after `init`
+/// mutes that slot's init/reset loop, counted in `suppressed` on its next event.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CamStateFilter {
+    state: String,
+    mode: String,
+    muted: bool,
+    suppressed: u64,
+}
+
+impl CamStateFilter {
+    /// Sends `cam_state` when the filter lets it through.
+    pub fn send(&mut self, ca: i64, state: &str, mode: &str) {
+        if !cfg!(feature = "diag-log") {
+            return;
+        }
+        if let Some(suppressed) = self.wanted(state, mode) {
+            emit("cam_state", &cam_state_fields(ca, state, mode, suppressed));
+        }
+    }
+
+    /// `Some(events muted since the last one)` when this event is sent.
+    fn wanted(&mut self, state: &str, mode: &str) -> Option<u64> {
+        // A mode change (CI+ falling back to CI) always ends the mute.
+        if matches!(state, "init" | "reset") && self.muted && self.mode == mode {
+            self.suppressed += 1;
+            return None;
+        }
+        if self.state == state && self.mode == mode {
+            return None;
+        }
+        self.muted = state == "reset" && self.state == "init";
+        self.state = state.to_owned();
+        self.mode = mode.to_owned();
+        Some(std::mem::take(&mut self.suppressed))
+    }
 }
 
 fn cw_fields(pmt: i64, parity: i64, ecm_ms: Option<i64>, source: &str) -> Fields {
@@ -319,6 +360,63 @@ pub fn ciplus_uri(ca: i64, length: u64) {
 mod tests {
     use super::*;
 
+    fn sent(states: &[&str]) -> Vec<String> {
+        let mut filter = CamStateFilter::default();
+        states
+            .iter()
+            .filter(|state| filter.wanted(state, "ci").is_some())
+            .map(|state| (*state).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn cam_state_carries_the_muted_count() {
+        assert_eq!(
+            json("cam_state", &cam_state_fields(2, "ready", "ci", 5)),
+            envelope(
+                "cam_state",
+                ",\"ca\":2,\"state\":\"ready\",\"mode\":\"ci\",\"suppressed\":5"
+            )
+        );
+    }
+
+    #[test]
+    fn an_empty_slot_loop_is_reported_once() {
+        // The command watchdog resets a slot that never answers every 15 s.
+        let states = ["init", "reset", "init", "reset", "init", "reset"];
+        assert_eq!(sent(&states), ["init", "reset"]);
+    }
+
+    #[test]
+    fn a_working_cam_reports_every_change() {
+        let states = [
+            "init", "ready", "ready", "reset", "init", "ready", "removed",
+        ];
+        assert_eq!(
+            sent(&states),
+            ["init", "ready", "reset", "init", "ready", "removed"]
+        );
+    }
+
+    #[test]
+    fn a_mute_ends_with_any_other_state() {
+        let states = [
+            "init", "reset", "init", "reset", "init", "ready", "reset", "init",
+        ];
+        assert_eq!(sent(&states), ["init", "reset", "ready", "reset", "init"]);
+        let mut filter = CamStateFilter::default();
+        assert_eq!(filter.wanted("init", "ci+"), Some(0));
+        assert_eq!(filter.wanted("reset", "ci+"), Some(0));
+        assert_eq!(filter.wanted("init", "ci+"), None, "muted");
+        assert_eq!(filter.wanted("reset", "ci+"), None, "muted");
+        assert_eq!(
+            filter.wanted("init", "ci"),
+            Some(2),
+            "a mode change ends the mute"
+        );
+        assert_eq!(filter.wanted("ready", "ci"), Some(0));
+    }
+
     const TS: &str = "2026-10-24T10:20:30.400+00:00";
     const THREAD: &str = "t";
 
@@ -433,7 +531,7 @@ mod tests {
     #[test]
     fn cam_state_event_json() {
         assert_eq!(
-            json("cam_state", &cam_state_fields(2, "ready", "ci+")),
+            json("cam_state", &cam_state_fields(2, "ready", "ci+", 0)),
             envelope(
                 "cam_state",
                 ",\"ca\":2,\"state\":\"ready\",\"mode\":\"ci+\""
