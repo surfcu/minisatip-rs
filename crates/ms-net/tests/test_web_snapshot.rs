@@ -1,7 +1,7 @@
 //! `/state.json` values the session fills from the scheduler and the CA runtime.
 
 use ms_net::session::SessionManager;
-use ms_net::web::{ADAPTER_CI, ADAPTER_DVB, CaDeviceState, PmtState};
+use ms_net::web::{ADAPTER_CI, ADAPTER_DVB, ADAPTER_SATIP, CaDeviceState, PmtState};
 use ms_sched::{AdapterConfig, AdapterTuner, AdapterType, Scheduler, TuneError};
 use ms_tuner::{DeliverySystem, TuneParams};
 
@@ -26,15 +26,20 @@ fn manager() -> SessionManager {
         ..AdapterConfig::default()
     };
     sched.add_adapter(8, ci, Box::new(NoTune));
+    let mut satip = AdapterConfig::new(DeliverySystem::DvbS2);
+    satip.adapter_type = AdapterType::Satip;
+    sched.add_adapter(3, satip, Box::new(NoTune));
     SessionManager::with_scheduler(sched)
 }
 
-// The status page shows dvbci.png and the CI pids only for ADAPTER_CI.
+// The status page shows dvbci.png and the CI pids only for ADAPTER_CI, and scales
+// the SNR of ADAPTER_SATIP by /0.15 (satipc.cpp:2027).
 #[test]
 fn ad_type_follows_the_adapter_kind() {
     let snapshot = manager().web_snapshot();
     assert_eq!(snapshot.adapters[0].kind, ADAPTER_DVB);
     assert_eq!(snapshot.adapters[8].kind, ADAPTER_CI);
+    assert_eq!(snapshot.adapters[3].kind, ADAPTER_SATIP);
 }
 
 // get_channel_for_adapter/get_pmt_for_adapter read the adapter's active PMTs.
