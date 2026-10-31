@@ -71,7 +71,7 @@ items back in without the user's explicit go-ahead.
             ┌──────────────── control plane (tokio, single task) ────────────────┐
  clients ──▶│ rtsp / http / ssdp ──▶ session mgr ──▶ scheduler ──▶ adapter cmds │
             │                             │              ▲                       │
-            │                       psi service ──▶ ca reconciler ──▶ ca drivers │
+            │                       psi service ──▶ ca dispatch  ──▶ ca drivers │
             └─────────────────────────────┼────────────────────────────┼─────────┘
                                           │ events                     │ CAPMT / CW
  data plane (thread per adapter):  dvr read → pid router → subscribers (rtp/http/srt)
@@ -85,7 +85,7 @@ items back in without the user's explicit go-ahead.
 | `ms-psi` | PAT/PMT/CAT/SDT parsing, versioning, charset tables | tables, pmt, dvb_charset |
 | `ms-tuner` | `Tuner` trait + backends: linux-dvb, satipc, netceiver, file-replay | dvb, satipc, netceiver |
 | `ms-sched` | adapter allocation, LNB/DiSEqC/unicable constraints, same-mux reuse | adapter |
-| `ms-ca` | desired/actual state reconciler, CAPMT diffing, policies | ca, ddci, dvbapi (logic) |
+| `ms-ca` | CAPMT building, CA device slots, the driver-facing `CaDriver` interface | ca, ddci, dvbapi (logic) |
 | `ms-ca-drivers` | en50221 (+ci-plus feature), ddci, dvbapi, hw descrambler, csa/aes | ca, ddci, dvbapi, csa, aes, hw_descrambler |
 | `ms-net` | rtsp, http, rtp/udp/tcp, srt, ssdp | socketworks, stream, minisatip, srt, httpc |
 | `ms-config` | CLI compat parser, config file, variables/status API | opts, api |
@@ -109,18 +109,19 @@ trait CaDriver {
 }
 ```
 
-### CA reconciler (core change versus C++)
-- Desired state: the set of services each CAM must descramble, derived from active subscriptions.
-- Actual state: the CAPMT list last acknowledged by each CAM.
-- The reconcile step emits a minimal diff (prefer add/update over `only`).
-- Policies are pluggable and individually testable:
-  - lazy leave with hysteresis
-  - rejoin debounce
-  - least-used CAM selection
-  - bandwidth balancing
-  - pre-packing most-requested services
-- Must reproduce the current C++ CAPMT sequences first (see M6), then policies may
-  deviate, documented in `docs/deviations.md`.
+### CA policies on the event-driven path (M10)
+- The CA path is event-driven and C++-compatible; there is no reconciler (#37, option 2).
+  `ms-sched` offers one PMT at a time to every enabled CA (`send_pmt_to_cas`) and removes it
+  (`close_pmt_for_cas`), with per-PMT `ca_mask`, `ca_registered_mask` and `disabled_ca_mask`
+  deciding each send, so CAPMT bytes, `update` flags and send order match C++.
+- The hook is `ms_sched::pmt::CaSink::add_pmt`/`del_pmt`, implemented by `DvbcaSink` (the dvbca
+  worker calls `CaDevice::process_pmt`/`del_pmt`) and `DdciSink`. A policy wraps that sink, so it
+  sees each offer and removal as the scheduler issues them.
+- M10 policies (lazy leave with hysteresis, rejoin debounce, least-used CAM selection, bandwidth
+  balancing, pre-packing most-requested services) are added on that hook, each individually
+  testable with the `ms-sched` CA dispatch tests (`pmt_tests.rs`) and the `ms-ca-drivers` ported CA tests.
+- Regression net: the CA harness scenarios (§5, EN50221 CAPMT sequences against `ms-fakecam`)
+  must keep matching C++ for every policy. A policy that changes a sequence is documented in `docs/deviations.md`.
 
 ## 5. Differential harness (`ms-harness`)
 
@@ -190,9 +191,9 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 - [x] DVBAPI protocol against fake oscam; CSA (libdvbcsa FFI) + AES
 - **Exit:** scrambled channels play against fake oscam; DVBAPI message diff clean
 
-### M6 — CA reconciler + DDCI
+### M6 — CA path + DDCI
 - [x] Port `test_ddci.cpp` and DDCI-related parts of `test_ca.cpp`
-- [x] `ms-ca` reconciler with a "C++-compatible" policy set reproducing current sequences
+- [x] Event-driven, C++-compatible CA path: `ms-sched` offers and removes one PMT at a time, reproducing current sequences (the unused `ms-ca` reconciler was removed, #37)
 - [x] DDCI driver: virtual adapter, PID remapping, generated PAT/SDT (#1511 behaviour)
 - **Exit:** CAPMT sequences identical to C++ in all scenarios; real CAM on the box
   descrambles with no new glitches on join/leave/rejoin
@@ -327,7 +328,7 @@ Unvalidated rows must be called out in release notes.
   - M6: the harness diffs the EN50221 CAPMT sequences with a fake CAM (scenarios 19-21:
     join/leave, rejoin, `-c 0:**2` shared CAPMTs); DDCI CAPMTs are not in the
     harness yet (#36 phase C). The real-CAM join/leave/rejoin check passed. The runtime drives
-    `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
+    `ms_ca::CaDevice` directly, one PMT at a time; the unused `Reconciler` was removed (#37).
   - M7: the same scenarios diff every APDU with the fake CAM, from the CAM init on; they
     found the first CA keepalive firing before the init reply (fixed: a 1 s idle
     timer, as `sockets_timeout`, ca.cpp:3829). The real CAM works through the CI path.
@@ -420,6 +421,6 @@ Unvalidated rows must be called out in release notes.
   - Evidence: heartbeats, events and panics in Loki, a soak dashboard and a daily
     report script (private homelab notes). Known: CC errors right after a scrambled
     service starts come from the CAM.
-- **Tracked issues:** CA harness scenarios (#36); reconciler not on the runtime path (#37);
+- **Tracked issues:** CA harness scenarios (#36); #37 resolved (the unused reconciler was removed, the event-driven CA path is the runtime);
   CAM blocked after a CAM MMI error message until restart in CI+; once in plain CI it
   stopped descrambling and was restarted before it could recover (#63).

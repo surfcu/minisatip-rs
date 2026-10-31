@@ -42,8 +42,8 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   that stops delivering CI+ keys after an MMI message (DEV-281).
 - DDCI CAPMTs are not in the harness yet (#36 phase C); they are compared with C++
   by the ported unit tests and by the real-CAM check.
-- The runtime drives `ms_ca::CaDevice` directly; the `Reconciler` and its policies
-  are covered by tests only, so there are no alternative CA policies yet.
+- The runtime drives `ms_ca::CaDevice` directly, one PMT at a time as the scheduler offers
+  and removes it (the C++ event-driven path); there are no alternative CA policies yet (M10).
 - Netceiver is parked (PLAN §3): the `ms-tuner` backend exists but the binary does
   not use it, and `-n` is an unknown option, as in a C++ build without NETCVCLIENT.
 
@@ -57,7 +57,7 @@ Cargo workspace (Rust 2024) with these members:
 | `ms-psi` | PAT/PMT/CAT/SDT parsing and generated charset tables |
 | `ms-tuner` | `Tuner` trait and backends: Linux DVB, SAT>IP client, netceiver, file replay |
 | `ms-sched` | adapter allocation, PMT/PID state, DiSEqC/unicable constraints |
-| `ms-ca` | CAPMT building, CA device slots, reconciler and policies |
+| `ms-ca` | CAPMT building, CA device slots and the driver-facing interface |
 | `ms-ca-drivers` | EN50221, DDCI, DVBAPI, CSA/AES and hardware descramblers |
 | `ms-net` | RTSP, HTTP, RTP, SSDP, the adapter data plane and the web/status pages |
 | `ms-srt` | SRT bindings |

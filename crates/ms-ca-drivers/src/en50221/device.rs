@@ -44,7 +44,7 @@ pub enum ReadOutcome {
     Eof,
 }
 
-/// What the host reports to its owner; the CA reconciler (M6) consumes the CAPMT ones.
+/// What the host reports to its owner; the CAM transport consumes the CAPMT ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
     /// `ca_request_close`: the owner must close the CA socket.
@@ -956,7 +956,7 @@ impl CaDevice {
     }
 }
 
-/// Hook the CA reconciler (M6) calls to hand CA_PMT bodies to this CAM.
+/// Hook the CAM transport (dvbca) uses to hand CA_PMT bodies to this CAM.
 pub trait CaPmtSink {
     /// A CA support session is open (`find_session_for_resource`).
     fn has_ca_session(&self) -> bool;

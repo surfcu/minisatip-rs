@@ -630,7 +630,7 @@ fn ca_read_enigma_removal() {
     assert!(!d.take_close_request(), "no close when inactive");
 }
 
-// Ported from tests/test_ca.cpp:1637 (the tables CA bit belongs to the M6 reconciler)
+// Ported from tests/test_ca.cpp:1637 (the tables CA bit is set by ms-sched `init_ca_for_adapter`)
 #[test]
 fn dvbca_init_dev_guards() {
     let (_, c) = clock();
@@ -794,7 +794,7 @@ fn ca_open_session_unknown_resource() {
     assert!(link.take_writes().is_empty());
 }
 
-// Ported from tests/test_ca.cpp:1871 (the tables CA bit belongs to the M6 reconciler)
+// Ported from tests/test_ca.cpp:1871 (the tables CA bit is set by ms-sched `init_ca_for_adapter`)
 #[test]
 fn ca_reconnect_success() {
     let (_, c) = clock();
