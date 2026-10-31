@@ -1,14 +1,16 @@
-From ca4d806a9e32de3a2ba067692ba5768972dbb915 Mon Sep 17 00:00:00 2001
+From ff4ab9e19dae630f910ac459ba65ca23e1e633a7 Mon Sep 17 00:00:00 2001
 From: surfcu <59124393+surfcu@users.noreply.github.com>
-Date: Wed, 21 Oct 2026 16:31:33 +0300
-Subject: [PATCH] Add file-replay tuner for the differential harness
+Date: Sat, 31 Oct 2026 17:21:24 +0300
+Subject: [PATCH] Add file-replay tuner and CA socket for the differential
+ harness
 
 ---
  CMakeLists.txt  |   6 +-
  src/adapter.cpp |   3 +
- src/adapter.h   |   3 +
- src/replay.cpp  | 198 ++++++++++++++++++++++++++++++++++++++++++++++++
- 4 files changed, 209 insertions(+), 1 deletion(-)
+ src/adapter.h   |   6 ++
+ src/ca.cpp      |  23 ++++-
+ src/replay.cpp  | 244 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 279 insertions(+), 3 deletions(-)
  create mode 100644 src/replay.cpp
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -57,25 +59,80 @@ index 403442a..b357036 100644
      find_dvb_adapter(a);
  #endif
 diff --git a/src/adapter.h b/src/adapter.h
-index 54c10eb..5b879ca 100644
+index 54c10eb..cb834cf 100644
 --- a/src/adapter.h
 +++ b/src/adapter.h
-@@ -193,6 +193,9 @@ int init_hw(int i);
+@@ -193,6 +193,12 @@ int init_hw(int i);
  int init_all_hw();
  int getAdaptersCount();
  adapter *adapter_alloc();
 +#ifndef DISABLE_REPLAY
 +void find_replay_adapter(adapter **a);
++int replay_is_adapter(adapter *ad);
++int replay_ca_open(adapter *ad);
++int replay_ca_is_fd(int fd);
 +#endif
  void adapter_resize_buffers();
  int close_adapter(int na);
  int get_free_adapter(transponder *tp);
+diff --git a/src/ca.cpp b/src/ca.cpp
+index 66d22c1..9d4175e 100644
+--- a/src/ca.cpp
++++ b/src/ca.cpp
+@@ -3747,10 +3747,23 @@ int ca_init_enigma(ca_device_t *d) {
+ static int ca_slot_reset(int fd) {
+     ca_slot_info_t info;
+     memset(&info, 0, sizeof(info));
++#ifndef DISABLE_REPLAY
++    if (replay_ca_is_fd(fd))
++        return 0;
++#endif
+     return ioctl(fd, CA_RESET, &info);
+ }
+ 
+ static int ca_slot_get_info(int fd, struct ca_slot_info *info) {
++#ifndef DISABLE_REPLAY
++    // The harness CAM is a ready link-layer slot.
++    if (replay_ca_is_fd(fd)) {
++        memset(info, 0, sizeof(*info));
++        info->type = CA_CI_LINK;
++        info->flags = CA_CI_MODULE_PRESENT | CA_CI_MODULE_READY;
++        return 0;
++    }
++#endif
+     return ioctl(fd, CA_GET_SLOT_INFO, info);
+ }
+ 
+@@ -3871,7 +3884,7 @@ int ca_slot_has_module(const struct ca_slot_info *info) {
+ static int ca_slot_present(int fd) {
+     ca_slot_info_t info;
+     memset(&info, 0, sizeof(info));
+-    if (ioctl(fd, CA_GET_SLOT_INFO, &info))
++    if (ca_slot_get_info(fd, &info))
+         return 1;
+     return ca_slot_has_module(&info);
+ }
+@@ -3933,7 +3946,13 @@ int dvbca_init_dev(adapter *ad) {
+     if (opts.enigma) {
+         sprintf(ca_dev_path, "/dev/ci%d", ad->id);
+     }
+-    fd = open(ca_dev_path, O_RDWR);
++#ifndef DISABLE_REPLAY
++    // Harness: a replay adapter never opens a host CA device.
++    if (replay_is_adapter(ad))
++        fd = replay_ca_open(ad);
++    else
++#endif
++        fd = open(ca_dev_path, O_RDWR);
+     if (fd < 0) {
+         if (opts.enigma && has_ci) {
+             LOG_AND_RETURN(TABLES_RESULT_OK,
 diff --git a/src/replay.cpp b/src/replay.cpp
 new file mode 100644
-index 0000000..6aa3ca8
+index 0000000..f6150ad
 --- /dev/null
 +++ b/src/replay.cpp
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,244 @@
 +/*
 + * File-replay tuner for differential testing (minisatip-rs ms-harness).
 + * MINISATIP_REPLAY=<file.ts> adds MINISATIP_REPLAY_ADAPTERS (default 1)
@@ -97,6 +154,8 @@ index 0000000..6aa3ca8
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
 +#include <string>
 +#include <thread>
 +#include <unistd.h>
@@ -273,6 +332,50 @@ index 0000000..6aa3ca8
 +        a_count = na + 1;
 +    }
 +    LOG("replay: %d adapter(s) for %s", a_count, path);
++}
++
++// MINISATIP_REPLAY_CA: a unix datagram socket to a fake CAM stands in for the
++// CA device of a replay adapter ("%d" = adapter id, else only adapter 0).
++static std::atomic<int> replay_ca_fds[MAX_ADAPTERS];
++
++int replay_is_adapter(adapter *ad) { return ad && ad->open == replay_open; }
++
++int replay_ca_open(adapter *ad) {
++    const char *tmpl = getenv("MINISATIP_REPLAY_CA");
++    if (!tmpl || !*tmpl || ad->id < 0 || ad->id >= MAX_ADAPTERS)
++        return -1;
++    struct sockaddr_un local, remote;
++    memset(&local, 0, sizeof(local));
++    memset(&remote, 0, sizeof(remote));
++    local.sun_family = remote.sun_family = AF_UNIX;
++    if (strstr(tmpl, "%d"))
++        snprintf(remote.sun_path, sizeof(remote.sun_path), tmpl, ad->id);
++    else if (ad->id == 0)
++        snprintf(remote.sun_path, sizeof(remote.sun_path), "%s", tmpl);
++    else
++        return -1;
++    // One client path per adapter; a reconnect rebinds it.
++    snprintf(local.sun_path, sizeof(local.sun_path), "%s.c%d", remote.sun_path,
++             ad->id);
++    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
++    if (fd < 0)
++        return -1;
++    unlink(local.sun_path);
++    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) ||
++        connect(fd, (struct sockaddr *)&remote, sizeof(remote))) {
++        LOG("replay: CA socket %s: %s", remote.sun_path, strerror(errno));
++        close(fd);
++        return -1;
++    }
++    replay_ca_fds[ad->id] = fd;
++    return fd;
++}
++
++int replay_ca_is_fd(int fd) {
++    for (auto &f : replay_ca_fds)
++        if (fd > 0 && f == fd)
++            return 1;
++    return 0;
 +}
 -- 
 2.53.0

@@ -1,0 +1,101 @@
+# scenario capmt-multi
+== 1 capmt until 00400041 st=00
+cam0 H>C create_tc
+cam0 C>H open_session 00010041
+cam0 C>H ctc_reply
+cam0 H>C open_session_rsp s1 00010041 st=00
+cam0 H>C apdu s1 00010041 9F8010 profile_enq -
+cam0 C>H apdu s1 00010041 9F8011 profile 0001004100020041000300410024004100400041
+cam0 H>C apdu s1 00010041 9F8012 profile_change -
+cam0 C>H apdu s1 00010041 9F8010 profile_enq -
+cam0 H>C apdu s1 00010041 9F8011 profile 000100410002004100030041002000410024004100400041
+cam0 C>H open_session 00020041
+cam0 H>C open_session_rsp s2 00020041 st=00
+cam0 C>H open_session 00030041
+cam0 H>C apdu s2 00020041 9F8020 app_info_enq -
+cam0 C>H apdu s2 00020041 9F8021 app_info 01FA4E00010846616B652043414D
+cam0 H>C open_session_rsp s3 00030041 st=00
+cam0 C>H open_session 00240041
+cam0 H>C apdu s3 00030041 9F8030 ca_info_enq -
+cam0 C>H apdu s3 00030041 9F8031 ca_info 0100
+cam0 H>C open_session_rsp s4 00240041 st=00
+cam0 C>H apdu s4 00240041 9F8440 date_time_enq 00
+cam0 C>H open_session 00400041
+cam0 H>C apdu s4 00240041 9F8441 date_time <TIME>
+cam0 H>C open_session_rsp s5 00400041 st=00
+== 5 rtsp c1 > SETUP rtsp://127.0.0.1:<RTSP>/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,256,257,258 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 1
+Server: minisatip/<VER>
+Transport: RTP/AVP;unicast;destination=127.0.0.1;source=127.0.0.1;client_port=<u1.rtp>-<u1.rtcp>;server_port=<SRTP+0>-<SRTP+1>
+Session: <SESSION1>;timeout=30
+com.ses.streamID: 1
+== 6 rtsp c1 > PLAY rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION1>
+CSeq: 2
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=1;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 7 capmt until ca_pmt
+cam0 H>C apdu s3 00030041 9F8032 ca_pmt 0300010100000201010007010904010001F10301020007010904010001F1 # lm=only pn=0001 v=0 cmd=01 es=0101/0100:01F1 es=0102/0100:01F1
+== 8 rtsp c2 > SETUP rtsp://127.0.0.1:<RTSP>/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,512,513,514 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 1
+Server: minisatip/<VER>
+Transport: RTP/AVP;unicast;destination=127.0.0.1;source=127.0.0.1;client_port=<u2.rtp>-<u2.rtcp>;server_port=<SRTP+2>-<SRTP+3>
+Session: <SESSION2>;timeout=30
+com.ses.streamID: 2
+== 9 rtsp c2 > PLAY rtsp://127.0.0.1:<RTSP>/stream=2 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION2>
+CSeq: 2
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=2;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 10 capmt until ca_pmt
+cam0 H>C apdu s3 00030041 9F8032 ca_pmt 0500080100000202010007010904010001F20302020007010904010001F2 # lm=update pn=0008 v=0 cmd=01 es=0201/0100:01F2 es=0202/0100:01F2
+== 11 rtsp c3 > SETUP rtsp://127.0.0.1:<RTSP>/?src=1&freq=11494&pol=h&ro=0.35&msys=dvbs2&mtype=8psk&plts=off&sr=22000&fec=23&pids=0,768,769,770 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 1
+Server: minisatip/<VER>
+Transport: RTP/AVP;unicast;destination=127.0.0.1;source=127.0.0.1;client_port=<u3.rtp>-<u3.rtcp>;server_port=<SRTP+4>-<SRTP+5>
+Session: <SESSION3>;timeout=30
+com.ses.streamID: 3
+== 12 rtsp c3 > PLAY rtsp://127.0.0.1:<RTSP>/stream=3 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+Session: <SESSION3>
+CSeq: 2
+Server: minisatip/<VER>
+RTP-Info: url=rtsp://127.0.0.1:<RTSP>/stream=3;seq=<SEQ>;rtptime=<RTPTIME>
+Range: npt=0.000-
+== 13 capmt until ca_pmt
+cam0 H>C apdu s3 00030041 9F8032 ca_pmt 0500010300000201010007010904010001F10301020007010904010001F10203010007010904010001F30303020007010904010001F3 # lm=update pn=0001 v=1 cmd=01 es=0101/0100:01F1 es=0102/0100:01F1 es=0301/0100:01F3 es=0302/0100:01F3
+== 14 rtsp c2 > TEARDOWN rtsp://127.0.0.1:<RTSP>/stream=2 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 3
+Server: minisatip/<VER>
+Session: <SESSION2>
+== 15 capmt until ca_pmt
+cam0 H>C apdu s3 00030041 9F8032 ca_pmt 0500080300000202010007040904010001F20302020007040904010001F2 # lm=update pn=0008 v=1 cmd=04 es=0201/0100:01F2 es=0202/0100:01F2
+== 16 rtsp c1 > TEARDOWN rtsp://127.0.0.1:<RTSP>/stream=1 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 3
+Server: minisatip/<VER>
+Session: <SESSION1>
+== 17 rtsp c3 > TEARDOWN rtsp://127.0.0.1:<RTSP>/stream=3 RTSP/1.0
+RTSP/1.0 200 OK
+Date: <DATE>
+CSeq: 3
+Server: minisatip/<VER>
+Session: <SESSION3>
+== 18 capmt until ca_pmt
+cam0 H>C apdu s3 00030041 9F8032 ca_pmt 0500010500000203010007040904010001F30303020007040904010001F3 # lm=update pn=0001 v=2 cmd=04 es=0301/0100:01F3 es=0302/0100:01F3

@@ -324,11 +324,13 @@ Unvalidated rows must be called out in release notes.
     job runs it and the CSA tests with libdvbcsa. DVBAPI messages are checked by the
     ported `test_dvbapi` tests. The harness diffs the DVBAPI messages against a
     recording fake OSCam (scenarios 16-18: join/leave, zap, two services, #36).
-  - M6: no CAPMT (EN50221) harness scenarios yet, so CAPMT sequences are only diffed by
-    the ported tests; the real-CAM join/leave/rejoin check passed. The runtime drives
+  - M6: the harness diffs the EN50221 CAPMT sequences with a fake CAM (scenarios 19-21:
+    join/leave, rejoin, `-c 0:**2` shared CAPMTs); DDCI CAPMTs are not in the
+    harness yet (#36 phase C). The real-CAM join/leave/rejoin check passed. The runtime drives
     `ms_ca::CaDevice` directly; `Reconciler`/`CppCompatible` are exercised by tests only.
-  - M7: APDU diff with the fake CAM needs the same CA harness scenarios; the real CAM
-    works through the CI path.
+  - M7: the same scenarios diff every APDU with the fake CAM, from the CAM init on; they
+    found the first CA keepalive firing before the init reply (fixed: a 1 s idle
+    timer, as `sockets_timeout`, ca.cpp:3829). The real CAM works through the CI path.
   - M8: satipc against a real SAT>IP server. Status API: SAT>IP client adapters
     report `ad_type` 1 (DEV-053), so the status page scales satipc SNR as DVB (/2.55
     instead of /0.15).

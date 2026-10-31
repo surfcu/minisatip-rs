@@ -145,6 +145,7 @@ dependencies = [
 name = "ms-harness"
 version = "0.1.0"
 dependencies = [
+ "ms-fakecam",
  "serde",
  "serde_yaml",
 ]
