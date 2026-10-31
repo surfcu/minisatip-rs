@@ -333,16 +333,16 @@ Unvalidated rows must be called out in release notes.
     timer, as `sockets_timeout`, ca.cpp:3829). The real CAM works through the CI path.
   - M8: satipc against a real SAT>IP server. SAT>IP client adapters report `ad_type` 2
     (`ADAPTER_SATIP`, DEV-053), so the status page scales their SNR as C++ does.
-  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); the 7-day soak on the main
-    box is stopped and will be restarted cleanly (see "Soak"); resource comparison.
+  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); 7-day soak has been running
+    since 2026-10-31 19:08:47 +03 on the main box (see "Soak"); resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - Soak with evidence: a clean restart of the 7-day soak on the main box with the same
-    build, command line and reduced load (see "Soak" below); the enigma2 box runs the
-    armv7 `diag-log` build since 2026-10-25 09:08 +03 and passed its 12 h validation
-    (see "Logging ... Part B").
+  - Soak with evidence: the 7-day soak has been running on the main box since
+    2026-10-31 19:08:47 +03 (see "Soak" below); the enigma2 box runs the armv7
+    `diag-log` build since 2026-10-25 09:08 +03 and passed its 12 h validation (see
+    "Logging ... Part B").
   - CA scenarios in the harness (#36).
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
     is in that box.
@@ -374,40 +374,47 @@ Unvalidated rows must be called out in release notes.
     watchdog resetting the two empty CI slots as in C++ (ca.cpp:3679-3693), plus 60
     heartbeats and the stream events. The -F file reached 2.2 MB, so it did not
     rotate.
-- **Soak (M9), stopped 2026-10-31 18:12:35 +03; a clean restart is planned:** the run
-  started 2026-10-31 16:04:56 +03 ended after 2 h 8 min. At 18:11:23 the CAM showed
-  its error message while channels were being zapped, and stopped descrambling (about
-  70 s until the restart; #63, this time in plain CI). The minisatip-rs service was
-  restarted by hand at 18:12:35; until then minisatip-rs kept running, the CI link
-  stayed up and CAPMTs were still sent. Whether the CAM would have recovered by itself
-  is not known. The run started 2026-10-25 14:30:15 +03 was stopped at about 16:36
-  +03, when the main box's tuner card overheated (I2C errors, tuners stuck), and the
-  16:49 driver reload restarted minisatip-rs. The planned Friday 2026-10-30 start was
-  skipped (the box was rebooted and ran C++ minisatip on purpose). The 2026-10-31 run
-  used the same build and command line (binary sha `51ebd46d`, banner compile time Oct
-  25 09:18:47; the remote sink connected and both slots log "using plain CI"), and the
-  load generator started with it, cut to at most 2 busy main-box tuners (all clients)
-  and no exhaustion run. The build: git `752c02b` (code as `86464d4`), static x86_64
-  musl with feature `diag-log` (no `ci-plus`, so the slot forces plain CI). The
-  2026-10-25 13:53 start with `ci-plus-vendored` was ended after 37 min, when plain CI
-  was chosen for the soak: in CI+ mode a CAM MMI error message left the CAM blocked
-  until a restart, while plain CI had recovered by itself until then (#63). Command
-  line
+- **Soak (M9), restarted 2026-10-31 19:08:47 +03 on the main box in plain CI:** main
+  `0bdd784`, static x86_64 musl with feature `diag-log` (sha `6d59188c`, banner
+  compile time Oct 31 2026 16:08:13 UTC; both slots log "using plain CI"), the same
+  unit and command line, and the load generator from 19:09:22 +03, reduced as for the
+  16:04 run (at most 2 busy main-box tuners, no exhaustion run). The user never saw
+  the CAM error message (#63) with C++ minisatip (the measured C++ window had almost
+  no CAPMT traffic). `752c02b` lacked the 1 s idle CA keepalive (#70, landed via #72),
+  the clearest CI-link difference to C++; this build has it, so the run also checks
+  whether that was the trigger. Earlier runs: the run started 2026-10-31 16:04:56 +03
+  ended after 2 h 8 min. At 18:11:23 the CAM showed its error message while channels
+  were being zapped, and stopped descrambling (about 70 s until the restart; #63, this
+  time in plain CI). The minisatip-rs service was restarted by hand at 18:12:35; until
+  then minisatip-rs kept running, the CI link stayed up and CAPMTs were still sent.
+  Whether the CAM would have recovered by itself is not known. The run started
+  2026-10-25 14:30:15 +03 was stopped at about 16:36 +03, when the main box's tuner
+  card overheated (I2C errors, tuners stuck), and the 16:49 driver reload restarted
+  minisatip-rs. The planned Friday 2026-10-30 start was skipped (the box was rebooted
+  and ran C++ minisatip on purpose). The 16:04 run used the 2026-10-25 build and
+  command line (binary sha `51ebd46d`, banner compile time Oct 25 09:18:47; the remote
+  sink connected and both slots log "using plain CI"), and the load generator started
+  with it, cut to at most 2 busy main-box tuners (all clients) and no exhaustion run.
+  That build: git `752c02b` (code as `86464d4`), static x86_64 musl with feature
+  `diag-log` (no `ci-plus`, so the slot forces plain CI). The 2026-10-25 13:53 start
+  with `ci-plus-vendored` was ended after 37 min, when plain CI was chosen for the
+  soak: in CI+ mode a CAM MMI error message left the CAM blocked until a restart,
+  while plain CI had recovered by itself until then (#63). Command line
   `/usr/local/bin/minisatip-rs -f -c 8:**2 -d *:*1-0 -R /usr/src/minisatip/html -l pmt,ca,ddci
   --log-remote tcp://<logging host>:6514`. The soak started 2026-10-24 02:37 was ended
   for the 13:53 start; it had in fact already been restarted by the later deploys
   (#54, the CI+ test build, two restarts to clear a CAM error message).
-  - Load (full load of the 2026-10-25 run; the 2026-10-31 run was reduced as above): a
-    load generator on the logging host opens streams through tvheadend's HTTP API: 2-3
-    long steady streams (FTA and scrambled), channel zapping every 30-120 s (scrambled
-    changes at least 30 s apart), leave-and-return on a scrambled service, up to 3
-    parallel scrambled services (the CAM's limit), FTA streams spread over both boxes,
-    an exhaustion run at most every 6 h (100 s with more streams than tuners), and
-    quiet hours 00:00-07:00 with one steady stream and one idle hour. While another
-    client is subscribed or a recording starts within 10 min, it runs steady streams
-    only (at most 3 loadgen streams on the main box; enigma2 streams do not count).
-    Every stream is checked with TSDuck (CC errors, bitrate, time to first packet and
-    to clear picture).
+  - Load (full load of the 2026-10-25 run; the 2026-10-31 runs were reduced as above):
+    a load generator on the logging host opens streams through tvheadend's HTTP API:
+    2-3 long steady streams (FTA and scrambled), channel zapping every 30-120 s
+    (scrambled changes at least 30 s apart), leave-and-return on a scrambled service,
+    up to 3 parallel scrambled services (the CAM's limit), FTA streams spread over
+    both boxes, an exhaustion run at most every 6 h (100 s with more streams than
+    tuners), and quiet hours 00:00-07:00 with one steady stream and one idle hour.
+    While another client is subscribed or a recording starts within 10 min, it runs
+    steady streams only (at most 3 loadgen streams on the main box; enigma2 streams do
+    not count). Every stream is checked with TSDuck (CC errors, bitrate, time to first
+    packet and to clear picture).
   - tvheadend adapter priorities (higher first): main #1 6, enigma2 #1 5, main #2 4,
     enigma2 #2 3, main #3-#8 2.
   - Evidence: heartbeats, events and panics in Loki, a soak dashboard and a daily
