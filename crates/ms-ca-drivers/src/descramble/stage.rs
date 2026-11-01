@@ -133,6 +133,8 @@ pub struct DescramblerStats {
     pub services: Vec<ServiceStats>,
     /// Packets left scrambled (`ad->dec_err`).
     pub dec_err: u64,
+    /// Clear data packets (pid above 0x1F) while the CA is active.
+    pub clear_pkts: u64,
     /// `ad_decerr`: dec errors of the two busiest active pids.
     pub ad_decerr: u64,
 }
@@ -253,6 +255,7 @@ impl DescramblerStage {
                 let _ = reply.send(DescramblerStats {
                     services: self.descrambler.all_stats(),
                     dec_err: self.descrambler.dec_err(),
+                    clear_pkts: self.descrambler.clear_pkts(),
                     ad_decerr: self.descrambler.adapter_decerr(),
                 });
             }

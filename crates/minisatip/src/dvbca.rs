@@ -37,6 +37,10 @@ pub struct DvbcaSettings {
     cache_dir: String,
     /// `--ci-plus-recovery` in ms; 0 disables the CI+ key watchdog.
     ci_plus_recovery_ms: i64,
+    /// `--cam-recovery` in ms; 0 disables the scrambled-output watchdog.
+    pub cam_recovery_ms: i64,
+    /// Zap guard of `--cam-recovery`; off with `--cam-recovery-no-zap-guard`.
+    pub cam_recovery_zap_guard: bool,
 }
 
 impl Default for DvbcaSettings {
@@ -48,6 +52,8 @@ impl Default for DvbcaSettings {
             enigma: false,
             cache_dir: "/var/cache/minisatip".to_owned(),
             ci_plus_recovery_ms: 0,
+            cam_recovery_ms: 0,
+            cam_recovery_zap_guard: true,
         }
     }
 }
@@ -77,6 +83,8 @@ impl DvbcaSettings {
         settings.enigma = opts.enigma;
         settings.cache_dir = opts.cache_dir.clone();
         settings.ci_plus_recovery_ms = i64::from(opts.ci_plus_recovery).max(0) * 1000;
+        settings.cam_recovery_ms = i64::from(opts.cam_recovery).max(0) * 1000;
+        settings.cam_recovery_zap_guard = !opts.cam_recovery_no_zap_guard;
         settings
     }
 
@@ -85,6 +93,29 @@ impl DvbcaSettings {
         self.channels
             .get(&id)
             .map_or((DEFAULT_CA_PMT, 0), |(max, multiple, _)| (*max, *multiple))
+    }
+}
+
+/// Reads back the scrambled windows a test `Dvbca` was sent.
+#[cfg(test)]
+pub(crate) struct WindowRecorder(Receiver<Request>);
+
+#[cfg(test)]
+impl WindowRecorder {
+    /// The `(adapter, scrambled, clear, window_ms)` windows sent so far, in order.
+    pub(crate) fn windows(&self) -> Vec<(usize, u64, u64, i64)> {
+        self.0
+            .try_iter()
+            .filter_map(|request| match request {
+                Request::ScrambledWindow {
+                    adapter,
+                    scrambled,
+                    clear,
+                    window_ms,
+                } => Some((adapter, scrambled, clear, window_ms)),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -102,6 +133,13 @@ enum Request {
     },
     /// The adapters' pid tables for the `added_only` CAPMT filter.
     RequestedPids(BTreeSet<(u16, u16)>),
+    /// One window of an adapter's output: packets left scrambled and clear.
+    ScrambledWindow {
+        adapter: usize,
+        scrambled: u64,
+        clear: u64,
+        window_ms: i64,
+    },
     Stop,
 }
 
@@ -190,6 +228,19 @@ impl Dvbca {
         }
     }
 
+    /// A handle whose scrambled windows can be read back with the recorder.
+    #[cfg(test)]
+    pub(crate) fn recording() -> (Self, WindowRecorder) {
+        let (requests, rx) = mpsc::channel();
+        let (_, notices) = mpsc::channel();
+        let dvbca = Self {
+            requests,
+            notices,
+            thread: None,
+        };
+        (dvbca, WindowRecorder(rx))
+    }
+
     /// Queues `dvbca_process_pmt`; `None` when the worker is gone.
     fn add_pmt(&self, program: Program, update: bool) -> Option<Receiver<TablesResult>> {
         let (reply, rx) = mpsc::channel();
@@ -210,6 +261,16 @@ impl Dvbca {
     /// Replaces the requested `(adapter, pid)` set the worker's CAPMTs filter on.
     pub fn set_requested_pids(&self, pids: BTreeSet<(u16, u16)>) {
         let _ = self.requests.send(Request::RequestedPids(pids));
+    }
+
+    /// Reports one window of an adapter's output to its CAM (`--cam-recovery`).
+    pub fn report_scrambled(&self, adapter: usize, scrambled: u64, clear: u64, window_ms: i64) {
+        let _ = self.requests.send(Request::ScrambledWindow {
+            adapter,
+            scrambled,
+            clear,
+            window_ms,
+        });
     }
 
     /// Withdraws pending offers `keep` rejects; the worker runs requests in
@@ -397,6 +458,13 @@ impl CaDriver for SlotDriver<'_> {
     }
 }
 
+/// The PMT ids of a CAPMT, sorted: the composition the zap guard compares.
+fn capmt_ids(capmt: &ms_ca::CaDevice) -> Vec<usize> {
+    let mut ids = capmt_pmt_ids(capmt);
+    ids.sort_unstable();
+    ids
+}
+
 /// Every valid PMT id of the CAPMT slots (`send_cw_to_all_pmts`).
 fn capmt_pmt_ids(capmt: &ms_ca::CaDevice) -> Vec<usize> {
     let mut ids = Vec::new();
@@ -445,6 +513,8 @@ impl Worker {
         registry.enigma = settings.enigma;
         registry.set_cache_dir(&settings.cache_dir);
         registry.set_ci_plus_recovery_ms(settings.ci_plus_recovery_ms);
+        registry.set_cam_recovery_ms(settings.cam_recovery_ms);
+        registry.set_cam_recovery_zap_guard(settings.cam_recovery_zap_guard);
         for (id, pin) in &settings.pins {
             registry.device(*id).set_pin(pin.as_bytes());
         }
@@ -519,11 +589,34 @@ impl Worker {
                     self.capmt.get_mut(&device),
                     self.registry.get_mut(device as i32),
                 ) {
-                    capmt.del_pmt(pmt_id, &self.programs, &mut SlotDriver(dev));
+                    let before = capmt_ids(capmt);
+                    capmt.del_pmt(pmt_id, &self.programs, &mut SlotDriver(&mut *dev));
+                    if capmt_ids(capmt) != before {
+                        dev.cam_recovery_pmts_changed();
+                    }
                 }
                 self.programs.del(pmt_id);
             }
             Request::RequestedPids(pids) => self.programs.set_requested_pids(pids),
+            Request::ScrambledWindow {
+                adapter,
+                scrambled,
+                clear,
+                window_ms,
+            } => {
+                // A window counts only while a CAPMT is in place on an initialised CAM.
+                let active = self
+                    .registry
+                    .get(adapter as i32)
+                    .is_some_and(|dev| dev.state == CaState::Initialized)
+                    && self
+                        .capmt
+                        .get(&adapter)
+                        .is_some_and(|capmt| !capmt_pmt_ids(capmt).is_empty());
+                if let Some(dev) = self.registry.get_mut(adapter as i32) {
+                    dev.cam_recovery_window(window_ms, scrambled, clear, active);
+                }
+            }
             Request::Stop => {}
         }
     }
@@ -567,7 +660,11 @@ impl Worker {
             return TablesResult::Retry;
         }
         self.programs.insert(program);
-        let result = capmt.process_pmt(pmt_id, update, &self.programs, &mut SlotDriver(dev));
+        let before = capmt_ids(capmt);
+        let result = capmt.process_pmt(pmt_id, update, &self.programs, &mut SlotDriver(&mut *dev));
+        if capmt_ids(capmt) != before {
+            dev.cam_recovery_pmts_changed();
+        }
         // ca.cpp:1330-1335: a PMT that got its CAPMT also gets the stored CI+ keys.
         if result == TablesResult::Ok
             && let Ok(id) = usize::try_from(pmt_id)
@@ -766,6 +863,7 @@ impl Worker {
                 HostEvent::Opened => {
                     *capmt = ms_ca::CaDevice::new(id as i32, max_ca_pmt, multiple);
                     capmt.state = ms_ca::CaState::Inactive;
+                    dev.cam_recovery_pmts_changed();
                 }
                 HostEvent::CaInfo { caids } => {
                     capmt.state = ms_ca::CaState::Initialized;
@@ -780,6 +878,7 @@ impl Worker {
                 HostEvent::ReleasePmts => {
                     capmt.state = ms_ca::CaState::Inactive;
                     let released = capmt.release_pmts();
+                    dev.cam_recovery_pmts_changed();
                     if !released.is_empty() {
                         let _ = self.notices.send(Notice::Released(released));
                     }
@@ -1130,6 +1229,257 @@ mod tests {
         worker
             .adapters
             .insert(id, AdapterInfo::dvb(id as i32, 0, id as u32));
+    }
+
+    /// `--cam-recovery`: a window reaches the device through the worker, and a CAM
+    /// with no CAPMT in place is not judged, so an armed watchdog disarms.
+    #[test]
+    fn scrambled_window_without_a_capmt_disarms() {
+        let (mut worker, _writes, _rx) = enigma_worker();
+        ready_ci(&mut worker, 1, 0x0B00);
+        let dev = worker.registry.device(1);
+        dev.cam_recovery_timeout_ms = 10_000;
+        dev.cam_recovery_since = 0;
+        worker.handle(Request::ScrambledWindow {
+            adapter: 1,
+            scrambled: 50_000,
+            clear: 0,
+            window_ms: 10_000,
+        });
+        assert_eq!(
+            worker.registry.get(1).unwrap().cam_recovery_since,
+            -1,
+            "no CAPMT: the window disarms"
+        );
+    }
+
+    /// A worker on a manual clock, with `--cam-recovery` set to `timeout_ms`.
+    fn cam_recovery_worker(timeout_ms: i64) -> (Worker, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(0, 0));
+        let (tx, _rx) = mpsc::channel();
+        let settings = DvbcaSettings {
+            cam_recovery_ms: timeout_ms,
+            ..DvbcaSettings::default()
+        };
+        let worker = Worker::new(
+            settings,
+            Box::new(ProcLog(Writes::default())),
+            clock.clone(),
+            tx,
+        );
+        (worker, clock)
+    }
+
+    /// `--cam-recovery`: an initialised CAM with a CAPMT in place is judged, so a
+    /// stuck window judged after the anchor resets it through the worker.
+    #[test]
+    fn scrambled_window_with_a_capmt_resets_the_cam() {
+        let (mut worker, clock) = cam_recovery_worker(10_000);
+        ready_ci(&mut worker, 1, 0x0B00);
+        worker.capmt.get_mut(&1).unwrap().capmt[0].pmt_id = 5;
+        let dev = worker.registry.device(1);
+        dev.cam_recovery_since = 0;
+        clock.advance(20_000);
+        worker.handle(Request::ScrambledWindow {
+            adapter: 1,
+            scrambled: 50_000,
+            clear: 0,
+            window_ms: 10_000,
+        });
+        assert!(
+            worker.registry.get_mut(1).unwrap().take_close_request(),
+            "the stuck window resets the CAM"
+        );
+    }
+
+    /// `--cam-recovery`: a CAM that is not initialised is not judged, even with a CAPMT.
+    #[test]
+    fn scrambled_window_on_an_uninitialised_cam_disarms() {
+        let (mut worker, clock) = cam_recovery_worker(10_000);
+        ready_ci(&mut worker, 1, 0x0B00);
+        worker.capmt.get_mut(&1).unwrap().capmt[0].pmt_id = 5;
+        let dev = worker.registry.device(1);
+        dev.cam_recovery_since = 0;
+        worker.registry.get_mut(1).unwrap().state = CaState::Active;
+        clock.advance(20_000);
+        worker.handle(Request::ScrambledWindow {
+            adapter: 1,
+            scrambled: 50_000,
+            clear: 0,
+            window_ms: 10_000,
+        });
+        assert_eq!(
+            worker.registry.get(1).unwrap().cam_recovery_since,
+            -1,
+            "not initialised: the window disarms"
+        );
+        assert!(!worker.registry.get_mut(1).unwrap().take_close_request());
+    }
+
+    /// A worker whose slot 0 is an initialised CAM with a CA session; the zap
+    /// guard is `zap_guard`.
+    fn zap_worker(zap_guard: bool) -> (Worker, Arc<ManualClock>) {
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let clock = Arc::new(ManualClock::new(0, 0));
+        let (tx, _rx) = mpsc::channel();
+        let settings = DvbcaSettings {
+            cam_recovery_ms: 10_000,
+            cam_recovery_zap_guard: zap_guard,
+            ..DvbcaSettings::default()
+        };
+        let mut worker = Worker::new(settings, Box::new(CamOpener(cam)), clock.clone(), tx);
+        worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        for _ in 0..500 {
+            let up = worker.registry.get(0).is_some_and(|dev| {
+                dev.state == CaState::Initialized && CaPmtSink::has_ca_session(dev)
+            });
+            if up {
+                break;
+            }
+            clock.advance(10);
+            worker.service();
+        }
+        (worker, clock)
+    }
+
+    fn zap_program(pmt_id: usize, sid: u16) -> Program {
+        program_from_service(&CaService {
+            pmt_id,
+            adapter: 0,
+            sid,
+            pmt_pid: 0x100,
+            ..CaService::default()
+        })
+    }
+
+    /// Arms the watchdog as if slot 0 had been clean and an MMI had anchored it.
+    fn arm_slot_0(worker: &mut Worker) {
+        let dev = worker.registry.get_mut(0).unwrap();
+        dev.cam_recovery_ok = true;
+        dev.cam_recovery_since = 0;
+    }
+
+    /// `--cam-recovery` zap guard: a service joining the CAPMT clears the arming
+    /// state, a service leaving it does too, and a re-add of the same service does not.
+    #[test]
+    fn zap_guard_clears_arming_on_a_join_and_a_leave() {
+        let (mut worker, _clock) = zap_worker(true);
+        arm_slot_0(&mut worker);
+        worker.add_pmt(zap_program(4, 0x64), false);
+        assert_eq!(worker.capmt[&0].slot_of(4), Some(0), "the service joined");
+        let dev = worker.registry.get(0).unwrap();
+        assert!(!dev.cam_recovery_ok, "a join clears the guard");
+        assert_eq!(dev.cam_recovery_since, -1, "a join drops the anchor");
+
+        arm_slot_0(&mut worker);
+        worker.add_pmt(zap_program(4, 0x64), true);
+        assert_eq!(worker.capmt[&0].slot_of(4), Some(0), "still joined");
+        assert!(
+            worker.registry.get(0).unwrap().cam_recovery_ok,
+            "a re-add of the same service is no change"
+        );
+
+        worker.handle(Request::DelPmt {
+            adapter: 0,
+            pmt_id: 4,
+        });
+        assert!(
+            !worker.registry.get(0).unwrap().cam_recovery_ok,
+            "a leave clears the guard"
+        );
+    }
+
+    /// With `--cam-recovery-no-zap-guard` a join leaves the arming state alone.
+    #[test]
+    fn zap_guard_off_keeps_arming_on_a_join() {
+        let (mut worker, _clock) = zap_worker(false);
+        arm_slot_0(&mut worker);
+        worker.add_pmt(zap_program(4, 0x64), false);
+        assert_eq!(worker.capmt[&0].slot_of(4), Some(0), "the service joined");
+        assert!(worker.registry.get(0).unwrap().cam_recovery_ok);
+    }
+
+    /// A worker with slot 0 initialised by `Init`, its `Opened` event not yet forwarded.
+    fn opened_worker() -> Worker {
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let settings = DvbcaSettings {
+            cam_recovery_ms: 10_000,
+            ..DvbcaSettings::default()
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            settings,
+            Box::new(CamOpener(cam)),
+            Arc::new(ManualClock::new(0, 0)),
+            tx,
+        );
+        worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        worker
+    }
+
+    /// The `Opened` event of a (re)opened CAM clears the zap guard's arming state.
+    #[test]
+    fn opened_event_clears_the_arming_state() {
+        let mut worker = opened_worker();
+        arm_slot_0(&mut worker);
+        worker.forward_events(0);
+        let dev = worker.registry.get(0).unwrap();
+        assert!(!dev.cam_recovery_ok, "an opened CAM clears the guard");
+        assert_eq!(dev.cam_recovery_since, -1, "an opened CAM drops the anchor");
+    }
+
+    /// The `ReleasePmts` event (a teardown) clears the zap guard's arming state.
+    #[test]
+    fn release_pmts_event_clears_the_arming_state() {
+        let (mut worker, _clock) = zap_worker(true);
+        arm_slot_0(&mut worker);
+        worker.registry.get_mut(0).unwrap().teardown();
+        worker.forward_events(0);
+        assert!(
+            !worker.registry.get(0).unwrap().cam_recovery_ok,
+            "released PMTs clear the guard"
+        );
+    }
+
+    /// `--cam-recovery-no-zap-guard` reaches the settings inverted, so the guard is on by default.
+    #[test]
+    fn settings_map_the_zap_guard_flag() {
+        assert!(DvbcaSettings::from_options(&Options::default()).cam_recovery_zap_guard);
+        let opts = Options {
+            cam_recovery: 10,
+            cam_recovery_no_zap_guard: true,
+            ..Options::default()
+        };
+        let settings = DvbcaSettings::from_options(&opts);
+        assert!(!settings.cam_recovery_zap_guard);
+        assert_eq!(settings.cam_recovery_ms, 10_000);
+    }
+
+    #[test]
+    fn report_scrambled_sends_the_window_to_the_worker() {
+        let (requests, rx) = mpsc::channel();
+        let (_tx, notices) = mpsc::channel();
+        let dvbca = Dvbca {
+            requests,
+            notices,
+            thread: None,
+        };
+        dvbca.report_scrambled(3, 9, 1, 10_000);
+        match rx.try_recv() {
+            Ok(Request::ScrambledWindow {
+                adapter,
+                scrambled,
+                clear,
+                window_ms,
+            }) => assert_eq!((adapter, scrambled, clear, window_ms), (3, 9, 1, 10_000)),
+            _ => panic!("no scrambled window request"),
+        }
     }
 
     fn program_on(adapter: u16, caid: u16) -> Program {

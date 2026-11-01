@@ -158,6 +158,21 @@ pub struct CaDevice {
     pub last_rx_ms: i64,
     /// CI+ key watchdog timeout (ms; 0 disables it). No C++ equivalent.
     pub recovery_timeout_ms: i64,
+    /// `--cam-recovery` in ms; 0 disables the scrambled-output watchdog.
+    pub cam_recovery_timeout_ms: i64,
+    /// Anchor of the scrambled-output watchdog: the first MMI message (ms; -1 unarmed).
+    pub cam_recovery_since: i64,
+    /// Start of the current run of judged stuck windows (ms; -1 none). Any other window ends it.
+    pub cam_recovery_stuck_since: i64,
+    /// True while the last window was clean: an MMI message arms only then, so the
+    /// slot was descrambling just before it. A stuck window clears it.
+    pub cam_recovery_ok: bool,
+    /// Time of the last `cam_recovery` reset (ms; -1 none).
+    pub cam_recovery_last: i64,
+    /// Zap guard: a CAPMT change clears the arming state (off with `--cam-recovery-no-zap-guard`).
+    pub cam_recovery_zap_guard: bool,
+    /// Time of the last CAPMT change the guard saw (ms; -1 none).
+    pub cam_recovery_changed: i64,
     /// This slot's `cam_state` changes; kept across reconnects.
     cam_states: ms_log::diag::events::CamStateFilter,
     close_requested: bool,
@@ -204,6 +219,13 @@ impl CaDevice {
             last_key_ms: -1,
             last_rx_ms: -1,
             recovery_timeout_ms: 0,
+            cam_recovery_timeout_ms: 0,
+            cam_recovery_since: -1,
+            cam_recovery_stuck_since: -1,
+            cam_recovery_ok: false,
+            cam_recovery_last: -1,
+            cam_recovery_zap_guard: true,
+            cam_recovery_changed: -1,
             cam_states: Default::default(),
             close_requested: false,
             events: VecDeque::new(),
@@ -378,6 +400,8 @@ impl CaDevice {
         self.mmi_error_since = -1;
         self.last_key_ms = -1;
         self.last_rx_ms = -1;
+        self.cam_recovery_since = -1;
+        self.cam_recovery_stuck_since = -1;
         self.link = None;
         self.sock = None;
         self.close_requested = false;
@@ -954,7 +978,114 @@ impl CaDevice {
         self.mmi_error_since = -1;
         self.request_close();
     }
+
+    /// Arms the scrambled-output watchdog on an MMI message (`--cam-recovery`), only
+    /// after a clean window; a repeat keeps the first anchor. No C++ equivalent.
+    pub fn note_cam_recovery_mmi(&mut self) {
+        if self.cam_recovery_timeout_ms > 0 && self.cam_recovery_since < 0 && self.cam_recovery_ok {
+            self.cam_recovery_since = self.now();
+        }
+    }
+
+    /// Zap guard: a CAPMT change (a service joins or leaves) clears the arming
+    /// state, so only a clean window that starts after it arms the watchdog again.
+    pub fn cam_recovery_pmts_changed(&mut self) {
+        if !self.cam_recovery_zap_guard {
+            return;
+        }
+        self.cam_recovery_ok = false;
+        self.cam_recovery_since = -1;
+        self.cam_recovery_stuck_since = -1;
+        self.cam_recovery_changed = self.now();
+    }
+
+    /// Judges one window: `scrambled` and `clear` are its packet counts, `window_ms`
+    /// its length, `active` a CAPMT in place. Only windows after the anchor plus lag count.
+    pub fn cam_recovery_window(
+        &mut self,
+        window_ms: i64,
+        scrambled: u64,
+        clear: u64,
+        active: bool,
+    ) {
+        if self.cam_recovery_timeout_ms <= 0 {
+            return;
+        }
+        if !active {
+            self.cam_recovery_since = -1;
+            self.cam_recovery_stuck_since = -1;
+            return;
+        }
+        let now = self.now();
+        let start = now - window_ms;
+        let total = scrambled + clear;
+        let stuck =
+            scrambled >= CAM_RECOVERY_MIN_PKTS && scrambled * 100 >= total * CAM_RECOVERY_SHARE;
+        let clean = clear >= CAM_RECOVERY_MIN_PKTS && scrambled * 100 < total * CAM_RECOVERY_SHARE;
+        let judged =
+            self.cam_recovery_since >= 0 && start >= self.cam_recovery_since + CAM_RECOVERY_LAG_MS;
+        if clean {
+            // A window that starts before the last CAPMT change does not re-arm.
+            let after_change = self.cam_recovery_changed < 0
+                || start >= self.cam_recovery_changed + CAM_RECOVERY_LAG_MS;
+            self.cam_recovery_ok |= after_change;
+            self.cam_recovery_stuck_since = -1;
+            if judged {
+                self.cam_recovery_since = -1;
+            }
+            return;
+        }
+        if !stuck {
+            // Neutral: too few packets to call it stuck, so it ends the run.
+            self.cam_recovery_stuck_since = -1;
+            return;
+        }
+        // A stuck window clears the guard: no re-arm until a clean window.
+        self.cam_recovery_ok = false;
+        if !judged {
+            return;
+        }
+        if self.cam_recovery_stuck_since < 0 {
+            self.cam_recovery_stuck_since = start;
+        }
+        let run = now - self.cam_recovery_stuck_since;
+        if run < self.cam_recovery_timeout_ms {
+            return;
+        }
+        if self.cam_recovery_last >= 0 && now - self.cam_recovery_last < CAM_RECOVERY_MIN_GAP_MS {
+            ms_log::log!(
+                "CA {}: {} of {} packets still scrambled, not resetting: the last CAM recovery reset was less than 10 minutes ago",
+                self.id,
+                scrambled,
+                total
+            );
+            self.cam_recovery_since = -1;
+            self.cam_recovery_stuck_since = -1;
+            return;
+        }
+        ms_log::log!(
+            "CA {}: {} of {} packets still scrambled for {} ms after a CAM MMI message, resetting the CAM (CAM recovery)",
+            self.id,
+            scrambled,
+            total,
+            run
+        );
+        self.cam_recovery_last = now;
+        self.report_state("cam_recovery");
+        self.cam_recovery_since = -1;
+        self.cam_recovery_stuck_since = -1;
+        self.request_close();
+    }
 }
+
+/// `--cam-recovery` per-window thresholds: stuck is at least CAM_RECOVERY_MIN_PKTS
+/// scrambled at CAM_RECOVERY_SHARE percent or more; clean is the reverse. No C++ equivalent.
+pub const CAM_RECOVERY_MIN_PKTS: u64 = 1000;
+pub const CAM_RECOVERY_SHARE: u64 = 90;
+/// Minimum time between two resets of one slot (ms), against a reset loop.
+pub const CAM_RECOVERY_MIN_GAP_MS: i64 = 600_000;
+/// Stats reach the watchdog up to two STATS_MS late, so a window must start this long after the anchor.
+pub const CAM_RECOVERY_LAG_MS: i64 = 2_000;
 
 /// Hook the CAM transport (dvbca) uses to hand CA_PMT bodies to this CAM.
 pub trait CaPmtSink {
