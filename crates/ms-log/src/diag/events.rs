@@ -287,6 +287,26 @@ pub fn ddci_fifo_overflow(adapter: i64, dropped: u64) {
     );
 }
 
+fn ddci_capture_fields(slot: i64, files: &str, bytes: u64, drops: u64) -> Fields {
+    let mut fields = Fields::new();
+    fields.integer("slot", slot);
+    fields.string("files", files);
+    fields.int("bytes", bytes);
+    fields.int("drops", drops);
+    fields
+}
+
+/// `ddci_capture`: a `--ddci-capture` pair was written; `drops` counts bytes the writer missed.
+pub fn ddci_capture(slot: i64, files: &str, bytes: u64, drops: u64) {
+    if !cfg!(feature = "diag-log") {
+        return;
+    }
+    emit(
+        "ddci_capture",
+        &ddci_capture_fields(slot, files, bytes, drops),
+    );
+}
+
 fn ci_decrypt_fields(adapter: i64, keys_installed: u64, errors: u64, period_s: u64) -> Fields {
     let mut fields = Fields::new();
     fields.integer("adapter", adapter);

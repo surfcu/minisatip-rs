@@ -361,6 +361,10 @@ const DIAG_USAGE: &str = "\
 
 * --log-ring lines: keep the last lines in memory for crash dumps and GET /debug/log; 0 disables the ring (default 20000)
 
+* --ddci-capture dir: on a CAM MMI menu or enquiry, write the last and next 60 s of DDCI TS (in and out) to dir, at most one per slot per 10 min
+
+* --ddci-capture-max-mb mb: refuse a new --ddci-capture when dir already holds this many MB (default 2048)
+
 ";
 
 #[cfg(test)]
