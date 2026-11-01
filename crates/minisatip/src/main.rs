@@ -2,6 +2,8 @@
 
 mod ca;
 mod ddci;
+#[cfg(feature = "diag-log")]
+mod ddci_capture;
 mod dvbca;
 mod hw;
 #[cfg(unix)]
