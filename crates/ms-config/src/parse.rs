@@ -65,6 +65,8 @@ enum OptId {
     DemuxDev,
     Ci,
     CiPlusRecovery,
+    CamRecovery,
+    CamRecoveryNoZapGuard,
     CaPin,
     Ipv6,
     NoPidsAll,
@@ -459,6 +461,18 @@ const OPTIONS: &[OptSpec] = &[
         short: None,
         kind: ArgKind::Required,
         id: OptId::CiPlusRecovery,
+    },
+    OptSpec {
+        long: "cam-recovery",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::CamRecovery,
+    },
+    OptSpec {
+        long: "cam-recovery-no-zap-guard",
+        short: None,
+        kind: ArgKind::None,
+        id: OptId::CamRecoveryNoZapGuard,
     },
     OptSpec {
         long: "ca-channels",
@@ -933,6 +947,10 @@ impl Parser<'_> {
             OptId::CiPlusRecovery => {
                 self.opts.ci_plus_recovery = parse_int(value, 0).max(0);
             }
+            OptId::CamRecovery => {
+                self.opts.cam_recovery = parse_int(value, 0).max(0);
+            }
+            OptId::CamRecoveryNoZapGuard => self.opts.cam_recovery_no_zap_guard = true,
             OptId::CaChannels => self.parse_ca_channels(value),
             OptId::HwDescrambler => self.opts.hw_descrambler = true,
             OptId::SdtCharset => {

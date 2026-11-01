@@ -344,12 +344,20 @@ pub fn usage_text() -> String {
     if cfg!(feature = "ci-plus") {
         text.push_str(CI_PLUS_USAGE);
     }
+    text.push_str(CAM_RECOVERY_USAGE);
     text
 }
 
 /// Help line for `--ci-plus-recovery`, printed only in CI+ builds.
 const CI_PLUS_USAGE: &str = "\
 * --ci-plus-recovery seconds: reset a CAM that sends no CI+ key after an MMI message; 0 disables it (default 0)
+
+";
+
+/// Help line for `--cam-recovery`, printed in every build.
+const CAM_RECOVERY_USAGE: &str = "\
+* --cam-recovery seconds: reset a CAM whose CI output stays scrambled after an MMI message; 0 disables it (default 0)
+* --cam-recovery-no-zap-guard: with --cam-recovery, let any clean window before an MMI message arm, even one before a zap (default off)
 
 ";
 

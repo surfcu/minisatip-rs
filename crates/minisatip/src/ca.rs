@@ -40,8 +40,8 @@ const DVBAPI_POLL_MS: i64 = 1000;
 const WATCHDOG_MS: i64 = 100;
 /// How often every descrambler is asked for its statistics (`ad_decerr`).
 const STATS_MS: i64 = 1000;
-/// Period of the `ci_decrypt` diagnostics.
-const DIAG_DECRYPT_MS: i64 = 10_000;
+/// Period of the decrypt windows: the `ci_decrypt` diagnostics and the `--cam-recovery` counts.
+const DECRYPT_WINDOW_MS: i64 = 10_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 /// PID that requests the whole transport stream.
@@ -82,10 +82,20 @@ pub struct CaRuntime {
     next_poll: i64,
     next_watchdog: i64,
     next_stats: i64,
-    /// Next `ci_decrypt` window (ms).
-    diag_next_decrypt: i64,
+    /// Next decrypt window (ms).
+    next_decrypt_window: i64,
     /// Cumulative `dec_err` already reported per adapter.
     diag_dec_err: BTreeMap<usize, u64>,
+    /// Counters of each CI adapter at its last decrypt window (`--cam-recovery`).
+    window_base: BTreeMap<usize, WindowBase>,
+}
+
+/// Cumulative counters of one CI adapter and when they were read (ms).
+#[derive(Clone, Copy, Debug)]
+struct WindowBase {
+    scrambled: u64,
+    clear: u64,
+    at: i64,
 }
 
 impl CaRuntime {
@@ -115,8 +125,9 @@ impl CaRuntime {
             next_poll: 0,
             next_watchdog: 0,
             next_stats: 0,
-            diag_next_decrypt: 0,
+            next_decrypt_window: 0,
             diag_dec_err: BTreeMap::new(),
+            window_base: BTreeMap::new(),
         }
     }
 
@@ -548,6 +559,7 @@ impl CaRuntime {
         self.section_pids.remove(&aid);
         self.hw_nodes.remove(&aid);
         self.ca_views.remove(&aid);
+        self.window_base.remove(&aid);
         self.router.forget_adapter(aid as i32);
     }
 
@@ -663,9 +675,9 @@ impl CaRuntime {
         let now = self.now();
         self.set_driver_time(now);
         self.collect_stats();
-        if cfg!(feature = "diag-log") && now >= self.diag_next_decrypt {
-            self.diag_next_decrypt = now + DIAG_DECRYPT_MS;
-            self.diag_decrypt(sched);
+        if now >= self.next_decrypt_window {
+            self.next_decrypt_window = now + DECRYPT_WINDOW_MS;
+            self.decrypt_windows(sched, now);
         }
         self.dvbca_notices(sched);
         if let Some(dvbapi) = self.dvbapi.as_mut() {
@@ -891,9 +903,11 @@ impl CaRuntime {
         }
     }
 
-    /// Emits `ci_decrypt` per CI adapter when keys or errors were seen.
-    fn diag_decrypt(&mut self, sched: &Scheduler) {
+    /// Per decrypt window of every CI adapter: `ci_decrypt` diagnostics, and the
+    /// counts to its CAM when `--cam-recovery` is set.
+    fn decrypt_windows(&mut self, sched: &Scheduler, now: i64) {
         let aids: Vec<usize> = self.adapters.keys().copied().collect();
+        let mut windows = Vec::new();
         for aid in aids {
             let is_ci = sched
                 .adapter(aid)
@@ -906,14 +920,54 @@ impl CaRuntime {
             };
             let keys = ca.stats.services.iter().filter(|s| s.cw.is_some()).count();
             let total = ca.stats.dec_err;
+            let clear_total = ca.stats.clear_pkts;
             let previous = self.diag_dec_err.insert(aid, total).unwrap_or(0);
             let errors = total.saturating_sub(previous);
-            if keys == 0 && errors == 0 {
-                continue;
+            if cfg!(feature = "diag-log") && (keys > 0 || errors > 0) {
+                let period_s = (DECRYPT_WINDOW_MS / 1000) as u64;
+                ms_log::diag::events::ci_decrypt(aid as i64, keys as u64, errors, period_s);
             }
-            let period_s = (DIAG_DECRYPT_MS / 1000) as u64;
-            ms_log::diag::events::ci_decrypt(aid as i64, keys as u64, errors, period_s);
+            if let Some(sample) = self.window_sample(aid, total, clear_total, now) {
+                windows.push((aid, sample));
+            }
         }
+        if self.dvbca_settings.cam_recovery_ms <= 0 {
+            return;
+        }
+        if let Some(state) = self.dvbca.as_ref() {
+            for (aid, (scrambled, clear, window_ms)) in windows {
+                state
+                    .dvbca
+                    .report_scrambled(aid, scrambled, clear, window_ms);
+            }
+        }
+    }
+
+    /// The `(scrambled, clear, window_ms)` counts since the last window; the first
+    /// sample, or counters that went back, only reseed the baseline.
+    fn window_sample(
+        &mut self,
+        aid: usize,
+        scrambled: u64,
+        clear: u64,
+        now: i64,
+    ) -> Option<(u64, u64, i64)> {
+        let base = self.window_base.insert(
+            aid,
+            WindowBase {
+                scrambled,
+                clear,
+                at: now,
+            },
+        )?;
+        if scrambled < base.scrambled || clear < base.clear {
+            return None;
+        }
+        Some((
+            scrambled - base.scrambled,
+            clear - base.clear,
+            now - base.at,
+        ))
     }
 
     fn sync(&mut self, sched: &Scheduler, handles: &[Option<AdapterHandle>]) {
@@ -2056,5 +2110,128 @@ mod ci_stage_tests {
         for packet in fifo.chunks(188) {
             assert_eq!(packet, scrambled.as_slice(), "not nulled");
         }
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::dvbca::WindowRecorder;
+    use ms_sched::{AdapterConfig, AdapterTuner, TuneError};
+    use ms_tuner::{DeliverySystem, TuneParams};
+
+    // `--cam-recovery`: the first sample seeds the baseline, a window is the change
+    // since the previous sample, and counters that went back restart the baseline.
+    #[test]
+    fn windows_are_the_change_since_the_previous_sample() {
+        let mut ca = CaRuntime::new(&Options::default());
+        assert_eq!(
+            ca.window_sample(1, 100, 10, 1_000),
+            None,
+            "the first sample seeds"
+        );
+        assert_eq!(ca.window_sample(1, 150, 40, 11_000), Some((50, 30, 10_000)));
+        assert_eq!(
+            ca.window_sample(1, 20, 5, 21_000),
+            None,
+            "a restarted descrambler reseeds"
+        );
+        assert_eq!(ca.window_sample(1, 25, 9, 31_000), Some((5, 4, 10_000)));
+    }
+
+    /// A scheduler whose adapters are all CI adapters.
+    fn ci_sched(aids: &[usize]) -> Scheduler {
+        struct NoTune;
+        impl AdapterTuner for NoTune {
+            fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+                Ok(())
+            }
+        }
+        let mut sched = Scheduler::new();
+        for &aid in aids {
+            let mut config = AdapterConfig::new(DeliverySystem::DvbS2);
+            config.adapter_type = AdapterType::Ci;
+            sched.add_adapter(aid, config, Box::new(NoTune));
+        }
+        sched
+    }
+
+    /// Sets the descrambler counters `decrypt_windows` reads for `aid`.
+    fn set_counters(ca: &mut CaRuntime, aid: usize, dec_err: u64, clear_pkts: u64) {
+        let (descrambler, _rx) = mpsc::channel();
+        let adapter = ca.adapters.entry(aid).or_insert_with(|| AdapterCa {
+            descrambler,
+            services: BTreeMap::new(),
+            ca_active: false,
+            pids_all: false,
+            stats: DescramblerStats::default(),
+            pending_stats: None,
+            pid_table: Vec::new(),
+        });
+        adapter.stats.dec_err = dec_err;
+        adapter.stats.clear_pkts = clear_pkts;
+    }
+
+    /// A runtime whose CAM link records the windows it reports, with `--cam-recovery` at `cam_recovery_ms`.
+    fn recording_runtime(cam_recovery_ms: i64) -> (CaRuntime, WindowRecorder) {
+        let mut ca = CaRuntime::new(&Options::default());
+        ca.dvbca_settings.cam_recovery_ms = cam_recovery_ms;
+        let (dvbca, recorder) = Dvbca::recording();
+        ca.dvbca = Some(DvbcaState {
+            dvbca: Rc::new(dvbca),
+            caids: Rc::new(RefCell::new(BTreeMap::new())),
+            pending: PendingOffers::default(),
+            ca_id: 0,
+            requested: None,
+        });
+        (ca, recorder)
+    }
+
+    // `--cam-recovery` off: no window reaches the CAM, while the same counters do with it on.
+    #[test]
+    fn decrypt_windows_report_nothing_when_cam_recovery_is_off() {
+        let sched = ci_sched(&[1]);
+        for (cam_recovery_ms, expected) in [(0, 0), (-5_000, 0), (10_000, 1)] {
+            let (mut ca, recorder) = recording_runtime(cam_recovery_ms);
+            set_counters(&mut ca, 1, 0, 0);
+            ca.decrypt_windows(&sched, 1_000);
+            set_counters(&mut ca, 1, 50_000, 0);
+            ca.decrypt_windows(&sched, 11_000);
+            assert_eq!(
+                recorder.windows().len(),
+                expected,
+                "--cam-recovery {cam_recovery_ms} ms"
+            );
+        }
+    }
+
+    // Each CI adapter has its own baseline, so two adapters' windows do not mix.
+    #[test]
+    fn decrypt_windows_keep_each_adapters_window_apart() {
+        let sched = ci_sched(&[1, 2]);
+        let (mut ca, recorder) = recording_runtime(10_000);
+        set_counters(&mut ca, 1, 0, 0);
+        set_counters(&mut ca, 2, 0, 0);
+        ca.decrypt_windows(&sched, 1_000);
+        set_counters(&mut ca, 1, 3_000, 40);
+        set_counters(&mut ca, 2, 7_000, 90);
+        ca.decrypt_windows(&sched, 11_000);
+        assert_eq!(
+            recorder.windows(),
+            vec![(1, 3_000, 40, 10_000), (2, 7_000, 90, 10_000)]
+        );
+    }
+
+    // `adapter_removed` drops the baseline, so a later sample of that adapter reseeds.
+    #[test]
+    fn adapter_removed_forgets_its_window_baseline() {
+        let mut ca = CaRuntime::new(&Options::default());
+        assert_eq!(ca.window_sample(3, 100, 10, 1_000), None);
+        ca.adapter_removed(3);
+        assert_eq!(
+            ca.window_sample(3, 150, 40, 11_000),
+            None,
+            "a removed adapter reseeds"
+        );
     }
 }

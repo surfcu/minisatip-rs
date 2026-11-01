@@ -1,6 +1,6 @@
 //! The host stack driven by `ms-fakecam`, checked through its APDU log.
 
-use super::clock::ManualClock;
+use super::clock::{Clock, ManualClock};
 use super::consts::*;
 use super::device::{CaDevice, CaState, HostEvent};
 use super::link::{
@@ -546,4 +546,494 @@ fn ciplus_language_upgrade_and_operator_stubs() {
         &[0, 0, 0, 0, 1],
     );
     assert!(dev.take_close_request(), "reset requested after upgrade");
+}
+
+// --- --cam-recovery: a CAM whose output stays scrambled after an MMI message.
+// Plain CI (force_ci), so there are no CI+ keys: the host judges each 10 s window.
+
+const WINDOW_MS: i64 = 10_000;
+
+/// A slot with the watchdog on that has not seen any output yet.
+fn cam_recovery_cold(timeout_ms: i64) -> (ManualClock, Arc<Mutex<FakeCam>>, CaDevice) {
+    let (clock, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.cam_recovery_timeout_ms = timeout_ms;
+    (clock, cam, dev)
+}
+
+/// A slot that was descrambling at time 0: a clean window precedes any MMI message.
+fn cam_recovery_rig(timeout_ms: i64) -> (ManualClock, Arc<Mutex<FakeCam>>, CaDevice) {
+    let (clock, cam, mut dev) = cam_recovery_cold(timeout_ms);
+    dev.cam_recovery_window(WINDOW_MS, 0, 50_000, true);
+    (clock, cam, dev)
+}
+
+/// Shows an MMI menu and lets the host read it.
+fn show_menu(cam: &Arc<Mutex<FakeCam>>, dev: &mut CaDevice) {
+    assert!(
+        cam.lock()
+            .unwrap()
+            .send_mmi_menu(&["Title", "Subtitle", "Bottom", "Item"])
+    );
+    dev.timeout();
+    assert!(dev.service());
+    drain_events(dev);
+}
+
+/// Advances the clock to `at` and judges the 10 s window that ends there.
+fn window_at(clock: &ManualClock, dev: &mut CaDevice, at: i64, scrambled: u64, clear: u64) {
+    clock.advance(at - clock.tick_ms());
+    dev.cam_recovery_window(WINDOW_MS, scrambled, clear, true);
+}
+
+#[test]
+fn cam_recovery_fires_once_the_output_stays_scrambled() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 10_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "a window that starts at the anchor is not judged"
+    );
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "the first judged stuck window starts a run"
+    );
+    window_at(&clock, &mut dev, 30_000, 50_000, 0);
+    assert!(dev.take_close_request(), "stuck for the timeout");
+    assert_eq!(dev.cam_recovery_since, -1, "the reset disarms");
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "one reset per episode");
+}
+
+#[test]
+fn cam_recovery_one_stuck_window_after_quiet_windows_does_not_fire() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    show_menu(&cam, &mut dev);
+    // Near-silent windows are neutral: they make a window neither stuck nor clean.
+    window_at(&clock, &mut dev, 20_000, 100, 0);
+    window_at(&clock, &mut dev, 30_000, 0, 200);
+    window_at(&clock, &mut dev, 40_000, 100, 0);
+    assert!(
+        !dev.take_close_request(),
+        "neutral windows do not count as stuck"
+    );
+    // The stuck window ends 50 s after the anchor, but it is the only stuck window.
+    window_at(&clock, &mut dev, 50_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "a single stuck window is not a sustained run"
+    );
+    assert_eq!(dev.cam_recovery_stuck_since, 40_000, "the run starts here");
+    window_at(&clock, &mut dev, 60_000, 50_000, 0);
+    assert!(
+        dev.take_close_request(),
+        "a run of stuck windows spanning the timeout fires"
+    );
+}
+
+#[test]
+fn cam_recovery_neutral_window_breaks_a_stuck_run() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    assert_eq!(dev.cam_recovery_stuck_since, 10_000, "the run starts");
+    window_at(&clock, &mut dev, 30_000, 100, 0);
+    assert_eq!(dev.cam_recovery_stuck_since, -1, "a neutral window ends it");
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    assert_eq!(dev.cam_recovery_stuck_since, 30_000, "a new run starts");
+    assert!(
+        !dev.take_close_request(),
+        "the new run is only 10 s long at 40 s"
+    );
+    window_at(&clock, &mut dev, 50_000, 50_000, 0);
+    assert!(dev.take_close_request(), "the new run spans the timeout");
+}
+
+#[test]
+fn cam_recovery_clean_window_breaks_a_stuck_run() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    window_at(&clock, &mut dev, 30_000, 0, 50_000);
+    assert_eq!(dev.cam_recovery_stuck_since, -1, "a clean window ends it");
+    assert_eq!(dev.cam_recovery_since, -1, "a judged clean window disarms");
+    // Re-armed by an MMI message after the clean window: the old run does not count.
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    window_at(&clock, &mut dev, 50_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "only 10 s of stuck windows");
+    window_at(&clock, &mut dev, 60_000, 50_000, 0);
+    assert!(dev.take_close_request(), "the new run spans the timeout");
+}
+
+#[test]
+fn cam_recovery_needs_an_mmi_message() {
+    let (clock, _cam, mut dev) = cam_recovery_rig(20_000);
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "no MMI message, no reset");
+}
+
+#[test]
+fn cam_recovery_is_off_by_default() {
+    let (clock, cam, mut dev) = setup(CamConfig::default(), true);
+    assert_eq!(dev.cam_recovery_timeout_ms, 0, "the knob defaults to off");
+    show_menu(&cam, &mut dev);
+    assert_eq!(dev.cam_recovery_since, -1, "off means never armed");
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    assert!(!dev.take_close_request());
+}
+
+#[test]
+fn cam_recovery_disarms_when_the_output_is_clear_again() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 20_000, 0, 50_000);
+    assert_eq!(dev.cam_recovery_since, -1, "a judged clean window disarms");
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    window_at(&clock, &mut dev, 60_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "not re-armed without an MMI message"
+    );
+}
+
+#[test]
+fn cam_recovery_threshold_and_share_boundaries() {
+    // (scrambled, clear, fires): 90% exactly, one below, too few packets, and a low share.
+    for (scrambled, clear, fires) in [
+        (9_000, 1_000, true),
+        (8_999, 1_001, false),
+        (1_000, 0, true),
+        (999, 0, false),
+        (1_000, 200, false),
+    ] {
+        let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+        show_menu(&cam, &mut dev);
+        window_at(&clock, &mut dev, 10_000, scrambled, clear);
+        window_at(&clock, &mut dev, 20_000, scrambled, clear);
+        window_at(&clock, &mut dev, 30_000, scrambled, clear);
+        assert_eq!(
+            dev.take_close_request(),
+            fires,
+            "scrambled {scrambled}, clear {clear}"
+        );
+    }
+}
+
+#[test]
+fn cam_recovery_window_must_start_after_the_lag() {
+    let (clock, cam, mut dev) = cam_recovery_rig(1);
+    show_menu(&cam, &mut dev);
+    // Starts at 1999 ms: inside the stats lag, not judged.
+    window_at(&clock, &mut dev, 11_999, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "a window inside the lag is not judged"
+    );
+    // Starts at exactly the lag: judged.
+    window_at(&clock, &mut dev, 12_000, 50_000, 0);
+    assert!(dev.take_close_request(), "a window at the lag is judged");
+}
+
+#[test]
+fn cam_recovery_keeps_the_anchor_through_a_straddling_clear_window() {
+    let (clock, cam, mut dev) = cam_recovery_rig(10_000);
+    clock.advance(8_000);
+    show_menu(&cam, &mut dev);
+    // The zap MMI lands mid-window: this window is mostly clear, but starts before the anchor.
+    window_at(&clock, &mut dev, 10_000, 0, 50_000);
+    assert_eq!(
+        dev.cam_recovery_since, 8_000,
+        "a straddling window keeps the anchor"
+    );
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    assert!(dev.take_close_request(), "the stuck window after it fires");
+}
+
+#[test]
+fn cam_recovery_ignores_a_window_that_starts_before_the_anchor() {
+    let (clock, cam, mut dev) = cam_recovery_rig(5_000);
+    clock.advance(5_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 10_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "stuck, but the window starts before the anchor"
+    );
+}
+
+#[test]
+fn cam_recovery_needs_a_clean_window_before_the_mmi_message() {
+    // Nothing was descrambling (no entitlement, or a fresh zap): the MMI must not arm.
+    let (clock, cam, mut dev) = cam_recovery_cold(20_000);
+    show_menu(&cam, &mut dev);
+    assert_eq!(dev.cam_recovery_since, -1, "no clean window before the MMI");
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "never descrambled, so no reset");
+}
+
+#[test]
+fn cam_recovery_resets_when_it_was_descrambling_before_the_mmi() {
+    let (clock, cam, mut dev) = cam_recovery_cold(20_000);
+    window_at(&clock, &mut dev, 5_000, 0, 50_000);
+    show_menu(&cam, &mut dev);
+    assert_eq!(
+        dev.cam_recovery_since, 5_000,
+        "a clean window before the MMI arms"
+    );
+    window_at(&clock, &mut dev, 15_000, 50_000, 0);
+    window_at(&clock, &mut dev, 25_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "the run has only 10 s");
+    window_at(&clock, &mut dev, 35_000, 50_000, 0);
+    assert!(
+        dev.take_close_request(),
+        "it was descrambling, then stopped"
+    );
+}
+
+#[test]
+fn cam_recovery_waits_for_a_clean_window_after_a_reset() {
+    let (clock, cam, mut dev) = cam_recovery_rig(10_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    assert!(dev.take_close_request(), "the first episode resets");
+    assert!(!dev.cam_recovery_ok, "the guard holds until a clean window");
+
+    clock.advance(5_000);
+    show_menu(&cam, &mut dev);
+    assert_eq!(
+        dev.cam_recovery_since, -1,
+        "no re-arm before a clean window"
+    );
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    assert!(!dev.take_close_request());
+
+    window_at(&clock, &mut dev, 50_000, 0, 50_000);
+    assert!(dev.cam_recovery_ok, "a clean window re-enables it");
+    show_menu(&cam, &mut dev);
+    assert_eq!(
+        dev.cam_recovery_since, 50_000,
+        "armed again after the clean window"
+    );
+}
+
+#[test]
+fn cam_recovery_keeps_ten_minutes_between_resets() {
+    use super::device::CAM_RECOVERY_MIN_GAP_MS;
+    let (clock, cam, mut dev) = cam_recovery_rig(10_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    assert!(dev.take_close_request(), "the first reset");
+
+    // A second episode 30 s later is refused: less than the gap since the first reset.
+    window_at(&clock, &mut dev, 30_000, 0, 50_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 50_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "within ten minutes of the last reset"
+    );
+    assert_eq!(dev.cam_recovery_since, -1, "the refused episode disarms");
+
+    // The gap is measured from the first reset: exactly ten minutes later it is allowed.
+    let at = 20_000 + CAM_RECOVERY_MIN_GAP_MS;
+    window_at(&clock, &mut dev, at - 30_000, 0, 50_000);
+    clock.advance(10_000);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, at - 10_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "not judged yet");
+    window_at(&clock, &mut dev, at, 50_000, 0);
+    assert!(dev.take_close_request(), "the gap has passed");
+}
+
+#[test]
+fn cam_recovery_teardown_clears_the_anchor_and_keeps_the_guard() {
+    let (_clock, cam, mut dev) = cam_recovery_rig(10_000);
+    show_menu(&cam, &mut dev);
+    dev.cam_recovery_last = 12_345;
+    dev.teardown();
+    assert_eq!(dev.cam_recovery_since, -1, "a teardown disarms");
+    assert!(dev.cam_recovery_ok, "the guard survives a teardown");
+    assert_eq!(
+        dev.cam_recovery_last, 12_345,
+        "the reset time survives a teardown"
+    );
+}
+
+#[test]
+fn cam_recovery_repeated_mmi_keeps_the_first_anchor() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    show_menu(&cam, &mut dev);
+    clock.advance(5_000);
+    show_menu(&cam, &mut dev);
+    assert_eq!(dev.cam_recovery_since, 0, "the first message is the anchor");
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "the run has only 10 s");
+    window_at(&clock, &mut dev, 30_000, 50_000, 0);
+    assert!(dev.take_close_request(), "timed from the first message");
+}
+
+#[test]
+fn cam_recovery_skips_an_enquiry_the_pin_answers() {
+    let (_clock, cam, mut dev) = cam_recovery_rig(20_000);
+    dev.set_pin(b"1234");
+    assert!(cam.lock().unwrap().send_to_resource(
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x01, 4, b'P', b'I', b'N']
+    ));
+    dev.timeout();
+    assert!(dev.service());
+    assert_eq!(dev.cam_recovery_since, -1, "the configured PIN answers it");
+
+    assert!(cam.lock().unwrap().send_to_resource(
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x00, 2, b'O', b'K']
+    ));
+    dev.timeout();
+    assert!(dev.service());
+    assert_eq!(
+        dev.cam_recovery_since, 0,
+        "a prompt the PIN does not answer arms"
+    );
+}
+
+#[test]
+fn cam_recovery_setting_reaches_every_slot() {
+    let mut reg = CaRegistry::new(Arc::new(ManualClock::new(0, 0)));
+    reg.set_cam_recovery_ms(15_000);
+    assert_eq!(
+        reg.device(0).cam_recovery_timeout_ms,
+        15_000,
+        "a slot allocated later"
+    );
+    let dev = CaDevice::new(2, Arc::new(ManualClock::new(0, 0)));
+    reg.insert(dev);
+    assert_eq!(
+        reg.get(2).unwrap().cam_recovery_timeout_ms,
+        15_000,
+        "an inserted slot"
+    );
+    reg.set_cam_recovery_ms(0);
+    assert_eq!(
+        reg.device(0).cam_recovery_timeout_ms,
+        0,
+        "existing slots follow"
+    );
+}
+
+#[test]
+fn cam_recovery_refuses_one_millisecond_before_the_gap() {
+    let (clock, cam, mut dev) = cam_recovery_rig(10_000);
+    dev.cam_recovery_last = 0;
+    clock.advance(579_999);
+    show_menu(&cam, &mut dev);
+    window_at(&clock, &mut dev, 589_999, 50_000, 0);
+    window_at(&clock, &mut dev, 599_999, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "599999 ms after the last reset is refused"
+    );
+    assert_eq!(dev.cam_recovery_since, -1, "the refused episode disarms");
+}
+
+// --- Zap guard: a CAPMT change (a zap) clears the arming state.
+
+/// A slot that was clean at time 0, then saw a CAPMT change at `zap_at`.
+fn zap_rig(zap_at: i64) -> (ManualClock, Arc<Mutex<FakeCam>>, CaDevice) {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    clock.advance(zap_at);
+    dev.cam_recovery_pmts_changed();
+    (clock, cam, dev)
+}
+
+#[test]
+fn cam_recovery_zap_guard_blocks_an_mmi_after_a_zap() {
+    // Clean service, zap to one that never descrambles, MMI in the same window.
+    let (clock, cam, mut dev) = zap_rig(5_000);
+    show_menu(&cam, &mut dev);
+    assert_eq!(dev.cam_recovery_since, -1, "the zap leaves nothing to arm");
+    window_at(&clock, &mut dev, 20_000, 50_000, 0);
+    window_at(&clock, &mut dev, 40_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "never descrambled after the zap: no reset"
+    );
+}
+
+#[test]
+fn cam_recovery_zap_guard_rearms_after_a_clean_window_past_the_zap() {
+    let (clock, cam, mut dev) = zap_rig(5_000);
+    // Starts at 10 000, past the zap plus the lag: clean, so it re-arms.
+    window_at(&clock, &mut dev, 20_000, 0, 50_000);
+    clock.advance(5_000);
+    show_menu(&cam, &mut dev);
+    assert_eq!(
+        dev.cam_recovery_since, 25_000,
+        "a clean window after the zap arms"
+    );
+    window_at(&clock, &mut dev, 35_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "starts inside the lag: not judged"
+    );
+    window_at(&clock, &mut dev, 45_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "the run has only 10 s");
+    window_at(&clock, &mut dev, 55_000, 50_000, 0);
+    assert!(
+        dev.take_close_request(),
+        "stuck for the timeout after the MMI"
+    );
+}
+
+#[test]
+fn cam_recovery_zap_guard_ignores_a_clean_window_that_starts_before_the_zap() {
+    // Starts at 2 000, inside the lag after the zap at 1 000: it must not re-arm.
+    let (clock, cam, mut dev) = zap_rig(1_000);
+    window_at(&clock, &mut dev, 12_000, 0, 50_000);
+    show_menu(&cam, &mut dev);
+    assert_eq!(
+        dev.cam_recovery_since, -1,
+        "a window inside the lag does not re-arm"
+    );
+}
+
+#[test]
+fn cam_recovery_zap_disarms_an_armed_anchor() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    clock.advance(5_000);
+    show_menu(&cam, &mut dev);
+    assert_eq!(dev.cam_recovery_since, 5_000, "armed before the zap");
+    dev.cam_recovery_pmts_changed();
+    assert_eq!(dev.cam_recovery_since, -1, "the zap drops the anchor");
+    window_at(&clock, &mut dev, 25_000, 50_000, 0);
+    window_at(&clock, &mut dev, 45_000, 50_000, 0);
+    assert!(
+        !dev.take_close_request(),
+        "the stuck windows after the zap do not reset"
+    );
+}
+
+#[test]
+fn cam_recovery_without_the_zap_guard_resets_once_after_a_zap() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    dev.cam_recovery_zap_guard = false;
+    clock.advance(5_000);
+    dev.cam_recovery_pmts_changed();
+    show_menu(&cam, &mut dev);
+    assert_eq!(
+        dev.cam_recovery_since, 5_000,
+        "the MMI arms on the old clean window"
+    );
+    window_at(&clock, &mut dev, 25_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "the run has only 10 s");
+    window_at(&clock, &mut dev, 35_000, 50_000, 0);
+    assert!(dev.take_close_request(), "the zap case resets once");
+    window_at(&clock, &mut dev, 45_000, 50_000, 0);
+    assert!(!dev.take_close_request(), "one reset per episode");
 }

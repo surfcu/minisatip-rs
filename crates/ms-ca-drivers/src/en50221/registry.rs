@@ -27,6 +27,10 @@ pub struct CaRegistry {
     cache_dir: String,
     /// `--ci-plus-recovery` in ms, applied to every slot (0 disables it).
     ci_plus_recovery_ms: i64,
+    /// `--cam-recovery` in ms, applied to every slot (0 disables it).
+    cam_recovery_ms: i64,
+    /// Zap guard of `--cam-recovery`, applied to every slot (on unless `--cam-recovery-no-zap-guard`).
+    cam_recovery_zap_guard: bool,
 }
 
 fn index(i: i32) -> Option<usize> {
@@ -42,6 +46,8 @@ impl CaRegistry {
             has_ci: false,
             cache_dir: "/var/cache/minisatip".to_owned(),
             ci_plus_recovery_ms: 0,
+            cam_recovery_ms: 0,
+            cam_recovery_zap_guard: true,
         }
     }
 
@@ -58,6 +64,22 @@ impl CaRegistry {
         }
     }
 
+    /// Sets `--cam-recovery` for every slot, existing or allocated later.
+    pub fn set_cam_recovery_ms(&mut self, ms: i64) {
+        self.cam_recovery_ms = ms;
+        for dev in self.iter_mut() {
+            dev.cam_recovery_timeout_ms = ms;
+        }
+    }
+
+    /// Sets the `--cam-recovery` zap guard for every slot, existing or allocated later.
+    pub fn set_cam_recovery_zap_guard(&mut self, on: bool) {
+        self.cam_recovery_zap_guard = on;
+        for dev in self.iter_mut() {
+            dev.cam_recovery_zap_guard = on;
+        }
+    }
+
     pub fn get(&self, i: i32) -> Option<&CaDevice> {
         self.devices.get(index(i)?)?.as_ref()
     }
@@ -70,8 +92,12 @@ impl CaRegistry {
     pub fn device(&mut self, i: usize) -> &mut CaDevice {
         let clock = Arc::clone(&self.clock);
         let recovery = self.ci_plus_recovery_ms;
+        let cam_recovery = self.cam_recovery_ms;
+        let zap_guard = self.cam_recovery_zap_guard;
         let dev = self.devices[i].get_or_insert_with(|| CaDevice::new(i, clock));
         dev.recovery_timeout_ms = recovery;
+        dev.cam_recovery_timeout_ms = cam_recovery;
+        dev.cam_recovery_zap_guard = zap_guard;
         dev
     }
 
@@ -95,6 +121,8 @@ impl CaRegistry {
     pub fn insert(&mut self, mut dev: CaDevice) {
         let i = dev.id;
         dev.recovery_timeout_ms = self.ci_plus_recovery_ms;
+        dev.cam_recovery_timeout_ms = self.cam_recovery_ms;
+        dev.cam_recovery_zap_guard = self.cam_recovery_zap_guard;
         self.devices[i] = Some(dev);
     }
 
