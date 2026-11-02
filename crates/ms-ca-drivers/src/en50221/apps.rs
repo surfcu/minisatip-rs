@@ -6,7 +6,7 @@ use super::ciplus::cc::CcAction;
 use super::consts::*;
 #[cfg(feature = "ci-plus")]
 use super::device::CcKeyBytes;
-use super::device::{CaDevice, CaState, HostEvent};
+use super::device::{CaDevice, CaState, HostEvent, MmiPage, UnsolicitedMmi};
 use super::resources::App;
 
 /// `#define DEFAULT_LOG LOG_DVBCA` (ca.cpp:52).
@@ -75,6 +75,17 @@ pub fn mmi_menu_lines(id: usize, body: &[u8]) -> Vec<String> {
     lines
 }
 
+/// FNV-1a over the page lines, each ended by a newline, to group equal pages.
+fn text_hash<'a>(lines: impl IntoIterator<Item = &'a str>) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for line in lines {
+        for byte in line.bytes().chain(std::iter::once(b'\n')) {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
 impl CaDevice {
     fn app_of(&self, idx: usize) -> Option<App> {
         self.sessions[idx].map(|s| s.handler.app)
@@ -122,8 +133,11 @@ impl CaDevice {
         }
     }
 
-    /// The handler's `close`; only CA support has one.
+    /// The handler's `close`; only CA support has one (MMI ends a `--cam-menu` request).
     pub(super) fn app_close(&mut self, idx: usize) {
+        if self.app_of(idx) == Some(App::Mmi) {
+            self.end_menu();
+        }
         if self.app_of(idx) == Some(App::CaSupport) {
             ms_log::log!("Closed the CA session for CA {}", self.id);
             self.state = CaState::Active;
@@ -360,8 +374,11 @@ impl CaDevice {
                 }
             }
             TAG_ENQUIRY if data.len() >= 2 => {
+                let solicited = self.menu_open();
                 #[cfg(feature = "ci-plus")]
-                self.note_mmi_error();
+                if !solicited {
+                    self.note_mmi_error();
+                }
                 let blind = data[0] & 0x01 != 0;
                 let answer_len = data[1];
                 let text_bytes = &data[2..data.len().min(2 + 255)];
@@ -373,26 +390,101 @@ impl CaDevice {
                     if blind { "blind " } else { "" },
                     answer_len
                 );
+                let hash = text_hash([text.as_str()]);
                 self.push_event(HostEvent::MmiEnquiry {
                     text,
                     blind,
                     answer_len,
+                    solicited,
                 });
-                if self.pin.len() == usize::from(answer_len) {
+                let answer = if self.pin.len() == usize::from(answer_len) {
                     ms_log::log!("answering to PIN enquiry");
                     let mut answer = vec![MMI_ANSW_ID_ANSWER];
                     answer.extend_from_slice(&self.pin);
                     self.write_apdu(idx, TAG_ANSWER, &answer);
+                    "pin"
+                } else if solicited {
+                    self.write_apdu(idx, TAG_ANSWER, &[MMI_ANSW_ID_CANCEL]);
+                    "cancel"
+                } else {
+                    "close"
+                };
+                if solicited {
+                    // A request waits for the CAM's next page instead of closing.
+                    self.menu_request_ms = self.now();
+                    self.mmi_page = None;
+                } else {
+                    self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+                    self.end_menu();
                 }
-                self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+                self.report_menu("enquiry", 0, 1, hash, answer, solicited);
             }
             TAG_LIST_LAST | TAG_MENU_LAST => {
+                let solicited = self.menu_open();
                 #[cfg(feature = "ci-plus")]
-                self.note_mmi_error();
+                if !solicited {
+                    self.note_mmi_error();
+                }
                 let lines = mmi_menu_lines(self.id, data);
-                self.push_event(HostEvent::MmiMenu { lines });
-                self.write_apdu(idx, TAG_MENU_ANSWER, &[0x01]);
-                self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+                let items = lines.len().saturating_sub(3);
+                let (kind, page) = if tag == TAG_LIST_LAST {
+                    ("list", MmiPage::List)
+                } else {
+                    ("menu", MmiPage::Menu { items })
+                };
+                let hash = text_hash(lines.iter().map(String::as_str));
+                let count = lines.len();
+                self.push_event(HostEvent::MmiMenu { lines, solicited });
+                let answer = if solicited {
+                    self.menu_request_ms = self.now();
+                    self.mmi_page = Some(page);
+                    "request"
+                } else {
+                    match self.unsolicited_mmi {
+                        UnsolicitedMmi::Answer1 | UnsolicitedMmi::Answer0 => {
+                            let (choice, name) = if self.unsolicited_mmi == UnsolicitedMmi::Answer1
+                            {
+                                (0x01, "1")
+                            } else {
+                                (0x00, "0")
+                            };
+                            self.write_apdu(idx, TAG_MENU_ANSWER, &[choice]);
+                            self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+                            name
+                        }
+                        UnsolicitedMmi::Open => {
+                            if self.mmi_hold_ms < 0 {
+                                self.mmi_hold_ms = self.now();
+                            }
+                            self.mmi_page = Some(page);
+                            "open"
+                        }
+                    }
+                };
+                self.report_menu(kind, items, count, hash, answer, solicited);
+            }
+            TAG_CLOSE_MMI => {
+                ms_log::log!(
+                    "APP_MMI_handler: CA {} unknown tag resource {:06X}",
+                    self.id,
+                    tag
+                );
+                // The CAM left its menu: later pages are unsolicited again.
+                self.end_menu();
+            }
+            TAG_LIST_MORE | TAG_MENU_MORE => {
+                ms_log::log!(
+                    "APP_MMI_handler: CA {} unknown tag resource {:06X}",
+                    self.id,
+                    tag
+                );
+                let kind = if tag == TAG_LIST_MORE {
+                    "list_more"
+                } else {
+                    "menu_more"
+                };
+                let solicited = self.menu_open();
+                self.report_menu(kind, 0, 0, 0, "none", solicited);
             }
             // C++ reads these unchecked; the port leaves short APDUs alone.
             TAG_DISPLAY_CONTROL | TAG_ENQUIRY => {}
@@ -402,6 +494,27 @@ impl CaDevice {
                 tag
             ),
         }
+    }
+
+    /// Sends one `cam_menu` diag event for the page just handled.
+    fn report_menu(
+        &self,
+        kind: &str,
+        items: usize,
+        lines: usize,
+        hash: u64,
+        answer: &str,
+        solicited: bool,
+    ) {
+        ms_log::diag::events::cam_menu(&ms_log::diag::events::CamMenu {
+            ca: i64::try_from(self.id).unwrap_or(0),
+            kind,
+            items: items as u64,
+            lines: lines as u64,
+            text_hash: hash,
+            answer,
+            solicited,
+        });
     }
 
     /// Arms CI+ key recovery when a CI+ CAM reports an MMI error, not on plain CI

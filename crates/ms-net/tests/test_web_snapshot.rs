@@ -71,6 +71,7 @@ fn ca_slots_pushed_by_the_runtime_reach_the_snapshot() {
         state: 2,
         caids: vec![0x0664],
         ci_name: "Irdeto Access".to_owned(),
+        ..CaDeviceState::default()
     });
     session.set_web_ca(ca.clone(), Vec::new());
     assert_eq!(session.web_snapshot().ca, ca);

@@ -2,7 +2,7 @@
 
 use super::clock::Clock;
 use super::consts::*;
-use super::device::{CaDevice, CaState, HostEvent, LinkMode};
+use super::device::{CaDevice, CaState, HostEvent, LinkMode, UnsolicitedMmi};
 use super::link::{AdapterInfo, AdapterKind, CaOpener};
 use std::sync::Arc;
 
@@ -27,6 +27,8 @@ pub struct CaRegistry {
     cache_dir: String,
     /// `--ci-plus-recovery` in ms, applied to every slot (0 disables it).
     ci_plus_recovery_ms: i64,
+    /// `--cam-menu-unsolicited`, applied to every slot.
+    unsolicited_mmi: UnsolicitedMmi,
 }
 
 fn index(i: i32) -> Option<usize> {
@@ -42,6 +44,7 @@ impl CaRegistry {
             has_ci: false,
             cache_dir: "/var/cache/minisatip".to_owned(),
             ci_plus_recovery_ms: 0,
+            unsolicited_mmi: UnsolicitedMmi::default(),
         }
     }
 
@@ -58,6 +61,14 @@ impl CaRegistry {
         }
     }
 
+    /// Sets `--cam-menu-unsolicited` for every slot, existing or allocated later.
+    pub fn set_unsolicited_mmi(&mut self, mode: UnsolicitedMmi) {
+        self.unsolicited_mmi = mode;
+        for dev in self.iter_mut() {
+            dev.unsolicited_mmi = mode;
+        }
+    }
+
     pub fn get(&self, i: i32) -> Option<&CaDevice> {
         self.devices.get(index(i)?)?.as_ref()
     }
@@ -70,8 +81,10 @@ impl CaRegistry {
     pub fn device(&mut self, i: usize) -> &mut CaDevice {
         let clock = Arc::clone(&self.clock);
         let recovery = self.ci_plus_recovery_ms;
+        let unsolicited = self.unsolicited_mmi;
         let dev = self.devices[i].get_or_insert_with(|| CaDevice::new(i, clock));
         dev.recovery_timeout_ms = recovery;
+        dev.unsolicited_mmi = unsolicited;
         dev
     }
 

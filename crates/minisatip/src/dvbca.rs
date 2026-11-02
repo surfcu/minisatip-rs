@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use ms_ca::{CaCaps, CaDriver, CaService, EsStream, Program, ProgramTable, TablesResult};
 use ms_ca_drivers::en50221::device::{
-    CaDevice as CiDevice, CaPmtSink, CaState, CcKeyBytes, HostEvent,
+    CaDevice as CiDevice, CaPmtSink, CaState, CcKeyBytes, HostEvent, UnsolicitedMmi,
 };
 use ms_ca_drivers::en50221::{AdapterInfo, CaOpener, CaRegistry, Clock, InitResult};
 use ms_config::Options;
+use ms_net::web::CamMenuOp;
 
 /// `DEFAULT_CA_PMT` (ca.h:11).
 const DEFAULT_CA_PMT: usize = 1;
@@ -37,6 +38,8 @@ pub struct DvbcaSettings {
     cache_dir: String,
     /// `--ci-plus-recovery` in ms; 0 disables the CI+ key watchdog.
     ci_plus_recovery_ms: i64,
+    /// `--cam-menu-unsolicited`.
+    unsolicited_mmi: UnsolicitedMmi,
 }
 
 impl Default for DvbcaSettings {
@@ -48,6 +51,7 @@ impl Default for DvbcaSettings {
             enigma: false,
             cache_dir: "/var/cache/minisatip".to_owned(),
             ci_plus_recovery_ms: 0,
+            unsolicited_mmi: UnsolicitedMmi::default(),
         }
     }
 }
@@ -77,6 +81,11 @@ impl DvbcaSettings {
         settings.enigma = opts.enigma;
         settings.cache_dir = opts.cache_dir.clone();
         settings.ci_plus_recovery_ms = i64::from(opts.ci_plus_recovery).max(0) * 1000;
+        settings.unsolicited_mmi = match opts.cam_menu_unsolicited.as_str() {
+            "answer0" => UnsolicitedMmi::Answer0,
+            "open" => UnsolicitedMmi::Open,
+            _ => UnsolicitedMmi::Answer1,
+        };
         settings
     }
 
@@ -102,6 +111,11 @@ enum Request {
     },
     /// The adapters' pid tables for the `added_only` CAPMT filter.
     RequestedPids(BTreeSet<(u16, u16)>),
+    /// A `--cam-menu` command, in order with the CAPMT requests.
+    Cam {
+        ca: usize,
+        op: CamMenuOp,
+    },
     Stop,
 }
 
@@ -139,6 +153,10 @@ pub struct DeviceView {
     pub state: i32,
     pub caids: Vec<u16>,
     pub ci_name: String,
+    /// `--cam-menu` readiness for the web routes.
+    pub ai_session: bool,
+    pub mmi_session: bool,
+    pub menu_open: bool,
 }
 
 /// Control-thread handle of the worker.
@@ -146,6 +164,25 @@ pub struct Dvbca {
     requests: Sender<Request>,
     notices: Receiver<Notice>,
     thread: Option<JoinHandle<()>>,
+    /// Identifies this handle's entry in [`CAM_MENU`].
+    serial: usize,
+}
+
+static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+thread_local! {
+    /// The control thread's worker for `--cam-menu` (the web routes run on this thread).
+    static CAM_MENU: std::cell::RefCell<Option<(usize, Sender<Request>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`ms_net::web::CamMenuSend`]: queues `op` for CA `ca` on this thread's worker.
+pub fn cam_menu_command(ca: usize, op: CamMenuOp) -> bool {
+    CAM_MENU.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|(_, tx)| tx.send(Request::Cam { ca, op }).is_ok())
+    })
 }
 
 impl Dvbca {
@@ -164,10 +201,13 @@ impl Dvbca {
                 ms_log::set_thread_name("CA_poll");
                 Worker::new(settings, opener, clock, tx).run(&rx)
             })?;
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CAM_MENU.with(|slot| *slot.borrow_mut() = Some((serial, requests.clone())));
         Ok(Self {
             requests,
             notices,
             thread: Some(thread),
+            serial,
         })
     }
 
@@ -189,6 +229,7 @@ impl Dvbca {
             requests,
             notices,
             thread: None,
+            serial: 0,
         }
     }
 
@@ -233,6 +274,15 @@ impl Dvbca {
 
 impl Drop for Dvbca {
     fn drop(&mut self) {
+        CAM_MENU.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|(serial, _)| *serial == self.serial)
+            {
+                *slot = None;
+            }
+        });
         let _ = self.requests.send(Request::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -447,6 +497,7 @@ impl Worker {
         registry.enigma = settings.enigma;
         registry.set_cache_dir(&settings.cache_dir);
         registry.set_ci_plus_recovery_ms(settings.ci_plus_recovery_ms);
+        registry.set_unsolicited_mmi(settings.unsolicited_mmi);
         for (id, pin) in &settings.pins {
             registry.device(*id).set_pin(pin.as_bytes());
         }
@@ -526,7 +577,24 @@ impl Worker {
                 self.programs.del(pmt_id);
             }
             Request::RequestedPids(pids) => self.programs.set_requested_pids(pids),
+            Request::Cam { ca, op } => self.cam_menu(ca, op),
             Request::Stop => {}
+        }
+    }
+
+    /// Runs a `--cam-menu` command; the route checked a snapshot that may be stale.
+    fn cam_menu(&mut self, ca: usize, op: CamMenuOp) {
+        let Some(dev) = self.registry.get_mut(ca as i32) else {
+            ms_log::log!("CA {}: menu command {:?} for a missing CA", ca, op);
+            return;
+        };
+        let result = match op {
+            CamMenuOp::Enter => dev.enter_menu(),
+            CamMenuOp::Answer(choice) => dev.menu_answer(choice),
+            CamMenuOp::Close => dev.close_mmi(),
+        };
+        if let Err(error) = result {
+            ms_log::log!("CA {}: menu command {:?} not sent: {:?}", ca, op, error);
         }
     }
 
@@ -741,6 +809,9 @@ impl Worker {
             },
             caids: dev.caids().to_vec(),
             ci_name: dev.ci_name(),
+            ai_session: dev.has_ai_session(),
+            mmi_session: dev.has_mmi_session(),
+            menu_open: dev.menu_open(),
         };
         if self.views.get(&id) != Some(&view) {
             self.views.insert(id, view.clone());
@@ -788,15 +859,21 @@ impl Worker {
                 }
                 HostEvent::CaSessionClosed => capmt.state = ms_ca::CaState::Inactive,
                 // The C++ MMI logs live in APP_MMI_handler (en50221/apps.rs).
-                HostEvent::MmiMenu { .. } => {
+                // A requested page is no CAM error: no capture.
+                HostEvent::MmiMenu {
+                    solicited: false, ..
+                } => {
                     let _ = self.notices.send(Notice::MmiTrigger { id, kind: "menu" });
                 }
-                HostEvent::MmiEnquiry { .. } => {
+                HostEvent::MmiEnquiry {
+                    solicited: false, ..
+                } => {
                     let _ = self.notices.send(Notice::MmiTrigger {
                         id,
                         kind: "enquiry",
                     });
                 }
+                HostEvent::MmiMenu { .. } | HostEvent::MmiEnquiry { .. } => {}
                 HostEvent::CcKey { parity, key, iv } => {
                     let pmt_ids = capmt_pmt_ids(capmt);
                     ms_log::diag::events::ciplus_key(
@@ -1020,6 +1097,103 @@ mod tests {
             .map(|p| p.number())
             .collect();
         assert_eq!(programs, [0x64]);
+    }
+
+    /// Host-to-CAM APDUs with `tag` the fake CAM has seen.
+    fn sent(cam: &Arc<Mutex<FakeCam>>, tag: u32) -> Vec<Vec<u8>> {
+        use ms_fakecam::record::{Direction, Event};
+        cam.lock()
+            .unwrap()
+            .recorder()
+            .apdus()
+            .into_iter()
+            .filter_map(|r| match (r.dir, r.event) {
+                (Direction::HostToCam, Event::Apdu { tag: t, body, .. }) if t == tag => Some(body),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // --cam-menu: the web callback reaches this thread's worker; a requested page is no capture trigger.
+    #[test]
+    fn cam_menu_commands_reach_the_worker_and_skip_the_capture() {
+        use ms_ca_drivers::en50221::consts::{
+            EN50221_APP_MMI_RESOURCEID, TAG_CLOSE_MMI, TAG_ENTER_MENU, TAG_MENU_ANSWER,
+            TAG_MENU_LAST,
+        };
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let dvbca = Dvbca::spawn(
+            DvbcaSettings::from_options(&Options::default()),
+            Box::new(CamOpener(Arc::clone(&cam))),
+            Arc::new(ms_ca_drivers::en50221::SystemClock::default()),
+        )
+        .unwrap();
+        dvbca.init_dev(AdapterInfo::dvb(0, 0, 0));
+        let triggers = std::cell::Cell::new(0);
+        let until = |want: &dyn Fn(&Notice) -> bool| {
+            wait_notice(&dvbca, |n| {
+                triggers.set(triggers.get() + usize::from(matches!(n, Notice::MmiTrigger { .. })));
+                want(n)
+            })
+        };
+        assert!(until(&|n| matches!(
+            n,
+            Notice::State(0, v) if v.ai_session && v.mmi_session && !v.menu_open
+        )));
+        assert!(cam_menu_command(0, CamMenuOp::Enter));
+        assert!(until(&|n| matches!(n, Notice::State(0, v) if v.menu_open)));
+        assert_eq!(sent(&cam, TAG_ENTER_MENU), [Vec::<u8>::new()]);
+
+        let mut page = vec![0x00];
+        for text in ["Main", "", "", "Status"] {
+            page.extend_from_slice(&[0x9F, 0x88, 0x03, text.len() as u8]);
+            page.extend_from_slice(text.as_bytes());
+        }
+        assert!(cam.lock().unwrap().send_to_resource(
+            EN50221_APP_MMI_RESOURCEID,
+            TAG_MENU_LAST,
+            &page
+        ));
+        // The page arrives on the next 1 s poll; until then the device refuses the answer.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sent(&cam, TAG_MENU_ANSWER).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the answer never reached the CAM"
+            );
+            assert!(cam_menu_command(0, CamMenuOp::Answer(1)));
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(sent(&cam, TAG_MENU_ANSWER), [vec![1]]);
+        assert!(cam_menu_command(0, CamMenuOp::Close));
+        assert!(until(&|n| matches!(n, Notice::State(0, v) if !v.menu_open)));
+        assert_eq!(sent(&cam, TAG_CLOSE_MMI), [vec![0]]);
+
+        assert!(cam.lock().unwrap().send_to_resource(
+            EN50221_APP_MMI_RESOURCEID,
+            TAG_MENU_LAST,
+            &page
+        ));
+        assert!(until(&|n| matches!(
+            n,
+            Notice::MmiTrigger {
+                id: 0,
+                kind: "menu"
+            }
+        )));
+        assert_eq!(
+            triggers.get(),
+            1,
+            "only the unsolicited page triggers a capture"
+        );
+        drop(dvbca);
+        assert!(
+            !cam_menu_command(0, CamMenuOp::Close),
+            "cleared with its worker"
+        );
     }
 
     // DEV-151: a join, an unchanged update and a leave each emit one event.
@@ -1389,6 +1563,7 @@ mod pending_tests {
             requests,
             notices,
             thread: None,
+            serial: 0,
         };
         (Rc::new(dvbca), rx)
     }

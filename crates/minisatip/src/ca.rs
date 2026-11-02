@@ -717,6 +717,9 @@ impl CaRuntime {
                     state: view.state,
                     caids: view.caids.clone(),
                     ci_name: view.ci_name.clone(),
+                    ai_session: view.ai_session,
+                    mmi_session: view.mmi_session,
+                    menu_open: view.menu_open,
                 });
             }
         }
@@ -1751,6 +1754,8 @@ mod wiring_tests {
             state: 2,
             caids: vec![0x0664],
             ci_name: "Irdeto Access".to_owned(),
+            mmi_session: true,
+            ..DeviceView::default()
         };
         ca.ca_views.insert(8, view);
         let (slots, keys) = ca.web_state(&sched());
@@ -1762,6 +1767,8 @@ mod wiring_tests {
                 state: 2,
                 caids: vec![0x0664],
                 ci_name: "Irdeto Access".to_owned(),
+                mmi_session: true,
+                ..CaDeviceState::default()
             })
         );
         assert!(slots.iter().enumerate().all(|(i, s)| i == 8 || s.is_none()));

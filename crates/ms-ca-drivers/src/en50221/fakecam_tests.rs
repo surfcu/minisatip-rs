@@ -2,7 +2,7 @@
 
 use super::clock::ManualClock;
 use super::consts::*;
-use super::device::{CaDevice, CaState, HostEvent};
+use super::device::{CaDevice, CaState, HostEvent, MENU_IDLE_MS, MenuError, UnsolicitedMmi};
 use super::link::{
     AdapterInfo, CA_CI_LINK, CA_CI_MODULE_PRESENT, CA_CI_MODULE_READY, CaLink, CaOpener, SlotInfo,
 };
@@ -384,6 +384,7 @@ fn mmi_pin_enquiry_is_answered_from_the_configured_pin() {
         text: "PIN".into(),
         blind: true,
         answer_len: 4,
+        solicited: false,
     }));
     let cam = cam.lock().unwrap();
     let apdus = host_apdus(&cam);
@@ -414,7 +415,10 @@ fn mmi_menu_is_logged_then_cancelled() {
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
-    assert!(events.contains(&HostEvent::MmiMenu { lines }));
+    assert!(events.contains(&HostEvent::MmiMenu {
+        lines,
+        solicited: false
+    }));
     let cam = cam.lock().unwrap();
     let apdus = host_apdus(&cam);
     let tail = &apdus[apdus.len() - 2..];
@@ -546,4 +550,260 @@ fn ciplus_language_upgrade_and_operator_stubs() {
         &[0, 0, 0, 0, 1],
     );
     assert!(dev.take_close_request(), "reset requested after upgrade");
+}
+
+/// An MMI menu body with `items` after title, subtitle and bottom (`choice_nb` = items - 1, as C++ reads it).
+fn menu_body(texts: &[&str]) -> Vec<u8> {
+    let mut body = vec![(texts.len() - 4) as u8];
+    for text in texts {
+        body.extend_from_slice(&[0x9F, 0x88, 0x03, text.len() as u8]);
+        body.extend_from_slice(text.as_bytes());
+    }
+    body
+}
+
+/// The MMI APDUs the host sent, in order.
+fn mmi_apdus(cam: &Arc<Mutex<FakeCam>>) -> Vec<(u32, Vec<u8>)> {
+    host_apdus(&cam.lock().unwrap())
+        .into_iter()
+        .filter(|(tag, _)| {
+            matches!(
+                *tag,
+                TAG_ENTER_MENU | TAG_MENU_ANSWER | TAG_CLOSE_MMI | TAG_ANSWER
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_menu_request_walks_pages_without_auto_answers() {
+    let (_, cam, mut dev) = setup(CamConfig::default(), true);
+    drain_events(&mut dev);
+    assert_eq!(
+        dev.menu_answer(1),
+        Err(MenuError::NotOpen),
+        "no request yet"
+    );
+    assert!(dev.has_ai_session() && dev.has_mmi_session());
+    dev.enter_menu().expect("AI session open");
+    assert!(dev.menu_open());
+    assert_eq!(mmi_apdus(&cam), [(TAG_ENTER_MENU, vec![])]);
+    assert_eq!(dev.menu_answer(1), Err(MenuError::NotOpen), "no page yet");
+
+    let texts = ["Main", "", "", "Status", "Info"];
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_MENU_LAST,
+        &menu_body(&texts),
+    );
+    let lines: Vec<String> = texts.iter().map(|s| (*s).to_owned()).collect();
+    assert!(drain_events(&mut dev).contains(&HostEvent::MmiMenu {
+        lines,
+        solicited: true
+    }));
+    assert_eq!(mmi_apdus(&cam).len(), 1, "the page waits for the requester");
+    assert_eq!(dev.menu_answer(3), Err(MenuError::BadChoice));
+    dev.menu_answer(2).expect("item 2 is on the page");
+    assert_eq!(mmi_apdus(&cam).last(), Some(&(TAG_MENU_ANSWER, vec![2])));
+    assert_eq!(dev.menu_answer(1), Err(MenuError::NotOpen), "answered once");
+
+    let list = ["Card", "", "", "Line"];
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_LIST_LAST,
+        &menu_body(&list),
+    );
+    assert_eq!(
+        dev.menu_answer(1),
+        Err(MenuError::BadChoice),
+        "a list takes 0"
+    );
+    dev.menu_answer(0).expect("back from the list");
+    dev.close_mmi().expect("MMI session open");
+    assert!(!dev.menu_open());
+    assert_eq!(
+        mmi_apdus(&cam)[2..],
+        [
+            (TAG_MENU_ANSWER, vec![0]),
+            (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])
+        ]
+    );
+    #[cfg(feature = "diag-log")]
+    {
+        let events = crate::test_log::events("cam_menu");
+        assert!(
+            events.iter().any(|e| e.contains("\"kind\":\"list\"")
+                && e.contains("\"answer\":\"request\"")
+                && e.contains("\"solicited\":true")),
+            "{events:?}"
+        );
+    }
+}
+
+#[test]
+fn an_idle_menu_request_is_backed_out_and_closed() {
+    let (clock, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.enter_menu().expect("AI session open");
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_MENU_LAST,
+        &menu_body(&["Main", "", "", "A", "B"]),
+    );
+    clock.advance(MENU_IDLE_MS - 1);
+    dev.timeout();
+    assert!(dev.menu_open(), "not idle yet");
+    clock.advance(1);
+    dev.timeout();
+    assert!(!dev.menu_open());
+    assert_eq!(
+        mmi_apdus(&cam)[1..],
+        [
+            (TAG_MENU_ANSWER, vec![0]),
+            (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])
+        ]
+    );
+}
+
+#[test]
+fn a_requested_enquiry_is_cancelled_without_a_fitting_pin() {
+    let (_, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.enter_menu().expect("AI session open");
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x01, 4, b'P', b'I', b'N'],
+    );
+    assert!(dev.menu_open(), "the request stays open");
+    assert_eq!(
+        mmi_apdus(&cam)[1..],
+        [(TAG_ANSWER, vec![MMI_ANSW_ID_CANCEL])],
+        "cancelled, not closed"
+    );
+}
+
+#[test]
+fn unsolicited_menus_follow_the_configured_reply() {
+    let body = menu_body(&["E", "", "", "One", "Two"]);
+    let (_, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.unsolicited_mmi = UnsolicitedMmi::Answer0;
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_MENU_LAST,
+        &body,
+    );
+    assert_eq!(
+        mmi_apdus(&cam),
+        [
+            (TAG_MENU_ANSWER, vec![0]),
+            (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])
+        ]
+    );
+
+    let (clock, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.unsolicited_mmi = UnsolicitedMmi::Open;
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_MENU_LAST,
+        &body,
+    );
+    assert!(mmi_apdus(&cam).is_empty(), "left open");
+    assert!(!dev.menu_open(), "a held page is not a request");
+    clock.advance(MENU_IDLE_MS / 2);
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_MENU_LAST,
+        &body,
+    );
+    clock.advance(MENU_IDLE_MS / 2);
+    dev.timeout();
+    assert_eq!(
+        mmi_apdus(&cam),
+        [
+            (TAG_MENU_ANSWER, vec![0]),
+            (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])
+        ],
+        "a repeated page does not extend the hold"
+    );
+}
+
+#[test]
+fn menu_commands_need_their_sessions() {
+    let clock = ManualClock::new(0, UNIX);
+    let mut dev = CaDevice::new(0, Arc::new(clock));
+    assert_eq!(dev.enter_menu(), Err(MenuError::NoSession));
+    assert_eq!(dev.close_mmi(), Err(MenuError::NoSession));
+    assert!(!dev.menu_open());
+}
+
+#[test]
+fn a_cam_side_close_ends_the_request() {
+    let (_, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.enter_menu().expect("AI session open");
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_CLOSE_MMI,
+        &[0],
+    );
+    assert!(!dev.menu_open(), "close_mmi from the CAM");
+    let body = menu_body(&["E", "", "", "One", "Two"]);
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_MENU_LAST,
+        &body,
+    );
+    assert_eq!(
+        mmi_apdus(&cam)[1..],
+        [
+            (TAG_MENU_ANSWER, vec![1]),
+            (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])
+        ],
+        "the next page is unsolicited again"
+    );
+
+    dev.enter_menu().expect("AI session open");
+    assert!(
+        cam.lock()
+            .unwrap()
+            .request_close(EN50221_APP_MMI_RESOURCEID)
+    );
+    dev.timeout();
+    assert!(dev.service());
+    assert!(!dev.menu_open(), "the MMI session closed");
+}
+
+#[test]
+fn a_requested_pin_enquiry_is_answered_without_a_close() {
+    let (_, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.set_pin(b"1234");
+    dev.enter_menu().expect("AI session open");
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x01, 4, b'P', b'I', b'N'],
+    );
+    assert!(dev.menu_open());
+    assert_eq!(
+        mmi_apdus(&cam)[1..],
+        [(TAG_ANSWER, vec![MMI_ANSW_ID_ANSWER, b'1', b'2', b'3', b'4'])]
+    );
 }

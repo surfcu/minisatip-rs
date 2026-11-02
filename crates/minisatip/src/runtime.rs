@@ -440,6 +440,9 @@ impl Runtime {
         if cfg!(feature = "diag-log") && opts.log_ring > 0 {
             web = web.with_debug_log(ms_log::diag::ring_dump, ms_log::diag::ring_capacity());
         }
+        if cfg!(feature = "diag-log") && opts.cam_menu {
+            web = web.with_cam_menu(crate::dvbca::cam_menu_command);
+        }
         session.set_web(web);
         // minisatip.cpp:1149-1166; read_http refreshes the current time.
         let start = SystemTime::now();

@@ -72,6 +72,8 @@ pub const TAG_PROFILE_ENQUIRY: u32 = 0x9F8010;
 pub const TAG_PROFILE: u32 = 0x9F8011;
 pub const TAG_PROFILE_CHANGE: u32 = 0x9F8012;
 pub const TAG_APP_INFO_ENQUIRY: u32 = 0x9F8020;
+/// `enter_menu` (EN 50221 8.4.2.3): the host asks the CAM to open its menu.
+pub const TAG_ENTER_MENU: u32 = 0x9F8022;
 pub const CI_DATA_RATE_INFO: u32 = 0x9F8024;
 pub const TAG_CA_INFO_ENQUIRY: u32 = 0x9F8030;
 pub const TAG_CA_INFO: u32 = 0x9F8031;
