@@ -489,6 +489,11 @@ impl CaRuntime {
         let caids = Rc::clone(&state.caids);
         match notice {
             Notice::State(aid, view) => {
+                // ca_teardown and APP_CA_close leave CA_STATE_INITIALIZED (ca.cpp): the CAM
+                // is initialising again, so new PMTs wait for its CA_INFO instead of old masks.
+                if view.state != 2 {
+                    self.ddci_cam(aid, |cam, _| cam.initialized = false);
+                }
                 self.ca_views.insert(aid, view);
             }
             Notice::Usable(aid) => {
@@ -2035,13 +2040,13 @@ mod ci_stage_tests {
         }
     }
 
-    // A PMT read before the worker has initialised the DDCI CAM is retried, as in C++,
-    // where dvbca_init_dev runs before any PMT and leaves the CAM enabled.
+    // A PMT read while the DDCI CAM initialises, at start or on a reconnect, is retried as in
+    // C++ (dvbca_init_dev runs before any PMT; ca_teardown resets the state).
     #[test]
     fn a_pmt_before_the_ddci_cam_is_ready_is_retried() {
         let mut sched = Scheduler::new();
         let mut ca = CaRuntime::new(&Options::default());
-        let (_notices, notices_rx) = mpsc::channel();
+        let (notices, notices_rx) = mpsc::channel();
         ca.dvbca = Some(DvbcaState {
             dvbca: Rc::new(Dvbca::from_notices(notices_rx)),
             caids: Rc::new(RefCell::new(BTreeMap::new())),
@@ -2082,6 +2087,36 @@ mod ci_stage_tests {
         // A non-DDCI adapter is not touched.
         ca.dvbca_init_dev(AdapterInfo::dvb(3, 3, 0));
         assert!(!hub.lock().ddci.cams.contains_key(&3));
+
+        // CA_INFO makes it ready; a teardown or a closed CA session makes it initialising again.
+        let ready = |state| {
+            Notice::State(
+                8,
+                DeviceView {
+                    enabled: true,
+                    state,
+                    ..DeviceView::default()
+                },
+            )
+        };
+        notices.send(Notice::Caids(8, vec![0x0B00])).unwrap();
+        notices.send(ready(2)).unwrap();
+        ca.dvbca_notices(&mut sched);
+        assert!(!hub.lock().ddci.is_ca_initializing(8), "CA_INFO arrived");
+        for state in [0, 1] {
+            notices.send(ready(state)).unwrap();
+            ca.dvbca_notices(&mut sched);
+            assert!(hub.lock().ddci.is_ca_initializing(8), "state {state}");
+            program.id += 1;
+            assert_eq!(
+                hub.lock().ddci.process_pmt(2, &program, false),
+                TablesResult::Retry,
+                "a PMT during the reconnect waits, state {state}"
+            );
+            notices.send(Notice::Caids(8, vec![0x0B00])).unwrap();
+            ca.dvbca_notices(&mut sched);
+            assert!(!hub.lock().ddci.is_ca_initializing(8), "ready again");
+        }
     }
 
     // ddci_read_sec_data: read_dmx decrypts the CAM output on the CI adapter
