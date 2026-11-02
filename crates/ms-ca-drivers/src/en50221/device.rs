@@ -109,6 +109,9 @@ pub enum ApduDir {
     CamToHost,
 }
 
+/// `--ddci-capture` APDU trace: slot, direction, session, tag and body length (never the body).
+pub type ApduSink = Arc<dyn Fn(usize, ApduDir, u16, u32, usize) + Send + Sync>;
+
 /// One APDU seen by the host, for traces and parity checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApduRecord {
@@ -204,6 +207,8 @@ pub struct CaDevice {
     close_requested: bool,
     events: VecDeque<HostEvent>,
     apdu_log: Option<Vec<ApduRecord>>,
+    /// `--ddci-capture`: every APDU's header goes here.
+    pub apdu_sink: Option<ApduSink>,
     pub(super) clock: Arc<dyn Clock>,
 }
 
@@ -253,6 +258,7 @@ impl CaDevice {
             close_requested: false,
             events: VecDeque::new(),
             apdu_log: None,
+            apdu_sink: None,
             clock,
         }
     }
@@ -361,6 +367,9 @@ impl CaDevice {
     }
 
     fn log_apdu(&mut self, dir: ApduDir, session: u16, tag: u32, body: &[u8]) {
+        if let Some(sink) = self.apdu_sink.as_ref() {
+            sink(self.id, dir, session, tag, body.len());
+        }
         if let Some(log) = self.apdu_log.as_mut() {
             log.push(ApduRecord {
                 dir,

@@ -116,6 +116,8 @@ one event per distinct key.
 | `ddci_fifo_overflow` | `adapter`, `dropped` | DDCI device id (the device map key), bytes | Flushed: bytes lost when a DDCI FIFO overflowed. |
 | `ddci_capture` | `slot`, `files`, `bytes`, `drops` | CA slot, the two file names, bytes written, bytes the writer missed | A `--ddci-capture` pair and its sidecar are written (feature `diag-log`). |
 | `cam_menu` | `ca`, `kind`, `items`, `lines`, `text_hash`, `answer`, `solicited` | Kind `menu`/`list`/`enquiry`/`menu_more`/`list_more`; menu items (0 for an enquiry or fragment); text lines (title, subtitle and bottom included); FNV-1a hash of the lines as 16 hex digits; what the host answered: `1`/`0`/`open` (unsolicited, per `--cam-menu-unsolicited`), `request` (left to a `--cam-menu` request), `pin`/`cancel`/`close` (enquiry), `none`; `solicited` inside a request | Every MMI page from the CAM (feature `diag-log`). The page text itself is in the `[UI n]` log lines; a PIN is never logged. |
+| `ca_tables` | `ddci`, `ecm_pkts`, `emm_pkts`, `ecm_sections`, `emm_sections`, `parity_dropped`, `period_s` | DDCI device, ECM and EMM packets written to the CAM, packets that start a section, parity changes of this device not reported (over 1024 in a window for all devices), window seconds | Every 10 s per DDCI device that received ECM or EMM packets (`--cam-ecm-trace`). |
+| `ecm_parity` | `ddci`, `adapter`, `pid`, `table_id`, `at_ms` | DDCI device, source adapter and ECM PID, the new table_id (`128`/`129`), UTC ms when the first packet with it was written | An ECM PID switched between table_id 0x80 and 0x81, i.e. a crypto-period change (`--cam-ecm-trace`); reported with the next 10 s window. |
 | `ci_decrypt` | `adapter`, `keys_installed`, `errors`, `period_s` | Active CW services, descrambler error delta, window seconds | Every 10 s for a CI adapter when keys or errors were seen. |
 | `ciplus_sac` | `ca`, `state` | `open`/`dh_ok`/`auth_ok`/`auth_failed`/`sac_ok`/`sac_failed` | CI+ SAC/DH handshake progress (feature `ci-plus`). |
 | `ciplus_key` | `ca`, `parity`, `target_adapters` | CA id, parity, adapter ids (max 16) | A CI+ key is installed for the offered PMTs (feature `ci-plus`). |
@@ -194,12 +196,18 @@ after service changes can be analysed afterwards.
 - **Output:** on a trigger, two files are written to `dir`:
   `ca<slot>-<UTC YYYYMMDDTHHMMSS>-in.ts` and `-out.ts`, holding the last 60 s
   before the trigger plus the next 60 s, and a `ca<slot>-<time>.json` sidecar.
-  The sidecar holds `format` (`ddci-capture/1`), the slot, the trigger time and
+  The sidecar holds `format` (`ddci-capture/2`), the slot, the trigger time and
   kind, `window_ms` (60000), the `files` names, a time index per file with one
   entry `[monotonic ms, UTC ms, byte offset]` for each recorded chunk (each CI
   write or CAM read, so its spacing follows the traffic), the PID remap pairs,
   `short_writes` (CI writes the device accepted only in part), `bytes`,
   `dropped_bytes` and `truncated` per direction.
+- **APDU trace:** `apdus_before` lists the slot's last 512 APDUs before the
+  trigger and `apdus_after` those up to the end of the capture, each as
+  `[seq, monotonic ms, UTC ms, "cam"|"host", session, "tag", length]`. Only
+  headers are kept, never an APDU body. A host APDU is listed when it is
+  handed to the CI device, even if the write then fails. `apdus_after_truncated` is set when
+  more than 512 APDUs followed the trigger and the oldest of them are missing.
 - **Limits:** at most one capture per slot per 10 minutes. A trigger is
   refused, with a log line, when `dir` already holds `--ddci-capture-max-mb`
   (default 2048) MB of `ca*.ts`/`ca*.json` files; one accepted capture can
@@ -231,6 +239,22 @@ Example:
 ```sh
 minisatip --ddci-capture /var/lib/minisatip/ddci --ddci-capture-max-mb 1024
 ```
+
+## ECM trace
+
+`--cam-ecm-trace` (diag-log builds only) counts the ECM and EMM packets that
+each DDCI CAM receives and reports every ECM crypto-period change, so CAM
+errors can be lined up with the key changes without a capture.
+
+- ECM PIDs come from the programs' CA descriptors, EMM PIDs from the CAT.
+- Packets are counted when they are written to the CI device, before the
+  `writev`; a short write still counts them.
+- Only the `table_id` of a section that starts in a packet is read (0x80 even,
+  0x81 odd); nothing else of an ECM or EMM is looked at or logged.
+- The first `table_id` seen on a PID is a baseline; each later switch is one
+  `ecm_parity` event. A PID that stops being an ECM PID loses its baseline.
+- Packets with the scrambling bits set are counted, but their table_id is not
+  read.
 
 ## CAM menu
 

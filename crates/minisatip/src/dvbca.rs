@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ms_ca::{CaCaps, CaDriver, CaService, EsStream, Program, ProgramTable, TablesResult};
 use ms_ca_drivers::en50221::device::{
-    CaDevice as CiDevice, CaPmtSink, CaState, CcKeyBytes, HostEvent, UnsolicitedMmi,
+    ApduSink, CaDevice as CiDevice, CaPmtSink, CaState, CcKeyBytes, HostEvent, UnsolicitedMmi,
 };
 use ms_ca_drivers::en50221::{AdapterInfo, CaOpener, CaRegistry, Clock, InitResult};
 use ms_config::Options;
@@ -40,6 +40,18 @@ pub struct DvbcaSettings {
     ci_plus_recovery_ms: i64,
     /// `--cam-menu-unsolicited`.
     unsolicited_mmi: UnsolicitedMmi,
+    /// `--ddci-capture` APDU trace.
+    apdu_sink: Option<ApduHook>,
+}
+
+/// An [`ApduSink`] that can sit in the `Debug` settings.
+#[derive(Clone)]
+struct ApduHook(ApduSink);
+
+impl std::fmt::Debug for ApduHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApduHook(..)")
+    }
 }
 
 impl Default for DvbcaSettings {
@@ -52,6 +64,7 @@ impl Default for DvbcaSettings {
             cache_dir: "/var/cache/minisatip".to_owned(),
             ci_plus_recovery_ms: 0,
             unsolicited_mmi: UnsolicitedMmi::default(),
+            apdu_sink: None,
         }
     }
 }
@@ -87,6 +100,12 @@ impl DvbcaSettings {
             _ => UnsolicitedMmi::Answer1,
         };
         settings
+    }
+
+    /// Sends every slot's APDU headers to `sink` (`--ddci-capture`).
+    #[cfg_attr(not(feature = "diag-log"), allow(dead_code))]
+    pub fn set_apdu_sink(&mut self, sink: ApduSink) {
+        self.apdu_sink = Some(ApduHook(sink));
     }
 
     /// `(max_ca_pmt, multiple_pmt)` of a slot (`-c`, else `DEFAULT_CA_PMT`).
@@ -498,6 +517,7 @@ impl Worker {
         registry.set_cache_dir(&settings.cache_dir);
         registry.set_ci_plus_recovery_ms(settings.ci_plus_recovery_ms);
         registry.set_unsolicited_mmi(settings.unsolicited_mmi);
+        registry.set_apdu_sink(settings.apdu_sink.as_ref().map(|hook| hook.0.clone()));
         for (id, pin) in &settings.pins {
             registry.device(*id).set_pin(pin.as_bytes());
         }

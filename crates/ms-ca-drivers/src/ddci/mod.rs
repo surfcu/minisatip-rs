@@ -67,6 +67,119 @@ pub struct Mapping {
     pub pid_added: bool,
 }
 
+/// `--cam-ecm-trace` packet counts for one DDCI device since the last drain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableCounts {
+    pub ecm_pkts: u64,
+    pub emm_pkts: u64,
+    /// Packets that start a section (at most one counted per packet).
+    pub ecm_sections: u64,
+    pub emm_sections: u64,
+    /// Parity changes not kept because the window already had [`MAX_PARITY_CHANGES`].
+    pub parity_dropped: u64,
+}
+
+/// An ECM PID whose table_id changed between 0x80 and 0x81: a crypto-period change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParityChange {
+    pub dev: i32,
+    pub ad: u16,
+    pub pid: u16,
+    pub table_id: u8,
+    pub wall_ms: i64,
+}
+
+/// Parity changes kept between two drains; later ones are dropped and counted.
+const MAX_PARITY_CHANGES: usize = 1024;
+const CLASS_ECM: u8 = 1;
+const CLASS_EMM: u8 = 2;
+
+/// `--cam-ecm-trace`: ECM/EMM packets sent to each CAM. Only the table_id byte is read.
+#[derive(Clone, Debug, Default)]
+pub struct TableTrace {
+    counts: BTreeMap<i32, TableCounts>,
+    changes: Vec<ParityChange>,
+    last_tid: BTreeMap<(i32, u16, u16), u8>,
+}
+
+impl TableTrace {
+    /// Counts and parity changes since the last call.
+    pub fn take(&mut self) -> (BTreeMap<i32, TableCounts>, Vec<ParityChange>) {
+        (
+            std::mem::take(&mut self.counts),
+            std::mem::take(&mut self.changes),
+        )
+    }
+
+    /// Forgets the baselines of `ad`'s PIDs that are no longer ECM PIDs (a retune reuses PIDs).
+    fn retain_ecm(&mut self, dev: i32, ad: u16, classes: &[u8]) {
+        self.last_tid.retain(|&(d, a, pid), _| {
+            d != dev || a != ad || classes[usize::from(pid & 0x1FFF)] == CLASS_ECM
+        });
+    }
+
+    fn packet(
+        &mut self,
+        dev: i32,
+        ad: u16,
+        pid: u16,
+        class: u8,
+        ts: &[u8],
+        wall_ms: impl Fn() -> i64,
+    ) {
+        let tid = section_table_id(ts);
+        let counts = self.counts.entry(dev).or_default();
+        let parity = tid.filter(|&t| class == CLASS_ECM && matches!(t, 0x80 | 0x81));
+        if class == CLASS_EMM {
+            counts.emm_pkts += 1;
+            counts.emm_sections += u64::from(tid.is_some());
+            return;
+        }
+        counts.ecm_pkts += 1;
+        counts.ecm_sections += u64::from(tid.is_some());
+        let Some(table_id) = parity else {
+            return;
+        };
+        let last = self.last_tid.insert((dev, ad, pid), table_id);
+        if last.is_none_or(|last| last == table_id) {
+            return;
+        }
+        if self.changes.len() >= MAX_PARITY_CHANGES {
+            self.counts.entry(dev).or_default().parity_dropped += 1;
+            return;
+        }
+        self.changes.push(ParityChange {
+            dev,
+            ad,
+            pid,
+            table_id,
+            wall_ms: wall_ms(),
+        });
+    }
+}
+
+/// The table_id of a section that starts in this TS packet, if any.
+fn section_table_id(ts: &[u8]) -> Option<u8> {
+    if ts.len() < DVB_FRAME || ts[1] & 0x40 == 0 || ts[3] & 0xC0 != 0 {
+        return None;
+    }
+    let start = match (ts[3] >> 4) & 0x3 {
+        1 => 4,
+        3 => 5 + usize::from(ts[4]),
+        _ => return None,
+    };
+    let pointer = usize::from(*ts.get(start)?);
+    ts.get(start + 1 + pointer)
+        .copied()
+        .filter(|&tid| start + 1 + pointer < DVB_FRAME && tid != 0xFF)
+}
+
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 /// One DDCI device (`ddci_device_t`).
 #[derive(Clone, Debug)]
 pub struct DdciDevice {
@@ -244,6 +357,8 @@ pub struct Ddci {
     pub now_ms: u64,
     /// Local time one hour ago, for the EIT start time.
     pub eit_start: LocalTime,
+    /// `--cam-ecm-trace` (diag-log); `None` adds one branch per mapped packet.
+    pub table_trace: Option<TableTrace>,
 }
 
 impl Default for Ddci {
@@ -264,6 +379,7 @@ impl Ddci {
             next_filter: 0,
             now_ms: 0,
             eit_start: LocalTime::default(),
+            table_trace: None,
         }
     }
 
@@ -1401,6 +1517,22 @@ impl Ddci {
                 dev_id
             );
         }
+        // ECM/EMM classes of the adapter's PIDs, built only when tracing.
+        let classes = self.table_trace.is_some().then(|| {
+            let mut classes = vec![0u8; 8192];
+            for program in programs.iter().filter(|p| p.adapter == ad.id) {
+                for ca in &program.caids {
+                    classes[usize::from(ca.pid & 0x1FFF)] = CLASS_ECM;
+                }
+            }
+            for &(_, pid) in d.emm_pids.iter().filter(|(a, _)| *a == ad.id) {
+                classes[usize::from(pid & 0x1FFF)] = CLASS_EMM;
+            }
+            classes
+        });
+        if let (Some(trace), Some(classes)) = (self.table_trace.as_mut(), classes.as_deref()) {
+            trace.retain_ecm(dev_id, ad.id, classes);
+        }
         let d = self.devices.get_mut(&dev).unwrap();
         if ec == 0 {
             d.read_index[usize::from(ad.id)] = 0;
@@ -1418,6 +1550,11 @@ impl Ddci {
                 let pid = pid_from_ts(b);
                 let dpid = ad_dd[usize::from(pid)];
                 if dpid != 0 {
+                    let class = classes.as_deref().map_or(0, |c| c[usize::from(pid)]);
+                    if let Some(trace) = self.table_trace.as_mut().filter(|_| class != 0) {
+                        // Counted before the write: a short write still counts.
+                        trace.packet(dev_id, ad.id, pid, class, b, wall_now_ms);
+                    }
                     ms_log::dump_packets!("ddci_process_ts -> DD", &b[..DVB_FRAME], i as i64);
                     set_pid_ts(b, dpid);
                     match runs.last_mut() {

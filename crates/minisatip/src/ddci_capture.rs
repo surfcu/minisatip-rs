@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ms_ca_drivers::ddci::CiWriter;
+use ms_ca_drivers::en50221::device::{ApduDir, ApduSink};
 use ms_tuner::{PidSet, SignalStatus, TsBuf, TuneParams, Tuner, TunerError};
 
 /// Length of the rolling window and of the capture that follows a trigger.
@@ -26,6 +27,19 @@ const QUEUE_MESSAGES: usize = 4096;
 const QUEUE_BYTES: usize = 2 * RING_BYTES;
 /// File suffix per direction: 0 is the CAM input, 1 the CAM output.
 const DIR_NAMES: [&str; 2] = ["in", "out"];
+/// APDU headers kept per slot for the sidecar.
+const APDU_RING: usize = 512;
+
+/// One APDU header: per-slot sequence number, tap time, sender, session, tag and length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApduEntry {
+    seq: u64,
+    mono_ms: u64,
+    from_cam: bool,
+    session: u16,
+    tag: u32,
+    len: usize,
+}
 
 #[derive(Clone)]
 struct Chunk {
@@ -65,6 +79,8 @@ struct Capture {
     truncated: [bool; 2],
     drops: [u64; 2],
     short_writes_at_start: u64,
+    /// The slot's last APDU sequence number at the trigger.
+    apdu_seq_at_start: u64,
 }
 
 #[derive(Default)]
@@ -74,6 +90,8 @@ struct TapState {
     last_accepted: BTreeMap<usize, u64>,
     short_writes: BTreeMap<usize, u64>,
     next_id: u64,
+    apdus: BTreeMap<usize, VecDeque<ApduEntry>>,
+    apdu_seq: BTreeMap<usize, u64>,
 }
 
 enum Msg {
@@ -85,6 +103,7 @@ enum Msg {
         pid_map: Vec<(u16, u16)>,
         trigger_wall_ms: i64,
         trigger_mono_ms: u64,
+        apdus_before: Vec<ApduEntry>,
     },
     Chunks {
         id: u64,
@@ -97,6 +116,8 @@ enum Msg {
         drops: [u64; 2],
         truncated: [bool; 2],
         short_writes: u64,
+        apdus_after: Vec<ApduEntry>,
+        apdus_after_truncated: bool,
     },
 }
 
@@ -232,6 +253,48 @@ impl CaptureTap {
         }
     }
 
+    /// The CA worker's APDU hook: headers go to this slot's ring, stamped in tap time.
+    pub fn apdu_sink(self: &Arc<Self>) -> ApduSink {
+        let tap = Arc::clone(self);
+        Arc::new(move |slot, dir, session, tag, len| {
+            tap.record_apdu(
+                slot,
+                dir == ApduDir::CamToHost,
+                session,
+                tag,
+                len,
+                tap.now_ms(),
+            );
+        })
+    }
+
+    fn record_apdu(
+        &self,
+        slot: usize,
+        from_cam: bool,
+        session: u16,
+        tag: u32,
+        len: usize,
+        now: u64,
+    ) {
+        let mut guard = self.state();
+        let st = &mut *guard;
+        let seq = st.apdu_seq.entry(slot).or_default();
+        *seq += 1;
+        let ring = st.apdus.entry(slot).or_default();
+        ring.push_back(ApduEntry {
+            seq: *seq,
+            mono_ms: now,
+            from_cam,
+            session,
+            tag,
+            len,
+        });
+        if ring.len() > APDU_RING {
+            ring.pop_front();
+        }
+    }
+
     /// Counts a `writev` that accepted fewer bytes than offered.
     fn note_short_write(&self, dev: usize) {
         *self.state().short_writes.entry(dev).or_default() += 1;
@@ -284,6 +347,12 @@ impl CaptureTap {
         let id = st.next_id;
         let base = format!("ca{dev}-{}", utc_stamp(wall_ms));
         let short_writes_at_start = st.short_writes.get(&dev).copied().unwrap_or(0);
+        let apdu_seq_at_start = st.apdu_seq.get(&dev).copied().unwrap_or(0);
+        let apdus_before = st
+            .apdus
+            .get(&dev)
+            .map(|ring| ring.iter().copied().collect())
+            .unwrap_or_default();
         let started = self.queue(
             Msg::Start {
                 id,
@@ -293,6 +362,7 @@ impl CaptureTap {
                 pid_map,
                 trigger_wall_ms: wall_ms,
                 trigger_mono_ms: now,
+                apdus_before,
             },
             0,
         );
@@ -309,6 +379,7 @@ impl CaptureTap {
             truncated: [false; 2],
             drops: [0; 2],
             short_writes_at_start,
+            apdu_seq_at_start,
         };
         // The pre-window goes out as one batch per direction (Arc handles, no copy).
         for dir in 0..2 {
@@ -363,11 +434,24 @@ impl CaptureTap {
                 .copied()
                 .unwrap_or(0)
                 .saturating_sub(cap.short_writes_at_start);
+            let ring = st.apdus.get(&cap.dev);
+            let apdus_after: Vec<ApduEntry> = ring
+                .into_iter()
+                .flatten()
+                .filter(|e| e.seq > cap.apdu_seq_at_start && e.mono_ms < cap.end_ms)
+                .copied()
+                .collect();
+            // The ring wrapped past the trigger: some APDUs after it are missing.
+            let apdus_after_truncated = ring
+                .and_then(VecDeque::front)
+                .is_some_and(|e| e.seq > cap.apdu_seq_at_start + 1);
             let msg = Msg::Finish {
                 id: cap.id,
                 drops: cap.drops,
                 truncated: cap.truncated,
                 short_writes,
+                apdus_after,
+                apdus_after_truncated,
             };
             if self.queue(msg, 0) {
                 st.captures.remove(i);
@@ -482,6 +566,7 @@ struct Job {
     pid_map: Vec<(u16, u16)>,
     trigger_wall_ms: i64,
     trigger_mono_ms: u64,
+    apdus_before: Vec<ApduEntry>,
 }
 
 impl Job {
@@ -509,6 +594,7 @@ impl Job {
             pid_map: Vec::new(),
             trigger_wall_ms: 0,
             trigger_mono_ms: 0,
+            apdus_before: Vec::new(),
         })
     }
 
@@ -537,13 +623,26 @@ impl Job {
         }
     }
 
-    fn finish(mut self, drops: [u64; 2], truncated: [bool; 2], short_writes: u64) {
+    fn finish(
+        mut self,
+        drops: [u64; 2],
+        truncated: [bool; 2],
+        short_writes: u64,
+        apdus_after: &[ApduEntry],
+        apdus_after_truncated: bool,
+    ) {
         for file in self.files.iter_mut().flatten() {
             let _ = file.flush();
         }
         let bytes: u64 = self.offset.iter().sum();
         let dropped: u64 = drops.iter().sum();
-        let json = self.sidecar(drops, truncated, short_writes);
+        let json = self.sidecar(
+            drops,
+            truncated,
+            short_writes,
+            apdus_after,
+            apdus_after_truncated,
+        );
         let sidecar = format!("{}.json", self.base.display());
         // Written under a temporary name and renamed, so readers never see a partial file.
         let tmp = format!("{sidecar}.tmp");
@@ -567,9 +666,32 @@ impl Job {
         );
     }
 
-    fn sidecar(&self, drops: [u64; 2], truncated: [bool; 2], short_writes: u64) -> String {
+    /// `[seq, mono ms, UTC ms, "cam"|"host", session, "tag", length]`, one per APDU.
+    fn apdu_rows(&self, entries: &[ApduEntry]) -> String {
+        let rows: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let wall = self.trigger_wall_ms + (e.mono_ms as i64 - self.trigger_mono_ms as i64);
+                let from = if e.from_cam { "cam" } else { "host" };
+                format!(
+                    "[{}, {}, {wall}, \"{from}\", {}, \"{:06X}\", {}]",
+                    e.seq, e.mono_ms, e.session, e.tag, e.len
+                )
+            })
+            .collect();
+        rows.join(", ")
+    }
+
+    fn sidecar(
+        &self,
+        drops: [u64; 2],
+        truncated: [bool; 2],
+        short_writes: u64,
+        apdus_after: &[ApduEntry],
+        apdus_after_truncated: bool,
+    ) -> String {
         let mut out = String::from("{\n");
-        out.push_str("  \"format\": \"ddci-capture/1\",\n");
+        out.push_str("  \"format\": \"ddci-capture/2\",\n");
         out.push_str(&format!("  \"slot\": {},\n", self.slot));
         out.push_str(&format!("  \"kind\": \"{}\",\n", self.kind));
         out.push_str(&format!(
@@ -592,6 +714,17 @@ impl Job {
             .map(|(input, ddci)| format!("[{input}, {ddci}]"))
             .collect();
         out.push_str(&format!("  \"pid_remap\": [{}],\n", pairs.join(", ")));
+        out.push_str(&format!(
+            "  \"apdus_before\": [{}],\n",
+            self.apdu_rows(&self.apdus_before)
+        ));
+        out.push_str(&format!(
+            "  \"apdus_after\": [{}],\n",
+            self.apdu_rows(apdus_after)
+        ));
+        out.push_str(&format!(
+            "  \"apdus_after_truncated\": {apdus_after_truncated},\n"
+        ));
         out.push_str("  \"dirs\": {\n");
         for d in 0..2 {
             let index: Vec<String> = self.index[d]
@@ -625,11 +758,13 @@ fn writer_loop(rx: mpsc::Receiver<Msg>, queued: &AtomicUsize, dir: &Path) {
                 pid_map,
                 trigger_wall_ms,
                 trigger_mono_ms,
+                apdus_before,
             } => {
                 if let Some(mut job) = Job::open(dir, &base, slot, kind) {
                     job.pid_map = pid_map;
                     job.trigger_wall_ms = trigger_wall_ms;
                     job.trigger_mono_ms = trigger_mono_ms;
+                    job.apdus_before = apdus_before;
                     jobs.insert(id, job);
                 }
             }
@@ -649,9 +784,17 @@ fn writer_loop(rx: mpsc::Receiver<Msg>, queued: &AtomicUsize, dir: &Path) {
                 drops,
                 truncated,
                 short_writes,
+                apdus_after,
+                apdus_after_truncated,
             } => {
                 if let Some(job) = jobs.remove(&id) {
-                    job.finish(drops, truncated, short_writes);
+                    job.finish(
+                        drops,
+                        truncated,
+                        short_writes,
+                        &apdus_after,
+                        apdus_after_truncated,
+                    );
                 }
             }
         }
@@ -785,6 +928,69 @@ mod tests {
         // Ten minutes later a new capture is accepted again.
         tap.trigger_at(8, "menu", vec![], 2_000 + MIN_INTERVAL_MS, 0);
         assert_eq!(tap.state().captures.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sidecar_lists_apdu_headers_around_the_trigger() {
+        let dir = temp_dir("apdu");
+        let tap = CaptureTap::new(dir.to_str().unwrap(), 2048).unwrap();
+        tap.record_apdu(8, false, 3, 0x9F8032, 40, 500);
+        tap.record_apdu(8, true, 5, 0x9F8809, 120, 1_900);
+        tap.record_apdu(9, true, 5, 0x9F8809, 7, 1_950);
+        tap.record_at(8, 0, &[&[0x47; 188]], 1_000);
+        tap.trigger_at(8, "menu", vec![], 2_000, 1_793_538_453_000);
+        tap.record_apdu(8, false, 5, 0x9F880B, 1, 2_100);
+        tap.tick_at(62_000);
+        let sidecar = format!("{}.json", dir.join("ca8-20261101T130733").display());
+        for _ in 0..200 {
+            if Path::new(&sidecar).exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let json = fs::read_to_string(&sidecar).unwrap();
+        assert!(json.contains("\"format\": \"ddci-capture/2\""), "{json}");
+        assert!(
+            json.contains(
+                "\"apdus_before\": [[1, 500, 1793538451500, \"host\", 3, \"9F8032\", 40], [2, 1900, 1793538452900, \"cam\", 5, \"9F8809\", 120]]"
+            ),
+            "{json}"
+        );
+        assert!(
+            json.contains(
+                "\"apdus_after\": [[3, 2100, 1793538453100, \"host\", 5, \"9F880B\", 1]]"
+            ),
+            "{json}"
+        );
+        assert!(json.contains("\"apdus_after_truncated\": false"), "{json}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrapped_apdu_ring_marks_the_after_list_truncated() {
+        let dir = temp_dir("apduwrap");
+        let tap = CaptureTap::new(dir.to_str().unwrap(), 2048).unwrap();
+        tap.record_at(8, 0, &[&[0x47; 188]], 1_000);
+        tap.trigger_at(8, "menu", vec![], 2_000, 0);
+        for i in 0..APDU_RING as u64 + 3 {
+            tap.record_apdu(8, true, 1, 0x9F8001, 0, 2_000 + i);
+        }
+        // Past the window end: not listed.
+        tap.record_apdu(8, true, 1, 0x9F8001, 0, 62_000);
+        tap.tick_at(62_000);
+        let sidecar = format!("{}.json", dir.join("ca8-19700101T000000").display());
+        for _ in 0..200 {
+            if Path::new(&sidecar).exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let json = fs::read_to_string(&sidecar).unwrap();
+        assert!(json.contains("\"apdus_after_truncated\": true"), "{json}");
+        let after = json.split("\"apdus_after\": ").nth(1).unwrap();
+        let after = &after[..after.find("],\n").unwrap()];
+        assert_eq!(after.matches("\"cam\"").count(), APDU_RING - 1, "{after}");
         let _ = fs::remove_dir_all(&dir);
     }
 

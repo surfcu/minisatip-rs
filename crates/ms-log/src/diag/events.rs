@@ -339,6 +339,59 @@ pub fn cam_menu(menu: &CamMenu<'_>) {
     emit("cam_menu", &cam_menu_fields(menu));
 }
 
+/// `ca_tables` fields: ECM/EMM traffic to one DDCI CAM in one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaTables {
+    pub ddci: i64,
+    pub ecm_pkts: u64,
+    pub emm_pkts: u64,
+    pub ecm_sections: u64,
+    pub emm_sections: u64,
+    pub parity_dropped: u64,
+    pub period_s: u64,
+}
+
+fn ca_tables_fields(t: &CaTables) -> Fields {
+    let mut fields = Fields::new();
+    fields.integer("ddci", t.ddci);
+    fields.int("ecm_pkts", t.ecm_pkts);
+    fields.int("emm_pkts", t.emm_pkts);
+    fields.int("ecm_sections", t.ecm_sections);
+    fields.int("emm_sections", t.emm_sections);
+    fields.int("parity_dropped", t.parity_dropped);
+    fields.int("period_s", t.period_s);
+    fields
+}
+
+/// `ca_tables`: ECM/EMM packets sent to a DDCI CAM (`--cam-ecm-trace`).
+pub fn ca_tables(tables: &CaTables) {
+    if !cfg!(feature = "diag-log") {
+        return;
+    }
+    emit("ca_tables", &ca_tables_fields(tables));
+}
+
+fn ecm_parity_fields(ddci: i64, adapter: i64, pid: u64, table_id: u64, at_ms: i64) -> Fields {
+    let mut fields = Fields::new();
+    fields.integer("ddci", ddci);
+    fields.integer("adapter", adapter);
+    fields.int("pid", pid);
+    fields.int("table_id", table_id);
+    fields.integer("at_ms", at_ms);
+    fields
+}
+
+/// `ecm_parity`: an ECM PID switched table_id (0x80/0x81) at UTC `at_ms` (`--cam-ecm-trace`).
+pub fn ecm_parity(ddci: i64, adapter: i64, pid: u64, table_id: u64, at_ms: i64) {
+    if !cfg!(feature = "diag-log") {
+        return;
+    }
+    emit(
+        "ecm_parity",
+        &ecm_parity_fields(ddci, adapter, pid, table_id, at_ms),
+    );
+}
+
 fn ci_decrypt_fields(adapter: i64, keys_installed: u64, errors: u64, period_s: u64) -> Fields {
     let mut fields = Fields::new();
     fields.integer("adapter", adapter);
@@ -428,6 +481,36 @@ mod tests {
             envelope(
                 "cam_state",
                 ",\"ca\":2,\"state\":\"ready\",\"mode\":\"ci\",\"suppressed\":5"
+            )
+        );
+    }
+
+    #[test]
+    fn table_events_carry_counts_and_parity() {
+        let tables = CaTables {
+            ddci: 8,
+            ecm_pkts: 66,
+            emm_pkts: 12,
+            ecm_sections: 33,
+            emm_sections: 6,
+            parity_dropped: 0,
+            period_s: 10,
+        };
+        assert_eq!(
+            json("ca_tables", &ca_tables_fields(&tables)),
+            envelope(
+                "ca_tables",
+                ",\"ddci\":8,\"ecm_pkts\":66,\"emm_pkts\":12,\"ecm_sections\":33,\"emm_sections\":6,\"parity_dropped\":0,\"period_s\":10"
+            )
+        );
+        assert_eq!(
+            json(
+                "ecm_parity",
+                &ecm_parity_fields(8, 2, 0x5f5, 0x81, 1_793_613_371_000)
+            ),
+            envelope(
+                "ecm_parity",
+                ",\"ddci\":8,\"adapter\":2,\"pid\":1525,\"table_id\":129,\"at_ms\":1793613371000"
             )
         );
     }
