@@ -263,7 +263,7 @@ impl Runtime {
             #[cfg(unix)]
             if let Some(template) = &replay_ca {
                 let dvbca = crate::dvbca::Dvbca::spawn(
-                    crate::dvbca::DvbcaSettings::from_options(opts),
+                    ca.dvbca_settings(),
                     Box::new(crate::replay_ca::ReplayCaOpener::new(template.clone())),
                     Arc::new(ms_ca_drivers::en50221::SystemClock::default()),
                 )
@@ -303,7 +303,7 @@ impl Runtime {
         #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
         if !replay_enabled && !opts.disable_dvb {
             let dvbca = crate::dvbca::Dvbca::spawn(
-                crate::dvbca::DvbcaSettings::from_options(opts),
+                ca.dvbca_settings(),
                 Box::new(ms_ca_drivers::en50221::sys::DvbCaOpener),
                 Arc::new(ms_ca_drivers::en50221::SystemClock::default()),
             )

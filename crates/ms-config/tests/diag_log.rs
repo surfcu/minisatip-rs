@@ -84,6 +84,18 @@ fn usage_lists_the_diag_options() {
         usage.contains("--cam-menu-unsolicited answer1|answer0|open"),
         "{usage}"
     );
+    assert!(usage.contains("--cam-ecm-trace: every 10 s"), "{usage}");
+}
+
+#[cfg(feature = "diag-log")]
+#[test]
+fn cam_ecm_trace_is_a_flag() {
+    assert!(!parse_args(&[]).options.cam_ecm_trace);
+    assert!(
+        parse_args(&["--cam-ecm-trace".to_owned()])
+            .options
+            .cam_ecm_trace
+    );
 }
 
 #[cfg(feature = "diag-log")]
@@ -129,6 +141,9 @@ fn diag_options_are_unknown_without_the_feature() {
     assert!(!usage.contains("--log-ring"), "{usage}");
     assert!(!usage.contains("--ddci-capture"), "{usage}");
     assert!(!usage.contains("--cam-menu"), "{usage}");
+    let outcome = parse_args(&["--cam-ecm-trace".to_owned()]);
+    assert!(!outcome.options.cam_ecm_trace);
+    assert!(!outcome.warnings.is_empty(), "--cam-ecm-trace was accepted");
     let outcome = parse_args(&["--cam-menu".to_owned()]);
     assert!(!outcome.options.cam_menu);
     assert!(!outcome.warnings.is_empty(), "--cam-menu was accepted");

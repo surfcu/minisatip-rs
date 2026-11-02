@@ -33,6 +33,7 @@ enum OptId {
     DdciCaptureMaxMb,
     CamMenu,
     CamMenuUnsolicited,
+    CamEcmTrace,
     Help,
     Playlist,
     Adapters,
@@ -327,6 +328,12 @@ const OPTIONS: &[OptSpec] = &[
         id: OptId::CamMenuUnsolicited,
     },
     OptSpec {
+        long: "cam-ecm-trace",
+        short: None,
+        kind: ArgKind::None,
+        id: OptId::CamEcmTrace,
+    },
+    OptSpec {
         long: "multiplier",
         short: Some('M'),
         kind: ArgKind::Required,
@@ -530,6 +537,7 @@ fn compiled_options() -> impl Iterator<Item = &'static OptSpec> {
                         | OptId::DdciCaptureMaxMb
                         | OptId::CamMenu
                         | OptId::CamMenuUnsolicited
+                        | OptId::CamEcmTrace
                 ))
             && (cfg!(feature = "ci-plus") || !matches!(spec.id, OptId::CiPlusRecovery))
     })
@@ -852,6 +860,7 @@ impl Parser<'_> {
                 self.opts.ddci_capture_max_mb = value.parse::<u64>().unwrap_or(2048);
             }
             OptId::CamMenu => self.opts.cam_menu = true,
+            OptId::CamEcmTrace => self.opts.cam_ecm_trace = true,
             OptId::CamMenuUnsolicited => {
                 if !matches!(value, "answer1" | "answer0" | "open") {
                     return Err(OptError::InvalidValue {

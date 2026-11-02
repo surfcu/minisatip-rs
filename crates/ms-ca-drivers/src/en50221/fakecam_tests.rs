@@ -741,6 +741,43 @@ fn unsolicited_menus_follow_the_configured_reply() {
 }
 
 #[test]
+fn the_apdu_sink_sees_headers_only() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (_, cam, mut dev) = setup(CamConfig::default(), true);
+    let log = Arc::clone(&seen);
+    dev.apdu_sink = Some(Arc::new(move |slot, dir, session, tag, len| {
+        log.lock().unwrap().push((slot, dir, session, tag, len));
+    }));
+    let body = menu_body(&["E", "", "", "One", "Two"]);
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_MENU_LAST,
+        &body,
+    );
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|e| e.0 == 0
+        && e.1 == super::device::ApduDir::CamToHost
+        && e.3 == TAG_MENU_LAST
+        && e.4 == body.len()));
+    assert!(
+        seen.iter().any(|e| e.1 == super::device::ApduDir::HostToCam
+            && e.3 == TAG_MENU_ANSWER
+            && e.4 == 1)
+    );
+}
+
+#[test]
+fn the_registry_hands_the_apdu_sink_to_later_slots() {
+    let mut registry = CaRegistry::new(Arc::new(ManualClock::new(0, UNIX)));
+    registry.set_apdu_sink(Some(Arc::new(|_, _, _, _, _| {})));
+    assert!(registry.device(4).apdu_sink.is_some());
+    registry.set_apdu_sink(None);
+    assert!(registry.device(4).apdu_sink.is_none());
+}
+
+#[test]
 fn menu_commands_need_their_sessions() {
     let clock = ManualClock::new(0, UNIX);
     let mut dev = CaDevice::new(0, Arc::new(clock));
