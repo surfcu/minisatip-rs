@@ -254,7 +254,8 @@ impl CaDevice {
         programs: &ProgramTable,
         driver: &mut dyn CaDriver,
     ) -> SendOutcome {
-        let diag_reason = if self.capmt[slot].diag_retry {
+        // A recovery re-send is reported as such, even over a pending retry.
+        let diag_reason = if self.capmt[slot].diag_retry && cmd.diag_reason != "recovery" {
             "retry"
         } else {
             cmd.diag_reason
@@ -325,6 +326,29 @@ impl CaDevice {
         c.diag_retry = false;
         self.diag_capmt(slot, diag_reason, || hash, false);
         SendOutcome::Sent
+    }
+
+    /// `--cam-recovery`: re-sends every active CAPMT as a forced CLM_UPDATE with
+    /// ok_descrambling and a new version; returns how many went out.
+    pub fn resend_capmts(&mut self, programs: &ProgramTable, driver: &mut dyn CaDriver) -> usize {
+        let cmd = SendCmd {
+            command: CMD_ID_OK_DESCRAMBLING,
+            diag_reason: "recovery",
+        };
+        let slots: Vec<usize> = self
+            .slots()
+            .filter(|&i| self.capmt[i].pmt_count() > 0)
+            .collect();
+        let sent = slots
+            .into_iter()
+            .filter(|&slot| {
+                self.send_capmt(slot, CLM_UPDATE, cmd, true, programs, driver) == SendOutcome::Sent
+            })
+            .count();
+        if sent == 0 {
+            ms_log::log!("CA {}: CAM recovery re-sent no CAPMT", self.id);
+        }
+        sent
     }
 
     /// Emits `capmt` for one send attempt; the hash and PMT list are built

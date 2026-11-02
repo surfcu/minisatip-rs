@@ -688,8 +688,15 @@ impl Worker {
                         .capmt
                         .get(&adapter)
                         .is_some_and(|capmt| !capmt_pmt_ids(capmt).is_empty());
-                if let Some(dev) = self.registry.get_mut(adapter as i32) {
-                    dev.cam_recovery_window(window_ms, scrambled, clear, active);
+                let Some(dev) = self.registry.get_mut(adapter as i32) else {
+                    return;
+                };
+                dev.cam_recovery_window(window_ms, scrambled, clear, active);
+                // Re-sent here, where `active` was just checked: the CAM has a CA session.
+                if dev.take_cam_recovery()
+                    && let Some(capmt) = self.capmt.get_mut(&adapter)
+                {
+                    capmt.resend_capmts(&self.programs, &mut SlotDriver(dev));
                 }
             }
             Request::Stop => {}
@@ -1475,26 +1482,68 @@ mod tests {
         (worker, clock)
     }
 
-    /// `--cam-recovery`: an initialised CAM with a CAPMT in place is judged, so a
-    /// stuck window judged after the anchor resets it through the worker.
+    /// `--cam-recovery`: a stuck window judged after the anchor re-sends the CAPMT as a
+    /// forced CLM_UPDATE with a new version; the CAM is not reset.
     #[test]
-    fn scrambled_window_with_a_capmt_resets_the_cam() {
-        let (mut worker, clock) = cam_recovery_worker(10_000);
-        ready_ci(&mut worker, 1, 0x0B00);
-        worker.capmt.get_mut(&1).unwrap().capmt[0].pmt_id = 5;
-        let dev = worker.registry.device(1);
-        dev.cam_recovery_since = 0;
+    fn scrambled_window_with_a_capmt_resends_it() {
+        use ms_ca_drivers::en50221::consts::TAG_CA_PMT;
+        let (mut worker, clock, cam) = resend_worker();
+        worker.add_pmt(zap_program(4, 0x64), false);
+        let before = sent(&cam, TAG_CA_PMT);
+        assert_eq!(before.len(), 1, "the join");
+        arm_slot_0(&mut worker);
         clock.advance(20_000);
         worker.handle(Request::ScrambledWindow {
-            adapter: 1,
+            adapter: 0,
             scrambled: 50_000,
             clear: 0,
             window_ms: 10_000,
         });
-        assert!(
-            worker.registry.get_mut(1).unwrap().take_close_request(),
-            "the stuck window resets the CAM"
+        let after = sent(&cam, TAG_CA_PMT);
+        assert_eq!(after.len(), 2, "one forced re-send");
+        assert_eq!(
+            after[1][0],
+            ms_ca::capmt::CLM_UPDATE,
+            "list management update"
         );
+        assert_ne!(after[1][3], before[0][3], "a new CAPMT version");
+        assert_eq!(&after[1][4..], &before[0][4..], "the same programs");
+        assert!(
+            !worker.registry.get_mut(0).unwrap().take_close_request(),
+            "the CAM is not reset"
+        );
+    }
+
+    /// `zap_worker(true)` that also hands back the fake CAM.
+    fn resend_worker() -> (Worker, Arc<ManualClock>, Arc<Mutex<FakeCam>>) {
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let clock = Arc::new(ManualClock::new(0, 0));
+        let (tx, _rx) = mpsc::channel();
+        let settings = DvbcaSettings {
+            cam_recovery_ms: 10_000,
+            ..DvbcaSettings::default()
+        };
+        let mut worker = Worker::new(
+            settings,
+            Box::new(CamOpener(Arc::clone(&cam))),
+            clock.clone(),
+            tx,
+        );
+        worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        for _ in 0..500 {
+            let up = worker.registry.get(0).is_some_and(|dev| {
+                dev.state == CaState::Initialized && CaPmtSink::has_ca_session(dev)
+            });
+            if up {
+                break;
+            }
+            clock.advance(10);
+            worker.service();
+        }
+        (worker, clock, cam)
     }
 
     /// `--cam-recovery`: a CAM that is not initialised is not judged, even with a CAPMT.
@@ -1518,7 +1567,7 @@ mod tests {
             -1,
             "not initialised: the window disarms"
         );
-        assert!(!worker.registry.get_mut(1).unwrap().take_close_request());
+        assert!(!worker.registry.get_mut(1).unwrap().take_cam_recovery());
     }
 
     /// A worker whose slot 0 is an initialised CAM with a CA session; the zap

@@ -356,7 +356,7 @@ const CI_PLUS_USAGE: &str = "\
 
 /// Help line for `--cam-recovery`, printed in every build.
 const CAM_RECOVERY_USAGE: &str = "\
-* --cam-recovery seconds: reset a CAM whose CI output stays scrambled after an MMI message; 0 disables it (default 0)
+* --cam-recovery seconds: re-send the CAPMTs to a CAM whose CI output stays scrambled after an MMI message; 0 disables it (default 0)
 * --cam-recovery-no-zap-guard: with --cam-recovery, let any clean window before an MMI message arm, even one before a zap (default off)
 
 ";
