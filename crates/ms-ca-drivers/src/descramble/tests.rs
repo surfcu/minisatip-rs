@@ -873,6 +873,38 @@ fn ad_decerr_sums_the_two_busiest_active_pids() {
     assert_eq!(d.adapter_decerr(), 7);
 }
 
+// `--cam-recovery`: clear data packets (pid above 0x1F) are counted per adapter,
+// untracked pids included; null packets and PSI pids are not.
+#[test]
+fn clear_packets_are_counted_for_data_pids_only() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    pass(
+        &mut d,
+        &[
+            (0x100, false),
+            (0x100, false),
+            (0x101, true),
+            (0x1FFF, false),
+            (0x0010, false),
+            (0x0020, false),
+        ],
+    );
+    assert_eq!(
+        d.clear_pkts(),
+        3,
+        "clear data packets from 0x20 up, 0x10 and null excluded"
+    );
+    assert_eq!(d.dec_err(), 1);
+    pass(&mut d, &[(0x100, false), (0x100, false)]);
+    assert_eq!(d.clear_pkts(), 5, "every clear packet of a pid counts");
+
+    // With pids=all the stream is passed without decryption: nothing is counted.
+    let mut buf = batch(&[(0x100, false), (0x100, false)]);
+    d.count_packets(&buf, true);
+    d.mark_pids_null(&mut buf, DropEncrypted::Send, true);
+    assert_eq!(d.clear_pkts(), 5, "pids=all does not count");
+}
+
 #[test]
 fn a_claim_change_rearms_the_reset_and_removed_pids_are_forgotten() {
     let mut d = Descrambler::new(CipherRegistry::software());

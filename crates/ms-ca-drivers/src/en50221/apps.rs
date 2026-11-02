@@ -417,6 +417,11 @@ impl CaDevice {
                     self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
                     self.end_menu();
                 }
+                // A prompt the configured PIN answers is not a stuck CAM.
+                if !solicited && (self.pin.is_empty() || self.pin.len() != usize::from(answer_len))
+                {
+                    self.note_cam_recovery_mmi();
+                }
                 self.report_menu("enquiry", 0, 1, hash, answer, solicited);
             }
             TAG_LIST_LAST | TAG_MENU_LAST => {
@@ -424,6 +429,9 @@ impl CaDevice {
                 #[cfg(feature = "ci-plus")]
                 if !solicited {
                     self.note_mmi_error();
+                }
+                if !solicited {
+                    self.note_cam_recovery_mmi();
                 }
                 let lines = mmi_menu_lines(self.id, data);
                 let items = lines.len().saturating_sub(3);

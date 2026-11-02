@@ -40,6 +40,12 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   mode and CI+-protected channels will not descramble.
 - In `ci-plus` builds, `--ci-plus-recovery seconds` (off by default) resets a CAM
   that stops delivering CI+ keys after an MMI message (DEV-281).
+- `--cam-recovery seconds` (off by default, every build) resets a CI adapter whose
+  output stays mostly scrambled for that long after an MMI message (DEV-284). A CAPMT
+  change (a zap) needs a clean window before the MMI message to arm the reset, unless
+  `--cam-recovery-no-zap-guard` is given; with the guard, a CAM error right after a
+  zap, before the new service has descrambled, gets no automatic recovery until a clean
+  window that starts after the zap is seen.
 - DDCI CAPMTs are not in the harness yet (#36 phase C); they are compared with C++
   by the ported unit tests and by the real-CAM check.
 - The runtime drives `ms_ca::CaDevice` directly, one PMT at a time as the scheduler offers

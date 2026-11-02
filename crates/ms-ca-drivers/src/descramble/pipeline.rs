@@ -106,6 +106,7 @@ pub struct Descrambler {
     pid_pmt: Box<[u32; 8192]>,
     order: Vec<usize>,
     dec_err: u64,
+    clear_pkts: u64,
     pids: Box<[PidCounters; 8192]>,
 }
 
@@ -265,6 +266,7 @@ impl Descrambler {
             pid_pmt: Box::new([NO_PMT; 8192]),
             order: Vec::new(),
             dec_err: 0,
+            clear_pkts: 0,
             pids: vec![PidCounters::default(); 8192]
                 .into_boxed_slice()
                 .try_into()
@@ -427,6 +429,12 @@ impl Descrambler {
     /// Scrambled packets left after decrypting (`ad->dec_err`).
     pub fn dec_err(&self) -> u64 {
         self.dec_err
+    }
+
+    /// Clear data packets (pid above 0x1F) seen while the CA is active; with
+    /// `dec_err` this gives the scrambled share of the adapter's output.
+    pub fn clear_pkts(&self) -> u64 {
+        self.clear_pkts
     }
 
     /// Overrides the decrypt stamps, like tests that reset `SPMT` fields.
@@ -859,6 +867,9 @@ impl Descrambler {
                 continue;
             }
             if b[3] & 0x80 == 0 {
+                if pid > 0x001F {
+                    self.clear_pkts += 1;
+                }
                 // The first clear packet resets the pid's errors (pmt.cpp:1366-1372).
                 let entry = &mut self.pids[usize::from(pid)];
                 if pid > 0x001F && entry.tracked && !entry.decrypted {
