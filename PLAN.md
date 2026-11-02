@@ -289,7 +289,18 @@ Unvalidated rows must be called out in release notes.
     tvheadend since 02:37; this started a 7-day soak (M9), later ended (see "Soak").
   - The enigma2 box (armv7) runs it with `-E -g` since 02:05.
   - Logs from both boxes and tvheadend go to a central Loki/Grafana host.
-- **Last sessions (2026-10-23/24):** merged and verified:
+- **Last sessions (2026-11-01/02):** merged:
+  - #80 `--cam-recovery` (DEV-284): resets a plain-CI CAM whose output stays scrambled after
+    an MMI message; `--cam-recovery-no-zap-guard` lets a clean window before a zap arm it.
+  - #82 `--ddci-capture` (DEV-280): the 60 s before and after a CAM MMI message, both DDCI
+    directions, written to disk with a JSON sidecar.
+  - #83 `--cam-menu` / `--cam-menu-unsolicited` (DEV-285, DEV-286) and #84 `--cam-ecm-trace`
+    plus APDU headers in captures (DEV-287, DEV-288), all diag-log only; #85 brought #83 and
+    #84 to main (they had merged into their stacked parent branches).
+  - #86 a DDCI PMT read before the CA worker has initialised the CAM, or while it
+    reconnects, is retried instead of dropped (C++ parity).
+  - #81 PLAN soak status.
+- **Sessions (2026-10-23/24):** merged and verified:
   - #43 real-capture harness scenarios and the `pmt_scan` wiring; #44 PLAN.
   - #45 `-k` pids=all emulation; #46 demux-device modes 1-3; #47 enigma2 detection,
     FBC and `DMX_SET_SOURCE`; #48 enigma2 CI routing; #50 local time before the
@@ -340,6 +351,8 @@ Unvalidated rows must be called out in release notes.
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
+  - #63: wait for the next stuck episode under `--cam-recovery`, `--cam-ecm-trace` and
+    `--ddci-capture`; open `--cam-menu` during it for the CAM's status pages.
   - Soak with evidence: no valid 7-day soak is running on the main box (see "Soak"
     below); the enigma2 box runs the armv7 `diag-log` build since 2026-10-25 09:08 +03
     and passed its 12 h validation (see "Logging ... Part B").
@@ -374,7 +387,40 @@ Unvalidated rows must be called out in release notes.
     watchdog resetting the two empty CI slots as in C++ (ca.cpp:3679-3693), plus 60
     heartbeats and the stream events. The -F file reached 2.2 MB, so it did not
     rotate.
-- **Soak (M9), status 2026-11-01 13:55 +03: no valid soak is running.** The main box ran:
+- **Soak (M9), status 2026-11-02 16:10 +03: a #63 soak, not the standard one.** The load
+  generator started on 2026-11-02 10:05:28 +03 (a soak start) with a scrambled-only zapping
+  load, not the standard mix, so it does not count for the 7-day criterion. The minisatip-rs
+  restarts at 13:47:01, 15:30:46 and 16:07:44 broke it up; the current minisatip-rs run
+  started at 16:07:44. Since 2026-11-01 13:55 +03 the main box ran:
+  - C++ minisatip (CI+ mode) under the one-service load until 14:13:31, then the dddvb 0.9.42
+    driver instead of the in-kernel one (14:12-14:15);
+  - four ramp tests (one to four scrambled services, 3 min steps, no zapping): C++ and
+    minisatip-rs, each in CI+ and plain CI, 14:31-15:27, all with no scrambled output;
+  - minisatip-rs plain CI with `--ddci-capture` from 15:32:07, a zapping test until 15:58: one
+    start-up CAM message at the first join, no stuck service;
+  - C++ minisatip in plain CI from 15:58:39, no load;
+  - minisatip-rs plain CI with `--ddci-capture` from 22:20:02, scripted idle-join, zap,
+    rejoin and long-hold tests 22:35-06:52: one CAM error message on the first join after
+    16 min idle (output clear within 5 s of the join), no stuck service;
+  - 2026-11-02 10:05:13 a local merge with #80 (`--cam-recovery 60`) under a scrambled-only
+    zapping load from 10:05:28. At 12:56:14 the CAM error message came on a service that had
+    descrambled for 70 s (input clean in the capture, output scrambled from 3 s before the
+    message), and every later join stayed scrambled. `--cam-recovery` did not fire: the
+    stuck service was zapped away 3 s after the message, which dropped the anchor; later
+    joins never had a clean window (zap guard), and the clients dropped each after 20 s,
+    before the 60 s timeout. Restarted at 13:47:01 with `--cam-recovery 10
+    --cam-recovery-no-zap-guard`;
+  - 15:30:46 a local merge of #80 and #82-#84 with `--cam-ecm-trace --cam-menu`. A client
+    that re-tuned within 1.5 s of the start got its PMT dropped and stayed scrambled (fixed
+    by #86);
+  - since 16:07:44 main `a90c11f` (#80, #82-#86) with the same options, under the same
+    scrambled-only load.
+
+  The ECM trace (from 15:31) shows the ECM parity changing at second x1 of every 10 s; the
+  CAM error messages that left a service stuck came at second x4-x5, 3-4 s after a change.
+
+  A fresh soak needs a minisatip-rs start under the standard load.
+- **Soak (M9), status 2026-11-01 13:55 +03: no valid soak was running.** The main box ran:
   - minisatip-rs from 2026-10-31 19:08:47 (sha `6d59188c`) under the standard load; the
     service was restarted by hand at 21:54:32 after the CAM error (#63), which ended that
     run after 2 h 46 min;
@@ -437,5 +483,6 @@ Unvalidated rows must be called out in release notes.
     report script (private homelab notes). Known: CC errors right after a scrambled
     service starts come from the CAM.
 - **Tracked issues:** CA harness scenarios (#36); #37 resolved (the unused reconciler was removed, the event-driven CA path is the runtime);
-  CAM blocked after a CAM MMI error message until restart in CI+; once in plain CI it
-  stopped descrambling and was restarted before it could recover (#63).
+  CAM blocked after a CAM MMI error message until restart (#63), in CI+ and in plain CI,
+  with C++ as well as minisatip-rs; `--cam-recovery` (#80) is the plain-CI recovery under
+  test.
