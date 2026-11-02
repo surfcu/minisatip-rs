@@ -79,6 +79,43 @@ fn usage_lists_the_diag_options() {
     assert!(usage.contains("--log-ring lines"), "{usage}");
     assert!(usage.contains("--ddci-capture dir"), "{usage}");
     assert!(usage.contains("--ddci-capture-max-mb mb"), "{usage}");
+    assert!(usage.contains("--cam-menu: serve POST"), "{usage}");
+    assert!(
+        usage.contains("--cam-menu-unsolicited answer1|answer0|open"),
+        "{usage}"
+    );
+    assert!(usage.contains("--cam-ecm-trace: every 10 s"), "{usage}");
+}
+
+#[cfg(feature = "diag-log")]
+#[test]
+fn cam_ecm_trace_is_a_flag() {
+    assert!(!parse_args(&[]).options.cam_ecm_trace);
+    assert!(
+        parse_args(&["--cam-ecm-trace".to_owned()])
+            .options
+            .cam_ecm_trace
+    );
+}
+
+#[cfg(feature = "diag-log")]
+#[test]
+fn cam_menu_options_are_parsed_with_defaults() {
+    let options = parse_args(&[]).options;
+    assert!(!options.cam_menu);
+    assert_eq!(options.cam_menu_unsolicited, "answer1");
+    for mode in ["answer1", "answer0", "open"] {
+        let outcome = parse_args(&[
+            "--cam-menu".to_owned(),
+            "--cam-menu-unsolicited".to_owned(),
+            mode.to_owned(),
+        ]);
+        assert!(outcome.error.is_none(), "{mode}: {:?}", outcome.error);
+        assert!(outcome.options.cam_menu);
+        assert_eq!(outcome.options.cam_menu_unsolicited, mode);
+    }
+    let outcome = parse_args(&["--cam-menu-unsolicited".to_owned(), "2".to_owned()]);
+    assert!(outcome.error.is_some(), "a bad mode is fatal");
 }
 
 #[cfg(not(feature = "diag-log"))]
@@ -93,6 +130,7 @@ fn diag_options_are_unknown_without_the_feature() {
         "--log-ring",
         "--ddci-capture",
         "--ddci-capture-max-mb",
+        "--cam-menu-unsolicited",
     ] {
         let outcome = parse_args(&[name.to_owned(), "1".to_owned()]);
         assert!(outcome.error.is_none(), "{name}: {:?}", outcome.error);
@@ -102,4 +140,11 @@ fn diag_options_are_unknown_without_the_feature() {
     assert!(!usage.contains("--log-remote"), "{usage}");
     assert!(!usage.contains("--log-ring"), "{usage}");
     assert!(!usage.contains("--ddci-capture"), "{usage}");
+    assert!(!usage.contains("--cam-menu"), "{usage}");
+    let outcome = parse_args(&["--cam-ecm-trace".to_owned()]);
+    assert!(!outcome.options.cam_ecm_trace);
+    assert!(!outcome.warnings.is_empty(), "--cam-ecm-trace was accepted");
+    let outcome = parse_args(&["--cam-menu".to_owned()]);
+    assert!(!outcome.options.cam_menu);
+    assert!(!outcome.warnings.is_empty(), "--cam-menu was accepted");
 }

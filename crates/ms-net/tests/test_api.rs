@@ -774,6 +774,7 @@ fn ca_dvbapi_satipc_pmt_symbols_match_cpp() {
         state: 2,
         caids: vec![0x0B00, 0x0B01],
         ci_name: "CAM".to_owned(),
+        ..CaDeviceState::default()
     })];
     state.keys = vec![Some(KeyState {
         enabled: 1,

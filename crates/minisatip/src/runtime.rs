@@ -263,7 +263,7 @@ impl Runtime {
             #[cfg(unix)]
             if let Some(template) = &replay_ca {
                 let dvbca = crate::dvbca::Dvbca::spawn(
-                    crate::dvbca::DvbcaSettings::from_options(opts),
+                    ca.dvbca_settings(),
                     Box::new(crate::replay_ca::ReplayCaOpener::new(template.clone())),
                     Arc::new(ms_ca_drivers::en50221::SystemClock::default()),
                 )
@@ -303,7 +303,7 @@ impl Runtime {
         #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
         if !replay_enabled && !opts.disable_dvb {
             let dvbca = crate::dvbca::Dvbca::spawn(
-                crate::dvbca::DvbcaSettings::from_options(opts),
+                ca.dvbca_settings(),
                 Box::new(ms_ca_drivers::en50221::sys::DvbCaOpener),
                 Arc::new(ms_ca_drivers::en50221::SystemClock::default()),
             )
@@ -439,6 +439,9 @@ impl Runtime {
         let mut web = web;
         if cfg!(feature = "diag-log") && opts.log_ring > 0 {
             web = web.with_debug_log(ms_log::diag::ring_dump, ms_log::diag::ring_capacity());
+        }
+        if cfg!(feature = "diag-log") && opts.cam_menu {
+            web = web.with_cam_menu(crate::dvbca::cam_menu_command);
         }
         session.set_web(web);
         // minisatip.cpp:1149-1166; read_http refreshes the current time.

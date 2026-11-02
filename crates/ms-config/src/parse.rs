@@ -31,6 +31,9 @@ enum OptId {
     LogRing,
     DdciCapture,
     DdciCaptureMaxMb,
+    CamMenu,
+    CamMenuUnsolicited,
+    CamEcmTrace,
     Help,
     Playlist,
     Adapters,
@@ -313,6 +316,24 @@ const OPTIONS: &[OptSpec] = &[
         id: OptId::DdciCaptureMaxMb,
     },
     OptSpec {
+        long: "cam-menu",
+        short: None,
+        kind: ArgKind::None,
+        id: OptId::CamMenu,
+    },
+    OptSpec {
+        long: "cam-menu-unsolicited",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::CamMenuUnsolicited,
+    },
+    OptSpec {
+        long: "cam-ecm-trace",
+        short: None,
+        kind: ArgKind::None,
+        id: OptId::CamEcmTrace,
+    },
+    OptSpec {
         long: "multiplier",
         short: Some('M'),
         kind: ArgKind::Required,
@@ -514,6 +535,9 @@ fn compiled_options() -> impl Iterator<Item = &'static OptSpec> {
                         | OptId::LogRing
                         | OptId::DdciCapture
                         | OptId::DdciCaptureMaxMb
+                        | OptId::CamMenu
+                        | OptId::CamMenuUnsolicited
+                        | OptId::CamEcmTrace
                 ))
             && (cfg!(feature = "ci-plus") || !matches!(spec.id, OptId::CiPlusRecovery))
     })
@@ -834,6 +858,19 @@ impl Parser<'_> {
             OptId::DdciCapture => self.opts.ddci_capture = Some(value.into()),
             OptId::DdciCaptureMaxMb => {
                 self.opts.ddci_capture_max_mb = value.parse::<u64>().unwrap_or(2048);
+            }
+            OptId::CamMenu => self.opts.cam_menu = true,
+            OptId::CamEcmTrace => self.opts.cam_ecm_trace = true,
+            OptId::CamMenuUnsolicited => {
+                if !matches!(value, "answer1" | "answer0" | "open") {
+                    return Err(OptError::InvalidValue {
+                        option: "--cam-menu-unsolicited".into(),
+                        message: "Invalid --cam-menu-unsolicited value, expected answer1, answer0 or open"
+                            .into(),
+                        show_usage: true,
+                    });
+                }
+                self.opts.cam_menu_unsolicited = value.into();
             }
             OptId::Help => self.opts.help = true,
             OptId::Version => self.opts.version = true,
