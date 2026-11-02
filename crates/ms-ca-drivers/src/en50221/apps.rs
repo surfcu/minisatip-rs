@@ -76,7 +76,7 @@ pub fn mmi_menu_lines(id: usize, body: &[u8]) -> Vec<String> {
 }
 
 /// FNV-1a over the page lines, each ended by a newline, to group equal pages.
-fn text_hash<'a>(lines: impl IntoIterator<Item = &'a str>) -> u64 {
+pub(super) fn text_hash<'a>(lines: impl IntoIterator<Item = &'a str>) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for line in lines {
         for byte in line.bytes().chain(std::iter::once(b'\n')) {
@@ -136,6 +136,7 @@ impl CaDevice {
     /// The handler's `close`; only CA support has one (MMI ends a `--cam-menu` request).
     pub(super) fn app_close(&mut self, idx: usize) {
         if self.app_of(idx) == Some(App::Mmi) {
+            self.snapshot_closed();
             self.end_menu();
         }
         if self.app_of(idx) == Some(App::CaSupport) {
@@ -397,6 +398,13 @@ impl CaDevice {
                     answer_len,
                     solicited,
                 });
+                if solicited && self.snapshot_walking() {
+                    // A status snapshot never sends the PIN: cancel and end the path.
+                    self.write_apdu(idx, TAG_ANSWER, &[MMI_ANSW_ID_CANCEL]);
+                    self.snapshot_end_path(true);
+                    self.report_menu("enquiry", 0, 1, hash, "snapshot", solicited);
+                    return;
+                }
                 let answer = if self.pin.len() == usize::from(answer_len) {
                     ms_log::log!("answering to PIN enquiry");
                     let mut answer = vec![MMI_ANSW_ID_ANSWER];
@@ -421,6 +429,7 @@ impl CaDevice {
                 if !solicited && (self.pin.is_empty() || self.pin.len() != usize::from(answer_len))
                 {
                     self.note_cam_recovery_mmi();
+                    self.snapshot_trigger();
                 }
                 self.report_menu("enquiry", 0, 1, hash, answer, solicited);
             }
@@ -443,11 +452,20 @@ impl CaDevice {
                 let hash = text_hash(lines.iter().map(String::as_str));
                 let count = lines.len();
                 self.push_event(HostEvent::MmiMenu { lines, solicited });
-                let answer = if solicited {
+                let answer = if solicited && self.snapshot_walking() {
+                    let menu_items = (tag == TAG_MENU_LAST).then_some(items);
+                    self.snapshot_page(idx, menu_items, hash);
+                    "snapshot"
+                } else if solicited {
                     self.menu_request_ms = self.now();
                     self.mmi_page = Some(page);
                     "request"
+                } else if self.snapshot_started() {
+                    // A leftover of the snapshot's walk: closed with no choice (still arms recovery).
+                    self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+                    "snapshot"
                 } else {
+                    self.snapshot_trigger();
                     match self.unsolicited_mmi {
                         UnsolicitedMmi::Answer1 | UnsolicitedMmi::Answer0 => {
                             let (choice, name) = if self.unsolicited_mmi == UnsolicitedMmi::Answer1
@@ -478,6 +496,7 @@ impl CaDevice {
                     tag
                 );
                 // The CAM left its menu: later pages are unsolicited again.
+                self.snapshot_closed();
                 self.end_menu();
             }
             TAG_LIST_MORE | TAG_MENU_MORE => {

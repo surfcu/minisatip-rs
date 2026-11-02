@@ -202,6 +202,11 @@ pub struct CaDevice {
     /// Since when an unsolicited page is held open (ms; -1 none).
     pub(super) mmi_hold_ms: i64,
     pub(super) mmi_page: Option<MmiPage>,
+    /// `--cam-menu-snapshot` paths: `(page text_hash, choice)` steps.
+    pub snapshot_paths: Vec<Vec<(u64, u8)>>,
+    pub(super) snapshot: Option<super::snapshot::Snapshot>,
+    /// When the last snapshot was scheduled (ms; -1 none).
+    pub(super) snapshot_last: i64,
     /// `--cam-recovery` in ms; 0 disables the scrambled-output watchdog.
     pub cam_recovery_timeout_ms: i64,
     /// Anchor of the scrambled-output watchdog: the first MMI message (ms; -1 unarmed).
@@ -268,6 +273,9 @@ impl CaDevice {
             last_rx_ms: -1,
             recovery_timeout_ms: 0,
             unsolicited_mmi: UnsolicitedMmi::default(),
+            snapshot_paths: Vec::new(),
+            snapshot: None,
+            snapshot_last: -1,
             menu_request_ms: -1,
             mmi_hold_ms: -1,
             mmi_page: None,
@@ -458,6 +466,7 @@ impl CaDevice {
         self.last_key_ms = -1;
         self.last_rx_ms = -1;
         self.end_menu();
+        self.snapshot = None;
         self.cam_recovery_since = -1;
         self.cam_recovery_stuck_since = -1;
         self.link = None;
@@ -986,11 +995,12 @@ impl CaDevice {
         let now = self.now();
         self.cmd_watchdog(now);
         self.mmi_recovery_watchdog(now);
+        self.snapshot_tick(now);
         self.menu_idle_timeout(now);
     }
 
     /// The first open session of `app`, any resource version.
-    fn session_for_app(&self, app: App) -> Option<usize> {
+    pub(super) fn session_for_app(&self, app: App) -> Option<usize> {
         self.sessions
             .iter()
             .position(|s| s.is_some_and(|s| s.handler.app == app))
@@ -1013,6 +1023,7 @@ impl CaDevice {
 
     /// `--cam-menu`: sends `enter_menu` and opens a request. No C++ equivalent.
     pub fn enter_menu(&mut self) -> Result<(), MenuError> {
+        self.snapshot_cancel();
         let idx = self
             .session_for_app(App::AppInfo)
             .ok_or(MenuError::NoSession)?;
@@ -1040,6 +1051,7 @@ impl CaDevice {
             return Err(MenuError::BadChoice);
         }
         let idx = self.session_for_app(App::Mmi).ok_or(MenuError::NoSession)?;
+        self.snapshot_cancel();
         ms_log::log!("CA {}: menu answer {} on request", self.id, choice);
         self.write_apdu(idx, TAG_MENU_ANSWER, &[choice]);
         self.menu_request_ms = self.now();
@@ -1049,6 +1061,10 @@ impl CaDevice {
 
     /// `--cam-menu`: closes the MMI and ends the request or a held page.
     pub fn close_mmi(&mut self) -> Result<(), MenuError> {
+        // Closing a held page before a snapshot starts is no takeover.
+        if self.snapshot_started() {
+            self.snapshot_cancel();
+        }
         let idx = self.session_for_app(App::Mmi).ok_or(MenuError::NoSession)?;
         ms_log::log!("CA {}: closing the CAM menu on request", self.id);
         self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);

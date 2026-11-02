@@ -44,6 +44,8 @@ pub struct DvbcaSettings {
     pub cam_recovery_zap_guard: bool,
     /// `--cam-menu-unsolicited`.
     unsolicited_mmi: UnsolicitedMmi,
+    /// `--cam-menu-snapshot` paths.
+    menu_snapshot: Vec<Vec<(u64, u8)>>,
     /// `--ddci-capture` APDU trace.
     apdu_sink: Option<ApduHook>,
 }
@@ -68,6 +70,7 @@ impl Default for DvbcaSettings {
             cache_dir: "/var/cache/minisatip".to_owned(),
             ci_plus_recovery_ms: 0,
             unsolicited_mmi: UnsolicitedMmi::default(),
+            menu_snapshot: Vec::new(),
             apdu_sink: None,
             cam_recovery_ms: 0,
             cam_recovery_zap_guard: true,
@@ -100,6 +103,7 @@ impl DvbcaSettings {
         settings.enigma = opts.enigma;
         settings.cache_dir = opts.cache_dir.clone();
         settings.ci_plus_recovery_ms = i64::from(opts.ci_plus_recovery).max(0) * 1000;
+        settings.menu_snapshot = opts.cam_menu_snapshot.clone();
         settings.unsolicited_mmi = match opts.cam_menu_unsolicited.as_str() {
             "answer0" => UnsolicitedMmi::Answer0,
             "open" => UnsolicitedMmi::Open,
@@ -586,6 +590,7 @@ impl Worker {
         registry.set_cache_dir(&settings.cache_dir);
         registry.set_ci_plus_recovery_ms(settings.ci_plus_recovery_ms);
         registry.set_unsolicited_mmi(settings.unsolicited_mmi);
+        registry.set_menu_snapshot(settings.menu_snapshot.clone());
         registry.set_apdu_sink(settings.apdu_sink.as_ref().map(|hook| hook.0.clone()));
         registry.set_cam_recovery_ms(settings.cam_recovery_ms);
         registry.set_cam_recovery_zap_guard(settings.cam_recovery_zap_guard);

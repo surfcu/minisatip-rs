@@ -33,6 +33,7 @@ enum OptId {
     DdciCaptureMaxMb,
     CamMenu,
     CamMenuUnsolicited,
+    CamMenuSnapshot,
     CamEcmTrace,
     Help,
     Playlist,
@@ -330,6 +331,12 @@ const OPTIONS: &[OptSpec] = &[
         id: OptId::CamMenuUnsolicited,
     },
     OptSpec {
+        long: "cam-menu-snapshot",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::CamMenuSnapshot,
+    },
+    OptSpec {
         long: "cam-ecm-trace",
         short: None,
         kind: ArgKind::None,
@@ -551,6 +558,7 @@ fn compiled_options() -> impl Iterator<Item = &'static OptSpec> {
                         | OptId::DdciCaptureMaxMb
                         | OptId::CamMenu
                         | OptId::CamMenuUnsolicited
+                        | OptId::CamMenuSnapshot
                         | OptId::CamEcmTrace
                 ))
             && (cfg!(feature = "ci-plus") || !matches!(spec.id, OptId::CiPlusRecovery))
@@ -875,6 +883,16 @@ impl Parser<'_> {
             }
             OptId::CamMenu => self.opts.cam_menu = true,
             OptId::CamEcmTrace => self.opts.cam_ecm_trace = true,
+            OptId::CamMenuSnapshot => match parse_cam_menu_snapshot(value) {
+                Some(paths) => self.opts.cam_menu_snapshot = paths,
+                None => {
+                    return Err(OptError::InvalidValue {
+                        option: "--cam-menu-snapshot".into(),
+                        message: "Invalid --cam-menu-snapshot value, expected HASH:CHOICE steps (16 hex digits, choice 1-9), up to 3 per path joined by '/', up to 8 paths joined by ','".into(),
+                        show_usage: true,
+                    });
+                }
+            },
             OptId::CamMenuUnsolicited => {
                 if !matches!(value, "answer1" | "answer0" | "open") {
                     return Err(OptError::InvalidValue {
@@ -1928,6 +1946,28 @@ fn truncate_bytes(text: &str, max: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// `--cam-menu-snapshot`: `HASH:CHOICE` steps (16 hex digits, choice 1-9), up to 3 per path
+/// joined by `/`, up to 8 paths joined by `,`; `None` on any other value.
+pub fn parse_cam_menu_snapshot(value: &str) -> Option<Vec<Vec<(u64, u8)>>> {
+    let paths: Vec<Vec<(u64, u8)>> = value
+        .split(',')
+        .map(|path| {
+            path.split('/')
+                .map(|step| {
+                    let (hash, choice) = step.trim().split_once(':')?;
+                    let choice: u8 = choice.parse().ok().filter(|c| (1..=9).contains(c))?;
+                    (hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .then(|| u64::from_str_radix(hash, 16).ok())
+                        .flatten()
+                        .map(|hash| (hash, choice))
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|steps| (1..=3).contains(&steps.len()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (1..=8).contains(&paths.len()).then_some(paths)
 }
 
 #[cfg(test)]

@@ -85,6 +85,38 @@ fn usage_lists_the_diag_options() {
         "{usage}"
     );
     assert!(usage.contains("--cam-ecm-trace: every 10 s"), "{usage}");
+    assert!(usage.contains("--cam-menu-snapshot HASH:CHOICE"), "{usage}");
+}
+
+#[cfg(feature = "diag-log")]
+#[test]
+fn cam_menu_snapshot_takes_hash_pinned_paths() {
+    assert!(parse_args(&[]).options.cam_menu_snapshot.is_empty());
+    let good = "00000000000000aa:1/00000000000000bb:2,00000000000000aa:4";
+    let options = parse_args(&["--cam-menu-snapshot".to_owned(), good.to_owned()]).options;
+    assert_eq!(
+        options.cam_menu_snapshot,
+        [vec![(0xaa, 1), (0xbb, 2)], vec![(0xaa, 4)]]
+    );
+    for bad in [
+        "",
+        "aa:1",
+        "00000000000000aa:0",
+        "00000000000000aa:10",
+        "00000000000000ag:1",
+        "00000000000000aa:1/00000000000000aa:1/00000000000000aa:1/00000000000000aa:1",
+        "00000000000000aa:1,,00000000000000aa:2",
+    ] {
+        let outcome = parse_args(&["--cam-menu-snapshot".to_owned(), bad.to_owned()]);
+        assert!(outcome.error.is_some(), "{bad:?} must be refused");
+    }
+    let nine = ["00000000000000aa:1"; 9].join(",");
+    assert!(
+        parse_args(&["--cam-menu-snapshot".to_owned(), nine])
+            .error
+            .is_some(),
+        "at most 8 paths"
+    );
 }
 
 #[cfg(feature = "diag-log")]
@@ -131,6 +163,7 @@ fn diag_options_are_unknown_without_the_feature() {
         "--ddci-capture",
         "--ddci-capture-max-mb",
         "--cam-menu-unsolicited",
+        "--cam-menu-snapshot",
     ] {
         let outcome = parse_args(&[name.to_owned(), "1".to_owned()]);
         assert!(outcome.error.is_none(), "{name}: {:?}", outcome.error);

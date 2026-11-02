@@ -115,7 +115,7 @@ one event per distinct key.
 | `ddci_batch` | `adapter`, `grown_to` | Bytes | Flushed: CAM output grew the adapter batch; the largest value in the window is kept. |
 | `ddci_fifo_overflow` | `adapter`, `dropped` | DDCI device id (the device map key), bytes | Flushed: bytes lost when a DDCI FIFO overflowed. |
 | `ddci_capture` | `slot`, `files`, `bytes`, `drops` | CA slot, the two file names, bytes written, bytes the writer missed | A `--ddci-capture` pair and its sidecar are written (feature `diag-log`). |
-| `cam_menu` | `ca`, `kind`, `items`, `lines`, `text_hash`, `answer`, `solicited` | Kind `menu`/`list`/`enquiry`/`menu_more`/`list_more`; menu items (0 for an enquiry or fragment); text lines (title, subtitle and bottom included); FNV-1a hash of the lines as 16 hex digits; what the host answered: `1`/`0`/`open` (unsolicited, per `--cam-menu-unsolicited`), `request` (left to a `--cam-menu` request), `pin`/`cancel`/`close` (enquiry), `none`; `solicited` inside a request | Every MMI page from the CAM (feature `diag-log`). The page text itself is in the `[UI n]` log lines; a PIN is never logged. |
+| `cam_menu` | `ca`, `kind`, `items`, `lines`, `text_hash`, `answer`, `solicited` | Kind `menu`/`list`/`enquiry`/`menu_more`/`list_more`; menu items (0 for an enquiry or fragment); text lines (title, subtitle and bottom included); FNV-1a hash of the lines as 16 hex digits; what the host answered: `1`/`0`/`open` (unsolicited, per `--cam-menu-unsolicited`), `request` (left to a `--cam-menu` request), `snapshot` (a `--cam-menu-snapshot` walk, or a page closed during one), `pin`/`cancel`/`close` (enquiry), `none`; `solicited` inside a request | Every MMI page from the CAM (feature `diag-log`). The page text itself is in the `[UI n]` log lines; a PIN is never logged. |
 | `ca_tables` | `ddci`, `ecm_pkts`, `emm_pkts`, `ecm_sections`, `emm_sections`, `parity_dropped`, `period_s` | DDCI device, ECM and EMM packets written to the CAM, packets that start a section, parity changes of this device not reported (over 1024 in a window for all devices), window seconds | Every 10 s per DDCI device that received ECM or EMM packets (`--cam-ecm-trace`). |
 | `ecm_parity` | `ddci`, `adapter`, `pid`, `table_id`, `at_ms` | DDCI device, source adapter and ECM PID, the new table_id (`128`/`129`), UTC ms when the first packet with it was written | An ECM PID switched between table_id 0x80 and 0x81, i.e. a crypto-period change (`--cam-ecm-trace`); reported with the next 10 s window. |
 | `ci_decrypt` | `adapter`, `keys_installed`, `errors`, `period_s` | Active CW services, descrambler error delta, window seconds | Every 10 s for a CI adapter when keys or errors were seen. |
@@ -283,6 +283,38 @@ A requested page triggers no `--ddci-capture` and does not arm
 `--ci-plus-recovery`. After 120 s without a page or command the host answers
 0 (when a page waits) and closes. A close from the CAM, or the MMI session
 closing, ends the request at once.
+
+### CAM status snapshot
+
+`--cam-menu-snapshot` (diag-log builds only) reads the CAM's own status pages
+automatically when the CAM opens a menu, list or enquiry by itself (an error
+message), so the card state at that moment ends up in the log next to the episode.
+
+- The value is a list of paths: `HASH:CHOICE` steps joined by `/` (up to 3), paths
+  joined by `,` (up to 8). HASH is the 16-digit `text_hash` of the page the choice
+  is made on, from its `cam_menu` event; CHOICE is the item number (1-9).
+- Get the hashes once by opening the menu by hand with `--cam-menu` and reading the
+  `text_hash` of each page. Only list steps that lead to read-only status pages:
+  never a choice that changes a setting, resets the CAM or asks for a PIN.
+- 5 s after the CAM's own page, each path is walked: the main menu is opened, a step
+  is answered only when the page's hash is exactly the step's HASH and the choice is
+  on it, and the page reached after the last step is logged and closed. Any other
+  page (another hash, a list, the error message again) ends the path and closes the
+  MMI. A page that does not come within 10 s ends the path; the next path starts 4 s
+  later. Any enquiry that arrives while a path waits for a page is cancelled, never answered with the PIN, even one the CAM raises for a service (it asks again on the next tune).
+- At most one snapshot per slot per 10 minutes, counted from its trigger; it does
+  not start while a `--cam-menu` request or an `open` held page is in progress, and is
+  dropped if it cannot start within 5 minutes. A `--cam-menu` command cancels it.
+- The walk's pages count as requested: no `--ddci-capture`, no recovery arming, no
+  automatic answer. After the first path has opened, a menu the CAM opens by itself is
+  closed with no choice (it still arms recovery and may trigger a capture); an
+  enquiry of its own keeps the PIN answer.
+
+Example (placeholder hashes):
+
+```sh
+minisatip --cam-menu --cam-menu-snapshot 1111111111111111:1/2222222222222222:1,1111111111111111:1/2222222222222222:4
+```
 
 `--cam-menu-unsolicited answer1|answer0|open` sets the reply to a menu or list
 the CAM opens by itself: `answer1` (default) is the C++ choice 1 and close,

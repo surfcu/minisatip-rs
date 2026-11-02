@@ -377,6 +377,8 @@ const DIAG_USAGE: &str = "\
 
 * --cam-ecm-trace: every 10 s, count the ECM and EMM packets each DDCI CAM receives and report each ECM parity (crypto-period) change
 
+* --cam-menu-snapshot HASH:CHOICE[/HASH:CHOICE...][,...]: after the CAM opens a menu by itself, walk these menu paths, each step only on the page with that text_hash, and log the pages reached; at most once per slot per 10 min
+
 * --cam-menu-unsolicited answer1|answer0|open: reply to a menu the CAM opens by itself with choice 1 (default, as C++), with 0, or leave it open for up to 120 s
 
 ";
