@@ -334,16 +334,15 @@ Unvalidated rows must be called out in release notes.
     timer, as `sockets_timeout`, ca.cpp:3829). The real CAM works through the CI path.
   - M8: satipc against a real SAT>IP server. SAT>IP client adapters report `ad_type` 2
     (`ADAPTER_SATIP`, DEV-053), so the status page scales their SNR as C++ does.
-  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); 7-day soak has been running
-    since 2026-10-31 19:08:47 +03 on the main box (see "Soak"); resource comparison.
+  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); no valid 7-day soak is running
+    (see "Soak"); resource comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - Soak with evidence: the 7-day soak has been running on the main box since
-    2026-10-31 19:08:47 +03 (see "Soak" below); the enigma2 box runs the armv7
-    `diag-log` build since 2026-10-25 09:08 +03 and passed its 12 h validation (see
-    "Logging ... Part B").
+  - Soak with evidence: no valid 7-day soak is running on the main box (see "Soak"
+    below); the enigma2 box runs the armv7 `diag-log` build since 2026-10-25 09:08 +03
+    and passed its 12 h validation (see "Logging ... Part B").
   - CA scenarios in the harness (#36).
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
     is in that box.
@@ -375,6 +374,22 @@ Unvalidated rows must be called out in release notes.
     watchdog resetting the two empty CI slots as in C++ (ca.cpp:3679-3693), plus 60
     heartbeats and the stream events. The -F file reached 2.2 MB, so it did not
     rotate.
+- **Soak (M9), status 2026-11-01 13:55 +03: no valid soak is running.** The main box ran:
+  - minisatip-rs from 2026-10-31 19:08:47 (sha `6d59188c`) under the standard load; the
+    service was restarted by hand at 21:54:32 after the CAM error (#63), which ended that
+    run after 2 h 46 min;
+  - the same build from 21:54:33 to 23:43:17, with no load after 21:55:05;
+  - minisatip-rs 0.1.1 (sha `03fdd820`, plain CI) from 23:43:17, for 2.5 min, with the
+    standard load from 23:43:33;
+  - C++ minisatip (CI+ mode) from 23:45:50 to 2026-11-01 00:18:44, a CAM error comparison
+    (#63) under a scrambled-only load from 23:47, with pinned channels from 23:48, until
+    00:18:42;
+  - minisatip-rs 0.1.1 from 00:18:44 to 13:41:40, with no load until 13:05:35, then a
+    one-adapter, one-scrambled-service load test;
+  - C++ minisatip (CI+ mode) since 13:41:44 under the same load (paused
+    13:41:39-13:42:13), a CAM error comparison.
+
+  A fresh soak needs a minisatip-rs start under the standard load. Earlier runs follow.
 - **Soak (M9), restarted 2026-10-31 19:08:47 +03 on the main box in plain CI:** main
   `0bdd784`, static x86_64 musl with feature `diag-log` (sha `6d59188c`, banner
   compile time Oct 31 2026 16:08:13 UTC; both slots log "using plain CI"), the same
