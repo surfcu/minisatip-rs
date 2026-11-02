@@ -12,6 +12,7 @@ pub mod device;
 pub mod link;
 pub mod registry;
 pub mod resources;
+pub mod snapshot;
 #[cfg(target_os = "linux")]
 pub mod sys;
 

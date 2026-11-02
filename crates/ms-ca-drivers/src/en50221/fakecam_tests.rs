@@ -1376,3 +1376,326 @@ fn cam_recovery_ignores_requested_menus_and_enquiries() {
         "an unsolicited menu arms again"
     );
 }
+
+// --- --cam-menu-snapshot: hash-pinned menu walks after a CAM page of its own.
+
+const MAIN: [&str; 5] = ["Main", "", "", "Status", "Other"];
+const SUB: [&str; 5] = ["Status", "", "", "Card", "Service"];
+const TARGET: [&str; 4] = ["Card", "", "", "Line"];
+
+fn page_hash(texts: &[&str]) -> u64 {
+    super::apps::text_hash(texts.iter().copied())
+}
+
+/// A slot with the paths `MAIN:1/SUB:choice` for each of `choices`.
+fn snapshot_rig(choices: &[u8]) -> (ManualClock, Arc<Mutex<FakeCam>>, CaDevice) {
+    let (clock, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.snapshot_paths = choices
+        .iter()
+        .map(|&c| vec![(page_hash(&MAIN), 1), (page_hash(&SUB), c)])
+        .collect();
+    (clock, cam, dev)
+}
+
+fn show(dev: &mut CaDevice, cam: &Arc<Mutex<FakeCam>>, tag: u32, texts: &[&str]) {
+    deliver(dev, cam, EN50221_APP_MMI_RESOURCEID, tag, &menu_body(texts));
+}
+
+/// The CAM's own error page, answered as today, then the 5 s wait.
+fn error_then_start(clock: &ManualClock, dev: &mut CaDevice, cam: &Arc<Mutex<FakeCam>>) {
+    show(dev, cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    clock.advance(5_000);
+    dev.timeout();
+}
+
+#[test]
+fn a_snapshot_walks_its_pinned_path_and_closes_on_the_target() {
+    let (clock, cam, mut dev) = snapshot_rig(&[1]);
+    error_then_start(&clock, &mut dev, &cam);
+    show(&mut dev, &cam, TAG_MENU_LAST, &MAIN);
+    show(&mut dev, &cam, TAG_MENU_LAST, &SUB);
+    show(&mut dev, &cam, TAG_LIST_LAST, &TARGET);
+    clock.advance(4_000);
+    dev.timeout();
+    let close = (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+    assert_eq!(
+        mmi_apdus(&cam),
+        [
+            (TAG_MENU_ANSWER, vec![1]),
+            close.clone(),
+            (TAG_ENTER_MENU, vec![]),
+            (TAG_MENU_ANSWER, vec![1]),
+            (TAG_MENU_ANSWER, vec![1]),
+            close
+        ]
+    );
+    assert!(
+        !dev.menu_open() && dev.snapshot.is_none(),
+        "done after the last path"
+    );
+}
+
+#[test]
+fn a_page_that_is_not_the_pinned_one_ends_the_path_unanswered() {
+    // A repeat of the parent page (same count, other step) and a changed menu both stop it.
+    for second in [&MAIN, &["Status", "", "", "Card", "Reset"]] {
+        let (clock, cam, mut dev) = snapshot_rig(&[1]);
+        error_then_start(&clock, &mut dev, &cam);
+        show(&mut dev, &cam, TAG_MENU_LAST, &MAIN);
+        show(&mut dev, &cam, TAG_MENU_LAST, second);
+        assert_eq!(
+            mmi_apdus(&cam)[2..],
+            [
+                (TAG_ENTER_MENU, vec![]),
+                (TAG_MENU_ANSWER, vec![1]),
+                (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])
+            ],
+            "{second:?}"
+        );
+    }
+}
+
+#[test]
+fn a_snapshot_never_sends_the_pin() {
+    let (clock, cam, mut dev) = snapshot_rig(&[1]);
+    dev.set_pin(b"1234");
+    error_then_start(&clock, &mut dev, &cam);
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x01, 4, b'P', b'I', b'N'],
+    );
+    assert_eq!(
+        mmi_apdus(&cam)[3..],
+        [
+            (TAG_ANSWER, vec![MMI_ANSW_ID_CANCEL]),
+            (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])
+        ]
+    );
+}
+
+#[test]
+fn between_paths_the_cam_s_own_pages_keep_their_pin_and_arm_recovery() {
+    let (clock, cam, mut dev) = cam_recovery_rig(20_000);
+    dev.snapshot_paths = vec![vec![(page_hash(&MAIN), 1)], vec![(page_hash(&MAIN), 2)]];
+    dev.set_pin(b"1234");
+    error_then_start(&clock, &mut dev, &cam);
+    dev.cam_recovery_since = -1;
+    dev.cam_recovery_ok = true;
+    show(&mut dev, &cam, TAG_MENU_LAST, &MAIN);
+    show(&mut dev, &cam, TAG_LIST_LAST, &TARGET);
+    let sent = mmi_apdus(&cam).len();
+    // In the gap: a menu of the CAM's own is closed with no choice, and still arms recovery.
+    show(&mut dev, &cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    assert_eq!(
+        mmi_apdus(&cam)[sent..],
+        [(TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])]
+    );
+    assert!(dev.cam_recovery_since >= 0, "recovery armed");
+    // A PIN prompt of its own still gets the PIN.
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x01, 4, b'P', b'I', b'N'],
+    );
+    assert_eq!(
+        mmi_apdus(&cam)[sent + 1],
+        (TAG_ANSWER, vec![MMI_ANSW_ID_ANSWER, b'1', b'2', b'3', b'4'])
+    );
+}
+
+#[test]
+fn while_waiting_the_cam_s_pages_keep_today_s_handling() {
+    let (_clock, cam, mut dev) = snapshot_rig(&[1]);
+    show(&mut dev, &cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    show(&mut dev, &cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    let close = (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+    assert_eq!(
+        mmi_apdus(&cam),
+        [
+            (TAG_MENU_ANSWER, vec![1]),
+            close.clone(),
+            (TAG_MENU_ANSWER, vec![1]),
+            close
+        ]
+    );
+}
+
+#[test]
+fn a_held_page_or_a_busy_mmi_delays_the_start_until_the_deadline() {
+    let (clock, cam, mut dev) = snapshot_rig(&[1]);
+    dev.unsolicited_mmi = UnsolicitedMmi::Open;
+    show(&mut dev, &cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    clock.advance(5_000);
+    dev.timeout();
+    assert!(mmi_apdus(&cam).is_empty(), "the held page is kept");
+    // Keep the MMI busy past the 5 min start limit.
+    for _ in 0..30 {
+        clock.advance(10_000);
+        dev.mmi_hold_ms = clock.tick_ms();
+        dev.timeout();
+    }
+    assert!(dev.snapshot.is_none(), "dropped after 5 min");
+    assert!(!mmi_apdus(&cam).contains(&(TAG_ENTER_MENU, vec![])));
+}
+
+#[test]
+fn a_cam_close_or_a_page_timeout_moves_to_the_next_path() {
+    let (clock, cam, mut dev) = snapshot_rig(&[1, 2]);
+    error_then_start(&clock, &mut dev, &cam);
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_CLOSE_MMI,
+        &[0],
+    );
+    assert!(!dev.menu_open(), "the CAM closed the first path");
+    clock.advance(4_000);
+    dev.timeout();
+    assert_eq!(
+        mmi_apdus(&cam).last(),
+        Some(&(TAG_ENTER_MENU, vec![])),
+        "path 2"
+    );
+    clock.advance(10_000);
+    dev.timeout();
+    assert_eq!(
+        mmi_apdus(&cam).last(),
+        Some(&(TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])),
+        "no page for 10 s"
+    );
+    clock.advance(4_000);
+    dev.timeout();
+    assert!(dev.snapshot.is_none());
+}
+
+#[test]
+fn a_menu_request_cancels_the_snapshot_and_the_window_stays_used() {
+    let (clock, cam, mut dev) = snapshot_rig(&[1]);
+    show(&mut dev, &cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    dev.enter_menu().expect("AI session open");
+    assert!(dev.snapshot.is_none(), "the request took over");
+    dev.close_mmi().expect("MMI session open");
+    clock.advance(super::snapshot::SNAPSHOT_MIN_GAP_MS - 1);
+    show(&mut dev, &cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    assert!(dev.snapshot.is_none(), "within 10 min of the cancelled one");
+    clock.advance(1);
+    show(&mut dev, &cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    assert!(dev.snapshot.is_some(), "10 min later");
+}
+
+#[test]
+fn a_requested_page_never_starts_a_snapshot() {
+    let (_clock, cam, mut dev) = snapshot_rig(&[1]);
+    dev.enter_menu().expect("AI session open");
+    show(&mut dev, &cam, TAG_MENU_LAST, &MAIN);
+    assert!(dev.snapshot.is_none());
+}
+
+#[test]
+fn the_cam_s_late_close_of_a_path_lands_in_the_gap() {
+    let (clock, cam, mut dev) = snapshot_rig(&[1, 2]);
+    error_then_start(&clock, &mut dev, &cam);
+    show(&mut dev, &cam, TAG_MENU_LAST, &MAIN);
+    show(&mut dev, &cam, TAG_MENU_LAST, &SUB);
+    show(&mut dev, &cam, TAG_LIST_LAST, &TARGET);
+    clock.advance(2_000);
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_CLOSE_MMI,
+        &[0],
+    );
+    clock.advance(2_000);
+    dev.timeout();
+    assert_eq!(
+        mmi_apdus(&cam).last(),
+        Some(&(TAG_ENTER_MENU, vec![])),
+        "path 2 opens"
+    );
+    show(&mut dev, &cam, TAG_MENU_LAST, &MAIN);
+    assert_eq!(
+        mmi_apdus(&cam).last(),
+        Some(&(TAG_MENU_ANSWER, vec![1])),
+        "path 2 is walked, not cut by the late close"
+    );
+}
+
+#[test]
+fn a_teardown_or_a_closed_mmi_session_ends_the_walk() {
+    let (clock, cam, mut dev) = snapshot_rig(&[1, 2]);
+    error_then_start(&clock, &mut dev, &cam);
+    assert!(
+        cam.lock()
+            .unwrap()
+            .request_close(EN50221_APP_MMI_RESOURCEID)
+    );
+    dev.timeout();
+    assert!(dev.service());
+    assert!(
+        !dev.menu_open() && !dev.snapshot_walking(),
+        "the session close ends path 1"
+    );
+    assert!(dev.snapshot.is_some(), "path 2 is still due");
+    let last = dev.snapshot_last;
+    dev.teardown();
+    assert!(dev.snapshot.is_none(), "a teardown cancels it");
+    assert_eq!(dev.snapshot_last, last, "the 10 min window stays used");
+}
+
+#[test]
+fn an_enquiry_the_pin_answers_starts_no_snapshot() {
+    let (_clock, cam, mut dev) = snapshot_rig(&[1]);
+    dev.set_pin(b"1234");
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x01, 4, b'P', b'I', b'N'],
+    );
+    assert!(dev.snapshot.is_none());
+}
+
+#[test]
+fn a_target_page_that_is_a_menu_is_closed_not_answered() {
+    let (clock, cam, mut dev) = setup(CamConfig::default(), true);
+    dev.snapshot_paths = vec![vec![(page_hash(&MAIN), 1)]];
+    error_then_start(&clock, &mut dev, &cam);
+    show(&mut dev, &cam, TAG_MENU_LAST, &MAIN);
+    show(&mut dev, &cam, TAG_MENU_LAST, &SUB);
+    assert_eq!(
+        mmi_apdus(&cam)[3..],
+        [
+            (TAG_MENU_ANSWER, vec![1]),
+            (TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])
+        ]
+    );
+}
+
+#[test]
+fn the_registry_hands_the_snapshot_paths_to_later_slots() {
+    let mut registry = CaRegistry::new(Arc::new(ManualClock::new(0, UNIX)));
+    registry.set_menu_snapshot(vec![vec![(1, 1)]]);
+    assert_eq!(registry.device(5).snapshot_paths, [vec![(1, 1)]]);
+}
+
+#[test]
+fn closing_a_held_page_keeps_a_waiting_snapshot() {
+    let (_clock, cam, mut dev) = snapshot_rig(&[1]);
+    dev.unsolicited_mmi = UnsolicitedMmi::Open;
+    show(&mut dev, &cam, TAG_MENU_LAST, &["E", "", "", "OK"]);
+    dev.close_mmi().expect("MMI session open");
+    assert!(dev.snapshot.is_some(), "not a takeover");
+    assert_eq!(dev.menu_answer(1), Err(MenuError::NotOpen));
+    assert!(
+        dev.snapshot.is_some(),
+        "a refused answer does not cancel it"
+    );
+}

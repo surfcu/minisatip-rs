@@ -29,6 +29,8 @@ pub struct CaRegistry {
     ci_plus_recovery_ms: i64,
     /// `--cam-menu-unsolicited`, applied to every slot.
     unsolicited_mmi: UnsolicitedMmi,
+    /// `--cam-menu-snapshot` paths, applied to every slot.
+    snapshot_paths: Vec<Vec<(u64, u8)>>,
     /// `--ddci-capture` APDU trace, applied to every slot.
     apdu_sink: Option<ApduSink>,
     /// `--cam-recovery` in ms, applied to every slot (0 disables it).
@@ -51,6 +53,7 @@ impl CaRegistry {
             cache_dir: "/var/cache/minisatip".to_owned(),
             ci_plus_recovery_ms: 0,
             unsolicited_mmi: UnsolicitedMmi::default(),
+            snapshot_paths: Vec::new(),
             apdu_sink: None,
             cam_recovery_ms: 0,
             cam_recovery_zap_guard: true,
@@ -68,6 +71,14 @@ impl CaRegistry {
         for dev in self.iter_mut() {
             dev.recovery_timeout_ms = ms;
         }
+    }
+
+    /// Sets `--cam-menu-snapshot` for every slot, existing or allocated later.
+    pub fn set_menu_snapshot(&mut self, paths: Vec<Vec<(u64, u8)>>) {
+        for dev in self.iter_mut() {
+            dev.snapshot_paths = paths.clone();
+        }
+        self.snapshot_paths = paths;
     }
 
     /// Sets `--cam-menu-unsolicited` for every slot, existing or allocated later.
@@ -120,6 +131,7 @@ impl CaRegistry {
         let dev = self.devices[i].get_or_insert_with(|| CaDevice::new(i, clock));
         dev.recovery_timeout_ms = recovery;
         dev.unsolicited_mmi = unsolicited;
+        dev.snapshot_paths = self.snapshot_paths.clone();
         dev.cam_recovery_timeout_ms = cam_recovery;
         dev.cam_recovery_zap_guard = zap_guard;
         if dev.apdu_sink.is_none() {

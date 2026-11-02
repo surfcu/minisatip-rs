@@ -439,6 +439,8 @@ pub struct Options {
     pub cam_menu: bool,
     /// `--cam-menu-unsolicited`: `answer1` (C++), `answer0` or `open` for menus the CAM opens.
     pub cam_menu_unsolicited: String,
+    /// `--cam-menu-snapshot`: `(page text_hash, choice)` steps per path; empty = off.
+    pub cam_menu_snapshot: Vec<Vec<(u64, u8)>>,
     /// `--cam-ecm-trace`: `ca_tables` and `ecm_parity` events for DDCI CAMs.
     pub cam_ecm_trace: bool,
     /// `-4` toggles this; 1 means IPv4 only.
@@ -613,6 +615,7 @@ impl Default for Options {
             ddci_capture_max_mb: 2048,
             cam_menu: false,
             cam_menu_unsolicited: "answer1".into(),
+            cam_menu_snapshot: Vec::new(),
             cam_ecm_trace: false,
             use_ipv4_only: 1,
             use_demux_device: 0,
