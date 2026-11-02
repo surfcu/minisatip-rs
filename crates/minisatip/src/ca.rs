@@ -452,6 +452,11 @@ impl CaRuntime {
     pub fn dvbca_init_dev(&self, info: AdapterInfo) {
         if let Some(state) = self.dvbca.as_ref() {
             state.dvbca.init_dev(info);
+            // C++ inits the CAM before any PMT is read; the worker does it later, so a DDCI
+            // CAM counts as initialising from here and early PMTs are retried, not dropped.
+            if let Ok(aid) = usize::try_from(info.id) {
+                self.ddci_cam(aid, |cam, _| cam.enabled = true);
+            }
         }
     }
 
@@ -2028,6 +2033,55 @@ mod ci_stage_tests {
         fn writev(&mut self, iov: &[&[u8]]) -> isize {
             iov.iter().map(|part| part.len()).sum::<usize>() as isize
         }
+    }
+
+    // A PMT read before the worker has initialised the DDCI CAM is retried, as in C++,
+    // where dvbca_init_dev runs before any PMT and leaves the CAM enabled.
+    #[test]
+    fn a_pmt_before_the_ddci_cam_is_ready_is_retried() {
+        let mut sched = Scheduler::new();
+        let mut ca = CaRuntime::new(&Options::default());
+        let (_notices, notices_rx) = mpsc::channel();
+        ca.dvbca = Some(DvbcaState {
+            dvbca: Rc::new(Dvbca::from_notices(notices_rx)),
+            caids: Rc::new(RefCell::new(BTreeMap::new())),
+            pending: PendingOffers::default(),
+            ca_id: 0,
+            requested: None,
+        });
+        let hub = DdciHub::new();
+        ca.attach_ddci(&mut sched, hub.clone());
+        hub.open_device(8, Box::new(Sink));
+        hub.lock().ddci.create_adapter(2);
+        let mut program = ms_ca::Program {
+            id: 8,
+            adapter: 2,
+            sid: 0x4286,
+            pid: 0x100,
+            ..ms_ca::Program::default()
+        };
+        program.add_caid(0x0B00, 0x500, &[]);
+        assert!(
+            !hub.lock().ddci.is_ca_initializing(8),
+            "nothing requested yet"
+        );
+
+        ca.dvbca_init_dev(AdapterInfo {
+            id: 8,
+            enabled: true,
+            kind: ms_ca_drivers::en50221::AdapterKind::Ci,
+            pa: 0,
+            fe: 0,
+        });
+        assert!(hub.lock().ddci.is_ca_initializing(8));
+        assert_eq!(
+            hub.lock().ddci.process_pmt(2, &program, false),
+            TablesResult::Retry,
+            "an early PMT waits for the CAM"
+        );
+        // A non-DDCI adapter is not touched.
+        ca.dvbca_init_dev(AdapterInfo::dvb(3, 3, 0));
+        assert!(!hub.lock().ddci.cams.contains_key(&3));
     }
 
     // ddci_read_sec_data: read_dmx decrypts the CAM output on the CI adapter
