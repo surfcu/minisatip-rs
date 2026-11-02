@@ -435,6 +435,12 @@ pub struct Options {
     pub ddci_capture: Option<String>,
     /// `--ddci-capture-max-mb` size cap for that directory.
     pub ddci_capture_max_mb: u64,
+    /// `--cam-menu`: the `POST /debug/cam/...` menu routes are served.
+    pub cam_menu: bool,
+    /// `--cam-menu-unsolicited`: `answer1` (C++), `answer0` or `open` for menus the CAM opens.
+    pub cam_menu_unsolicited: String,
+    /// `--cam-ecm-trace`: `ca_tables` and `ecm_parity` events for DDCI CAMs.
+    pub cam_ecm_trace: bool,
     /// `-4` toggles this; 1 means IPv4 only.
     pub use_ipv4_only: i32,
     /// `-1` demux device mode.
@@ -605,6 +611,9 @@ impl Default for Options {
             log_ring: 20_000,
             ddci_capture: None,
             ddci_capture_max_mb: 2048,
+            cam_menu: false,
+            cam_menu_unsolicited: "answer1".into(),
+            cam_ecm_trace: false,
             use_ipv4_only: 1,
             use_demux_device: 0,
             strength_multiplier: 1.0,

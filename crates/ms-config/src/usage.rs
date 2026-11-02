@@ -373,6 +373,12 @@ const DIAG_USAGE: &str = "\
 
 * --ddci-capture-max-mb mb: refuse a new --ddci-capture when dir already holds this many MB (default 2048)
 
+* --cam-menu: serve POST /debug/cam/<ca>/menu, /menu/answer?choice=N and /menu/close to open and walk the CAM menu
+
+* --cam-ecm-trace: every 10 s, count the ECM and EMM packets each DDCI CAM receives and report each ECM parity (crypto-period) change
+
+* --cam-menu-unsolicited answer1|answer0|open: reply to a menu the CAM opens by itself with choice 1 (default, as C++), with 0, or leave it open for up to 120 s
+
 ";
 
 #[cfg(test)]

@@ -10,8 +10,8 @@ use ms_net::handler::{HandlerContext, handle_http};
 use ms_net::rtsp::{Protocol, Request};
 use ms_net::session::SessionManager;
 use ms_net::web::{
-    ADAPTER_DVB, AdapterState, ApiFeatures, StreamState, TunerCounts, WebConfig, WebService,
-    WebSnapshot, content_type,
+    ADAPTER_DVB, AdapterState, ApiFeatures, CaDeviceState, CamMenuOp, StreamState, TunerCounts,
+    WebConfig, WebService, WebSnapshot, content_type,
 };
 use ms_tuner::DeliverySystem;
 
@@ -636,4 +636,91 @@ fn debug_log_route_returns_text_tail() {
         .route(&get("/debug/log"), &WebSnapshot::new())
         .expect("route");
     assert_eq!(missing.status, 404);
+}
+
+static CAM_SENT: std::sync::Mutex<Vec<(usize, CamMenuOp)>> = std::sync::Mutex::new(Vec::new());
+
+fn cam_send(ca: usize, op: CamMenuOp) -> bool {
+    CAM_SENT.lock().unwrap().push((ca, op));
+    ca != 7
+}
+
+fn post(uri: &str) -> Request {
+    Request {
+        method: "POST".to_owned(),
+        ..get(uri)
+    }
+}
+
+#[test]
+fn cam_menu_routes_check_method_sessions_and_choice() {
+    let service = WebService::new(config(PathBuf::from("html"))).with_cam_menu(cam_send);
+    let mut snapshot = WebSnapshot::new();
+    snapshot.ca = vec![None; 10];
+    snapshot.ca[8] = Some(CaDeviceState {
+        enabled: 1,
+        state: 2,
+        ai_session: true,
+        mmi_session: true,
+        ..CaDeviceState::default()
+    });
+    snapshot.ca[7] = snapshot.ca[8].clone();
+    let status = |request: &Request, snapshot: &WebSnapshot| {
+        service.route(request, snapshot).expect("route").status
+    };
+    assert_eq!(
+        status(&get("/debug/cam/8/menu"), &snapshot),
+        405,
+        "GET never drives the CAM"
+    );
+    assert_eq!(status(&post("/debug/cam/8/menu"), &snapshot), 202);
+    assert_eq!(
+        status(&post("/debug/cam/8/menu/answer?choice=2"), &snapshot),
+        409,
+        "no request open"
+    );
+    snapshot.ca[8].as_mut().unwrap().menu_open = true;
+    assert_eq!(
+        status(&post("/debug/cam/8/menu/answer?choice=2"), &snapshot),
+        202
+    );
+    assert_eq!(
+        status(&post("/debug/cam/8/menu/answer?choice=x"), &snapshot),
+        400
+    );
+    assert_eq!(status(&post("/debug/cam/8/menu/answer"), &snapshot), 400);
+    assert_eq!(status(&post("/debug/cam/8/menu/close"), &snapshot), 202);
+    assert_eq!(
+        status(&post("/debug/cam/3/menu"), &snapshot),
+        404,
+        "no such CA"
+    );
+    assert_eq!(status(&post("/debug/cam/8/other"), &snapshot), 404);
+    assert_eq!(
+        status(&post("/debug/cam/7/menu"), &snapshot),
+        503,
+        "worker gone"
+    );
+    snapshot.ca[8].as_mut().unwrap().ai_session = false;
+    assert_eq!(status(&post("/debug/cam/8/menu"), &snapshot), 409);
+    let sent: Vec<_> = CAM_SENT.lock().unwrap().clone();
+    assert_eq!(
+        sent,
+        [
+            (8, CamMenuOp::Enter),
+            (8, CamMenuOp::Answer(2)),
+            (8, CamMenuOp::Close),
+            (7, CamMenuOp::Enter),
+        ]
+    );
+
+    let plain = WebService::new(config(PathBuf::from("html")));
+    assert_eq!(
+        plain
+            .route(&post("/debug/cam/8/menu"), &snapshot)
+            .expect("route")
+            .status,
+        404,
+        "off without --cam-menu"
+    );
 }

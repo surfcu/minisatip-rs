@@ -71,6 +71,8 @@ pub struct CaRuntime {
     dvbca: Option<DvbcaState>,
     ddci: Option<DdciLink>,
     dvbca_settings: DvbcaSettings,
+    /// `--cam-ecm-trace`: the DDCI hub counts ECM/EMM packets.
+    ecm_trace: bool,
     /// `--hw-descrambler`: cipher registry for `(aid, pa, fe)` and the CA id.
     hw: Option<(HwRegistryFactory, i32)>,
     /// Physical adapter and frontend of each DVB adapter.
@@ -86,11 +88,11 @@ pub struct CaRuntime {
     next_decrypt_window: i64,
     /// Cumulative `dec_err` already reported per adapter.
     diag_dec_err: BTreeMap<usize, u64>,
-    /// Counters of each CI adapter at its last decrypt window (`--cam-recovery`).
-    window_base: BTreeMap<usize, WindowBase>,
     /// `--ddci-capture`: rolling DDCI TS buffers and the MMI-triggered writer.
     #[cfg(feature = "diag-log")]
     capture: Option<std::sync::Arc<crate::ddci_capture::CaptureTap>>,
+    /// Counters of each CI adapter at its last decrypt window (`--cam-recovery`).
+    window_base: BTreeMap<usize, WindowBase>,
 }
 
 /// Cumulative counters of one CI adapter and when they were read (ms).
@@ -113,6 +115,12 @@ impl CaRuntime {
             .ddci_capture
             .as_deref()
             .and_then(|dir| crate::ddci_capture::CaptureTap::new(dir, opts.ddci_capture_max_mb));
+        #[allow(unused_mut)]
+        let mut dvbca_settings = DvbcaSettings::from_options(opts);
+        #[cfg(feature = "diag-log")]
+        if let Some(tap) = capture.as_ref() {
+            dvbca_settings.set_apdu_sink(tap.apdu_sink());
+        }
         Self {
             #[cfg(feature = "diag-log")]
             capture,
@@ -127,7 +135,8 @@ impl CaRuntime {
             dvbapi,
             dvbca: None,
             ddci: None,
-            dvbca_settings: DvbcaSettings::from_options(opts),
+            dvbca_settings,
+            ecm_trace: cfg!(feature = "diag-log") && opts.cam_ecm_trace,
             hw: None,
             hw_nodes: BTreeMap::new(),
             offered,
@@ -143,6 +152,11 @@ impl CaRuntime {
 
     fn now(&self) -> i64 {
         self.origin.elapsed().as_millis() as i64
+    }
+
+    /// Settings for the `Dvbca` worker, with the `--ddci-capture` APDU hook.
+    pub fn dvbca_settings(&self) -> DvbcaSettings {
+        self.dvbca_settings.clone()
     }
 
     /// Whether `--ddci-capture` created a tap (tests).
@@ -263,6 +277,9 @@ impl CaRuntime {
 
     /// Registers the DDCI CA (`ddci_init`); call before spawning tuner adapters.
     pub fn attach_ddci(&mut self, sched: &mut Scheduler, hub: DdciHub) {
+        if self.ecm_trace {
+            hub.lock().ddci.table_trace = Some(Default::default());
+        }
         let sink = DdciSink { hub: hub.clone() };
         let ca_id = sched.add_ca(Box::new(Offering::new(sink, &self.offered)));
         ms_log::log!("Registered DDCI CA {}", ca_id);
@@ -729,6 +746,9 @@ impl CaRuntime {
                     state: view.state,
                     caids: view.caids.clone(),
                     ci_name: view.ci_name.clone(),
+                    ai_session: view.ai_session,
+                    mmi_session: view.mmi_session,
+                    menu_open: view.menu_open,
                 });
             }
         }
@@ -1010,6 +1030,7 @@ impl CaRuntime {
                 windows.push((aid, sample));
             }
         }
+        self.diag_tables();
         if self.dvbca_settings.cam_recovery_ms <= 0 {
             return;
         }
@@ -1047,6 +1068,43 @@ impl CaRuntime {
             clear - base.clear,
             now - base.at,
         ))
+    }
+
+    /// Emits `ca_tables` per DDCI device and `ecm_parity` per change (`--cam-ecm-trace`).
+    fn diag_tables(&mut self) {
+        let Some(link) = self.ddci.as_ref() else {
+            return;
+        };
+        let Some((counts, changes)) = link
+            .hub
+            .lock()
+            .ddci
+            .table_trace
+            .as_mut()
+            .map(|trace| trace.take())
+        else {
+            return;
+        };
+        for (dev, c) in &counts {
+            ms_log::diag::events::ca_tables(&ms_log::diag::events::CaTables {
+                ddci: i64::from(*dev),
+                ecm_pkts: c.ecm_pkts,
+                emm_pkts: c.emm_pkts,
+                ecm_sections: c.ecm_sections,
+                emm_sections: c.emm_sections,
+                parity_dropped: c.parity_dropped,
+                period_s: (DECRYPT_WINDOW_MS / 1000) as u64,
+            });
+        }
+        for change in changes {
+            ms_log::diag::events::ecm_parity(
+                i64::from(change.dev),
+                i64::from(change.ad),
+                u64::from(change.pid),
+                u64::from(change.table_id),
+                change.wall_ms,
+            );
+        }
     }
 
     fn sync(&mut self, sched: &Scheduler, handles: &[Option<AdapterHandle>]) {
@@ -1805,6 +1863,8 @@ mod wiring_tests {
             state: 2,
             caids: vec![0x0664],
             ci_name: "Irdeto Access".to_owned(),
+            mmi_session: true,
+            ..DeviceView::default()
         };
         ca.ca_views.insert(8, view);
         let (slots, keys) = ca.web_state(&sched());
@@ -1816,6 +1876,8 @@ mod wiring_tests {
                 state: 2,
                 caids: vec![0x0664],
                 ci_name: "Irdeto Access".to_owned(),
+                mmi_session: true,
+                ..CaDeviceState::default()
             })
         );
         assert!(slots.iter().enumerate().all(|(i, s)| i == 8 || s.is_none()));
@@ -2146,6 +2208,45 @@ mod ci_stage_tests {
                 "the FIFO gets the decrypted packet"
             );
         }
+    }
+
+    // --cam-ecm-trace (diag-log only) turns the hub's ECM/EMM counters on; the window drains them.
+    #[test]
+    fn cam_ecm_trace_turns_the_hub_counters_on() {
+        for on in [false, true] {
+            let opts = Options {
+                cam_ecm_trace: on,
+                ..Options::default()
+            };
+            let mut sched = Scheduler::new();
+            let mut ca = CaRuntime::new(&opts);
+            let hub = DdciHub::new();
+            ca.attach_ddci(&mut sched, hub.clone());
+            let traced = hub.lock().ddci.table_trace.is_some();
+            assert_eq!(traced, on && cfg!(feature = "diag-log"));
+            if traced {
+                ca.diag_tables();
+                assert!(
+                    hub.lock().ddci.table_trace.is_some(),
+                    "a drain keeps the trace"
+                );
+            }
+        }
+    }
+
+    // --ddci-capture hands the CA worker the tap's APDU hook.
+    #[cfg(feature = "diag-log")]
+    #[test]
+    fn ddci_capture_gives_the_worker_an_apdu_hook() {
+        let dir = std::env::temp_dir().join(format!("ms-apdu-hook-{}", std::process::id()));
+        let opts = Options {
+            ddci_capture: Some(dir.to_string_lossy().into_owned()),
+            ..Options::default()
+        };
+        assert!(format!("{:?}", CaRuntime::new(&opts).dvbca_settings()).contains("ApduHook"));
+        let plain = CaRuntime::new(&Options::default()).dvbca_settings();
+        assert!(!format!("{plain:?}").contains("ApduHook"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ddci.cpp:1678 sets drop_encrypted = 0: packets the CAM left scrambled

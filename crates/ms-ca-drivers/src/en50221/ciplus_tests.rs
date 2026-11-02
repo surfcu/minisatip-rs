@@ -683,6 +683,24 @@ fn mmi_recovery_resets_a_wedged_cam() {
 }
 
 #[test]
+fn a_requested_menu_does_not_arm_recovery() {
+    let mut rig = wedged_rig(CIPLUS_CC);
+    rig.dev.recovery_timeout_ms = 10_000;
+    rig.dev.enter_menu().expect("AI session open");
+    let page = ["Title", "Subtitle", "Bottom", "Item"];
+    assert!(rig.cam.lock().unwrap().send_mmi_menu(&page));
+    pump(&mut rig.dev);
+    assert_eq!(
+        rig.dev.mmi_error_since, -1,
+        "a requested page is not an error"
+    );
+    rig.dev.close_mmi().expect("MMI session open");
+    assert!(rig.cam.lock().unwrap().send_mmi_menu(&page));
+    pump(&mut rig.dev);
+    assert_eq!(rig.dev.mmi_error_since, 0, "an unsolicited page still arms");
+}
+
+#[test]
 fn mmi_recovery_is_disarmed_by_a_late_key() {
     let mut rig = wedged_rig(CIPLUS_CC);
     rig.dev.recovery_timeout_ms = 10_000;

@@ -152,10 +152,13 @@ impl Response {
 fn normalized_status(status: u16) -> (u16, &'static str) {
     match status {
         200 => (200, "OK"),
+        // Only the diag-log `--cam-menu` routes send 202 and 409; C++ never does.
+        202 => (202, "Accepted"),
         400 => (400, "Bad Request"),
         403 => (403, "Forbidden"),
         404 => (404, "Not Found"),
         405 => (405, "Method Not Allowed"),
+        409 => (409, "Conflict"),
         454 => (454, "Session Not Found"),
         500 => (500, "Internal Server Error"),
         501 => (501, "Not Implemented"),
@@ -221,6 +224,25 @@ mod tests {
 
     fn http() -> Response {
         Response::new(Protocol::Http, 200, "date".to_owned(), "server".to_owned())
+    }
+
+    #[test]
+    fn cam_menu_codes_keep_their_status_line() {
+        for (code, line) in [
+            (202, "HTTP/1.0 202 Accepted\r\n"),
+            (409, "HTTP/1.0 409 Conflict\r\n"),
+            (418, "HTTP/1.0 503 Service Unavailable\r\n"),
+        ] {
+            let bytes = Response {
+                status: code,
+                ..http()
+            }
+            .to_bytes();
+            assert!(
+                String::from_utf8(bytes).unwrap().starts_with(line),
+                "{code}"
+            );
+        }
     }
 
     #[test]
