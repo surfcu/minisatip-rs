@@ -1,0 +1,9 @@
+{
+  "ad_enabled": [1, 0, 1],
+  "ad_type": [0, 0, 1],
+  "ad_freq": [1155000, 0, 1200000],
+  "ad_sidcount": [1, 0, 2],
+  "ad_decerr": [0, 0, 5],
+  "ad_strength": [200, 0, 180],
+  "ad_snr": [30, 0, NaN],
+}
