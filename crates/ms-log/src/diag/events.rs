@@ -199,7 +199,7 @@ pub fn cam_state(ca: i64, state: &str, mode: &str) {
     emit("cam_state", &cam_state_fields(ca, state, mode, 0));
 }
 
-/// One CA slot's `cam_state` changes: a repeat is dropped; a reset right after `init`
+/// One CA slot's `cam_state` changes: a repeat is dropped (but not `cam_recovery`); a reset right after `init`
 /// mutes that slot's init/reset loop, counted in `suppressed` on its next event.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CamStateFilter {
@@ -227,7 +227,8 @@ impl CamStateFilter {
             self.suppressed += 1;
             return None;
         }
-        if self.state == state && self.mode == mode {
+        // Every `--cam-recovery` re-send is reported; it changes no other state.
+        if self.state == state && self.mode == mode && state != "cam_recovery" {
             return None;
         }
         self.muted = state == "reset" && self.state == "init";
@@ -532,6 +533,15 @@ mod tests {
                 "cam_menu",
                 ",\"ca\":8,\"kind\":\"menu\",\"items\":2,\"lines\":5,\"text_hash\":\"00000000000000ab\",\"answer\":\"1\",\"solicited\":false"
             )
+        );
+    }
+
+    #[test]
+    fn every_cam_recovery_is_reported() {
+        let states = ["init", "ready", "cam_recovery", "cam_recovery", "ready"];
+        assert_eq!(
+            sent(&states),
+            ["init", "ready", "cam_recovery", "cam_recovery", "ready"]
         );
     }
 

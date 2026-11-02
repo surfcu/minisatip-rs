@@ -1006,3 +1006,36 @@ fn test_capmt_zap_back_keeps_places() {
         assert_eq!(cam.read_capmts().0, 0, "zapping back sends nothing");
     }
 }
+
+// --cam-recovery: every active slot is re-sent as a forced CLM_UPDATE with a new
+// version, even when unchanged; an empty slot is skipped. No C++ equivalent.
+#[test]
+fn resend_capmts_forces_an_update_per_active_slot() {
+    let mut t = ProgramTable::new();
+    t.track_requested_pids();
+    let mut dev = CaDevice::new(0, 2, 0);
+    let mut drv = RecordingDriver::default();
+    let p1 = t.add(0, 0x2301, 0x301);
+    let p = t.get_mut(p1).unwrap();
+    p.add_caid(0x0B00, 0x570, &[]);
+    p.add_stream(0x401, 2, false, true);
+    assert_eq!(dev.process_pmt(p1, false, &t, &mut drv), TablesResult::Ok);
+    let joined = drv.take();
+    assert_eq!(joined.len(), 1);
+
+    assert_eq!(dev.resend_capmts(&t, &mut drv), 1, "slot 1 is empty");
+    let resent = drv.take();
+    assert_eq!(resent.len(), 1);
+    assert_eq!(resent[0][0], ms_ca::capmt::CLM_UPDATE);
+    // The join sent ok_descrambling: the re-send differs only in list management and version.
+    assert_eq!(&resent[0][1..3], &joined[0][1..3], "same program number");
+    assert_eq!(&resent[0][4..], &joined[0][4..], "same command and streams");
+    assert_ne!(resent[0][3], joined[0][3], "a new version");
+
+    drv.no_session = true;
+    assert_eq!(
+        dev.resend_capmts(&t, &mut drv),
+        0,
+        "nothing sent without a session"
+    );
+}

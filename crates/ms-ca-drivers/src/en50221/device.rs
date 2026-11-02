@@ -217,6 +217,8 @@ pub struct CaDevice {
     pub cam_recovery_zap_guard: bool,
     /// Time of the last CAPMT change the guard saw (ms; -1 none).
     pub cam_recovery_changed: i64,
+    /// A recovery fired: the worker re-sends this slot's CAPMTs ([`Self::take_cam_recovery`]).
+    cam_recovery_due: bool,
     /// This slot's `cam_state` changes; kept across reconnects.
     cam_states: ms_log::diag::events::CamStateFilter,
     close_requested: bool,
@@ -276,6 +278,7 @@ impl CaDevice {
             cam_recovery_last: -1,
             cam_recovery_zap_guard: true,
             cam_recovery_changed: -1,
+            cam_recovery_due: false,
             cam_states: Default::default(),
             close_requested: false,
             events: VecDeque::new(),
@@ -1207,7 +1210,7 @@ impl CaDevice {
         }
         if self.cam_recovery_last >= 0 && now - self.cam_recovery_last < CAM_RECOVERY_MIN_GAP_MS {
             ms_log::log!(
-                "CA {}: {} of {} packets still scrambled, not resetting: the last CAM recovery reset was less than 10 minutes ago",
+                "CA {}: {} of {} packets still scrambled, not re-sending: the last CAM recovery was less than 10 minutes ago",
                 self.id,
                 scrambled,
                 total
@@ -1217,7 +1220,7 @@ impl CaDevice {
             return;
         }
         ms_log::log!(
-            "CA {}: {} of {} packets still scrambled for {} ms after a CAM MMI message, resetting the CAM (CAM recovery)",
+            "CA {}: {} of {} packets still scrambled for {} ms after a CAM MMI message, re-sending the CAPMTs (CAM recovery)",
             self.id,
             scrambled,
             total,
@@ -1227,7 +1230,12 @@ impl CaDevice {
         self.report_state("cam_recovery");
         self.cam_recovery_since = -1;
         self.cam_recovery_stuck_since = -1;
-        self.request_close();
+        self.cam_recovery_due = true;
+    }
+
+    /// Whether `--cam-recovery` fired since the last call; the worker then re-sends the CAPMTs.
+    pub fn take_cam_recovery(&mut self) -> bool {
+        std::mem::take(&mut self.cam_recovery_due)
     }
 }
 
@@ -1235,7 +1243,7 @@ impl CaDevice {
 /// scrambled at CAM_RECOVERY_SHARE percent or more; clean is the reverse. No C++ equivalent.
 pub const CAM_RECOVERY_MIN_PKTS: u64 = 1000;
 pub const CAM_RECOVERY_SHARE: u64 = 90;
-/// Minimum time between two resets of one slot (ms), against a reset loop.
+/// Minimum time between two recoveries of one slot (ms), against a recovery loop.
 pub const CAM_RECOVERY_MIN_GAP_MS: i64 = 600_000;
 /// Stats reach the watchdog up to two STATS_MS late, so a window must start this long after the anchor.
 pub const CAM_RECOVERY_LAG_MS: i64 = 2_000;
