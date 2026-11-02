@@ -480,6 +480,11 @@ impl CaRuntime {
     pub fn dvbca_init_dev(&self, info: AdapterInfo) {
         if let Some(state) = self.dvbca.as_ref() {
             state.dvbca.init_dev(info);
+            // C++ inits the CAM before any PMT is read; the worker does it later, so a DDCI
+            // CAM counts as initialising from here and early PMTs are retried, not dropped.
+            if let Ok(aid) = usize::try_from(info.id) {
+                self.ddci_cam(aid, |cam, _| cam.enabled = true);
+            }
         }
     }
 
@@ -512,6 +517,11 @@ impl CaRuntime {
         let caids = Rc::clone(&state.caids);
         match notice {
             Notice::State(aid, view) => {
+                // ca_teardown and APP_CA_close leave CA_STATE_INITIALIZED (ca.cpp): the CAM
+                // is initialising again, so new PMTs wait for its CA_INFO instead of old masks.
+                if view.state != 2 {
+                    self.ddci_cam(aid, |cam, _| cam.initialized = false);
+                }
                 self.ca_views.insert(aid, view);
             }
             Notice::Usable(aid) => {
@@ -2143,6 +2153,85 @@ mod ci_stage_tests {
     impl CiWriter for Sink {
         fn writev(&mut self, iov: &[&[u8]]) -> isize {
             iov.iter().map(|part| part.len()).sum::<usize>() as isize
+        }
+    }
+
+    // A PMT read while the DDCI CAM initialises, at start or on a reconnect, is retried as in
+    // C++ (dvbca_init_dev runs before any PMT; ca_teardown resets the state).
+    #[test]
+    fn a_pmt_before_the_ddci_cam_is_ready_is_retried() {
+        let mut sched = Scheduler::new();
+        let mut ca = CaRuntime::new(&Options::default());
+        let (notices, notices_rx) = mpsc::channel();
+        ca.dvbca = Some(DvbcaState {
+            dvbca: Rc::new(Dvbca::from_notices(notices_rx)),
+            caids: Rc::new(RefCell::new(BTreeMap::new())),
+            pending: PendingOffers::default(),
+            ca_id: 0,
+            requested: None,
+        });
+        let hub = DdciHub::new();
+        ca.attach_ddci(&mut sched, hub.clone());
+        hub.open_device(8, Box::new(Sink));
+        hub.lock().ddci.create_adapter(2);
+        let mut program = ms_ca::Program {
+            id: 8,
+            adapter: 2,
+            sid: 0x4286,
+            pid: 0x100,
+            ..ms_ca::Program::default()
+        };
+        program.add_caid(0x0B00, 0x500, &[]);
+        assert!(
+            !hub.lock().ddci.is_ca_initializing(8),
+            "nothing requested yet"
+        );
+
+        ca.dvbca_init_dev(AdapterInfo {
+            id: 8,
+            enabled: true,
+            kind: ms_ca_drivers::en50221::AdapterKind::Ci,
+            pa: 0,
+            fe: 0,
+        });
+        assert!(hub.lock().ddci.is_ca_initializing(8));
+        assert_eq!(
+            hub.lock().ddci.process_pmt(2, &program, false),
+            TablesResult::Retry,
+            "an early PMT waits for the CAM"
+        );
+        // A non-DDCI adapter is not touched.
+        ca.dvbca_init_dev(AdapterInfo::dvb(3, 3, 0));
+        assert!(!hub.lock().ddci.cams.contains_key(&3));
+
+        // CA_INFO makes it ready; a teardown or a closed CA session makes it initialising again.
+        let ready = |state| {
+            Notice::State(
+                8,
+                DeviceView {
+                    enabled: true,
+                    state,
+                    ..DeviceView::default()
+                },
+            )
+        };
+        notices.send(Notice::Caids(8, vec![0x0B00])).unwrap();
+        notices.send(ready(2)).unwrap();
+        ca.dvbca_notices(&mut sched);
+        assert!(!hub.lock().ddci.is_ca_initializing(8), "CA_INFO arrived");
+        for state in [0, 1] {
+            notices.send(ready(state)).unwrap();
+            ca.dvbca_notices(&mut sched);
+            assert!(hub.lock().ddci.is_ca_initializing(8), "state {state}");
+            program.id += 1;
+            assert_eq!(
+                hub.lock().ddci.process_pmt(2, &program, false),
+                TablesResult::Retry,
+                "a PMT during the reconnect waits, state {state}"
+            );
+            notices.send(Notice::Caids(8, vec![0x0B00])).unwrap();
+            ca.dvbca_notices(&mut sched);
+            assert!(!hub.lock().ddci.is_ca_initializing(8), "ready again");
         }
     }
 
