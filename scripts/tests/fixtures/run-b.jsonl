@@ -1,0 +1,10 @@
+{"ts": 0.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 0, "decerr": 0}
+{"ts": 2.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 1, "decerr": 0}
+{"ts": 4.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 1, "decerr": 0}
+{"ts": 6.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 1, "decerr": 0}
+{"ts": 22.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 1, "decerr": 0}
+{"ts": 24.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 1, "decerr": 5}
+{"ts": 26.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 1, "decerr": 0}
+{"ts": 28.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 1, "decerr": 2}
+{"ts": 30.0, "label": "rs", "adapter": 0, "type": 1, "freq": 1200000, "sidcount": 1, "decerr": 0}
+{"ts": 32.0, "label": "rs", "error": "connection refused"}
