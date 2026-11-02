@@ -29,6 +29,8 @@ enum OptId {
     LogRemote,
     LogRemoteQueue,
     LogRing,
+    DdciCapture,
+    DdciCaptureMaxMb,
     Help,
     Playlist,
     Adapters,
@@ -299,6 +301,18 @@ const OPTIONS: &[OptSpec] = &[
         id: OptId::LogRing,
     },
     OptSpec {
+        long: "ddci-capture",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::DdciCapture,
+    },
+    OptSpec {
+        long: "ddci-capture-max-mb",
+        short: None,
+        kind: ArgKind::Required,
+        id: OptId::DdciCaptureMaxMb,
+    },
+    OptSpec {
         long: "multiplier",
         short: Some('M'),
         kind: ArgKind::Required,
@@ -495,7 +509,11 @@ fn compiled_options() -> impl Iterator<Item = &'static OptSpec> {
             && (cfg!(feature = "diag-log")
                 || !matches!(
                     spec.id,
-                    OptId::LogRemote | OptId::LogRemoteQueue | OptId::LogRing
+                    OptId::LogRemote
+                        | OptId::LogRemoteQueue
+                        | OptId::LogRing
+                        | OptId::DdciCapture
+                        | OptId::DdciCaptureMaxMb
                 ))
             && (cfg!(feature = "ci-plus") || !matches!(spec.id, OptId::CiPlusRecovery))
     })
@@ -813,6 +831,10 @@ impl Parser<'_> {
                 self.opts.log_remote_queue = value.parse::<usize>().unwrap_or(0).max(1);
             }
             OptId::LogRing => self.opts.log_ring = value.parse::<usize>().unwrap_or(0),
+            OptId::DdciCapture => self.opts.ddci_capture = Some(value.into()),
+            OptId::DdciCaptureMaxMb => {
+                self.opts.ddci_capture_max_mb = value.parse::<u64>().unwrap_or(2048);
+            }
             OptId::Help => self.opts.help = true,
             OptId::Version => self.opts.version = true,
             OptId::HttpPort => self.opts.http_port = c_atoi(value) as u32,

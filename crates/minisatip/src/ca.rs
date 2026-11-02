@@ -86,6 +86,9 @@ pub struct CaRuntime {
     diag_next_decrypt: i64,
     /// Cumulative `dec_err` already reported per adapter.
     diag_dec_err: BTreeMap<usize, u64>,
+    /// `--ddci-capture`: rolling DDCI TS buffers and the MMI-triggered writer.
+    #[cfg(feature = "diag-log")]
+    capture: Option<std::sync::Arc<crate::ddci_capture::CaptureTap>>,
 }
 
 impl CaRuntime {
@@ -95,7 +98,14 @@ impl CaRuntime {
         let offered = Rc::new(RefCell::new(Vec::new()));
         let cfg = DvbapiConfig::from_options(opts);
         let dvbapi = cfg.is_configured().then(|| Dvbapi::new(cfg));
+        #[cfg(feature = "diag-log")]
+        let capture = opts
+            .ddci_capture
+            .as_deref()
+            .and_then(|dir| crate::ddci_capture::CaptureTap::new(dir, opts.ddci_capture_max_mb));
         Self {
+            #[cfg(feature = "diag-log")]
+            capture,
             origin,
             stage_config: StageConfig {
                 drop_encrypted: opts.drop_encrypted,
@@ -122,6 +132,65 @@ impl CaRuntime {
 
     fn now(&self) -> i64 {
         self.origin.elapsed().as_millis() as i64
+    }
+
+    /// Whether `--ddci-capture` created a tap (tests).
+    #[cfg(all(test, feature = "diag-log"))]
+    pub(crate) fn capture_enabled(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// A CI device's writer and CAM-output reader, wrapped for `--ddci-capture`.
+    #[cfg(feature = "diag-log")]
+    pub fn ci_io(
+        &self,
+        aid: usize,
+        writer: Box<dyn ms_ca_drivers::ddci::CiWriter + Send>,
+        reader: Box<dyn ms_tuner::Tuner + Send>,
+    ) -> (
+        Box<dyn ms_ca_drivers::ddci::CiWriter + Send>,
+        Box<dyn ms_tuner::Tuner + Send>,
+    ) {
+        match self.capture.as_ref() {
+            Some(tap) => (tap.writer(aid, writer), tap.reader(aid, reader)),
+            None => (writer, reader),
+        }
+    }
+
+    /// Without diag-log the CI devices are used unwrapped.
+    #[cfg(not(feature = "diag-log"))]
+    pub fn ci_io(
+        &self,
+        _aid: usize,
+        writer: Box<dyn ms_ca_drivers::ddci::CiWriter + Send>,
+        reader: Box<dyn ms_tuner::Tuner + Send>,
+    ) -> (
+        Box<dyn ms_ca_drivers::ddci::CiWriter + Send>,
+        Box<dyn ms_tuner::Tuner + Send>,
+    ) {
+        (writer, reader)
+    }
+
+    /// An MMI menu or enquiry in CA `id`: starts a `--ddci-capture` when `id` is a DDCI device.
+    #[cfg(feature = "diag-log")]
+    fn ddci_mmi_trigger(&self, id: usize, kind: &'static str) {
+        let (Some(tap), Some(link)) = (self.capture.as_ref(), self.ddci.as_ref()) else {
+            return;
+        };
+        // The hub lock is released before the tap is touched (hub, then tap, never back).
+        let pid_map: Vec<(u16, u16)> = {
+            let state = link.hub.lock();
+            let Some(device) = state.ddci.devices.get(&id) else {
+                return;
+            };
+            device
+                .mapping
+                .values()
+                .filter(|m| m.rewrite)
+                .map(|m| (m.pid, m.ddci_pid as u16))
+                .collect()
+        };
+        tap.trigger(id, kind, pid_map);
     }
 
     /// The clock the CA sinks use inside scheduler calls (`getTick()`).
@@ -495,6 +564,12 @@ impl CaRuntime {
                     }
                 }
             }
+            Notice::MmiTrigger { id, kind } => {
+                #[cfg(feature = "diag-log")]
+                self.ddci_mmi_trigger(id, kind);
+                #[cfg(not(feature = "diag-log"))]
+                let _ = (id, kind);
+            }
             Notice::DisableCws(pmt_ids) => {
                 for pmt_id in pmt_ids {
                     let Some(aid) = sched
@@ -662,6 +737,10 @@ impl CaRuntime {
     pub fn tick(&mut self, sched: &mut Scheduler, handles: &[Option<AdapterHandle>]) {
         let now = self.now();
         self.set_driver_time(now);
+        #[cfg(feature = "diag-log")]
+        if let Some(tap) = self.capture.as_ref() {
+            tap.tick();
+        }
         self.collect_stats();
         if cfg!(feature = "diag-log") && now >= self.diag_next_decrypt {
             self.diag_next_decrypt = now + DIAG_DECRYPT_MS;

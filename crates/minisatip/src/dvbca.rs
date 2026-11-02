@@ -127,6 +127,8 @@ pub enum Notice {
     },
     /// `disable_cws_for_all_pmts`: stop descrambling these PMTs.
     DisableCws(Vec<usize>),
+    /// MMI menu or enquiry from the CAM in CA `id` (`--ddci-capture` trigger).
+    MmiTrigger { id: usize, kind: &'static str },
 }
 
 /// `ca_devices[i]` fields read by `ca_sym` (ca.cpp:4234-4242).
@@ -786,7 +788,15 @@ impl Worker {
                 }
                 HostEvent::CaSessionClosed => capmt.state = ms_ca::CaState::Inactive,
                 // The C++ MMI logs live in APP_MMI_handler (en50221/apps.rs).
-                HostEvent::MmiMenu { .. } | HostEvent::MmiEnquiry { .. } => {}
+                HostEvent::MmiMenu { .. } => {
+                    let _ = self.notices.send(Notice::MmiTrigger { id, kind: "menu" });
+                }
+                HostEvent::MmiEnquiry { .. } => {
+                    let _ = self.notices.send(Notice::MmiTrigger {
+                        id,
+                        kind: "enquiry",
+                    });
+                }
                 HostEvent::CcKey { parity, key, iv } => {
                     let pmt_ids = capmt_pmt_ids(capmt);
                     ms_log::diag::events::ciplus_key(

@@ -1900,14 +1900,16 @@ fn spawn_ddci_adapters(
                 continue;
             }
         };
-        hub.open_device(aid, Box::new(writer));
+        // `--ddci-capture` wraps both ends; without it they pass through unchanged.
+        let (writer, reader) = ca.ci_io(aid, Box::new(writer), Box::new(reader));
+        hub.open_device(aid, writer);
         let buffer = usize::try_from(opts.adapter_buffer)
             .ok()
             .filter(|size| *size > 0)
             .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
         let handle = spawn_adapter_with(
             aid,
-            Box::new(reader),
+            reader,
             buffer,
             ms_net::dataplane::clamp_threshold(opts.udp_threshold),
             opts.emulate_pids_all,

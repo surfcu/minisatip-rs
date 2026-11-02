@@ -114,6 +114,7 @@ one event per distinct key.
 | `cw` | `pmt`, `parity`, `ecm_ms`, `source` | PMT id, even/odd parity, milliseconds from ECM section to key (null when unknown), `dvbapi`/`ci+` | A control word is installed. |
 | `ddci_batch` | `adapter`, `grown_to` | Bytes | Flushed: CAM output grew the adapter batch; the largest value in the window is kept. |
 | `ddci_fifo_overflow` | `adapter`, `dropped` | DDCI device id (the device map key), bytes | Flushed: bytes lost when a DDCI FIFO overflowed. |
+| `ddci_capture` | `slot`, `files`, `bytes`, `drops` | CA slot, the two file names, bytes written, bytes the writer missed | A `--ddci-capture` pair and its sidecar are written (feature `diag-log`). |
 | `ci_decrypt` | `adapter`, `keys_installed`, `errors`, `period_s` | Active CW services, descrambler error delta, window seconds | Every 10 s for a CI adapter when keys or errors were seen. |
 | `ciplus_sac` | `ca`, `state` | `open`/`dh_ok`/`auth_ok`/`auth_failed`/`sac_ok`/`sac_failed` | CI+ SAC/DH handshake progress (feature `ci-plus`). |
 | `ciplus_key` | `ca`, `parity`, `target_adapters` | CA id, parity, adapter ids (max 16) | A CI+ key is installed for the offered PMTs (feature `ci-plus`). |
@@ -177,6 +178,58 @@ loki.source.syslog "minisatip" {
 Point `--log-remote` at the same address, for example
 `--log-remote tcp://receiver.example:5514`. Keep the collector reachable only
 from the hosts that run minisatip; the sink does not authenticate or encrypt.
+
+## DDCI capture
+
+`--ddci-capture dir` (diag-log builds only) records the transport stream that
+a DDCI CI device exchanges with its CAM, so a CAM that stops descrambling
+after service changes can be analysed afterwards.
+
+- **What is recorded:** per DDCI device, the bytes written to the CI device
+  after PID remapping (`in`), and the bytes read back from the CAM (`out`).
+  Nothing else is stored: no MMI text, keys or CW/CI+ data.
+- **Trigger:** a CAM MMI menu or enquiry on the device's slot. The slot number
+  is the DDCI adapter index, as in `ca<slot>` below.
+- **Output:** on a trigger, two files are written to `dir`:
+  `ca<slot>-<UTC YYYYMMDDTHHMMSS>-in.ts` and `-out.ts`, holding the last 60 s
+  before the trigger plus the next 60 s, and a `ca<slot>-<time>.json` sidecar.
+  The sidecar holds `format` (`ddci-capture/1`), the slot, the trigger time and
+  kind, `window_ms` (60000), the `files` names, a time index per file with one
+  entry `[monotonic ms, UTC ms, byte offset]` for each recorded chunk (each CI
+  write or CAM read, so its spacing follows the traffic), the PID remap pairs,
+  `short_writes` (CI writes the device accepted only in part), `bytes`,
+  `dropped_bytes` and `truncated` per direction.
+- **Limits:** at most one capture per slot per 10 minutes. A trigger is
+  refused, with a log line, when `dir` already holds `--ddci-capture-max-mb`
+  (default 2048) MB of `ca*.ts`/`ca*.json` files; one accepted capture can
+  overshoot the cap by its own size.
+- **Memory:** each device and direction keeps a ring of at most 160 MiB and
+  60 s. A 70 Mbit/s CI fills the byte bound after about 19 s, so the oldest
+  data is dropped first. A capture shares the ring's chunks instead of copying
+  them; chunks queued for the writer stay alive after the ring drops them, up
+  to 320 MiB in flight for all devices together. With the option on, the
+  bound is 320 MiB per CI device (160 MiB in each direction) plus the shared
+  320 MiB writer queue.
+- **Disk:** a capture holds at most 320 MiB per direction (the pre-window is at
+  most 160 MiB and the post-window is capped at 160 MiB; a capture that hit the
+  cap has `truncated` set), so a pair takes at most 640 MiB. At 8 Mbit/s a full
+  120 s pair is about 240 MB.
+- **Drops:** the writer thread gets chunks through a bounded queue. When it
+  cannot keep up, chunks are dropped and counted in the sidecar as
+  `dropped_bytes`. A dropped chunk breaks 188-byte packet alignment in the
+  `.ts` file, so analysis tools must resync on `0x47`.
+- **Timing:** the hot path records a monotonic timestamp only. Wall time in
+  the index is the trigger's UTC time plus the monotonic offset.
+- **Fetching:** copy `dir` off the host, for example with `scp` or `rsync`.
+  Then run the capture analysis script (kept with the homelab logging notes,
+  not in this repository) for continuity errors, input gaps, bitrates, ECM
+  intervals and the scrambled share of the output.
+
+Example:
+
+```sh
+minisatip --ddci-capture /var/lib/minisatip/ddci --ddci-capture-max-mb 1024
+```
 
 ## Queries
 
