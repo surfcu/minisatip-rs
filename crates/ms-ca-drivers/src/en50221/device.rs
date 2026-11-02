@@ -6,7 +6,7 @@ use super::consts::*;
 use super::link::{
     CA_CI_LINK, CA_CI_MODULE_READY, CaLink, ResetResult, SlotInfo, reset_and_wait_ready,
 };
-use super::resources::{Handler, cmd_reply, cmd_tracked, find_handler};
+use super::resources::{App, Handler, cmd_reply, cmd_tracked, find_handler};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
@@ -57,12 +57,13 @@ pub enum HostEvent {
     CaSessionClosed,
     /// `ca_release_pmts` during teardown: forget every PMT held on this CAM.
     ReleasePmts,
-    /// An MMI menu or list was shown and cancelled.
-    MmiMenu { lines: Vec<String> },
+    /// An MMI menu or list arrived; `solicited` inside a `--cam-menu` request.
+    MmiMenu { lines: Vec<String>, solicited: bool },
     MmiEnquiry {
         text: String,
         blind: bool,
         answer_len: u8,
+        solicited: bool,
     },
     /// `check_new_key`: a descrambling key and its IV for `parity` (0 even,
     /// 1 odd). The bytes are never printed.
@@ -117,6 +118,39 @@ pub struct ApduRecord {
     pub body: Vec<u8>,
 }
 
+/// Reply to an MMI menu or list the CAM opens by itself (`--cam-menu-unsolicited`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnsolicitedMmi {
+    /// Choice 1, then close: what C++ does.
+    #[default]
+    Answer1,
+    /// Choice 0 (back), then close: what enigma2 sends.
+    Answer0,
+    /// No answer for up to [`MENU_IDLE_MS`], then choice 0 and close.
+    Open,
+}
+
+/// Why a `--cam-menu` command was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuError {
+    /// No Application Information (enter) or MMI (answer, close) session.
+    NoSession,
+    /// No request is open, or no page waits for an answer.
+    NotOpen,
+    /// The choice is not on the page (a list takes only 0).
+    BadChoice,
+}
+
+/// The MMI page waiting for an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmiPage {
+    Menu { items: usize },
+    List,
+}
+
+/// A menu request or a held unsolicited page ends after this long without activity.
+pub const MENU_IDLE_MS: i64 = 120_000;
+
 /// One CI slot, host side.
 pub struct CaDevice {
     pub id: usize,
@@ -158,6 +192,13 @@ pub struct CaDevice {
     pub last_rx_ms: i64,
     /// CI+ key watchdog timeout (ms; 0 disables it). No C++ equivalent.
     pub recovery_timeout_ms: i64,
+    /// `--cam-menu-unsolicited`; the default is the C++ reply.
+    pub unsolicited_mmi: UnsolicitedMmi,
+    /// Last activity of a `--cam-menu` request (ms; -1 none open).
+    pub(super) menu_request_ms: i64,
+    /// Since when an unsolicited page is held open (ms; -1 none).
+    pub(super) mmi_hold_ms: i64,
+    pub(super) mmi_page: Option<MmiPage>,
     /// This slot's `cam_state` changes; kept across reconnects.
     cam_states: ms_log::diag::events::CamStateFilter,
     close_requested: bool,
@@ -204,6 +245,10 @@ impl CaDevice {
             last_key_ms: -1,
             last_rx_ms: -1,
             recovery_timeout_ms: 0,
+            unsolicited_mmi: UnsolicitedMmi::default(),
+            menu_request_ms: -1,
+            mmi_hold_ms: -1,
+            mmi_page: None,
             cam_states: Default::default(),
             close_requested: false,
             events: VecDeque::new(),
@@ -378,6 +423,7 @@ impl CaDevice {
         self.mmi_error_since = -1;
         self.last_key_ms = -1;
         self.last_rx_ms = -1;
+        self.end_menu();
         self.link = None;
         self.sock = None;
         self.close_requested = false;
@@ -904,6 +950,104 @@ impl CaDevice {
         let now = self.now();
         self.cmd_watchdog(now);
         self.mmi_recovery_watchdog(now);
+        self.menu_idle_timeout(now);
+    }
+
+    /// The first open session of `app`, any resource version.
+    fn session_for_app(&self, app: App) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|s| s.is_some_and(|s| s.handler.app == app))
+    }
+
+    /// An Application Information session is open (`--cam-menu` enter).
+    pub fn has_ai_session(&self) -> bool {
+        self.session_for_app(App::AppInfo).is_some()
+    }
+
+    /// An MMI session is open (`--cam-menu` answer and close).
+    pub fn has_mmi_session(&self) -> bool {
+        self.session_for_app(App::Mmi).is_some()
+    }
+
+    /// A `--cam-menu` request is open: MMI pages wait for the requester.
+    pub fn menu_open(&self) -> bool {
+        self.menu_request_ms >= 0
+    }
+
+    /// `--cam-menu`: sends `enter_menu` and opens a request. No C++ equivalent.
+    pub fn enter_menu(&mut self) -> Result<(), MenuError> {
+        let idx = self
+            .session_for_app(App::AppInfo)
+            .ok_or(MenuError::NoSession)?;
+        ms_log::log!("CA {}: entering the CAM menu on request", self.id);
+        if !self.write_apdu(idx, TAG_ENTER_MENU, &[]) {
+            return Err(MenuError::NoSession);
+        }
+        self.menu_request_ms = self.now();
+        self.mmi_hold_ms = -1;
+        self.mmi_page = None;
+        Ok(())
+    }
+
+    /// `--cam-menu`: answers the waiting menu (0 = back) or list (0 only).
+    pub fn menu_answer(&mut self, choice: u8) -> Result<(), MenuError> {
+        if !self.menu_open() {
+            return Err(MenuError::NotOpen);
+        }
+        let valid = match self.mmi_page {
+            Some(MmiPage::Menu { items }) => usize::from(choice) <= items,
+            Some(MmiPage::List) => choice == 0,
+            None => return Err(MenuError::NotOpen),
+        };
+        if !valid {
+            return Err(MenuError::BadChoice);
+        }
+        let idx = self.session_for_app(App::Mmi).ok_or(MenuError::NoSession)?;
+        ms_log::log!("CA {}: menu answer {} on request", self.id, choice);
+        self.write_apdu(idx, TAG_MENU_ANSWER, &[choice]);
+        self.menu_request_ms = self.now();
+        self.mmi_page = None;
+        Ok(())
+    }
+
+    /// `--cam-menu`: closes the MMI and ends the request or a held page.
+    pub fn close_mmi(&mut self) -> Result<(), MenuError> {
+        let idx = self.session_for_app(App::Mmi).ok_or(MenuError::NoSession)?;
+        ms_log::log!("CA {}: closing the CAM menu on request", self.id);
+        self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+        self.end_menu();
+        Ok(())
+    }
+
+    pub(super) fn end_menu(&mut self) {
+        self.menu_request_ms = -1;
+        self.mmi_hold_ms = -1;
+        self.mmi_page = None;
+    }
+
+    /// An idle request or held page gets choice 0 (when a page waits) and a close.
+    fn menu_idle_timeout(&mut self, now: i64) {
+        let since = if self.menu_request_ms >= 0 {
+            self.menu_request_ms
+        } else {
+            self.mmi_hold_ms
+        };
+        if since < 0 || now - since < MENU_IDLE_MS {
+            return;
+        }
+        ms_log::log!(
+            "CA {}: CAM menu idle for {} ms, answering 0 and closing",
+            self.id,
+            now - since
+        );
+        if let Some(idx) = self.session_for_app(App::Mmi) {
+            if self.mmi_page.is_some() {
+                self.write_apdu(idx, TAG_MENU_ANSWER, &[0x00]);
+            }
+            self.write_apdu(idx, TAG_CLOSE_MMI, &[MMI_CLOSE_MMI_CMD_ID_IMMEDIATE]);
+        }
+        self.end_menu();
     }
 
     /// `ca_cmd_watchdog`: resets a CAM that leaves a command or its initialization hanging.

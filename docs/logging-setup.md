@@ -115,6 +115,7 @@ one event per distinct key.
 | `ddci_batch` | `adapter`, `grown_to` | Bytes | Flushed: CAM output grew the adapter batch; the largest value in the window is kept. |
 | `ddci_fifo_overflow` | `adapter`, `dropped` | DDCI device id (the device map key), bytes | Flushed: bytes lost when a DDCI FIFO overflowed. |
 | `ddci_capture` | `slot`, `files`, `bytes`, `drops` | CA slot, the two file names, bytes written, bytes the writer missed | A `--ddci-capture` pair and its sidecar are written (feature `diag-log`). |
+| `cam_menu` | `ca`, `kind`, `items`, `lines`, `text_hash`, `answer`, `solicited` | Kind `menu`/`list`/`enquiry`/`menu_more`/`list_more`; menu items (0 for an enquiry or fragment); text lines (title, subtitle and bottom included); FNV-1a hash of the lines as 16 hex digits; what the host answered: `1`/`0`/`open` (unsolicited, per `--cam-menu-unsolicited`), `request` (left to a `--cam-menu` request), `pin`/`cancel`/`close` (enquiry), `none`; `solicited` inside a request | Every MMI page from the CAM (feature `diag-log`). The page text itself is in the `[UI n]` log lines; a PIN is never logged. |
 | `ci_decrypt` | `adapter`, `keys_installed`, `errors`, `period_s` | Active CW services, descrambler error delta, window seconds | Every 10 s for a CI adapter when keys or errors were seen. |
 | `ciplus_sac` | `ca`, `state` | `open`/`dh_ok`/`auth_ok`/`auth_failed`/`sac_ok`/`sac_failed` | CI+ SAC/DH handshake progress (feature `ci-plus`). |
 | `ciplus_key` | `ca`, `parity`, `target_adapters` | CA id, parity, adapter ids (max 16) | A CI+ key is installed for the offered PMTs (feature `ci-plus`). |
@@ -229,6 +230,48 @@ Example:
 
 ```sh
 minisatip --ddci-capture /var/lib/minisatip/ddci --ddci-capture-max-mb 1024
+```
+
+## CAM menu
+
+`--cam-menu` (diag-log builds only) lets an operator open the CAM's own menu,
+for example its card status pages while a CAM is failing, and walk it over
+HTTP. Without the option the routes are 404.
+
+- `POST /debug/cam/<ca>/menu` sends `enter_menu` on the slot's Application
+  Information session and opens a request.
+- `POST /debug/cam/<ca>/menu/answer?choice=N` answers the waiting page: a menu
+  item 1..N or 0 (back); a list takes only 0.
+- `POST /debug/cam/<ca>/menu/close` closes the MMI and ends the request.
+
+Replies: `202` queued, `400` bad choice, `404` unknown CA or path, `405` GET or
+HEAD, `409` no session or no open request, `503` no CA worker. The
+check uses the status snapshot, which can be one worker loop old, so a `202`
+can still fail in the worker; the log then has `menu command ... not sent`.
+The pages are not in the reply: read them in the log (`[UI n]` lines) or as
+`cam_menu` events.
+
+While a request is open, menu and list pages wait for an answer instead of
+getting C++'s automatic choice 1 and close. An enquiry is answered with the
+`-3` PIN when its length fits, else cancelled; a PIN never travels in a URL.
+A requested page triggers no `--ddci-capture` and does not arm
+`--ci-plus-recovery`. After 120 s without a page or command the host answers
+0 (when a page waits) and closes. A close from the CAM, or the MMI session
+closing, ends the request at once.
+
+`--cam-menu-unsolicited answer1|answer0|open` sets the reply to a menu or list
+the CAM opens by itself: `answer1` (default) is the C++ choice 1 and close,
+`answer0` sends 0 (back) and close, as enigma2 does, and `open` leaves the
+page open for up to 120 s, then answers 0 and closes. Enquiries keep the PIN
+behaviour in every mode.
+
+Example:
+
+```sh
+minisatip --cam-menu --log-remote tcp://logs:6514
+curl -X POST http://host:8080/debug/cam/8/menu
+curl -X POST 'http://host:8080/debug/cam/8/menu/answer?choice=2'
+curl -X POST http://host:8080/debug/cam/8/menu/close
 ```
 
 ## Queries

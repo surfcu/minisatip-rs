@@ -29,6 +29,8 @@ pub const BANDWIDTH_JSON_PATH: &str = "/bandwidth.json";
 pub const DEBUG_LOG_PATH: &str = "/debug/log";
 /// `GET /debug/log` default line count.
 const DEBUG_LOG_LINES: usize = 1000;
+/// `--cam-menu` routes: `POST /debug/cam/<ca>/menu[/answer?choice=N|/close]`.
+pub const CAM_MENU_PREFIX: &str = "/debug/cam/";
 /// Bytes C++ keeps for `/desc.xml` (`char buf[2000]`, minisatip.cpp:1462).
 const DESC_XML_MAX: usize = 1999;
 /// DVBAPI key slots (`MAX_KEYS`, dvbapi.h:56).
@@ -417,7 +419,27 @@ pub struct CaDeviceState {
     pub caids: Vec<u16>,
     /// CAM name.
     pub ci_name: String,
+    /// An Application Information session is open (`--cam-menu` enter).
+    pub ai_session: bool,
+    /// An MMI session is open (`--cam-menu` answer and close).
+    pub mmi_session: bool,
+    /// A `--cam-menu` request is open.
+    pub menu_open: bool,
 }
+
+/// One `--cam-menu` command for a CA device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CamMenuOp {
+    /// `enter_menu` on the Application Information session.
+    Enter,
+    /// `menu_answ` with this choice (0 = back).
+    Answer(u8),
+    /// `close_mmi`.
+    Close,
+}
+
+/// Queues a [`CamMenuOp`] for CA `ca`; false when no CA worker takes it.
+pub type CamMenuSend = fn(usize, CamMenuOp) -> bool;
 
 /// Channel resolved for a DVBAPI key (`get_channel_for_key`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -606,6 +628,7 @@ pub struct WebService {
     config: WebConfig,
     identity: Option<SharedIdentity>,
     debug_log: Option<DebugLog>,
+    cam_menu: Option<CamMenuSend>,
 }
 
 impl WebService {
@@ -615,6 +638,7 @@ impl WebService {
             config,
             identity: None,
             debug_log: None,
+            cam_menu: None,
         }
     }
 
@@ -623,6 +647,12 @@ impl WebService {
     /// Without a callback the path is a 404.
     pub fn with_debug_log(mut self, callback: fn(usize) -> Vec<String>, capacity: usize) -> Self {
         self.debug_log = Some((callback, capacity));
+        self
+    }
+
+    /// Serves the `--cam-menu` routes through `send`; without it they are 404.
+    pub fn with_cam_menu(mut self, send: CamMenuSend) -> Self {
+        self.cam_menu = Some(send);
         self
     }
 
@@ -658,9 +688,58 @@ impl WebService {
             STATE_JSON_PATH => json_route(self.state_json_bytes(state)),
             BANDWIDTH_JSON_PATH => json_route(self.bandwidth_json(state).into_bytes()),
             DEBUG_LOG_PATH => self.debug_log_route(&request.uri),
+            _ if self.cam_menu.is_some() && path.starts_with(CAM_MENU_PREFIX) => {
+                self.cam_menu_route(request, path, state)
+            }
             _ => self.static_route(&request.uri, request.is_method("HEAD"), state),
         };
         Some(route)
+    }
+
+    /// `--cam-menu`: checks the request against the CA snapshot, then queues it.
+    /// The CAM's pages go to the log; the reply only says whether it was queued.
+    fn cam_menu_route(&self, request: &Request, path: &str, state: &WebSnapshot) -> HttpRoute {
+        let Some(send) = self.cam_menu else {
+            return text_route(404, "");
+        };
+        let Some((ca, action)) = path
+            .strip_prefix(CAM_MENU_PREFIX)
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(ca, action)| Some((ca.parse::<usize>().ok()?, action)))
+        else {
+            return text_route(404, "");
+        };
+        let op = match action {
+            "menu" => CamMenuOp::Enter,
+            "menu/close" => CamMenuOp::Close,
+            "menu/answer" => match query_value(&request.uri, "choice").map(str::parse::<u8>) {
+                Some(Ok(choice)) => CamMenuOp::Answer(choice),
+                _ => return text_route(400, "choice=0..255 required\n"),
+            },
+            _ => return text_route(404, ""),
+        };
+        if !request.is_method("POST") {
+            return text_route(405, "POST only\n").with_headers(vec![
+                "Allow: POST".to_owned(),
+                "Content-Type: text/plain; charset=utf-8".to_owned(),
+                "Connection: close".to_owned(),
+            ]);
+        }
+        let Some(dev) = state.ca.get(ca).and_then(Option::as_ref) else {
+            return text_route(404, "no such CA\n");
+        };
+        let ready = match op {
+            CamMenuOp::Enter => dev.ai_session,
+            CamMenuOp::Answer(_) => dev.mmi_session && dev.menu_open,
+            CamMenuOp::Close => dev.mmi_session,
+        };
+        if !ready {
+            return text_route(409, "no session or no open menu\n");
+        }
+        if !send(ca, op) {
+            return text_route(503, "CA worker unavailable\n");
+        }
+        text_route(202, "queued\n")
     }
 
     /// Flight-recorder dump: plain text, oldest line first, newest last.
@@ -929,6 +1008,22 @@ fn debug_log_lines(uri: &str, capacity: usize) -> usize {
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEBUG_LOG_LINES);
     requested.clamp(1, capacity.max(1))
+}
+
+/// The value of `key` in the query string, if any.
+fn query_value<'a>(uri: &'a str, key: &str) -> Option<&'a str> {
+    uri.split_once('?')?
+        .1
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn text_route(status: u16, body: &str) -> HttpRoute {
+    HttpRoute::new(status, body.as_bytes().to_vec()).with_headers(vec![
+        "Cache-Control: no-cache".to_owned(),
+        "Content-Type: text/plain; charset=utf-8".to_owned(),
+        "Connection: close".to_owned(),
+    ])
 }
 
 fn json_route(body: Vec<u8>) -> HttpRoute {

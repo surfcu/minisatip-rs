@@ -307,6 +307,38 @@ pub fn ddci_capture(slot: i64, files: &str, bytes: u64, drops: u64) {
     );
 }
 
+/// One MMI page as `cam_menu` reports it; the page text itself stays in the `[UI n]` lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CamMenu<'a> {
+    pub ca: i64,
+    pub kind: &'a str,
+    pub items: u64,
+    pub lines: u64,
+    pub text_hash: u64,
+    pub answer: &'a str,
+    pub solicited: bool,
+}
+
+fn cam_menu_fields(menu: &CamMenu<'_>) -> Fields {
+    let mut fields = Fields::new();
+    fields.integer("ca", menu.ca);
+    fields.string("kind", menu.kind);
+    fields.int("items", menu.items);
+    fields.int("lines", menu.lines);
+    fields.string("text_hash", &format!("{:016x}", menu.text_hash));
+    fields.string("answer", menu.answer);
+    fields.boolean("solicited", menu.solicited);
+    fields
+}
+
+/// `cam_menu`: an MMI menu, list or enquiry page and what the host answered.
+pub fn cam_menu(menu: &CamMenu<'_>) {
+    if !cfg!(feature = "diag-log") {
+        return;
+    }
+    emit("cam_menu", &cam_menu_fields(menu));
+}
+
 fn ci_decrypt_fields(adapter: i64, keys_installed: u64, errors: u64, period_s: u64) -> Fields {
     let mut fields = Fields::new();
     fields.integer("adapter", adapter);
@@ -396,6 +428,26 @@ mod tests {
             envelope(
                 "cam_state",
                 ",\"ca\":2,\"state\":\"ready\",\"mode\":\"ci\",\"suppressed\":5"
+            )
+        );
+    }
+
+    #[test]
+    fn cam_menu_carries_counts_hash_and_answer() {
+        let menu = CamMenu {
+            ca: 8,
+            kind: "menu",
+            items: 2,
+            lines: 5,
+            text_hash: 0xab,
+            answer: "1",
+            solicited: false,
+        };
+        assert_eq!(
+            json("cam_menu", &cam_menu_fields(&menu)),
+            envelope(
+                "cam_menu",
+                ",\"ca\":8,\"kind\":\"menu\",\"items\":2,\"lines\":5,\"text_hash\":\"00000000000000ab\",\"answer\":\"1\",\"solicited\":false"
             )
         );
     }
