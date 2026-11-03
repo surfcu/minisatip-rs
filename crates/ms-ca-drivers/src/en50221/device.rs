@@ -157,6 +157,7 @@ pub const MENU_IDLE_MS: i64 = 120_000;
 /// `--cam-recovery` state of one service on the DDCI path, keyed by SID.
 struct ServiceRun {
     pmt_id: usize,
+    generation: u64,
     joined: i64,
     stuck_since: i64,
     used: bool,
@@ -1275,12 +1276,12 @@ impl CaDevice {
         std::mem::take(&mut self.cam_recovery_due)
     }
 
-    /// Syncs the per-service map with the CAPMT's `(pmt_id, sid)` pairs; an
-    /// inactive CAM restarts every join time.
-    pub fn cam_recovery_sync_services(&mut self, services: &[(usize, u16)], active: bool) {
+    /// Syncs the per-service map with the CAPMT's `(pmt_id, sid, generation)`
+    /// triples; an inactive CAM restarts every join time.
+    pub fn cam_recovery_sync_services(&mut self, services: &[(usize, u16, u64)], active: bool) {
         let now = self.now();
         let mut counts = BTreeMap::new();
-        for &(_, sid) in services {
+        for &(_, sid, _) in services {
             *counts.entry(sid).or_insert(0usize) += 1;
         }
         let duplicated: BTreeSet<u16> = counts
@@ -1300,21 +1301,23 @@ impl CaDevice {
         }
         self.cam_recovery_duplicates
             .retain(|sid| duplicated.contains(sid));
-        self.cam_recovery_services
-            .retain(|sid, _| !duplicated.contains(sid) && services.iter().any(|&(_, s)| s == *sid));
-        for &(pmt_id, sid) in services {
+        self.cam_recovery_services.retain(|sid, _| {
+            !duplicated.contains(sid) && services.iter().any(|&(_, s, _)| s == *sid)
+        });
+        for &(pmt_id, sid, generation) in services {
             if duplicated.contains(&sid) {
                 continue;
             }
             if self
                 .cam_recovery_services
                 .get(&sid)
-                .is_none_or(|run| run.pmt_id != pmt_id)
+                .is_none_or(|run| run.pmt_id != pmt_id || run.generation != generation)
             {
                 self.cam_recovery_services.insert(
                     sid,
                     ServiceRun {
                         pmt_id,
+                        generation,
                         joined: now,
                         stuck_since: -1,
                         used: false,

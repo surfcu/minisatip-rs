@@ -756,7 +756,7 @@ impl Worker {
                             .ok()
                             .and_then(|id| self.programs.get(id))
                         {
-                            pairs.push((pmt_id, program.sid));
+                            pairs.push((pmt_id, program.sid, program.generation));
                         }
                     }
                 }
