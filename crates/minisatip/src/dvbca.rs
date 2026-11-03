@@ -1195,9 +1195,12 @@ mod tests {
         });
         svc.pcr_pid = 0x1F0;
         let program = program_from_service(&svc);
-        assert!(program.streams.iter().any(|s| {
-            s.stream_type == 0 && s.pid == 0x1F0 && !s.is_audio && !s.is_video
-        }));
+        assert!(
+            program
+                .streams
+                .iter()
+                .any(|s| { s.stream_type == 0 && s.pid == 0x1F0 && !s.is_audio && !s.is_video })
+        );
     }
 
     #[test]
