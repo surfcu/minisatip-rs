@@ -499,10 +499,11 @@ pub(crate) fn program_from_service(service: &CaService) -> Program {
     for ca in &service.ca {
         program.add_caid(ca.caid, ca.pid, &ca.private_data);
     }
+    // pmt.cpp:2216 keeps the independent PCR as a type-0 stream; create_capmt
+    // filters it, ddci_create_pmt forwards it.
     program.streams = service
         .streams
         .iter()
-        .filter(|s| s.stream_type != 0)
         .map(|s| {
             let av = service.av_pids.contains(&s.pid);
             EsStream {
@@ -1181,6 +1182,22 @@ mod tests {
         assert_ne!(a, b);
         assert!(same_offer(&a, &b));
         assert!(!same_offer(&a, &program_from_service(&service(0x0100))));
+    }
+
+    // pmt.cpp:2216 keeps the independent PCR as a type-0 stream; ddci.cpp:944
+    // forwards it while create_capmt filters it.
+    #[test]
+    fn independent_pcr_stream_survives_program_from_service() {
+        let mut svc = service(0x0B00);
+        svc.streams.push(StreamPid {
+            stream_type: 0,
+            pid: 0x1F0,
+        });
+        svc.pcr_pid = 0x1F0;
+        let program = program_from_service(&svc);
+        assert!(program.streams.iter().any(|s| {
+            s.stream_type == 0 && s.pid == 0x1F0 && !s.is_audio && !s.is_video
+        }));
     }
 
     #[test]

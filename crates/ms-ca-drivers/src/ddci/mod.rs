@@ -697,6 +697,7 @@ impl Ddci {
         let emm = d.emm_pids.clone();
         let still_needed = |pid: u16| {
             pid == pmt.pid
+                || pid == pmt.pcr_pid
                 || pid == 1
                 || pid == 20
                 || emm.contains(&(ad, pid))
@@ -1008,6 +1009,20 @@ impl Ddci {
             if s.pid == pmt.pcr_pid {
                 self.devices.get_mut(&dev).unwrap().pmt[pos].pcr_pid = ddci_pid;
             }
+        }
+        if (0x10..=0x1FFE).contains(&pmt.pcr_pid)
+            && !pmt.streams.iter().any(|s| s.pid == pmt.pcr_pid)
+        {
+            // Parsed PMTs carry the PCR as a type-0 stream (pmt.cpp:2216); this
+            // fallback covers callers that omit it.
+            ms_log::logm!(
+                "DD {} adding stream pid {} PCR",
+                self.devices[&dev].id,
+                pmt.pcr_pid
+            );
+            count_new_mapping(&self.devices[&dev], ad, pmt.pcr_pid, pmt, &mut mapped);
+            let ddci_pid = self.add_pid_mapping_table(ad, pmt.pcr_pid, pmt.id, dev, false);
+            self.devices.get_mut(&dev).unwrap().pmt[pos].pcr_pid = ddci_pid;
         }
         // A re-send doubles as the update path; on first adds it heals stale entries.
         let unmapped = self.unmap_removed_pids(dev, ad, pmt);

@@ -244,7 +244,12 @@ fn test_update_resend_keeps_slot() {
     // a pid shared by two PMTs stays mapped until its last user is gone
     let pmt1 = create_pmt(&mut t, 8, 701, 702, 703, 0x100, 0x100);
     x.add_pid_mapping_table(8, 603, pmt1, 0, false);
-    t.get_mut(pmt0).unwrap().remove_stream(603);
+    {
+        // 603 stops being the PCR too: pcr_pid is kept like C++ keeps it.
+        let p = t.get_mut(pmt0).unwrap();
+        p.remove_stream(603);
+        p.pcr_pid = 602;
+    }
     assert_eq!(
         x.process_pmt(8, &prog(&t, pmt0), true),
         TablesResult::Ok,
@@ -274,6 +279,54 @@ fn test_update_resend_keeps_slot() {
         x.devices[&0].channels, 0,
         "expected 0 running channels after delete"
     );
+}
+
+// ddci.cpp:561-571: an independent PCR pid is mapped like a stream pid.
+#[test]
+fn independent_pcr_pid_is_mapped() {
+    let (mut x, mut t) = one_ddci(1);
+    let pmt0 = create_pmt(&mut t, 8, 600, 601, 602, 0x100, 0x100);
+    t.get_mut(pmt0).unwrap().pcr_pid = 604;
+    assert_eq!(
+        x.process_pmt(8, &prog(&t, pmt0), false),
+        TablesResult::Ok,
+        "slot expected"
+    );
+    assert!(mapped(&x, 8, 604), "independent PCR should be mapped");
+    let pcr = ddci_pid(&x, 8, 604);
+    assert_eq!(x.devices[&0].pmt[0].pcr_pid, pcr, "slot PCR mapping");
+    assert_eq!(
+        section_pcr_pid(&mut x, &prog(&t, pmt0)),
+        pcr,
+        "section PCR should match the slot"
+    );
+
+    assert_eq!(
+        x.process_pmt(8, &prog(&t, pmt0), true),
+        TablesResult::Ok,
+        "unchanged re-send expected to succeed"
+    );
+    assert!(mapped(&x, 8, 604), "unchanged PCR should stay mapped");
+    assert_eq!(
+        x.devices[&0].pmt[0].pcr_pid,
+        ddci_pid(&x, 8, 604),
+        "unchanged re-send keeps the slot PCR"
+    );
+
+    t.get_mut(pmt0).unwrap().pcr_pid = 605;
+    assert_eq!(
+        x.process_pmt(8, &prog(&t, pmt0), true),
+        TablesResult::Ok,
+        "PCR change expected to succeed"
+    );
+    assert!(!mapped(&x, 8, 604), "old PCR should be unmapped");
+    assert!(mapped(&x, 8, 605), "new PCR should be mapped");
+    let pcr = ddci_pid(&x, 8, 605);
+    assert_eq!(x.devices[&0].pmt[0].pcr_pid, pcr, "slot follows new PCR");
+
+    x.del_pmt(8, &prog(&t, pmt0));
+    assert!(!mapped(&x, 8, 604), "old PCR gone after delete");
+    assert!(!mapped(&x, 8, 605), "new PCR gone after delete");
 }
 
 // Ported from tests/test_ddci.cpp:330
