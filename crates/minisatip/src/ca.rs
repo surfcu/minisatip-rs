@@ -50,7 +50,7 @@ const PID_ALL: i32 = 8192;
 /// CA state of one adapter as last pushed to its data plane.
 struct AdapterCa {
     descrambler: Sender<DescramblerCommand>,
-    services: BTreeMap<usize, Vec<u16>>,
+    services: BTreeMap<usize, (u64, Vec<u16>)>,
     ca_active: bool,
     pids_all: bool,
     stats: DescramblerStats,
@@ -1189,7 +1189,7 @@ impl CaRuntime {
         let Some(ca) = self.adapters.get_mut(&aid) else {
             return;
         };
-        let mut wanted: BTreeMap<usize, Vec<u16>> = BTreeMap::new();
+        let mut wanted: BTreeMap<usize, (u64, Vec<u16>)> = BTreeMap::new();
         let mut pids_all = false;
         let mut ca_active = false;
         let mut pid_table: Vec<AdapterPid> = Vec::new();
@@ -1214,8 +1214,15 @@ impl CaRuntime {
                 let running = sched
                     .pmt(entry.pmt)
                     .is_some_and(|pmt| matches!(pmt.state, PmtState::Running | PmtState::Starting));
-                if running && let Ok(pid) = u16::try_from(entry.pid) {
-                    wanted.entry(entry.pmt as usize).or_default().push(pid);
+                if running
+                    && let Some(pmt) = sched.pmt(entry.pmt)
+                    && let Ok(pid) = u16::try_from(entry.pid)
+                {
+                    wanted
+                        .entry(entry.pmt as usize)
+                        .or_insert_with(|| (pmt.generation, Vec::new()))
+                        .1
+                        .push(pid);
                 }
             }
             ca_active = sched.adapter_ca_mask(aid) != 0;
@@ -1232,14 +1239,24 @@ impl CaRuntime {
                 .descrambler
                 .send(DescramblerCommand::RemoveService { pmt_id });
         }
-        for (pmt_id, mut pids) in wanted {
+        for (pmt_id, (generation, mut pids)) in wanted {
             pids.sort_unstable();
-            if ca.services.get(&pmt_id) != Some(&pids) {
+            let reused = ca
+                .services
+                .get(&pmt_id)
+                .is_some_and(|(known, _)| *known != generation);
+            if reused {
+                ca.services.remove(&pmt_id);
+                let _ = ca
+                    .descrambler
+                    .send(DescramblerCommand::RemoveService { pmt_id });
+            }
+            if ca.services.get(&pmt_id).map(|(_, pids)| pids) != Some(&pids) {
                 let _ = ca.descrambler.send(DescramblerCommand::UpdatePids {
                     pmt_id,
                     pids: pids.clone(),
                 });
-                ca.services.insert(pmt_id, pids);
+                ca.services.insert(pmt_id, (generation, pids));
             }
         }
         if ca.pid_table != pid_table {
@@ -2028,6 +2045,103 @@ mod wiring_tests {
                 .iter()
                 .any(|c| matches!(c, DescramblerCommand::RemoveService { .. }))
         );
+    }
+
+    fn ca_with_descrambler() -> (CaRuntime, Receiver<DescramblerCommand>) {
+        let mut ca = CaRuntime::new(&Options::default());
+        let (tx, rx) = mpsc::channel();
+        ca.adapters.insert(
+            0,
+            AdapterCa {
+                descrambler: tx,
+                services: BTreeMap::new(),
+                ca_active: false,
+                pids_all: false,
+                stats: DescramblerStats::default(),
+                pending_stats: None,
+                pid_table: Vec::new(),
+            },
+        );
+        (ca, rx)
+    }
+
+    fn start_pmt(sched: &mut Scheduler, sid: i32, pmt_pid: i32, pids: &[i32]) -> i32 {
+        let id = sched.pmt_add(0, sid, pmt_pid);
+        for &pid in pids {
+            assert_eq!(sched.mark_pid_add(0, 1, pid), 0);
+            sched.find_pid_mut(0, pid).unwrap().pmt = id;
+        }
+        sched.pmt_slot_mut(id).unwrap().state = PmtState::Running;
+        id
+    }
+
+    #[test]
+    fn reused_pmt_id_drops_old_cw_slots() {
+        for same_sid in [true, false] {
+            let mut sched = sched();
+            let (mut ca, rx) = ca_with_descrambler();
+            let old = start_pmt(&mut sched, 100, 0x100, &[0x101]);
+            let old_gen = sched.pmt(old).unwrap().generation;
+            ca.sync_adapter(&sched, 0);
+            let _: Vec<_> = rx.try_iter().collect();
+
+            // A version update keeps the generation: only UpdatePids.
+            sched.unmark_pid(0, 1, 0x101);
+            assert_eq!(sched.mark_pid_add(0, 1, 0x102), 0);
+            sched.find_pid_mut(0, 0x102).unwrap().pmt = old;
+            sched.pmt_slot_mut(old).unwrap().state = PmtState::Running;
+            ca.sync_adapter(&sched, 0);
+            let commands: Vec<_> = rx.try_iter().collect();
+            assert!(
+                commands.iter().any(|c| matches!(
+                    c,
+                    DescramblerCommand::UpdatePids { pmt_id, pids }
+                        if *pmt_id == old as usize && pids == &[0x102]
+                )),
+                "version update should send UpdatePids"
+            );
+            assert!(
+                !commands
+                    .iter()
+                    .any(|c| matches!(c, DescramblerCommand::RemoveService { .. })),
+                "version update must not remove the service"
+            );
+
+            // Reuse the id: a new generation must clear the old CW slots.
+            sched.unmark_pid(0, 1, 0x102);
+            sched.pmt_del(old);
+            // Same SID re-adds the same program with identical pids, the case with no other signal.
+            let (sid, pid) = if same_sid { (100, 0x102) } else { (200, 0x103) };
+            let reused = start_pmt(&mut sched, sid, 0x200, &[pid]);
+            assert_eq!(reused, old, "the freed id should be reused");
+            assert_ne!(
+                sched.pmt(reused).unwrap().generation,
+                old_gen,
+                "a reused id gets a new generation"
+            );
+            ca.sync_adapter(&sched, 0);
+            let commands: Vec<_> = rx.try_iter().collect();
+            let remove = commands.iter().position(|c| {
+                matches!(c, DescramblerCommand::RemoveService { pmt_id } if *pmt_id == old as usize)
+            });
+            let update = commands.iter().position(|c| {
+                matches!(
+                    c,
+                    DescramblerCommand::UpdatePids { pmt_id, pids }
+                        if *pmt_id == old as usize && pids == &[pid as u16]
+                )
+            });
+            let removes = commands
+                .iter()
+                .filter(|c| matches!(c, DescramblerCommand::RemoveService { .. }))
+                .count();
+            assert_eq!(removes, 1, "reused id should RemoveService once");
+            assert!(update.is_some(), "reused id should get UpdatePids");
+            assert!(
+                remove < update,
+                "RemoveService must come before the new-id commands"
+            );
+        }
     }
 
     #[test]

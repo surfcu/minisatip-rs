@@ -2403,6 +2403,46 @@ fn handover_stops_stale_holder() {
     sched.free_all_pmts();
 }
 
+#[test]
+fn pmt_add_assigns_a_new_generation() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let first = sched.pmt_add(0, 100, 48);
+    let second = sched.pmt_add(0, 200, 52);
+    let g1 = sched.pmt_slot(first).unwrap().generation;
+    let g2 = sched.pmt_slot(second).unwrap().generation;
+    assert_eq!(g1, 1);
+    assert_eq!(g2, 2);
+    sched.pmt_del(first);
+    let reused = sched.pmt_add(0, 300, 56);
+    assert_eq!(reused, first, "freed slot is reused");
+    assert!(
+        sched.pmt_slot(reused).unwrap().generation > g2,
+        "a reused id gets a new generation"
+    );
+}
+
+#[test]
+fn pmt_version_update_keeps_generation() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let id = sched.pmt_add(0, 100, 48);
+    let generation = sched.pmt_slot(id).unwrap().generation;
+    let fid = sched.add_filter(0, 48, FilterTarget::Pmt(Some(id as usize)), 0);
+    assert!(fid >= 0, "could not add the PMT filter");
+    assert_eq!(sched.mark_pid_add(0, 0, 48), 0);
+    sched.update_pids(0);
+    let v1 = build_pmt(100, 1, 3301, 0, 0, &[2], &[3301]);
+    assert_eq!(sched.process_pmt(fid, &v1), 0, "v1 to parse");
+    assert_eq!(sched.pmt_slot(id).unwrap().generation, generation);
+    let v2 = build_pmt(100, 2, 3301, 0, 0, &[2, 3], &[3301, 3401]);
+    assert_eq!(sched.process_pmt(fid, &v2), 0, "v2 to parse");
+    assert_eq!(pmt_version(&sched, id), 2, "version should advance");
+    assert_eq!(
+        sched.pmt_slot(id).unwrap().generation,
+        generation,
+        "a version update keeps the generation"
+    );
+}
+
 // Ported from tests/test_pmt.cpp:3282
 #[test]
 fn version_update_keeps_claims() {

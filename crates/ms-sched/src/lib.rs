@@ -456,6 +456,7 @@ pub struct Scheduler {
     fe_map: [i16; FE_MAP_LEN],
     disabled: [bool; MAX_ADAPTERS],
     absolute_switch: bool,
+    pmt_generation: u64,
     pub(crate) pmt: pmt::PmtTables,
 }
 
@@ -475,6 +476,7 @@ impl Scheduler {
             fe_map: [-1; FE_MAP_LEN],
             disabled: [false; MAX_ADAPTERS],
             absolute_switch: false,
+            pmt_generation: 0,
             pmt: pmt::PmtTables::new(),
         }
     }
