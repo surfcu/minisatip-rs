@@ -150,7 +150,7 @@ impl DvbTransponder {
             fec: p.fec_specified.then_some(i32::from(p.fec)),
             sr: (p.sr > 0).then(|| i32::try_from(p.sr).unwrap_or(i32::MAX)),
             pol,
-            diseqc: (p.src_specified && p.src > 0).then_some(i32::from(p.src)),
+            diseqc: (p.src_specified && p.src > 0).then_some(p.src),
             diseqc_param,
             c2tft: p.c2tft,
             ds: p.ds,

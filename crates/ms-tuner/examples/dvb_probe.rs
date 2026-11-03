@@ -45,7 +45,7 @@ fn main() {
         "l" => Polarization::Left,
         other => fail(&format!("unknown polarisation '{other}'")),
     };
-    let src: u8 = parse_number(&positional[5]);
+    let src: i32 = parse_number(&positional[5]);
     let params = TuneParams {
         // The CLI stays in MHz/kSym/s; `TuneParams` uses C++ kHz/sym/s.
         freq: parse_number::<i32>(&positional[3]).saturating_mul(1_000),

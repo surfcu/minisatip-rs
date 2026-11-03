@@ -186,11 +186,7 @@ pub(crate) struct TuneInputs {
 
 /// Reads the `netcv_commit` tuning values with the C++ defaults.
 pub(crate) fn tune_inputs(tp: &TuneParams) -> TuneInputs {
-    let diseqc = if tp.src_specified {
-        i32::from(tp.src)
-    } else {
-        0
-    };
+    let diseqc = if tp.src_specified { tp.src } else { 0 };
     let diseqc = if (0..=4).contains(&diseqc) { diseqc } else { 0 };
     let pol = pol_number(tp);
     let pol = if (0..=3).contains(&pol) { pol } else { 0 };

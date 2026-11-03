@@ -660,6 +660,44 @@ fn continuity_counter_skips_all_pid_mode_and_forgets_removed_pids() {
     );
 }
 
+#[test]
+fn adapter_ccerr_sums_only_the_two_busiest_pids() {
+    let mut cc = ContinuityCounter::new();
+    // PID 0x100: 6 packets, 1 error.
+    for counter in [0u32, 1, 2, 3, 4, 6] {
+        cc.check_packet(&ts_packet(0x100, counter));
+    }
+    // PID 0x101: 4 packets, 1 error.
+    for counter in [0u32, 1, 2, 5] {
+        cc.check_packet(&ts_packet(0x101, counter));
+    }
+    // PID 0x102: 2 packets, 1 error.
+    for counter in [0u32, 5] {
+        cc.check_packet(&ts_packet(0x102, counter));
+    }
+    assert_eq!(cc.errors(), 3);
+    assert_eq!(cc.adapter_ccerr(), 2, "0x102 has the fewest packets");
+}
+
+#[test]
+fn adapter_ccerr_forgets_errors_of_removed_pids() {
+    let mut cc = ContinuityCounter::new();
+    for counter in [0u32, 1, 5] {
+        cc.check_packet(&ts_packet(0x100, counter));
+    }
+    for counter in [0u32, 1] {
+        cc.check_packet(&ts_packet(0x200, counter));
+    }
+    assert_eq!(cc.adapter_ccerr(), 1);
+
+    cc.retain_pids(&PidSet::from_pids([0x200]));
+    assert_eq!(cc.adapter_ccerr(), 0, "removed PID's errors are dropped");
+
+    cc.retain_pids(&PidSet::from_pids([0x100, 0x200]));
+    assert!(!cc.check_packet(&ts_packet(0x100, 0)));
+    assert_eq!(cc.adapter_ccerr(), 0, "re-added PID starts over");
+}
+
 /// Marks every packet it sees, to check that stages run before the outputs.
 struct MarkStage(std::sync::Arc<std::sync::atomic::AtomicU64>);
 

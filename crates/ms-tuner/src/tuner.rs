@@ -93,8 +93,8 @@ pub struct TuneParams {
     pub msys: DeliverySystem,
     /// Symbol rate in sym/s, like the C++ `transponder::sr` (`sr * 1000`).
     pub sr: u32,
-    /// Source or diSEqC input.
-    pub src: u8,
+    /// Source or diSEqC input (`std::optional<int>` in C++).
+    pub src: i32,
     /// Whether `src` was present, like the C++ optional `diseqc`.
     pub src_specified: bool,
     /// DVB code rate (`fe_code_rate_t`).
@@ -153,11 +153,7 @@ impl TuneParams {
 
     /// `tp->diseqc.value_or(0)`.
     pub fn src_value(&self) -> i32 {
-        if self.src_specified {
-            i32::from(self.src)
-        } else {
-            0
-        }
+        if self.src_specified { self.src } else { 0 }
     }
 
     /// `tp->sys.value_or(SYS_UNDEFINED)` as a `fe_delivery_system_t`.

@@ -750,6 +750,19 @@ impl Runtime {
             let running = sys::now_seconds() - self.start_unix;
             self.session
                 .set_web_clock(sys::asctime_now(), sys::elapsed_string(running));
+            let outputs: Vec<(i32, i32)> = self
+                .outputs
+                .iter()
+                .map(|(id, active)| (*id, active.adapter))
+                .collect();
+            for (id, adapter) in outputs {
+                if let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref)
+                    && let Some(stats) = handle.query(id)
+                {
+                    self.session
+                        .set_stream_output_stats(id, stats.overflow, stats.buffered);
+                }
+            }
         }
         // describe_streams prints the socket's local address (stream.cpp:97-105).
         self.session.describe_options_mut().local_host = local_ip.clone();

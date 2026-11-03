@@ -67,7 +67,7 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
             "fe" => params.fe = Some(parse_int_prefix(value, 0)),
             "src" => {
                 let src = parse_int_prefix(value, 0);
-                params.src = u8::try_from(src).unwrap_or(0);
+                params.src = src;
                 // `src=0` is unset, like `tp->diseqc = d ? optional(d) : nullopt`.
                 params.src_specified = src != 0;
             }
@@ -432,4 +432,20 @@ fn parse_float(text: &str, multiplier: f64) -> i32 {
         return 0;
     }
     value as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn src_keeps_values_above_u8() {
+        let mut params = TuneParams::default();
+        parse_satip_url(
+            "rtsp://127.0.0.1/?src=300&freq=11000&pol=h&msys=dvbs",
+            &mut params,
+        );
+        assert_eq!(params.src, 300);
+        assert_eq!(params.src_value(), 300);
+    }
 }

@@ -155,6 +155,10 @@ pub struct Stream {
     pub touched: bool,
     /// Whether `session_open` was emitted and `session_close` is still due.
     opened: bool,
+    /// Socket overflow counter (`sid->overflow`).
+    pub overflow: i32,
+    /// Bytes waiting in the write queue (`st_buffered`).
+    pub buffered: i32,
 }
 
 impl Stream {
@@ -190,6 +194,8 @@ impl Stream {
             srt_streamid: String::new(),
             touched: false,
             opened: false,
+            overflow: 0,
+            buffered: 0,
         }
     }
 
@@ -1148,6 +1154,16 @@ impl SessionManager {
         }
     }
 
+    /// Records the output's socket overflow and queued bytes for the web UI.
+    pub fn set_stream_output_stats(&mut self, id: StreamId, overflow: u64, buffered: u64) {
+        if let Some(index) = self.slot_index(id)
+            && let Some(stream) = self.streams[index].as_mut()
+        {
+            stream.overflow = overflow.min(i32::MAX as u64) as i32;
+            stream.buffered = buffered.min(i32::MAX as u64) as i32;
+        }
+    }
+
     /// Stream details in handler form.
     pub fn stream_info(&self, id: StreamId) -> Option<StreamInfo> {
         self.stream(id).map(|stream| StreamInfo {
@@ -1282,7 +1298,7 @@ impl SessionManager {
             }
             DeliverySystem::DvbS | DeliverySystem::DvbS2 => format!(
                 "ver=1.0;src={};tuner={tuner},{strength},{status},{snr},{},{},{},{},{},{},{},{};pids=",
-                i32::from(params.src),
+                params.src,
                 params.freq / 1_000,
                 polarization_name(params.pol),
                 delivery_system_name(params.msys),
@@ -1442,7 +1458,7 @@ impl SessionManager {
                     .copied()
                     .filter(|sys| *sys != DeliverySystem::Undefined)
                     .collect(),
-                pos: i32::from(params.src),
+                pos: params.src,
                 freq: params.freq,
                 pol: polarization_code(params.pol),
                 sr: params.sr,
@@ -1509,7 +1525,8 @@ impl SessionManager {
                 protocol: protocol_name(stream.stream_type).to_owned(),
                 // get_stream_pids: the adapter's active pids carrying this stream.
                 pids: self.sched.stream_pids(stream.adapter, index as StreamId),
-                ..StreamState::default()
+                overflow: stream.overflow,
+                buffered: stream.buffered,
             };
         }
         snapshot.ca = self.web_ca.clone();
@@ -1933,5 +1950,22 @@ mod tests {
 
         // stream.cpp:1346: `sid->timeout == 1` closes without waiting.
         assert_eq!(manager.expired_streams(), vec![id]);
+    }
+
+    #[test]
+    fn output_stats_reach_the_web_snapshot() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut manager = manual_manager(&clock);
+        let id = manager.add_stream().expect("slot");
+        manager.set_stream_output_stats(id, 123, 456);
+
+        let snapshot = manager.web_snapshot();
+        assert_eq!(snapshot.streams[id as usize].overflow, 123);
+        assert_eq!(snapshot.streams[id as usize].buffered, 456);
+
+        manager.set_stream_output_stats(id, u64::MAX, u64::MAX);
+        let snapshot = manager.web_snapshot();
+        assert_eq!(snapshot.streams[id as usize].overflow, i32::MAX);
+        assert_eq!(snapshot.streams[id as usize].buffered, i32::MAX);
     }
 }

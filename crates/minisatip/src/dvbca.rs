@@ -871,7 +871,7 @@ impl Worker {
         {
             for parity in 0..2u8 {
                 let slot = usize::from(parity);
-                if dev.key[slot][0] != 0 {
+                if dev.key[slot] != [0; 16] {
                     let _ = self.notices.send(Notice::CcKey {
                         pmt_ids: vec![(id, generation)],
                         parity,
@@ -2699,7 +2699,9 @@ mod ciplus_worker_tests {
             "register 1 is still empty, so nothing is replayed for it"
         );
 
-        // ca.cpp:993-996: an unchanged update is not re-sent but still counts as sent.
+        // ca.cpp:993-996: an unchanged update is not re-sent but still counts as sent,
+        // and a stored key whose first byte is 0x00 is still replayed.
+        worker.registry.get_mut(0).unwrap().key[0][0] = 0;
         let (reply, answers) = mpsc::channel();
         worker.handle(Request::AddPmt {
             program: Box::new(program.clone()),
