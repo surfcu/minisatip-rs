@@ -1212,6 +1212,16 @@ fn pid_order_reset_on_remove() {
     sched.update_pids(0);
 }
 
+// F4-4: a PID added only for DDCI_SID must not take a subscription order.
+#[test]
+fn ddci_sid_does_not_take_subscription_order() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    assert_eq!(sched.mark_pid_add(0, DDCI_SID, 500), 0);
+    assert_eq!(sched.find_pid(0, 500).unwrap().order, 0);
+    assert_eq!(sched.mark_pid_add(0, 0, 500), 0);
+    assert!(sched.find_pid(0, 500).unwrap().order > 0);
+}
+
 // Ported from tests/test_pmt.cpp:1521
 #[test]
 fn d8_shared_pid() {
