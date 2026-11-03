@@ -48,6 +48,19 @@ impl Server {
     }
 
     fn start_bound(replay: &Path, bind: Option<&str>) -> io::Result<Self> {
+        Self::start_with(replay, bind, None, None)
+    }
+
+    fn start_with_web(replay: &Path, document_root: &Path) -> io::Result<Self> {
+        Self::start_with(replay, Some("127.0.0.1"), Some(document_root), Some(128))
+    }
+
+    fn start_with(
+        replay: &Path,
+        bind: Option<&str>,
+        document_root: Option<&Path>,
+        max_sbuf: Option<i32>,
+    ) -> io::Result<Self> {
         let _start_guard = START_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -58,6 +71,12 @@ impl Server {
         let mut command = Command::new(env!("CARGO_BIN_EXE_minisatip"));
         if let Some(bind) = bind {
             command.args(["-V", bind]);
+        }
+        if let Some(document_root) = document_root {
+            command.args(["-R", document_root.to_str().unwrap_or(".")]);
+        }
+        if let Some(max_sbuf) = max_sbuf {
+            command.args(["-B", &max_sbuf.to_string()]);
         }
         let mut child = command
             .args([
@@ -120,6 +139,17 @@ fn start_server(capture: &Capture) -> io::Result<Server> {
     let mut last_error = None;
     for _ in 0..3 {
         match Server::start(&capture.0) {
+            Ok(server) => return Ok(server),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("server did not start")))
+}
+
+fn start_server_with_web(capture: &Capture, document_root: &Path) -> io::Result<Server> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        match Server::start_with_web(&capture.0, document_root) {
             Ok(server) => return Ok(server),
             Err(error) => last_error = Some(error),
         }
@@ -323,6 +353,65 @@ fn http_reget_hides_reply() -> io::Result<()> {
         !data.windows(5).any(|window| window == b"HTTP/"),
         "no second HTTP header inside the stream"
     );
+    Ok(())
+}
+
+#[test]
+fn slow_http_reader_does_not_block_rtsp() -> io::Result<()> {
+    let capture = generate_ts()?;
+    let web_dir = unique_dir();
+    fs::create_dir_all(&web_dir)?;
+    // More than the kernel send and receive buffers hold, so part of it must wait.
+    let size = 32 * 1024 * 1024;
+    let big = fs::File::create(web_dir.join("big.bin"))?;
+    big.set_len(size as u64)?;
+    drop(big);
+    let server = start_server_with_web(&capture, &web_dir)?;
+
+    let mut slow = TcpStream::connect(("127.0.0.1", server.http_port))?;
+    slow.set_write_timeout(Some(TIMEOUT))?;
+    slow.write_all(b"GET /big.bin HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")?;
+    slow.flush()?;
+    thread::sleep(Duration::from_millis(300));
+
+    let mut rtsp = TcpStream::connect(("127.0.0.1", server.rtsp_port))?;
+    rtsp.set_read_timeout(Some(Duration::from_secs(1)))?;
+    rtsp.set_write_timeout(Some(TIMEOUT))?;
+    let base = format!("rtsp://127.0.0.1:{}/", server.rtsp_port);
+    let started = Instant::now();
+    let (status, _, _) = request(
+        &mut rtsp,
+        &format!("OPTIONS {base} RTSP/1.0\r\nCSeq: 1\r\n\r\n"),
+    )?;
+    let elapsed = started.elapsed();
+    assert_eq!(status, 200, "OPTIONS");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "OPTIONS waited {elapsed:?} for a slow HTTP client"
+    );
+
+    slow.set_read_timeout(Some(TIMEOUT))?;
+    let mut data = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = slow.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..read]);
+    }
+    let header_end = data
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("HTTP header")
+        + 4;
+    assert!(
+        data.starts_with(b"HTTP/1.0 200"),
+        "slow client status: {}",
+        String::from_utf8_lossy(&data[..header_end.min(data.len())])
+    );
+    assert_eq!(data.len() - header_end, size, "body size");
+    let _ = fs::remove_dir_all(&web_dir);
     Ok(())
 }
 
