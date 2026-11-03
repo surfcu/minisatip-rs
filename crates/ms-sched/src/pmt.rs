@@ -1514,6 +1514,7 @@ impl Scheduler {
             .map_or(0, |adapter| adapter.transponder_id);
         Some(CaService {
             pmt_id: pmt_id as usize,
+            generation: pmt.generation,
             adapter: usize::try_from(pmt.adapter).unwrap_or(0),
             hw_adapter: 0,
             hw_demux: 0,

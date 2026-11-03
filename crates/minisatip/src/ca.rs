@@ -557,7 +557,26 @@ impl CaRuntime {
                 }
             }
             Notice::Released(ids) => {
-                for pmt_id in ids {
+                for (pmt_id, generation) in ids {
+                    let Some(pmt) = sched.pmt(pmt_id) else {
+                        ms_log::debugm!(
+                            "CA {}: notice for pmt {} gen {} dropped, slot is gone",
+                            ca_id,
+                            pmt_id,
+                            generation
+                        );
+                        continue;
+                    };
+                    if pmt.generation != generation {
+                        ms_log::debugm!(
+                            "CA {}: notice for pmt {} gen {} dropped, slot now gen {}",
+                            ca_id,
+                            pmt_id,
+                            generation,
+                            pmt.generation
+                        );
+                        continue;
+                    }
                     sched.clear_pmt_ca_masks(pmt_id, ca_id, true);
                     let aid = sched
                         .pmt(pmt_id)
@@ -576,13 +595,29 @@ impl CaRuntime {
                 iv,
                 expiry_s,
             } => {
-                for pmt_id in pmt_ids {
-                    let Some(aid) = sched
-                        .pmt(pmt_id as i32)
-                        .and_then(|pmt| usize::try_from(pmt.adapter).ok())
-                    else {
+                for (pmt_id, generation) in pmt_ids {
+                    let Some(pmt) = sched.pmt(pmt_id as i32) else {
                         // `send_cw` (pmt.cpp:830-831): C++ logs the missing PMT.
                         ms_log::log!("send_cw: pmt not found {}", pmt_id);
+                        ms_log::debugm!(
+                            "CA {}: notice for pmt {} gen {} dropped, slot is gone",
+                            ca_id,
+                            pmt_id,
+                            generation
+                        );
+                        continue;
+                    };
+                    if pmt.generation != generation {
+                        ms_log::debugm!(
+                            "CA {}: notice for pmt {} gen {} dropped, slot now gen {}",
+                            ca_id,
+                            pmt_id,
+                            generation,
+                            pmt.generation
+                        );
+                        continue;
+                    }
+                    let Some(aid) = usize::try_from(pmt.adapter).ok() else {
                         continue;
                     };
                     self.sync_adapter(sched, aid);
@@ -612,11 +647,27 @@ impl CaRuntime {
                 let _ = (id, kind);
             }
             Notice::DisableCws(pmt_ids) => {
-                for pmt_id in pmt_ids {
-                    let Some(aid) = sched
-                        .pmt(pmt_id as i32)
-                        .and_then(|pmt| usize::try_from(pmt.adapter).ok())
-                    else {
+                for (pmt_id, generation) in pmt_ids {
+                    let Some(pmt) = sched.pmt(pmt_id as i32) else {
+                        ms_log::debugm!(
+                            "CA {}: notice for pmt {} gen {} dropped, slot is gone",
+                            ca_id,
+                            pmt_id,
+                            generation
+                        );
+                        continue;
+                    };
+                    if pmt.generation != generation {
+                        ms_log::debugm!(
+                            "CA {}: notice for pmt {} gen {} dropped, slot now gen {}",
+                            ca_id,
+                            pmt_id,
+                            generation,
+                            pmt.generation
+                        );
+                        continue;
+                    }
+                    let Some(aid) = usize::try_from(pmt.adapter).ok() else {
                         continue;
                     };
                     self.sync_adapter(sched, aid);
@@ -2065,6 +2116,19 @@ mod wiring_tests {
         (ca, rx)
     }
 
+    fn ca_with_dvbca() -> (CaRuntime, Receiver<DescramblerCommand>) {
+        let (mut ca, rx) = ca_with_descrambler();
+        let (_notices, notices_rx) = mpsc::channel();
+        ca.dvbca = Some(DvbcaState {
+            dvbca: Rc::new(Dvbca::from_notices(notices_rx)),
+            caids: Rc::new(RefCell::new(BTreeMap::new())),
+            pending: PendingOffers::default(),
+            ca_id: 0,
+            requested: None,
+        });
+        (ca, rx)
+    }
+
     fn start_pmt(sched: &mut Scheduler, sid: i32, pmt_pid: i32, pids: &[i32]) -> i32 {
         let id = sched.pmt_add(0, sid, pmt_pid);
         for &pid in pids {
@@ -2145,6 +2209,125 @@ mod wiring_tests {
     }
 
     #[test]
+    fn stale_cckey_notice_is_dropped_after_pmt_reuse() {
+        use ms_ca_drivers::en50221::device::CcKeyBytes;
+        let mut sched = sched();
+        let (mut ca, rx) = ca_with_dvbca();
+        let old = sched.pmt_add(0, 100, 0x100);
+        let old_gen = sched.pmt(old).unwrap().generation;
+        sched.pmt_del(old);
+        let reused = sched.pmt_add(0, 200, 0x200);
+        assert_eq!(reused, old, "the freed id should be reused");
+
+        ca.handle_notice_for_test(
+            &mut sched,
+            Notice::CcKey {
+                pmt_ids: vec![(old as usize, old_gen)],
+                parity: 0,
+                key: CcKeyBytes([0x11; 16]),
+                iv: CcKeyBytes([0x22; 16]),
+                expiry_s: 3720,
+            },
+        );
+        assert!(
+            !rx.try_iter()
+                .any(|c| matches!(c, DescramblerCommand::CwWithIv { .. })),
+            "a key for the old generation must not reach the reused slot"
+        );
+
+        let new_gen = sched.pmt(reused).unwrap().generation;
+        ca.handle_notice_for_test(
+            &mut sched,
+            Notice::CcKey {
+                pmt_ids: vec![(reused as usize, new_gen)],
+                parity: 0,
+                key: CcKeyBytes([0x33; 16]),
+                iv: CcKeyBytes([0x44; 16]),
+                expiry_s: 3720,
+            },
+        );
+        assert!(
+            rx.try_iter().any(|c| matches!(
+                c,
+                DescramblerCommand::CwWithIv { pmt_id, .. } if pmt_id == reused as usize
+            )),
+            "a key for the current generation still applies"
+        );
+    }
+
+    #[test]
+    fn stale_released_notice_keeps_the_reused_pmts_masks() {
+        let mut sched = sched();
+        let (mut ca, rx) = ca_with_dvbca();
+        let old = sched.pmt_add(0, 100, 0x100);
+        let old_gen = sched.pmt(old).unwrap().generation;
+        sched.pmt_del(old);
+        let reused = sched.pmt_add(0, 200, 0x200);
+        assert_eq!(reused, old, "the freed id should be reused");
+        {
+            let pmt = sched.pmt_slot_mut(reused).unwrap();
+            pmt.ca_mask = 1;
+            pmt.ca_registered_mask = 1;
+            pmt.disabled_ca_mask = 1;
+        }
+
+        ca.handle_notice_for_test(&mut sched, Notice::Released(vec![(old, old_gen)]));
+        let pmt = sched.pmt(reused).unwrap();
+        assert_eq!((pmt.ca_mask, pmt.ca_registered_mask), (1, 1));
+        assert!(
+            !rx.try_iter()
+                .any(|c| matches!(c, DescramblerCommand::DisableCw { .. })),
+            "a release for the old generation must not touch the reused slot"
+        );
+
+        let new_gen = sched.pmt(reused).unwrap().generation;
+        ca.handle_notice_for_test(&mut sched, Notice::Released(vec![(reused, new_gen)]));
+        let pmt = sched.pmt(reused).unwrap();
+        assert_eq!((pmt.ca_mask, pmt.ca_registered_mask), (0, 0));
+        assert!(
+            rx.try_iter().any(|c| matches!(
+                c,
+                DescramblerCommand::DisableCw { pmt_id } if pmt_id == reused as usize
+            )),
+            "a release for the current generation applies"
+        );
+    }
+
+    #[test]
+    fn stale_disable_cws_notice_is_dropped_after_pmt_reuse() {
+        let mut sched = sched();
+        let (mut ca, rx) = ca_with_dvbca();
+        let old = sched.pmt_add(0, 100, 0x100);
+        let old_gen = sched.pmt(old).unwrap().generation;
+        sched.pmt_del(old);
+        let reused = sched.pmt_add(0, 200, 0x200);
+        assert_eq!(reused, old, "the freed id should be reused");
+
+        ca.handle_notice_for_test(
+            &mut sched,
+            Notice::DisableCws(vec![(old as usize, old_gen)]),
+        );
+        assert!(
+            !rx.try_iter()
+                .any(|c| matches!(c, DescramblerCommand::DisableCw { .. })),
+            "a disable for the old generation must not reach the reused slot"
+        );
+
+        let new_gen = sched.pmt(reused).unwrap().generation;
+        ca.handle_notice_for_test(
+            &mut sched,
+            Notice::DisableCws(vec![(reused as usize, new_gen)]),
+        );
+        assert!(
+            rx.try_iter().any(|c| matches!(
+                c,
+                DescramblerCommand::DisableCw { pmt_id } if pmt_id == reused as usize
+            )),
+            "a disable for the current generation applies"
+        );
+    }
+
+    #[test]
     fn stale_dvbapi_filter_ids_are_forgotten() {
         let opts = Options {
             dvbapi_host: "127.0.0.1".to_owned(),
@@ -2200,7 +2383,7 @@ mod wiring_tests {
         });
         notices
             .send(Notice::CcKey {
-                pmt_ids: vec![pmt_id as usize],
+                pmt_ids: vec![(pmt_id as usize, sched.pmt(pmt_id).unwrap().generation)],
                 parity: 1,
                 key: CcKeyBytes([0x11; 16]),
                 iv: CcKeyBytes([0x22; 16]),
@@ -2259,7 +2442,10 @@ mod wiring_tests {
             requested: None,
         });
         notices
-            .send(Notice::DisableCws(vec![pmt_id as usize]))
+            .send(Notice::DisableCws(vec![(
+                pmt_id as usize,
+                sched.pmt(pmt_id).unwrap().generation,
+            )]))
             .unwrap();
         ca.dvbca_notices(&mut sched);
         let commands: Vec<DescramblerCommand> = rx.try_iter().collect();

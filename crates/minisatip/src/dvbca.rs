@@ -187,21 +187,22 @@ pub enum Notice {
     Usable(usize),
     /// CA_INFO: the CAM descrambles these CAIDs (`add_caid_mask`).
     Caids(usize, Vec<u16>),
-    /// `ca_release_pmts`: these PMTs must be offered again.
-    Released(Vec<i32>),
+    /// `ca_release_pmts`: these `(PMT id, generation)` must be offered again.
+    Released(Vec<(i32, u64)>),
     /// The device's `ca_sym` fields changed (status page).
     State(usize, DeviceView),
-    /// `send_cw_to_all_pmts`: a CI+ key for these PMT ids. The bytes are never printed.
+    /// `send_cw_to_all_pmts`: a CI+ key for these `(PMT id, generation)`.
+    /// The bytes are never printed.
     CcKey {
-        pmt_ids: Vec<usize>,
+        pmt_ids: Vec<(usize, u64)>,
         parity: u8,
         key: CcKeyBytes,
         iv: CcKeyBytes,
         /// CW lifetime: 3720 s for a new key, 3600 s for a replay on join.
         expiry_s: i64,
     },
-    /// `disable_cws_for_all_pmts`: stop descrambling these PMTs.
-    DisableCws(Vec<usize>),
+    /// `disable_cws_for_all_pmts`: stop descrambling these `(PMT id, generation)`.
+    DisableCws(Vec<(usize, u64)>),
     /// MMI menu or enquiry from the CAM in CA `id` (`--ddci-capture` trigger).
     MmiTrigger { id: usize, kind: &'static str },
 }
@@ -487,6 +488,7 @@ fn same_offer(a: &Program, b: &Program) -> bool {
 pub(crate) fn program_from_service(service: &CaService) -> Program {
     let mut program = Program {
         id: service.pmt_id as i32,
+        generation: service.generation,
         adapter: service.adapter as u16,
         sid: service.sid,
         pid: service.pmt_pid,
@@ -555,6 +557,14 @@ fn capmt_pmt_ids(capmt: &ms_ca::CaDevice) -> Vec<usize> {
         }
     }
     ids
+}
+
+/// A notice's `(PMT id, generation)`: an unknown program cannot match a slot.
+fn pmt_ref(programs: &ProgramTable, pmt_id: usize) -> (usize, u64) {
+    (
+        pmt_id,
+        programs.get(pmt_id as i32).map_or(0, |p| p.generation),
+    )
 }
 
 struct Worker {
@@ -763,6 +773,7 @@ impl Worker {
             ms_log::log!("CAM not yet initialized");
             return TablesResult::Retry;
         }
+        let generation = program.generation;
         self.programs.insert(program);
         let before = capmt_ids(capmt);
         let result = capmt.process_pmt(pmt_id, update, &self.programs, &mut SlotDriver(&mut *dev));
@@ -777,7 +788,7 @@ impl Worker {
                 let slot = usize::from(parity);
                 if dev.key[slot][0] != 0 {
                     let _ = self.notices.send(Notice::CcKey {
-                        pmt_ids: vec![id],
+                        pmt_ids: vec![(id, generation)],
                         parity,
                         key: CcKeyBytes(dev.key[slot]),
                         iv: CcKeyBytes(dev.iv[slot]),
@@ -987,6 +998,10 @@ impl Worker {
                     let released = capmt.release_pmts();
                     dev.cam_recovery_pmts_changed();
                     if !released.is_empty() {
+                        let released = released
+                            .into_iter()
+                            .map(|id| (id, self.programs.get(id).map_or(0, |p| p.generation)))
+                            .collect();
                         let _ = self.notices.send(Notice::Released(released));
                     }
                 }
@@ -1009,6 +1024,10 @@ impl Worker {
                 HostEvent::MmiMenu { .. } | HostEvent::MmiEnquiry { .. } => {}
                 HostEvent::CcKey { parity, key, iv } => {
                     let pmt_ids = capmt_pmt_ids(capmt);
+                    let pmt_refs: Vec<(usize, u64)> = pmt_ids
+                        .iter()
+                        .map(|id| pmt_ref(&self.programs, *id))
+                        .collect();
                     ms_log::diag::events::ciplus_key(
                         i64::try_from(id).unwrap_or(0),
                         i64::from(parity),
@@ -1021,7 +1040,7 @@ impl Worker {
                         },
                     );
                     let _ = self.notices.send(Notice::CcKey {
-                        pmt_ids,
+                        pmt_ids: pmt_refs,
                         parity,
                         key,
                         iv,
@@ -1029,7 +1048,10 @@ impl Worker {
                     });
                 }
                 HostEvent::CcDisableCws => {
-                    let pmt_ids = capmt_pmt_ids(capmt);
+                    let pmt_ids = capmt_pmt_ids(capmt)
+                        .into_iter()
+                        .map(|id| pmt_ref(&self.programs, id))
+                        .collect();
                     let _ = self.notices.send(Notice::DisableCws(pmt_ids));
                 }
                 HostEvent::CloseRequested => {}
@@ -2171,6 +2193,8 @@ mod ciplus_worker_tests {
                 pid: 0x101,
             }],
             av_pids: vec![0x101],
+            // Nonzero, so the notices prove the generation is passed through.
+            generation: 7,
             ..CaService::default()
         }
     }
@@ -2247,7 +2271,9 @@ mod ciplus_worker_tests {
                     key,
                     iv,
                     expiry_s,
-                } if pmt_ids == &[program.id as usize] => Some((key.0, iv.0, *expiry_s)),
+                } if pmt_ids == &[(program.id as usize, program.generation)] => {
+                    Some((key.0, iv.0, *expiry_s))
+                }
                 _ => None,
             })
             .expect("the stored key is replayed to the joining PMT");
@@ -2273,7 +2299,7 @@ mod ciplus_worker_tests {
             drain(&rx).iter().any(|notice| matches!(
                 notice,
                 Notice::CcKey { pmt_ids, parity: 0, expiry_s: 3600, .. }
-                    if pmt_ids == &[program.id as usize]
+                    if pmt_ids == &[(program.id as usize, program.generation)]
             )),
             "an unchanged update replays the stored key too"
         );
@@ -2317,7 +2343,7 @@ mod ciplus_worker_tests {
             panic!("matched above")
         };
         assert!(
-            pmt_ids.contains(&(program.id as usize)),
+            pmt_ids.contains(&(program.id as usize, program.generation)),
             "the offered PMT is addressed: {pmt_ids:?}"
         );
         let status = cam.lock().unwrap().ciplus_status().expect("CI+ CAM");

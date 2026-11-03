@@ -58,6 +58,8 @@ pub struct SdtInfo {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Program {
     pub id: i32,
+    /// Creation generation of the PMT slot, to detect a reused id.
+    pub generation: u64,
     pub adapter: u16,
     pub sid: u16,
     pub pid: u16,

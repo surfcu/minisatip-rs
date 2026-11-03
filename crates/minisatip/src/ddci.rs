@@ -982,6 +982,7 @@ mod tests {
             .get_all_pmt_for_sid(1, i32::from(SID))
             .expect("CI-side PMT")
             .id;
+        let ci_generation = sched.pmt(ci_pmt as i32).expect("CI-side PMT").generation;
 
         // Key routing only: the PMT pid gets an ES claim so packets on it decrypt;
         // ES-pid mapping is covered by ca.rs `ci_adapter_decrypts_before_the_fifo`.
@@ -997,7 +998,7 @@ mod tests {
         ca.handle_notice_for_test(
             &mut sched,
             Notice::CcKey {
-                pmt_ids: vec![ci_pmt],
+                pmt_ids: vec![(ci_pmt, ci_generation)],
                 parity: PARITY,
                 key: CcKeyBytes(key),
                 iv: CcKeyBytes(iv),

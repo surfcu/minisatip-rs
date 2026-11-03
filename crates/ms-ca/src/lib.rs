@@ -26,6 +26,8 @@ pub struct StreamPid {
 pub struct CaService {
     /// PMT slot id; identifies the service in every op and event.
     pub pmt_id: usize,
+    /// Creation generation of the PMT slot, to detect a reused id.
+    pub generation: u64,
     /// Logical adapter id.
     pub adapter: usize,
     /// Physical adapter number (`ad->pa`), used by local-socket DVBAPI.
