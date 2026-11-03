@@ -4,10 +4,10 @@
 //! accepted connection has a reader thread that parses requests and forwards
 //! them here. Adapters run on their own data-plane threads.
 
-use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -54,9 +54,13 @@ use crate::sys;
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOP_TICK: Duration = Duration::from_millis(20);
+/// Poll interval while replies are waiting for the socket to drain.
+const PENDING_POLL: Duration = Duration::from_millis(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 /// `set_linux_socket_timeout`: 1 s 100 ms (socketworks.cpp:374-386).
 const SSDP_READ_TIMEOUT: Duration = Duration::from_millis(1100);
+const OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(1100);
+const PENDING_STALL: Duration = Duration::from_secs(30);
 
 /// Fixed runtime values shared by every request.
 struct ServerConfig {
@@ -182,6 +186,15 @@ enum Inbound {
     Closed(u64, i32),
 }
 
+/// Bytes the main loop could not send without blocking.
+struct PendingReply {
+    writer: TcpStream,
+    data: Vec<u8>,
+    offset: usize,
+    close_when_flushed: bool,
+    last_progress: Instant,
+}
+
 /// Outputs started by PLAY/GET, tracked so they can be stopped or re-targeted.
 struct ActiveOutput {
     conn_id: u64,
@@ -229,6 +242,8 @@ struct Runtime {
     ca: CaRuntime,
     /// Close timeout armed on HTTP connections (`s->timeout_ms`).
     close_timeouts: HashMap<u64, i32>,
+    pending_replies: HashMap<u64, PendingReply>,
+    overflow_logged: HashSet<u64>,
 }
 
 impl Runtime {
@@ -476,22 +491,44 @@ impl Runtime {
             xml_poll,
             ca,
             close_timeouts: HashMap::new(),
+            pending_replies: HashMap::new(),
+            overflow_logged: HashSet::new(),
         })
     }
 
     fn run(&mut self, receiver: &Receiver<Inbound>, shutdown: &AtomicBool) {
         while !shutdown.load(Ordering::SeqCst) && !sys::shutdown_requested() {
-            match receiver.recv_timeout(LOOP_TICK) {
+            let tick = if self.pending_replies.is_empty() {
+                LOOP_TICK
+            } else {
+                PENDING_POLL
+            };
+            match receiver.recv_timeout(tick) {
                 Ok(Inbound::Request(message)) => self.handle_request(*message),
                 Ok(Inbound::Interleaved(conn_id)) => {
                     if let Some(id) = self.conn_streams.get(&conn_id).copied() {
                         self.session.touch_stream(id);
                     }
                 }
-                Ok(Inbound::Closed(conn_id, fd)) => self.close_connection(conn_id, fd),
+                Ok(Inbound::Closed(conn_id, fd)) => {
+                    self.close_connection(conn_id, fd);
+                    match self.pending_replies.get_mut(&conn_id) {
+                        Some(pending) if pending.offset < pending.data.len() => {
+                            pending.close_when_flushed = true;
+                        }
+                        Some(_) => {
+                            self.pending_replies.remove(&conn_id);
+                            self.overflow_logged.remove(&conn_id);
+                        }
+                        None => {
+                            self.overflow_logged.remove(&conn_id);
+                        }
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+            self.flush_pending();
             self.expire_streams();
             ACTIVE_STREAMS.store(self.session.active_streams(), Ordering::Relaxed);
             self.drain_events();
@@ -661,7 +698,7 @@ impl Runtime {
             protocol,
             peer,
             local_ip,
-            mut writer,
+            writer,
             request,
             reads,
             fd,
@@ -811,8 +848,7 @@ impl Runtime {
                         })
                     })
             });
-            write_failed =
-                !queued && (writer.write_all(&bytes).is_err() || writer.flush().is_err());
+            write_failed = !queued && !self.send_reply(conn_id, &writer, &bytes);
         }
         match sid {
             Some(id) => {
@@ -831,7 +867,12 @@ impl Runtime {
         if protocol == Protocol::Http
             && !(request.method.eq_ignore_ascii_case("GET") && request.uri.contains("/?"))
         {
-            let _ = writer.shutdown(std::net::Shutdown::Both);
+            match self.pending_replies.get_mut(&conn_id) {
+                Some(pending) => pending.close_when_flushed = true,
+                None => {
+                    let _ = writer.shutdown(std::net::Shutdown::Both);
+                }
+            }
         }
 
         let Some(id) = sid else {
@@ -849,6 +890,191 @@ impl Runtime {
         // PID changes move PMT claims (pmt_pid_updated_pids); push them to the data planes.
         self.ca
             .after_scheduler(self.session.scheduler_mut(), &self.handles);
+    }
+
+    /// Writes a reply with `MSG_DONTWAIT`; unsent bytes wait for the main loop.
+    fn send_reply(&mut self, conn_id: u64, writer: &TcpStream, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        if self.pending_replies.contains_key(&conn_id) {
+            return self.queue_reply(conn_id, writer, bytes, 0);
+        }
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match send_now(writer.as_raw_fd(), &bytes[offset..]) {
+                Ok(0) => break,
+                Ok(written) => offset += written,
+                Err(error) if would_block(&error) => break,
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(_) => return false,
+            }
+        }
+        if offset == bytes.len() {
+            return true;
+        }
+        self.queue_reply(conn_id, writer, bytes, offset)
+    }
+
+    /// Appends the unsent part of a reply to the connection's FIFO.
+    fn queue_reply(
+        &mut self,
+        conn_id: u64,
+        writer: &TcpStream,
+        bytes: &[u8],
+        offset: usize,
+    ) -> bool {
+        let remaining = &bytes[offset..];
+        let fifo_size = self.config.fifo_size;
+        if let Some(pending) = self.pending_replies.get_mut(&conn_id) {
+            let used = pending.data.len().saturating_sub(pending.offset);
+            if used.saturating_add(remaining.len()) > fifo_size {
+                self.log_overflow(conn_id, remaining.len(), bytes.len(), offset);
+            } else {
+                pending.data.extend_from_slice(remaining);
+            }
+            return true;
+        }
+        if remaining.len() > fifo_size {
+            self.log_overflow(conn_id, remaining.len(), bytes.len(), offset);
+            return true;
+        }
+        let Ok(writer) = writer.try_clone() else {
+            return false;
+        };
+        self.pending_replies.insert(
+            conn_id,
+            PendingReply {
+                writer,
+                data: remaining.to_vec(),
+                offset: 0,
+                close_when_flushed: false,
+                last_progress: Instant::now(),
+            },
+        );
+        true
+    }
+
+    /// socketworks.cpp:1489-1496 logs the first overflow of a socket.
+    fn log_overflow(&mut self, conn_id: u64, overflow: usize, len: usize, offset: usize) {
+        if self.overflow_logged.insert(conn_id) {
+            ms_log::log!(
+                "Insufficient bandwidth: sock {}: overflow {} bytes, len {}, offset {}",
+                conn_id,
+                overflow,
+                len,
+                offset
+            );
+        }
+    }
+
+    /// Sends each pending reply until the socket would block; closes once drained.
+    fn flush_pending(&mut self) {
+        if self.pending_replies.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        enum Action {
+            Remove,
+            Close,
+        }
+        let mut actions = Vec::new();
+        for (&conn_id, pending) in &mut self.pending_replies {
+            let mut hard_error = false;
+            while pending.offset < pending.data.len() {
+                match send_now(pending.writer.as_raw_fd(), &pending.data[pending.offset..]) {
+                    Ok(0) => break,
+                    Ok(written) => {
+                        pending.offset += written;
+                        pending.last_progress = now;
+                    }
+                    Err(error) if would_block(&error) => break,
+                    Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                    Err(_) => {
+                        hard_error = true;
+                        break;
+                    }
+                }
+            }
+            if hard_error {
+                actions.push((conn_id, Action::Close));
+            } else if pending.offset >= pending.data.len() {
+                pending.data.clear();
+                pending.offset = 0;
+                actions.push((
+                    conn_id,
+                    if pending.close_when_flushed {
+                        Action::Close
+                    } else {
+                        Action::Remove
+                    },
+                ));
+            } else if now.duration_since(pending.last_progress) >= PENDING_STALL {
+                actions.push((conn_id, Action::Close));
+            }
+        }
+        for (conn_id, action) in actions {
+            let Some(pending) = self.pending_replies.remove(&conn_id) else {
+                continue;
+            };
+            if matches!(action, Action::Close) {
+                let _ = pending.writer.shutdown(std::net::Shutdown::Both);
+                self.overflow_logged.remove(&conn_id);
+            }
+        }
+    }
+
+    /// Drains a queued reply before a TCP output takes the socket over.
+    fn flush_reply_sync(&mut self, conn_id: u64) -> bool {
+        let Some(mut pending) = self.pending_replies.remove(&conn_id) else {
+            return true;
+        };
+        let deadline = Instant::now() + OUTPUT_FLUSH_TIMEOUT;
+        loop {
+            while pending.offset < pending.data.len() {
+                match send_now(pending.writer.as_raw_fd(), &pending.data[pending.offset..]) {
+                    Ok(0) => break,
+                    Ok(written) => {
+                        pending.offset += written;
+                        pending.last_progress = Instant::now();
+                    }
+                    Err(error) if would_block(&error) => break,
+                    Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                    Err(_) => {
+                        let _ = pending.writer.shutdown(std::net::Shutdown::Both);
+                        self.overflow_logged.remove(&conn_id);
+                        return false;
+                    }
+                }
+            }
+            if pending.offset >= pending.data.len() {
+                if pending.close_when_flushed {
+                    let _ = pending.writer.shutdown(std::net::Shutdown::Both);
+                    self.overflow_logged.remove(&conn_id);
+                    return false;
+                }
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let millis = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as i32;
+            match poll_writable(pending.writer.as_raw_fd(), millis) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => {}
+                Err(_) => {
+                    let _ = pending.writer.shutdown(std::net::Shutdown::Both);
+                    self.overflow_logged.remove(&conn_id);
+                    return false;
+                }
+            }
+        }
+        ms_log::log!("sock {}: reply not flushed in 1100 ms, closing", conn_id);
+        let _ = pending.writer.shutdown(std::net::Shutdown::Both);
+        self.overflow_logged.remove(&conn_id);
+        false
     }
 
     /// Copies the live RTP sequence into the session for `RTP-Info`
@@ -954,6 +1180,12 @@ impl Runtime {
             stream.srt_sock,
         );
         if adapter < 0 {
+            return;
+        }
+        if matches!(stream_type, StreamType::RtspTcp | StreamType::Http)
+            && !self.flush_reply_sync(conn_id)
+        {
+            self.stop_output(id);
             return;
         }
         let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref) else {
@@ -1548,6 +1780,55 @@ fn udp_destination(stream: &ms_net::session::Stream) -> Option<SocketAddr> {
     }
     let ip = stream.remote_host.parse::<IpAddr>().ok()?;
     Some(SocketAddr::new(ip, stream.remote_port))
+}
+
+fn would_block(error: &io::Error) -> bool {
+    let code = error.raw_os_error();
+    code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK)
+}
+
+#[allow(unsafe_code)]
+fn send_now(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: `fd` is an open socket and `data` is valid for its length.
+        let result = unsafe {
+            libc::send(
+                fd,
+                data.as_ptr().cast(),
+                data.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        return Ok(result as usize);
+    }
+}
+
+#[allow(unsafe_code)]
+fn poll_writable(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `descriptor` is a valid pollfd and the count is one.
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        return Ok(result > 0);
+    }
 }
 
 fn fifo_size(max_sbuf: i32) -> usize {
