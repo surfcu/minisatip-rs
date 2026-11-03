@@ -800,10 +800,7 @@ impl Scheduler {
             return true;
         };
         let mapped = self.absolute_source(index, tp.src, tp.msys);
-        let old_src = adapter
-            .params
-            .src_specified
-            .then(|| i32::from(adapter.params.src));
+        let old_src = adapter.params.src_specified.then_some(adapter.params.src);
         if old_src != Some(mapped) {
             return true;
         }
@@ -847,7 +844,7 @@ impl Scheduler {
         }
         let pol = (polarization_code(tp) - 1) & 1;
         let diseqc = if tp.src_specified && tp.src > 0 {
-            i32::from(tp.src) - 1
+            tp.src - 1
         } else {
             0
         };
@@ -896,7 +893,7 @@ impl Scheduler {
         {
             return true;
         }
-        let src = i32::from(tp.src);
+        let src = tp.src;
         if src <= 0 || (src as usize) > MAX_SOURCES {
             return true;
         }
@@ -905,11 +902,10 @@ impl Scheduler {
             .is_some_and(|adapter| adapter.config.absolute_table[src as usize - 1] != 0)
     }
 
-    fn absolute_source(&self, aid: usize, src: u8, msys: DeliverySystem) -> i32 {
+    fn absolute_source(&self, aid: usize, src: i32, msys: DeliverySystem) -> i32 {
         if !self.absolute_switch || !matches!(msys, DeliverySystem::DvbS | DeliverySystem::DvbS2) {
-            return i32::from(src);
+            return src;
         }
-        let src = i32::from(src);
         if src <= 0 || (src as usize) > MAX_SOURCES {
             return src;
         }
@@ -1096,7 +1092,7 @@ impl Scheduler {
         if need_mapping {
             let mapped = self.absolute_source(index, src, msys);
             if let Some(adapter) = self.adapters[index].as_mut() {
-                adapter.params.src = u8::try_from(mapped).unwrap_or(0);
+                adapter.params.src = mapped;
                 adapter.params.src_specified = true;
             }
         }
@@ -1149,7 +1145,7 @@ impl Scheduler {
             if matches!(params.msys, DeliverySystem::DvbS | DeliverySystem::DvbS2) {
                 let pol = (polarization_code(&params) - 1) & 1;
                 let diseqc = if params.src_specified && params.src > 0 {
-                    i32::from(params.src) - 1
+                    params.src - 1
                 } else {
                     0
                 };
@@ -1716,7 +1712,7 @@ mod tests {
         }
     }
 
-    fn params(freq: i32, src: u8) -> TuneParams {
+    fn params(freq: i32, src: i32) -> TuneParams {
         TuneParams {
             freq,
             src,

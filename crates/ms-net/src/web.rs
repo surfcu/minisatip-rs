@@ -1166,15 +1166,11 @@ fn all_delsys(adapter: Option<&AdapterState>, max_size: usize) -> Raw {
     let Some(adapter) = adapter else {
         return Raw::text("");
     };
-    let names = adapter.systems.iter().filter_map(|sys| match sys {
-        DeliverySystem::DvbS => Some("dvbs"),
-        DeliverySystem::DvbS2 => Some("dvbs2"),
-        DeliverySystem::DvbT => Some("dvbt"),
-        DeliverySystem::DvbT2 => Some("dvbt2"),
-        DeliverySystem::DvbC => Some("dvbc"),
-        DeliverySystem::DvbC2 => Some("dvbc2"),
-        DeliverySystem::Undefined | DeliverySystem::Other(_) => None,
-    });
+    let names = adapter
+        .systems
+        .iter()
+        .map(|sys| sys.name())
+        .filter(|name| !name.is_empty() && *name != "undefined");
     joined(
         names.map(|name| format!("{name},").into_bytes()),
         max_size,
@@ -1474,6 +1470,18 @@ mod tests {
         assert_eq!(
             format_asctime_fields((0, 0, 1, 0, 0, 5, 1970)),
             "Sun Jan  1 00:00:05 1970 "
+        );
+    }
+
+    #[test]
+    fn all_delsys_uses_the_reverse_lookup_name() {
+        let adapter = AdapterState {
+            systems: vec![DeliverySystem::Other(11), DeliverySystem::DvbS2],
+            ..AdapterState::default()
+        };
+        assert_eq!(
+            all_delsys(Some(&adapter), 64),
+            Raw::Str(b"atsc,dvbs2".to_vec())
         );
     }
 }
