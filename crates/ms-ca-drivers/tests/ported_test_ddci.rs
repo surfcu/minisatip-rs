@@ -163,14 +163,8 @@ fn slot_pmts_and_es_ddci_pids_are_per_pmt() {
     let (mut x, mut t) = one_ddci(2);
     let pmt0 = create_pmt(&mut t, 8, 600, 601, 602, 0x100, 0x100);
     let pmt1 = create_pmt(&mut t, 8, 700, 701, 702, 0x100, 0x100);
-    assert_eq!(
-        x.process_pmt(8, &prog(&t, pmt0), false),
-        TablesResult::Ok
-    );
-    assert_eq!(
-        x.process_pmt(8, &prog(&t, pmt1), false),
-        TablesResult::Ok
-    );
+    assert_eq!(x.process_pmt(8, &prog(&t, pmt0), false), TablesResult::Ok);
+    assert_eq!(x.process_pmt(8, &prog(&t, pmt1), false), TablesResult::Ok);
 
     assert_eq!(x.slot_pmts(0), vec![pmt0, pmt1]);
 

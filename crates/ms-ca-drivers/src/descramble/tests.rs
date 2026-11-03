@@ -919,20 +919,14 @@ fn pid_totals_keep_scrambled_packets_after_the_first_clear() {
 #[test]
 fn pid_totals_count_untracked_and_psi_pids() {
     let mut d = Descrambler::new(CipherRegistry::software());
-    pass(
-        &mut d,
-        &[(0x200, true), (0x200, false), (0x0010, true)],
-    );
+    pass(&mut d, &[(0x200, true), (0x200, false), (0x0010, true)]);
     assert_eq!(d.pid_totals(), vec![(0x0010, 1, 0), (0x200, 1, 1)]);
 }
 
 #[test]
 fn pid_totals_skip_null_packets() {
     let mut d = Descrambler::new(CipherRegistry::software());
-    pass(
-        &mut d,
-        &[(0x1FFF, true), (0x1FFF, false), (0x100, true)],
-    );
+    pass(&mut d, &[(0x1FFF, true), (0x1FFF, false), (0x100, true)]);
     assert_eq!(d.pid_totals(), vec![(0x100, 1, 0)]);
 }
 

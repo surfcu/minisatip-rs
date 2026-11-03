@@ -487,13 +487,7 @@ impl Ddci {
     }
 
     /// The DDCI pids of `es_pids` that are mapped for `pmt_id` on `dev`.
-    pub fn es_ddci_pids(
-        &self,
-        dev: usize,
-        ad: u16,
-        pmt_id: i32,
-        es_pids: &[u16],
-    ) -> Vec<u16> {
+    pub fn es_ddci_pids(&self, dev: usize, ad: u16, pmt_id: i32, es_pids: &[u16]) -> Vec<u16> {
         let Some(d) = self.devices.get(&dev) else {
             return Vec::new();
         };
