@@ -230,8 +230,8 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 | Feature | Validated on | How |
 |---|---|---|
 | Linux DVB, 8 tuners | user's box | real: FTA through tvheadend (2026-10-22) |
-| DDCI, 1 CAM | user's box | real: Irdeto CAM on a DuoFlex CI, `-c 8:**2`, 3 channels through tvheadend without glitches (2026-10-22) |
-| CI+ CAM in CI-compatible mode | user's box | real: Smit Irdeto CAM on a DuoFlex CI |
+| DDCI, 1 CAM | user's box | real: a CI+ CAM in plain-CI mode on a DuoFlex CI, `-c 8:**2`, 3 channels through tvheadend without glitches (2026-10-22) |
+| CI+ CAM in CI-compatible mode | user's box | real: the same CI+ CAM on a DuoFlex CI |
 | Multi-CAM | — | fake CAM only |
 | DVBAPI / oscam | — | fake oscam only; no oscam on the box |
 | Unicable/JESS | — | tests + external testers |
@@ -289,9 +289,31 @@ Unvalidated rows must be called out in release notes.
     tvheadend since 02:37; this started a 7-day soak (M9), later ended (see "Soak").
   - The enigma2 box (armv7) runs it with `-E -g` since 02:05.
   - Logs from both boxes and tvheadend go to a central Loki/Grafana host.
-- **Last sessions (2026-11-01/02):** merged:
-  - #80 `--cam-recovery` (DEV-284): resets a plain-CI CAM whose output stays scrambled after
-    an MMI message; `--cam-recovery-no-zap-guard` lets a clean window before a zap arm it.
+- **Last sessions (2026-11-02/03):** merged:
+  - #87 PLAN status; #88 `--cam-recovery` re-sends the CAPMTs instead of resetting the CAM
+    (DEV-284).
+  - #89 `--cam-menu-snapshot` (DEV-289, diag-log): reads the CAM's status pages after a menu
+    the CAM opens by itself; it first ran live on 2026-11-03 and showed the entitlement loss
+    below.
+  - #90 DDCI EMM pids belong to the tuner whose CAT listed them and leave with its last PMT
+    (DEV-290). Before, a stale EMM mapping skipped every later CAT, and no EMM reached the CAM
+    for 6.5 h. The same bug is in C++; upstream PR catalinii/minisatip#1555 is open.
+  - #91 the main thread sends RTSP/HTTP replies with `MSG_DONTWAIT` and a per-connection
+    buffer (the C++ socket FIFO). Before, a slow status-page client blocked it for 20 s and
+    then 10 s, and RTSP SETUPs waited unanswered.
+  - #92 `ci_decrypt` reports `packets`, so a window's scrambled share is `errors / packets`.
+  - #93 the five high findings of a port review against the C++ baseline: a PID kept while a
+    `FILTER_ADD_REMOVE` filter uses it; an independent PCR PID mapped into the DDCI; a PMT
+    `generation`, so a reused PMT id drops the old CW slots and stale CAM notices; the C++
+    1.1 s send timeout on stream sockets.
+  - #94 `--cam-recovery` also re-joins, once per join, a service on a DDCI CAM whose own ES
+    pids stay scrambled for max(N, 30 s) with no MMI message (DEV-284).
+  - The port review itself (branch `rs/port-review`, not merged) lists 18 findings; the five
+    high ones are fixed, the medium and low ones are open.
+- **Sessions (2026-11-01/02):** merged:
+  - #80 `--cam-recovery` (DEV-284): recovers a plain-CI CAM whose output stays scrambled after
+    an MMI message (a reset then; a CAPMT re-send since #88); `--cam-recovery-no-zap-guard`
+    lets a clean window before a zap arm it.
   - #82 `--ddci-capture` (DEV-280): the 60 s before and after a CAM MMI message, both DDCI
     directions, written to disk with a JSON sidecar.
   - #83 `--cam-menu` / `--cam-menu-unsolicited` (DEV-285, DEV-286) and #84 `--cam-ecm-trace`
@@ -351,8 +373,12 @@ Unvalidated rows must be called out in release notes.
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - #63: wait for the next stuck episode under `--cam-recovery`, `--cam-ecm-trace` and
-    `--ddci-capture`; open `--cam-menu` during it for the CAM's status pages.
+  - #63: wait for the next stuck episode under `--cam-recovery` (now a CAPMT re-send),
+    `--cam-ecm-trace`, `--ddci-capture` and `--cam-menu-snapshot`, and see whether the
+    re-send clears it.
+  - Watch the per-service recovery (#94) on the main box.
+  - Port review: the medium and low findings, and a C++ vs Rust decrypt-error comparison
+    weighted by bitrate.
   - Soak with evidence: no valid 7-day soak is running on the main box (see "Soak"
     below); the enigma2 box runs the armv7 `diag-log` build since 2026-10-25 09:08 +03
     and passed its 12 h validation (see "Logging ... Part B").
@@ -387,6 +413,23 @@ Unvalidated rows must be called out in release notes.
     watchdog resetting the two empty CI slots as in C++ (ca.cpp:3679-3693), plus 60
     heartbeats and the stream events. The -F file reached 2.2 MB, so it did not
     rotate.
+- **Soak (M9), status 2026-11-03 23:40 +03: a #63 soak, not the standard one.** The load
+  generator restarted on 2026-11-03 09:51:38 +03 under the same scrambled-only zapping load,
+  with quiet hours off, so it does not count for the 7-day criterion. Deploys restarted
+  minisatip-rs at 11:11:00 (#90), 15:35:52 (#91), 16:32:43 (#92), 17:31:39 (#93) and 22:51:43
+  (#94); the current run started at 22:51:43. Episodes:
+  - 2026-11-03 04:02 (previous soak): every service was refused with the CAM's pay-per-view
+    notice and the CAM listed no products on the card. The EMM stream to the CAM had stopped
+    at 03:11, when the last service left the DDCI, because a stale EMM mapping skipped every
+    later CAT (fixed by #90). A minisatip-rs restart at 09:49 re-initialised the CAM, and the
+    products were back.
+  - 12:44: a slow status-page client stalled the main thread for 20 s and then 10 s, and
+    tvheadend's RTSP requests waited (fixed by #91).
+  - 16:32: after the restart a service that reconnected before the CAM was ready got its
+    normal CAPMT, but the CAM never descrambled it, with no MMI message, while another
+    service was clear. A re-join of that service fixed it; #94 now does that by itself.
+
+  No stuck episode of the #63 kind (a CAM error message mid-stream) has come since 11-02.
 - **Soak (M9), status 2026-11-02 16:10 +03: a #63 soak, not the standard one.** The load
   generator started on 2026-11-02 10:05:28 +03 (a soak start) with a scrambled-only zapping
   load, not the standard mix, so it does not count for the 7-day criterion. The minisatip-rs
@@ -484,5 +527,6 @@ Unvalidated rows must be called out in release notes.
     service starts come from the CAM.
 - **Tracked issues:** CA harness scenarios (#36); #37 resolved (the unused reconciler was removed, the event-driven CA path is the runtime);
   CAM blocked after a CAM MMI error message until restart (#63), in CI+ and in plain CI,
-  with C++ as well as minisatip-rs; `--cam-recovery` (#80) is the plain-CI recovery under
-  test.
+  with C++ as well as minisatip-rs; `--cam-recovery` (#80, a CAPMT re-send since #88, plus
+  the per-service re-join of #94) is the plain-CI recovery under test. Upstream: the DDCI
+  EMM fix catalinii/minisatip#1555 is open.
