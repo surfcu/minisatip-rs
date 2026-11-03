@@ -887,6 +887,284 @@ fn cam_recovery_ignores_a_window_that_starts_before_the_anchor() {
     );
 }
 
+/// Advances the clock to `at` and judges one service's 10 s window.
+fn service_window_at(
+    clock: &ManualClock,
+    dev: &mut CaDevice,
+    sid: u16,
+    at: i64,
+    scrambled: u64,
+    clear: u64,
+) {
+    clock.advance(at - clock.tick_ms());
+    dev.cam_recovery_service_window(sid, WINDOW_MS, scrambled, clear);
+}
+
+#[test]
+fn silent_recovery_fires_once_after_a_30_s_run() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x100;
+    dev.cam_recovery_sync_services(&[(7, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 10_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "a window inside the join lag is ignored"
+    );
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 30_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "N = 10 s still needs the 30 s run"
+    );
+    service_window_at(&clock, &mut dev, sid, 32_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![7]);
+    service_window_at(&clock, &mut dev, sid, 40_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "one silent re-send per join"
+    );
+}
+
+#[test]
+fn silent_recovery_window_must_start_after_the_join_lag() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x101;
+    dev.cam_recovery_sync_services(&[(7, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 10_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 31_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "the run starts after the lag, not at the join"
+    );
+    service_window_at(&clock, &mut dev, sid, 51_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![7]);
+}
+
+#[test]
+fn silent_recovery_clean_window_restarts_the_run() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x102;
+    dev.cam_recovery_sync_services(&[(7, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 20_000, 0, 50_000);
+    service_window_at(&clock, &mut dev, sid, 32_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "the clean window ended the first run"
+    );
+    service_window_at(&clock, &mut dev, sid, 52_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![7]);
+}
+
+#[test]
+fn silent_recovery_needs_a_new_join_for_another_re_send() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x103;
+    dev.cam_recovery_sync_services(&[(7, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 42_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![7]);
+
+    // The same join does not get a second re-send.
+    dev.cam_recovery_sync_services(&[(7, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 72_000, 50_000, 0);
+    assert!(dev.take_silent_recovery().is_empty());
+
+    // A new CAPMT pmt id for the SID is a new join and gets one more.
+    dev.cam_recovery_sync_services(&[(8, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 82_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 114_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "the run restarts at the new join"
+    );
+    service_window_at(&clock, &mut dev, sid, 134_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![8]);
+}
+
+#[test]
+fn silent_recovery_inactive_sync_restarts_the_join_time() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x104;
+    dev.cam_recovery_sync_services(&[(7, sid)], true);
+    clock.advance(100_000);
+    dev.cam_recovery_sync_services(&[(7, sid)], false);
+    service_window_at(&clock, &mut dev, sid, 110_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 132_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "windows before the new join plus lag are ignored"
+    );
+    service_window_at(&clock, &mut dev, sid, 152_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![7]);
+}
+
+#[test]
+fn silent_recovery_ignores_the_mmi_gap() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x105;
+    dev.cam_recovery_last = 0;
+    dev.cam_recovery_sync_services(&[(7, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 32_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![7]);
+    assert_eq!(
+        dev.cam_recovery_last, 0,
+        "the silent path does not touch the MMI gap"
+    );
+    assert!(
+        !dev.take_cam_recovery(),
+        "the silent path does not use the MMI due"
+    );
+}
+
+#[test]
+fn silent_recovery_is_off_with_the_knob() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(0);
+    let sid = 0x106;
+    dev.cam_recovery_sync_services(&[(7, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 62_000, 50_000, 0);
+    assert!(dev.take_silent_recovery().is_empty());
+}
+
+#[test]
+fn silent_recovery_warns_once_after_the_first_re_send() {
+    let _ = crate::test_log::captured_lines();
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x107;
+    let pmt = 0x7A07;
+    dev.cam_recovery_sync_services(&[(pmt, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 42_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![pmt]);
+    for at in [52_000, 62_000, 72_000, 82_000, 92_000] {
+        service_window_at(&clock, &mut dev, sid, at, 50_000, 0);
+        // A different line between the windows keeps repeat suppression from
+        // hiding a second warning.
+        ms_log::log!("silent_recovery_warns marker {}", at);
+    }
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "one silent re-send per join"
+    );
+    let needle =
+        format!("CA 0: PMT {pmt} ES packets still scrambled; its CAPMT was already re-sent once");
+    let count = crate::test_log::captured_lines()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|line| line.contains(&needle))
+        .count();
+    assert_eq!(count, 1, "the already re-sent line is logged exactly once");
+}
+
+#[test]
+fn silent_recovery_allows_another_re_send_after_the_sid_leaves() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x108;
+    let pmt = 0x7A08;
+    dev.cam_recovery_sync_services(&[(pmt, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 42_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![pmt]);
+
+    dev.cam_recovery_sync_services(&[], true);
+    dev.cam_recovery_sync_services(&[(pmt, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 50_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 60_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 72_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "the new join needs its own 30 s run"
+    );
+    service_window_at(&clock, &mut dev, sid, 84_000, 50_000, 0);
+    assert_eq!(
+        dev.take_silent_recovery(),
+        vec![pmt],
+        "the re-added SID gets one more re-send"
+    );
+}
+
+#[test]
+fn silent_recovery_inactive_sync_allows_another_re_send() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x109;
+    let pmt = 0x7A09;
+    dev.cam_recovery_sync_services(&[(pmt, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 42_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![pmt]);
+
+    service_window_at(&clock, &mut dev, sid, 52_000, 50_000, 0);
+    dev.cam_recovery_sync_services(&[(pmt, sid)], false);
+    service_window_at(&clock, &mut dev, sid, 60_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 72_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "the stuck run restarts at the inactive sync"
+    );
+    service_window_at(&clock, &mut dev, sid, 84_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "the new run is still too short"
+    );
+    service_window_at(&clock, &mut dev, sid, 96_000, 50_000, 0);
+    assert_eq!(
+        dev.take_silent_recovery(),
+        vec![pmt],
+        "a CAM re-init counts as a new join"
+    );
+}
+
+#[test]
+fn silent_recovery_skips_a_sid_on_more_than_one_pmt() {
+    let _ = crate::test_log::captured_lines();
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x10A;
+    let pmts = [(0x7A0A, sid), (0x7A0B, sid)];
+    dev.cam_recovery_sync_services(&pmts, true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 42_000, 50_000, 0);
+    service_window_at(&clock, &mut dev, sid, 72_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "a duplicated SID gets no silent recovery"
+    );
+    dev.cam_recovery_sync_services(&pmts, true);
+    ms_log::log!("silent_recovery_duplicate marker 1");
+    dev.cam_recovery_sync_services(&pmts, true);
+    ms_log::log!("silent_recovery_duplicate marker 2");
+    let needle = format!("CA 0: SID {sid} is on more than one PMT, no silent recovery for it");
+    let count = crate::test_log::captured_lines()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|line| line.contains(&needle))
+        .count();
+    assert_eq!(count, 1, "logged once while the SID stays duplicated");
+}
+
+#[test]
+fn silent_recovery_timeout_zero_clears_the_old_run() {
+    let (clock, _cam, mut dev) = cam_recovery_cold(10_000);
+    let sid = 0x10B;
+    let pmt = 0x7A0C;
+    dev.cam_recovery_sync_services(&[(pmt, sid)], true);
+    service_window_at(&clock, &mut dev, sid, 12_000, 50_000, 0);
+
+    dev.cam_recovery_timeout_ms = 0;
+    service_window_at(&clock, &mut dev, sid, 20_000, 50_000, 0);
+    dev.cam_recovery_timeout_ms = 10_000;
+    service_window_at(&clock, &mut dev, sid, 32_000, 50_000, 0);
+    assert!(
+        dev.take_silent_recovery().is_empty(),
+        "the old run was cleared with the knob off"
+    );
+    service_window_at(&clock, &mut dev, sid, 52_000, 50_000, 0);
+    assert_eq!(dev.take_silent_recovery(), vec![pmt]);
+}
+
 #[test]
 fn a_requested_enquiry_is_cancelled_without_a_fitting_pin() {
     let (_, cam, mut dev) = setup(CamConfig::default(), true);

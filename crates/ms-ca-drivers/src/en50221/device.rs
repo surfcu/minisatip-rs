@@ -7,7 +7,7 @@ use super::link::{
     CA_CI_LINK, CA_CI_MODULE_READY, CaLink, ResetResult, SlotInfo, reset_and_wait_ready,
 };
 use super::resources::{App, Handler, cmd_reply, cmd_tracked, find_handler};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -154,6 +154,15 @@ pub enum MmiPage {
 /// A menu request or a held unsolicited page ends after this long without activity.
 pub const MENU_IDLE_MS: i64 = 120_000;
 
+/// `--cam-recovery` state of one service on the DDCI path, keyed by SID.
+struct ServiceRun {
+    pmt_id: usize,
+    joined: i64,
+    stuck_since: i64,
+    used: bool,
+    warned: bool,
+}
+
 /// One CI slot, host side.
 pub struct CaDevice {
     pub id: usize,
@@ -224,6 +233,12 @@ pub struct CaDevice {
     pub cam_recovery_changed: i64,
     /// A recovery fired: the worker re-sends this slot's CAPMTs ([`Self::take_cam_recovery`]).
     cam_recovery_due: bool,
+    /// Per-service silent recovery state, keyed by SID.
+    cam_recovery_services: BTreeMap<u16, ServiceRun>,
+    /// CAPMT pmt ids whose service needs its silent re-send.
+    silent_due: Vec<usize>,
+    /// SIDs warned about being on more than one PMT.
+    cam_recovery_duplicates: BTreeSet<u16>,
     /// This slot's `cam_state` changes; kept across reconnects.
     cam_states: ms_log::diag::events::CamStateFilter,
     close_requested: bool,
@@ -287,6 +302,9 @@ impl CaDevice {
             cam_recovery_zap_guard: true,
             cam_recovery_changed: -1,
             cam_recovery_due: false,
+            cam_recovery_services: BTreeMap::new(),
+            silent_due: Vec::new(),
+            cam_recovery_duplicates: BTreeSet::new(),
             cam_states: Default::default(),
             close_requested: false,
             events: VecDeque::new(),
@@ -469,6 +487,9 @@ impl CaDevice {
         self.snapshot = None;
         self.cam_recovery_since = -1;
         self.cam_recovery_stuck_since = -1;
+        self.cam_recovery_services.clear();
+        self.silent_due.clear();
+        self.cam_recovery_duplicates.clear();
         self.link = None;
         self.sock = None;
         self.close_requested = false;
@@ -1253,6 +1274,135 @@ impl CaDevice {
     pub fn take_cam_recovery(&mut self) -> bool {
         std::mem::take(&mut self.cam_recovery_due)
     }
+
+    /// Syncs the per-service map with the CAPMT's `(pmt_id, sid)` pairs; an
+    /// inactive CAM restarts every join time.
+    pub fn cam_recovery_sync_services(&mut self, services: &[(usize, u16)], active: bool) {
+        let now = self.now();
+        let mut counts = BTreeMap::new();
+        for &(_, sid) in services {
+            *counts.entry(sid).or_insert(0usize) += 1;
+        }
+        let duplicated: BTreeSet<u16> = counts
+            .into_iter()
+            .filter(|&(_, n)| n > 1)
+            .map(|(sid, _)| sid)
+            .collect();
+        for &sid in &duplicated {
+            self.cam_recovery_services.remove(&sid);
+            if self.cam_recovery_duplicates.insert(sid) {
+                ms_log::log!(
+                    "CA {}: SID {} is on more than one PMT, no silent recovery for it",
+                    self.id,
+                    sid
+                );
+            }
+        }
+        self.cam_recovery_duplicates
+            .retain(|sid| duplicated.contains(sid));
+        self.cam_recovery_services
+            .retain(|sid, _| !duplicated.contains(sid) && services.iter().any(|&(_, s)| s == *sid));
+        for &(pmt_id, sid) in services {
+            if duplicated.contains(&sid) {
+                continue;
+            }
+            if self
+                .cam_recovery_services
+                .get(&sid)
+                .is_none_or(|run| run.pmt_id != pmt_id)
+            {
+                self.cam_recovery_services.insert(
+                    sid,
+                    ServiceRun {
+                        pmt_id,
+                        joined: now,
+                        stuck_since: -1,
+                        used: false,
+                        warned: false,
+                    },
+                );
+            }
+        }
+        if !active {
+            for run in self.cam_recovery_services.values_mut() {
+                run.joined = now;
+                run.stuck_since = -1;
+                run.used = false;
+                run.warned = false;
+            }
+        }
+    }
+
+    /// Judges one service's window by its own ES pids; a sustained stuck run
+    /// queues that service's CAPMT for a silent re-send, once per join.
+    pub fn cam_recovery_service_window(
+        &mut self,
+        sid: u16,
+        window_ms: i64,
+        scrambled: u64,
+        clear: u64,
+    ) {
+        if self.cam_recovery_timeout_ms <= 0 {
+            for run in self.cam_recovery_services.values_mut() {
+                run.stuck_since = -1;
+            }
+            return;
+        }
+        let Some(run) = self.cam_recovery_services.get(&sid) else {
+            return;
+        };
+        let now = self.now();
+        let start = now - window_ms;
+        if start < run.joined + CAM_RECOVERY_LAG_MS {
+            return;
+        }
+        let total = scrambled + clear;
+        let stuck =
+            scrambled >= CAM_RECOVERY_MIN_PKTS && scrambled * 100 >= total * CAM_RECOVERY_SHARE;
+        if !stuck {
+            if let Some(run) = self.cam_recovery_services.get_mut(&sid) {
+                run.stuck_since = -1;
+            }
+            return;
+        }
+        let timeout = self.cam_recovery_timeout_ms.max(SILENT_MIN_RUN_MS);
+        let run = self.cam_recovery_services.get_mut(&sid).expect("present");
+        if run.stuck_since < 0 {
+            run.stuck_since = start;
+        }
+        let run_ms = now - run.stuck_since;
+        if run_ms < timeout {
+            return;
+        }
+        let pmt_id = run.pmt_id;
+        if run.used {
+            if !run.warned {
+                ms_log::log!(
+                    "CA {}: PMT {} ES packets still scrambled; its CAPMT was already re-sent once",
+                    self.id,
+                    pmt_id
+                );
+                run.warned = true;
+            }
+            return;
+        }
+        run.used = true;
+        ms_log::log!(
+            "CA {}: PMT {} {} of {} ES packets still scrambled for {} ms with no CAM message, re-sending its CAPMT (CAM recovery)",
+            self.id,
+            pmt_id,
+            scrambled,
+            total,
+            run_ms
+        );
+        self.silent_due.push(pmt_id);
+        self.report_state("cam_recovery");
+    }
+
+    /// The CAPMT pmt ids queued by the silent path since the last call.
+    pub fn take_silent_recovery(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.silent_due)
+    }
 }
 
 /// `--cam-recovery` per-window thresholds: stuck is at least CAM_RECOVERY_MIN_PKTS
@@ -1263,6 +1413,8 @@ pub const CAM_RECOVERY_SHARE: u64 = 90;
 pub const CAM_RECOVERY_MIN_GAP_MS: i64 = 600_000;
 /// Stats reach the watchdog up to two STATS_MS late, so a window must start this long after the anchor.
 pub const CAM_RECOVERY_LAG_MS: i64 = 2_000;
+/// The silent per-service path needs at least this long a stuck run (ms).
+pub const SILENT_MIN_RUN_MS: i64 = 30_000;
 
 /// Hook the CAM transport (dvbca) uses to hand CA_PMT bodies to this CAM.
 pub trait CaPmtSink {
