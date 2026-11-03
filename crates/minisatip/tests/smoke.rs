@@ -6,6 +6,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -855,6 +856,119 @@ fn duplicate_destination_stops_the_old_output() -> io::Result<()> {
         }
     }
     assert_eq!(ssrcs.len(), 1, "only the new stream may keep sending");
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn shrink_receive_buffer(stream: &TcpStream, bytes: libc::c_int) -> io::Result<()> {
+    let value = &bytes as *const libc::c_int as *const libc::c_void;
+    // SAFETY: `fd` is the open socket owned by `stream`, and `value` is a
+    // valid `c_int` for the option's documented size.
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            value,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[test]
+fn stalled_interleaved_client_does_not_stall_other_streams() -> io::Result<()> {
+    let capture = generate_ts()?;
+    let server = start_server(&capture)?;
+    let base = format!("rtsp://127.0.0.1:{}/", server.rtsp_port);
+    let url = format!("{base}?freq=11500&msys=dvbs2&sr=27500&pids=0");
+
+    let mut stalled = TcpStream::connect(("127.0.0.1", server.rtsp_port))?;
+    stalled.set_read_timeout(Some(TIMEOUT))?;
+    stalled.set_write_timeout(Some(TIMEOUT))?;
+    shrink_receive_buffer(&stalled, 4096)?;
+    let (status, headers, _) = request(
+        &mut stalled,
+        &format!(
+            "SETUP {url} RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;interleaved=0-1\r\n\r\n"
+        ),
+    )?;
+    assert_eq!(status, 200, "interleaved SETUP");
+    let session = header_value(&headers, "Session").expect("Session header");
+    let session = session.split(';').next().unwrap_or("").trim().to_owned();
+    let (status, _, _) = request(
+        &mut stalled,
+        &format!("PLAY {base} RTSP/1.0\r\nCSeq: 2\r\nSession: {session}\r\n\r\n"),
+    )?;
+    assert_eq!(status, 200, "interleaved PLAY");
+    // From here the client never reads, so the server's writes to it stall.
+
+    let mut rtsp = TcpStream::connect(("127.0.0.1", server.rtsp_port))?;
+    rtsp.set_read_timeout(Some(TIMEOUT))?;
+    rtsp.set_write_timeout(Some(TIMEOUT))?;
+    let udp = UdpSocket::bind(("127.0.0.1", 0))?;
+    udp.set_read_timeout(Some(TIMEOUT))?;
+    let port = udp.local_addr()?.port();
+    let (status, headers, _) = request(
+        &mut rtsp,
+        &format!(
+            "SETUP {url} RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP;unicast;client_port={port}-{}\r\n\r\n",
+            port.wrapping_add(1)
+        ),
+    )?;
+    assert_eq!(status, 200, "UDP SETUP");
+    let session = header_value(&headers, "Session").expect("Session header");
+    let session = session.split(';').next().unwrap_or("").trim().to_owned();
+    let (status, _, _) = request(
+        &mut rtsp,
+        &format!("PLAY {base} RTSP/1.0\r\nCSeq: 2\r\nSession: {session}\r\n\r\n"),
+    )?;
+    assert_eq!(status, 200, "UDP PLAY");
+
+    let mut packet = [0u8; 2048];
+    udp.recv_from(&mut packet)?;
+    // No per-stream sent-byte counter reaches the test snapshot, so wait a
+    // fixed 5 s for the interleaved socket to fill.
+    thread::sleep(Duration::from_secs(5));
+    udp.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let drain_until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < drain_until && udp.recv_from(&mut packet).is_ok() {}
+
+    let mut last = Instant::now();
+    let mut packets = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        // Room for two 1.1 s blocks in one adapter cycle; the old 5 s timeout fails.
+        udp.set_read_timeout(Some(Duration::from_secs(3)))?;
+        match udp.recv_from(&mut packet) {
+            Ok(_) => {
+                assert!(
+                    last.elapsed() < Duration::from_secs(3),
+                    "UDP stream gap of {:?} while the interleaved client stalled",
+                    last.elapsed()
+                );
+                last = Instant::now();
+                packets += 1;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                panic!("UDP stream stalled for 3 s while the interleaved client stalled");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    assert!(
+        packets > 0,
+        "no RTP after the interleaved client stopped reading"
+    );
     Ok(())
 }
 

@@ -123,6 +123,8 @@ pub struct Pmt {
     pub adapter: i32,
     /// Last parsed version.
     pub version: i32,
+    /// Creation generation, bumped only when the slot is allocated (`pmt_add`).
+    pub generation: u64,
     /// Number of valid entries in [`Pmt::ca`].
     pub caids: usize,
     /// Reusable CA descriptor entries.
@@ -162,6 +164,7 @@ impl Pmt {
             pcr_pid: 0,
             adapter: -1,
             version: -1,
+            generation: 0,
             caids: 0,
             ca: Vec::new(),
             descriptors: Vec::new(),
@@ -342,9 +345,12 @@ impl Scheduler {
             ms_log::log_and_return!(-1, "PMT buffer is full, could not add new pmts");
         };
         let id = slot as i32;
+        self.pmt_generation += 1;
+        let generation = self.pmt_generation;
         let pmt = &mut self.pmt.pmts[slot];
         pmt.enabled = true;
         pmt.allocated = true;
+        pmt.generation = generation;
         pmt.sid = sid;
         pmt.pid = pmt_pid;
         pmt.adapter = adapter;
@@ -1508,6 +1514,7 @@ impl Scheduler {
             .map_or(0, |adapter| adapter.transponder_id);
         Some(CaService {
             pmt_id: pmt_id as usize,
+            generation: pmt.generation,
             adapter: usize::try_from(pmt.adapter).unwrap_or(0),
             hw_adapter: 0,
             hw_demux: 0,

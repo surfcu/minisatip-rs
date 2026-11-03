@@ -48,6 +48,8 @@ pub const PID_ALL: i32 = 8192;
 pub const MIN_ADAPTER_PIDS: i32 = 16;
 /// Stream id used when a PID has no owning stream.
 pub const PID_STREAM_ID_UNDEFINED: i32 = -1;
+/// Client stream ids are below this (`MAX_STREAMS`, stream.h:11).
+const MAX_STREAMS: i32 = 256;
 /// DVB stream identifier.
 pub type StreamId = i32;
 
@@ -454,6 +456,7 @@ pub struct Scheduler {
     fe_map: [i16; FE_MAP_LEN],
     disabled: [bool; MAX_ADAPTERS],
     absolute_switch: bool,
+    pmt_generation: u64,
     pub(crate) pmt: pmt::PmtTables,
 }
 
@@ -473,6 +476,7 @@ impl Scheduler {
             fe_map: [-1; FE_MAP_LEN],
             disabled: [false; MAX_ADAPTERS],
             absolute_switch: false,
+            pmt_generation: 0,
             pmt: pmt::PmtTables::new(),
         }
     }
@@ -1326,9 +1330,20 @@ impl Scheduler {
                     entry.order = 0;
                 } else {
                     entry.sids.remove(&sid);
-                    if entry.sids.is_empty() {
-                        entry.state = PidState::Deleted;
+                    if !entry.sids.iter().any(|sid| (0..MAX_STREAMS).contains(sid)) {
                         entry.order = 0;
+                    }
+                    // adapter.cpp:1183-1191: an active FILTER_ADD_REMOVE filter
+                    // keeps a PID alive after its last stream leaves.
+                    let keep = entry.sids.is_empty()
+                        && self.pmt.filters.iter().any(|filter| {
+                            filter.enabled
+                                && filter.adapter == index as i32
+                                && filter.pid == entry.pid
+                                && filter.flags & pmt::FILTER_ADD_REMOVE != 0
+                        });
+                    if entry.sids.is_empty() && !keep {
+                        entry.state = PidState::Deleted;
                     }
                 }
                 if was_live && entry.state == PidState::Deleted {

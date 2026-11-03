@@ -2403,6 +2403,46 @@ fn handover_stops_stale_holder() {
     sched.free_all_pmts();
 }
 
+#[test]
+fn pmt_add_assigns_a_new_generation() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let first = sched.pmt_add(0, 100, 48);
+    let second = sched.pmt_add(0, 200, 52);
+    let g1 = sched.pmt_slot(first).unwrap().generation;
+    let g2 = sched.pmt_slot(second).unwrap().generation;
+    assert_eq!(g1, 1);
+    assert_eq!(g2, 2);
+    sched.pmt_del(first);
+    let reused = sched.pmt_add(0, 300, 56);
+    assert_eq!(reused, first, "freed slot is reused");
+    assert!(
+        sched.pmt_slot(reused).unwrap().generation > g2,
+        "a reused id gets a new generation"
+    );
+}
+
+#[test]
+fn pmt_version_update_keeps_generation() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let id = sched.pmt_add(0, 100, 48);
+    let generation = sched.pmt_slot(id).unwrap().generation;
+    let fid = sched.add_filter(0, 48, FilterTarget::Pmt(Some(id as usize)), 0);
+    assert!(fid >= 0, "could not add the PMT filter");
+    assert_eq!(sched.mark_pid_add(0, 0, 48), 0);
+    sched.update_pids(0);
+    let v1 = build_pmt(100, 1, 3301, 0, 0, &[2], &[3301]);
+    assert_eq!(sched.process_pmt(fid, &v1), 0, "v1 to parse");
+    assert_eq!(sched.pmt_slot(id).unwrap().generation, generation);
+    let v2 = build_pmt(100, 2, 3301, 0, 0, &[2, 3], &[3301, 3401]);
+    assert_eq!(sched.process_pmt(fid, &v2), 0, "v2 to parse");
+    assert_eq!(pmt_version(&sched, id), 2, "version should advance");
+    assert_eq!(
+        sched.pmt_slot(id).unwrap().generation,
+        generation,
+        "a version update keeps the generation"
+    );
+}
+
 // Ported from tests/test_pmt.cpp:3282
 #[test]
 fn version_update_keeps_claims() {
@@ -2852,6 +2892,29 @@ fn pmt_scan_opens_the_pmt_pids_of_the_pat() {
         assert_eq!(flags & FILTER_ADD_REMOVE != 0, scan);
         assert_eq!(sched.find_pid(0, 0x200).is_some(), scan);
     }
+}
+
+// adapter.cpp:1176-1191: a PID kept by a FILTER_ADD_REMOVE filter outlives
+// its last stream, and is deleted when the filter goes.
+#[test]
+fn pid_with_add_remove_filter_survives_its_last_stream() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    assert_eq!(sched.mark_pid_add(0, 0, 0x200), 0);
+    sched.update_pids(0);
+    let filter = sched.add_filter(0, 0x200, FilterTarget::Pmt(None), FILTER_ADD_REMOVE);
+    assert!(filter >= 0);
+
+    sched.unmark_pid(0, 0, 0x200);
+    let entry = sched.find_pid(0, 0x200).expect("pid kept by its filter");
+    assert_ne!(entry.state, PidState::Deleted);
+    assert!(entry.sids.is_empty());
+    assert_eq!(entry.order, 0);
+
+    sched.del_filter(filter);
+    assert!(
+        sched.find_pid(0, 0x200).is_none(),
+        "pid deleted with its filter"
+    );
 }
 
 /// Records every `set_pid` call and every bulk PID set.

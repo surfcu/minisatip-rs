@@ -52,7 +52,8 @@ use crate::ca::CaRuntime;
 use crate::sys;
 
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// `set_linux_socket_timeout`: 1 s 100 ms (socketworks.cpp:374-386, :560).
+const WRITE_TIMEOUT: Duration = Duration::from_millis(1100);
 const LOOP_TICK: Duration = Duration::from_millis(20);
 /// Poll interval while replies are waiting for the socket to drain.
 const PENDING_POLL: Duration = Duration::from_millis(2);
