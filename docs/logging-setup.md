@@ -138,7 +138,7 @@ fields to report.
 | `rejoin` | A program rejoins a CAPMT slot it was already part of. |
 | `leave` | The last program leaves the slot; sent as not-selected. |
 | `retry` | The previous send failed with no session or a write error and is being retried. |
-| `recovery` | `--cam-recovery` re-sends an active slot as a forced update with a new version (it takes precedence over `retry`). |
+| `recovery` | `--cam-recovery` re-sends an active slot as a forced update with a new version (it takes precedence over `retry`). On a DDCI CAM the silent per-service path re-joins only that service's CAPMT with the same reason, once per join. |
 
 `skipped` is `true` when the built CAPMT hashes to the content already sent, so
 nothing was written. `version` is the CAPMT version after the attempt; a skipped
