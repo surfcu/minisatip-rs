@@ -158,6 +158,35 @@ fn ddci_pid(x: &Ddci, ad: u16, pid: u16) -> i32 {
     x.get_pid_mapping_allddci(ad, pid).unwrap().ddci_pid
 }
 
+#[test]
+fn slot_pmts_and_es_ddci_pids_are_per_pmt() {
+    let (mut x, mut t) = one_ddci(2);
+    let pmt0 = create_pmt(&mut t, 8, 600, 601, 602, 0x100, 0x100);
+    let pmt1 = create_pmt(&mut t, 8, 700, 701, 702, 0x100, 0x100);
+    assert_eq!(
+        x.process_pmt(8, &prog(&t, pmt0), false),
+        TablesResult::Ok
+    );
+    assert_eq!(
+        x.process_pmt(8, &prog(&t, pmt1), false),
+        TablesResult::Ok
+    );
+
+    assert_eq!(x.slot_pmts(0), vec![pmt0, pmt1]);
+
+    let mapped = |pid| u16::try_from(ddci_pid(&x, 8, pid)).unwrap();
+    assert_eq!(
+        x.es_ddci_pids(0, 8, pmt0, &[601, 602, 999]),
+        vec![mapped(601), mapped(602)],
+        "the other PMT's pids and unmapped pids are skipped"
+    );
+    assert_eq!(
+        x.es_ddci_pids(0, 8, pmt1, &[701, 702]),
+        vec![mapped(701), mapped(702)]
+    );
+    assert!(x.es_ddci_pids(0, 8, pmt1, &[601, 602]).is_empty());
+}
+
 // Ported from tests/test_ddci.cpp:206
 #[test]
 fn test_update_resend_keeps_slot() {

@@ -478,6 +478,36 @@ impl Ddci {
 
     // ---- mapping table ----
 
+    /// The PMT ids in the device's slots, in slot order; unused slots skipped.
+    pub fn slot_pmts(&self, dev: usize) -> Vec<i32> {
+        self.devices
+            .get(&dev)
+            .map(|d| d.pmt.iter().map(|p| p.id).filter(|&id| id >= 0).collect())
+            .unwrap_or_default()
+    }
+
+    /// The DDCI pids of `es_pids` that are mapped for `pmt_id` on `dev`.
+    pub fn es_ddci_pids(
+        &self,
+        dev: usize,
+        ad: u16,
+        pmt_id: i32,
+        es_pids: &[u16],
+    ) -> Vec<u16> {
+        let Some(d) = self.devices.get(&dev) else {
+            return Vec::new();
+        };
+        es_pids
+            .iter()
+            .filter_map(|&pid| {
+                let m = d.mapping.get(&(ad, pid))?;
+                (m.ddci_pid >= 0 && m.pmt.contains(&pmt_id))
+                    .then_some(u16::try_from(m.ddci_pid).ok())
+                    .flatten()
+            })
+            .collect()
+    }
+
     /// `add_pid_mapping_table`: the DDCI-side pid, or -1.
     pub fn add_pid_mapping_table(
         &mut self,
