@@ -2497,6 +2497,14 @@ mod window_tests {
         let mut ca = CaRuntime::new(&Options::default());
         assert_eq!(ca.decrypt_deltas(1, 100, 900), (100, 1_000));
         assert_eq!(ca.decrypt_deltas(1, 130, 1_050), (30, 180));
+        // Counters that went back (a descrambler restart) report nothing and reseed.
+        assert_eq!(ca.decrypt_deltas(1, 10, 20), (0, 0));
+        assert_eq!(ca.decrypt_deltas(1, 15, 50), (5, 35));
+        assert_eq!(
+            ca.decrypt_deltas(2, 7, 3),
+            (7, 10),
+            "adapter 2 has its own baseline"
+        );
     }
 
     // Each CI adapter has its own baseline, so two adapters' windows do not mix.
