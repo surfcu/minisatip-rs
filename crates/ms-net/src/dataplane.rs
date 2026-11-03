@@ -185,6 +185,10 @@ pub struct ContinuityCounter {
     last: BTreeMap<u16, i16>,
     packets: u64,
     errors: u64,
+    /// Packets checked per active PID (`p->packets`).
+    pid_packets: BTreeMap<u16, u64>,
+    /// Continuity errors per active PID (`p->cc_err`).
+    pid_errors: BTreeMap<u16, u64>,
     /// Adapter index printed by the continuity-error log (`ad->id`).
     adapter_id: i32,
 }
@@ -211,6 +215,20 @@ impl ContinuityCounter {
         self.errors
     }
 
+    /// `get_adapter_ccerrs`: sum of `cc_err` for the two busiest PIDs.
+    pub fn adapter_ccerr(&self) -> u64 {
+        let mut pids: Vec<(u16, u64)> = self
+            .pid_packets
+            .iter()
+            .map(|(pid, packets)| (*pid, *packets))
+            .collect();
+        pids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        pids.iter()
+            .take(2)
+            .map(|(pid, _)| self.pid_errors.get(pid).copied().unwrap_or(0))
+            .sum()
+    }
+
     /// Checks one 188-byte packet; `true` when its counter was out of sequence.
     pub fn check_packet(&mut self, packet: &[u8]) -> bool {
         self.check_packet_at(packet, 0)
@@ -226,6 +244,7 @@ impl ContinuityCounter {
             return false;
         }
         self.packets += 1;
+        *self.pid_packets.entry(pid).or_insert(0) += 1;
         if packet[3] & 0x10 == 0 {
             return false;
         }
@@ -239,6 +258,7 @@ impl ContinuityCounter {
         let error = expected != cc;
         if error {
             self.errors += 1;
+            *self.pid_errors.entry(pid).or_insert(0) += 1;
             ms_log::diag::count_cc(i64::from(self.adapter_id), pid);
             // stream.cpp:937 (`LOG`, general module).
             ms_log::log!(
@@ -297,11 +317,15 @@ impl ContinuityCounter {
             return;
         }
         self.last.retain(|pid, _| pids.contains(*pid));
+        self.pid_packets.retain(|pid, _| pids.contains(*pid));
+        self.pid_errors.retain(|pid, _| pids.contains(*pid));
     }
 
     /// Forgets every PID's counter.
     pub fn reset(&mut self) {
         self.last.clear();
+        self.pid_packets.clear();
+        self.pid_errors.clear();
     }
 }
 
@@ -1251,7 +1275,7 @@ impl DataPlane {
 
     /// Publishes the continuity error count at most once per second.
     fn report_continuity(&mut self, now_ms: i64) {
-        let errors = self.continuity.errors();
+        let errors = self.continuity.adapter_ccerr();
         if errors == self.reported_cc_errors {
             return;
         }
