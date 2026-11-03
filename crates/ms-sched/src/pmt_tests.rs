@@ -2854,6 +2854,29 @@ fn pmt_scan_opens_the_pmt_pids_of_the_pat() {
     }
 }
 
+// adapter.cpp:1176-1191: a PID kept by a FILTER_ADD_REMOVE filter outlives
+// its last stream, and is deleted when the filter goes.
+#[test]
+fn pid_with_add_remove_filter_survives_its_last_stream() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    assert_eq!(sched.mark_pid_add(0, 0, 0x200), 0);
+    sched.update_pids(0);
+    let filter = sched.add_filter(0, 0x200, FilterTarget::Pmt(None), FILTER_ADD_REMOVE);
+    assert!(filter >= 0);
+
+    sched.unmark_pid(0, 0, 0x200);
+    let entry = sched.find_pid(0, 0x200).expect("pid kept by its filter");
+    assert_ne!(entry.state, PidState::Deleted);
+    assert!(entry.sids.is_empty());
+    assert_eq!(entry.order, 0);
+
+    sched.del_filter(filter);
+    assert!(
+        sched.find_pid(0, 0x200).is_none(),
+        "pid deleted with its filter"
+    );
+}
+
 /// Records every `set_pid` call and every bulk PID set.
 struct PidLog {
     opened: Rc<RefCell<Vec<i32>>>,
