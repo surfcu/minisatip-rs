@@ -781,18 +781,60 @@ impl Scheduler {
             })
     }
 
+    fn pid_order(&self, aid: i32, pmt_id: i32) -> u32 {
+        let Some(pmt) = self.pmt(pmt_id) else {
+            return u32::MAX;
+        };
+        self.find_pid(aid, pmt.pid)
+            .filter(|entry| entry.state == PidState::Active)
+            .map_or(u32::MAX, |entry| {
+                if entry.order == 0 {
+                    u32::MAX
+                } else {
+                    entry.order
+                }
+            })
+    }
+
+    fn choice_outranks(order: u32, pct: i32, r_order: u32, r_pct: i32) -> bool {
+        if order != r_order {
+            order < r_order
+        } else {
+            pct > r_pct
+        }
+    }
+
+    fn pmt_completeness_pct(&self, pmt_id: i32) -> i32 {
+        let Some(pmt) = self.pmt(pmt_id) else {
+            return 0;
+        };
+        let aid = pmt.adapter;
+        let total = pmt.stream_pids.len() + pmt.caids;
+        if total == 0 {
+            return 0;
+        }
+        let matched = pmt
+            .stream_pids
+            .iter()
+            .map(|stream| stream.pid)
+            .chain(pmt.ca[..pmt.caids].iter().map(|ca| i32::from(ca.pid)))
+            .filter(|pid| {
+                self.find_pid(aid, *pid).is_some_and(|entry| {
+                    entry.state == PidState::Active
+                        && entry.sids.iter().any(|&sid| sid >= 0 && sid != DDCI_SID)
+                })
+            })
+            .count();
+        (matched * 100 / total) as i32
+    }
+
     fn handover_claims_from_lower_priority(&mut self, pmt_id: i32) {
         let Some(pmt) = self.pmt(pmt_id) else {
             return;
         };
         let aid = pmt.adapter;
-        let order = self.find_pid(aid, pmt.pid).map_or(u32::MAX, |entry| {
-            if entry.order == 0 {
-                u32::MAX
-            } else {
-                entry.order
-            }
-        });
+        let order = self.pid_order(aid, pmt_id);
+        let pct = self.pmt_completeness_pct(pmt_id);
         let streams: Vec<(i32, bool)> = pmt
             .stream_pids
             .iter()
@@ -812,10 +854,9 @@ impl Scheduler {
             let Some(old) = self.pmt(old_id) else {
                 continue;
             };
-            let old_order = self
-                .find_pid(aid, old.pid)
-                .map_or(u32::MAX, |entry| entry.order);
-            if order >= old_order {
+            let old_order = self.pid_order(aid, old_id);
+            let old_pct = self.pmt_completeness_pct(old_id);
+            if !Self::choice_outranks(order, pct, old_order, old_pct) {
                 continue;
             }
             if !matches!(old.state, PmtState::Running | PmtState::Starting) {
@@ -850,21 +891,11 @@ impl Scheduler {
             if !self.start_candidate(id) {
                 continue;
             }
-            let order = self
-                .pmt(id)
-                .and_then(|pmt| self.find_pid(aid, pmt.pid))
-                .filter(|entry| entry.state == PidState::Active)
-                .map_or(u32::MAX, |entry| {
-                    if entry.order == 0 {
-                        u32::MAX
-                    } else {
-                        entry.order
-                    }
-                });
-            let sid = self.pmt(id).map_or(0, |pmt| pmt.sid);
-            choices.push((order, sid, id));
+            let order = self.pid_order(aid, id);
+            let pct = self.pmt_completeness_pct(id);
+            choices.push((order, pct, id));
         }
-        choices.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        choices.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
 
         let mut alive = vec![true; choices.len()];
         for i in 0..choices.len() {
@@ -899,7 +930,7 @@ impl Scheduler {
             }
         }
 
-        for (index_in_choices, (order, _, id)) in choices.iter().copied().enumerate() {
+        for (index_in_choices, (order, pct, id)) in choices.iter().copied().enumerate() {
             if !alive[index_in_choices] {
                 continue;
             }
@@ -920,12 +951,9 @@ impl Scheduler {
                 }
                 if entry.pmt >= 0 {
                     let holder_id = entry.pmt;
-                    let holder_order = self
-                        .pmt(entry.pmt)
-                        .and_then(|holder| self.find_pid(aid, holder.pid))
-                        .filter(|entry| entry.state == PidState::Active)
-                        .map_or(u32::MAX, |entry| entry.order);
-                    if order >= holder_order {
+                    let holder_order = self.pid_order(aid, holder_id);
+                    let holder_pct = self.pmt_completeness_pct(holder_id);
+                    if !Self::choice_outranks(order, pct, holder_order, holder_pct) {
                         continue;
                     }
                     ms_log::logm!("PMT {} steals pid {} from PMT {}", id, pid, holder_id);
