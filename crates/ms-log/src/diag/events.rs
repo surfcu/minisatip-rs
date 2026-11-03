@@ -393,23 +393,30 @@ pub fn ecm_parity(ddci: i64, adapter: i64, pid: u64, table_id: u64, at_ms: i64) 
     );
 }
 
-fn ci_decrypt_fields(adapter: i64, keys_installed: u64, errors: u64, period_s: u64) -> Fields {
+fn ci_decrypt_fields(
+    adapter: i64,
+    keys_installed: u64,
+    errors: u64,
+    packets: u64,
+    period_s: u64,
+) -> Fields {
     let mut fields = Fields::new();
     fields.integer("adapter", adapter);
     fields.int("keys_installed", keys_installed);
     fields.int("errors", errors);
+    fields.int("packets", packets);
     fields.int("period_s", period_s);
     fields
 }
 
 /// `ci_decrypt`: CI-adapter descrambler state for one period.
-pub fn ci_decrypt(adapter: i64, keys_installed: u64, errors: u64, period_s: u64) {
+pub fn ci_decrypt(adapter: i64, keys_installed: u64, errors: u64, packets: u64, period_s: u64) {
     if !cfg!(feature = "diag-log") {
         return;
     }
     emit(
         "ci_decrypt",
-        &ci_decrypt_fields(adapter, keys_installed, errors, period_s),
+        &ci_decrypt_fields(adapter, keys_installed, errors, packets, period_s),
     );
 }
 
@@ -741,10 +748,10 @@ mod tests {
     #[test]
     fn ci_decrypt_event_json() {
         assert_eq!(
-            json("ci_decrypt", &ci_decrypt_fields(2, 3, 9, 10)),
+            json("ci_decrypt", &ci_decrypt_fields(2, 3, 9, 12, 10)),
             envelope(
                 "ci_decrypt",
-                ",\"adapter\":2,\"keys_installed\":3,\"errors\":9,\"period_s\":10"
+                ",\"adapter\":2,\"keys_installed\":3,\"errors\":9,\"packets\":12,\"period_s\":10"
             )
         );
     }
