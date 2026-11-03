@@ -213,6 +213,7 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 - [ ] All C++ tests ported and passing; full harness suite clean
 - [ ] Soak test on the box: 7 days as tvheadend backend, no regressions
 - [ ] Memory/CPU/binary size comparison vs C++ documented
+- [ ] Decrypt-error comparison vs C++ on the main box (`scripts/decerr.py`, docs/logging-setup.md); tool in place, run pending
 - [x] `-k` (`emulate_pids_all`) and the enigma2 path: pids=all emulation (#45), demux
   modes 1-3 (#46), enigma2 detection, FBC and `DMX_SET_SOURCE` (#47), CI routing
   (#48), log fixes (#50, #52); FTA and pids=all verified on the enigma2 box; CI routing

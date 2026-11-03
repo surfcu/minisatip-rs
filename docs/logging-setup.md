@@ -144,6 +144,43 @@ fields to report.
 nothing was written. `version` is the CAPMT version after the attempt; a skipped
 update keeps the current version because only a real send bumps it.
 
+## Comparing decrypt errors with the C++ build
+
+Both builds publish `ad_decerr` per adapter in `GET /state.json`. The C++ value
+comes from `get_adapter_decerrs` (adapter.cpp:2366); the Rust value comes from
+`Pipeline::adapter_decerr`
+(`crates/ms-ca-drivers/src/descramble/pipeline.rs:329`). Both mean the same
+thing: the decrypt errors of the two busiest active pids, reset when a pid's
+first clear packet arrives. It is a level, not a counter, so it falls back to 0
+on recovery and must never be summed.
+
+Run one sample while the box runs the C++ build and one while it runs the Rust
+build, with the same load and duration, from another host:
+
+```sh
+python3 scripts/decerr.py poll --url http://192.0.2.10:8080 \
+    --label cpp --interval 2 --out cpp.jsonl
+python3 scripts/decerr.py poll --url http://192.0.2.10:8080 \
+    --label rs --interval 2 --out rs.jsonl
+```
+
+Stop either run with Ctrl-C; each row is flushed as it is written. Then:
+
+```sh
+python3 scripts/decerr.py compare cpp.jsonl rs.jsonl
+```
+
+`compare` prints one row per label and adapter. `samples`, `nonzero_share` and
+`peak` describe steady-state errors; `startup_nonzero_samples` counts errors in
+the first 20 s after a join (`--join-grace`) and is excluded from the steady
+fields. `episodes` is the number of maximal runs of consecutive nonzero
+samples, with their longest and median lengths. Use `--json` for machine
+output.
+
+The two runs are only comparable with the same channels, tuner count, CAM and
+load. A difference in any of those can change both the error level and the
+share of nonzero samples.
+
 ## Collecting with Grafana Alloy
 
 The receiver must understand RFC 5424 and octet counting. A generic pipeline:
