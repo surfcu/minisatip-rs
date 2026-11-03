@@ -14,6 +14,8 @@ struct Mock {
     reads: Arc<Mutex<VecDeque<io::Result<Vec<u8>>>>>,
     writes: Arc<Mutex<Vec<Vec<u8>>>>,
     write_error: Option<i32>,
+    /// Return `WouldBlock` for the next write before accepting one.
+    write_block_once: Arc<Mutex<bool>>,
     dropped: Arc<AtomicBool>,
 }
 
@@ -51,6 +53,11 @@ impl CaLink for Mock {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if let Some(e) = self.write_error {
             return Err(io::Error::from_raw_os_error(e));
+        }
+        let mut block = self.write_block_once.lock().unwrap();
+        if *block {
+            *block = false;
+            return Err(io::ErrorKind::WouldBlock.into());
         }
         self.writes.lock().unwrap().push(buf.to_vec());
         Ok(buf.len())
@@ -327,6 +334,23 @@ fn ca_keepalive_counts_failures() {
         m.take_writes(),
         [vec![0, 1, T_DATA_LAST, 1, 1]],
         "keepalive poll"
+    );
+}
+
+#[test]
+fn would_block_write_is_retried() {
+    let (_, mut d) = dev(0);
+    let m = Mock::default();
+    *m.write_block_once.lock().unwrap() = true;
+    d.set_link(m.boxed());
+    assert!(
+        d.write_tpdu(T_CREATE_TC, &[]),
+        "a transient WouldBlock must not drop the TPDU"
+    );
+    assert_eq!(
+        m.take_writes(),
+        [vec![0, 1, T_CREATE_TC, 1, 1]],
+        "the TPDU is delivered on the retry"
     );
 }
 

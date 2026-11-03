@@ -57,6 +57,21 @@ impl DvbCaLink {
             p.revents & libc::POLLPRI != 0,
         ))
     }
+
+    /// Waits up to `timeout_ms` for the fd to accept a write.
+    fn poll_out(&self, timeout_ms: i32) -> io::Result<()> {
+        let mut p = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: poll(2) reads and writes exactly one valid pollfd.
+        let n = unsafe { libc::poll(&mut p, 1, timeout_ms) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl AsRawFd for DvbCaLink {
@@ -79,11 +94,21 @@ impl CaLink for DvbCaLink {
     }
 
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut retries = 0;
         loop {
             // SAFETY: write(2) reads buf.len() bytes from the slice.
             let rc = unsafe { libc::write(self.fd.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
             match check(rc) {
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if retries < 3
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                {
+                    retries += 1;
+                    self.poll_out(100)?;
+                }
                 r => return r,
             }
         }

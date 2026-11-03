@@ -26,27 +26,29 @@ pub enum SendOutcome {
     Sent,
     /// Content hash unchanged and not forced: nothing written.
     Unchanged,
-    /// The write failed (C++ `TABLES_RESULT_ERROR_RETRY`).
+    /// The write failed; the slot keeps its place (C++ `send_capmt` returns 0).
     WriteFailed,
-    /// No CA session (C++ returns 1, `TABLES_RESULT_ERROR_RETRY`).
+    /// No CA session (C++ `TABLES_RESULT_ERROR_NORETRY`).
     NoSession,
-    /// `create_capmt` failed (C++ NORETRY).
+    /// `create_capmt` failed (C++ `TABLES_RESULT_ERROR_NORETRY`).
     BuildFailed,
 }
 
 impl SendOutcome {
-    /// The C++ `send_capmt` return value (tables.h:13-15).
+    /// The C++ `send_capmt` return value (ca.cpp:1021, 1309-1310).
     pub fn result(self) -> TablesResult {
         match self {
-            Self::Sent | Self::Unchanged => TablesResult::Ok,
-            Self::WriteFailed | Self::NoSession => TablesResult::Retry,
-            Self::BuildFailed => TablesResult::NoRetry,
+            Self::Sent | Self::Unchanged | Self::WriteFailed => TablesResult::Ok,
+            Self::NoSession | Self::BuildFailed => TablesResult::NoRetry,
         }
     }
 
     /// The C++ return value treated as failure by callers.
     pub fn is_error(self) -> bool {
-        self.result() != TablesResult::Ok
+        matches!(
+            self,
+            Self::WriteFailed | Self::NoSession | Self::BuildFailed
+        )
     }
 }
 

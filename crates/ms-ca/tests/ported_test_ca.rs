@@ -697,10 +697,10 @@ fn test_capmt_joins_send_at_once() {
     assert_eq!(cam.read_capmts().0, 0, "the timeout sends no CAPMT");
 }
 
-// A retryable failure marks only the CAPMT slot that failed, so the next
-// send on another slot (including a leave) is not reported as a retry.
+// A failed write marks only the CAPMT slot that failed, so the next send on
+// another slot (including a leave) is not reported as a retry.
 #[test]
-fn retry_is_tracked_per_capmt_slot() {
+fn failed_write_is_tracked_per_capmt_slot() {
     let mut t = ProgramTable::new();
     t.track_requested_pids();
     let mut dev = CaDevice::new(0, 2, 0);
@@ -714,15 +714,17 @@ fn retry_is_tracked_per_capmt_slot() {
     }
 
     assert_eq!(dev.process_pmt(p1, false, &t, &mut drv), TablesResult::Ok);
-    drv.no_session = true;
+    drv.fail_writes = true;
     assert_eq!(
         dev.process_pmt(p2, false, &t, &mut drv),
-        TablesResult::Retry
+        TablesResult::Ok,
+        "a failed write keeps the slot without asking for a retry"
     );
+    assert_eq!(dev.slot_of(p2), Some(1), "the program keeps its place");
     assert!(!dev.capmt[0].diag_retry, "the sent slot is not marked");
     assert!(dev.capmt[1].diag_retry, "the failed slot is marked");
 
-    drv.no_session = false;
+    drv.fail_writes = false;
     dev.del_pmt(p1, &t, &mut drv);
     assert!(
         !dev.capmt[0].diag_retry,
@@ -932,36 +934,37 @@ fn test_capmt_changed_rejoin_still_sends() {
 }
 
 // Ported from tests/test_ca.cpp:2316 (minisatip 3d42bee)
-// A failed CAPMT write is reported as a retry and keeps no place, so the
-// next PMT pass registers the program from scratch.
+// A failed CAPMT write keeps its place and returns Ok (C++ send_capmt:1021);
+// a missing CA session returns NoRetry and drops a new offer (ca.cpp:1309).
 #[test]
-fn test_capmt_write_failure_retries() {
+fn test_capmt_write_failure_keeps_place() {
     let mut cam = PackingCam::open();
     let p1 = cam.program(0x2b01);
     cam.drv.fail_writes = true;
     assert_eq!(
         cam.join(p1, false),
-        TablesResult::Retry,
-        "a failed write asks to retry"
+        TablesResult::Ok,
+        "a failed write is not retried"
     );
-    assert_eq!(cam.dev.capmt[0].pmt_count(), 0, "no place is kept");
+    assert!(cam.dev.capmt[0].has_pmt(p1), "the place is kept");
+    assert_eq!(cam.read_capmts().0, 0, "nothing reached the CAM");
 
     cam.drv.fail_writes = false;
-    assert_eq!(cam.join(p1, false), TablesResult::Ok, "the retry");
+    assert_eq!(cam.join(p1, false), TablesResult::Ok, "the re-send");
     assert_eq!(cam.read_capmts().0, 1, "sends the CAPMT");
     assert!(cam.dev.capmt[0].has_pmt(p1), "and registers it");
 
-    // A failed update keeps its place; it is retried as an update.
+    // A failed update also keeps its place.
     cam.drv.fail_writes = true;
     cam.dev.capmt[0].sid = 0x2b0f;
-    assert_eq!(cam.join(p1, true), TablesResult::Retry);
+    assert_eq!(cam.join(p1, true), TablesResult::Ok);
     assert!(cam.dev.capmt[0].has_pmt(p1), "an update keeps its place");
     cam.drv.fail_writes = false;
 
-    // Without a CA session the add is retried too and keeps no place.
+    // Without a CA session a new offer is not retried and keeps no place.
     let p2 = cam.program(0x2b02);
     cam.drv.no_session = true;
-    assert_eq!(cam.join(p2, false), TablesResult::Retry);
+    assert_eq!(cam.join(p2, false), TablesResult::NoRetry);
     assert!(cam.dev.slot_of(p2).is_none(), "no place is kept");
 }
 

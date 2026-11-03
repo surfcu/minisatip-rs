@@ -541,14 +541,19 @@ pub(crate) fn program_from_service(service: &CaService) -> Program {
     program.streams = service
         .streams
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             let av = service.av_pids.contains(&s.pid);
             EsStream {
                 stream_type: s.stream_type,
                 pid: s.pid,
                 is_audio: av && !ms_psi::is_video_stream_type(s.stream_type),
                 is_video: av && ms_psi::is_video_stream_type(s.stream_type),
-                descriptors: Vec::new(),
+                descriptors: service
+                    .stream_descriptors
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -878,7 +883,7 @@ impl Worker {
             }
         }
         // ca.cpp:1265,1276: a PMT that found no place puts the CI back.
-        if result == TablesResult::Retry && capmt.slot_of(pmt_id).is_none() {
+        if result != TablesResult::Ok && capmt.slot_of(pmt_id).is_none() {
             self.restore_ci_link(device, adapter as i32, prev_linked);
         }
         result
@@ -2179,7 +2184,7 @@ mod tests {
         worker.linked.insert(0, 5);
         assert_eq!(
             worker.add_pmt(program_on(3, 0x0604), false),
-            TablesResult::Retry
+            TablesResult::NoRetry
         );
         assert_eq!(worker.capmt[&0].slot_of(3), None);
         assert_eq!(
@@ -2333,6 +2338,64 @@ mod tests {
         let mut sink = DvbcaSink::new(Rc::clone(&dvbca), Rc::default(), Rc::default());
         assert_eq!(sink.add_pmt(&service(0x0B00), false), TablesResult::NoRetry);
         assert_eq!(dvbca.try_notice(), None);
+    }
+
+    #[test]
+    fn ddci_pmt_forwards_es_descriptors_and_remaps_ecm() {
+        let ca_desc = ms_ca::RawDescriptor {
+            tag: 0x09,
+            data: vec![0x0B, 0x00, 0x05, 0x73],
+        };
+        let lang_desc = ms_ca::RawDescriptor {
+            tag: 0x0A,
+            data: b"eng\0".to_vec(),
+        };
+        let svc = CaService {
+            pmt_id: 0,
+            adapter: 0,
+            sid: 0x66,
+            pmt_pid: 0x3FF,
+            streams: vec![StreamPid {
+                stream_type: 2,
+                pid: 0x3FF,
+            }],
+            stream_descriptors: vec![vec![ca_desc.clone(), lang_desc.clone()]],
+            ..CaService::default()
+        };
+        let program = program_from_service(&svc);
+        assert_eq!(
+            program.streams[0].descriptors,
+            vec![ca_desc, lang_desc],
+            "stream descriptors must reach the CAPMT program"
+        );
+
+        use ms_ca_drivers::ddci::{Ddci, DdciDevice, DdciPmt};
+        let mut ddci = Ddci::new();
+        ddci.devices.insert(0, DdciDevice::new(0, 0));
+        // Occupy 0x0573 on adapter 1 so the ES-level ECM pid must be remapped.
+        ddci.add_pid_mapping_table(1, 0x0573, 99, 0, false);
+        let mapped = ddci.add_pid_mapping_table(0, 0x0573, program.id, 0, false);
+        assert!(mapped >= 0 && mapped != 0x0573, "ECM pid must be remapped");
+        let mut dp = DdciPmt {
+            ver: 0,
+            pcr_pid: 8191,
+            ..DdciPmt::default()
+        };
+        let psi = ddci.create_pmt(0, &program, 512, &mut dp);
+        let parsed =
+            ms_psi::Pmt::parse(&psi[1..], ms_psi::CrcCheck::Verify).expect("generated PMT parses");
+        let descriptors = &parsed.streams[0].descriptors;
+        assert!(
+            descriptors
+                .iter()
+                .any(|d| d.tag == 0x0A && d.data == b"eng\0"),
+            "the language descriptor must be forwarded"
+        );
+        let ca = descriptors
+            .iter()
+            .find(|d| d.is_ca())
+            .expect("ES-level CA descriptor");
+        assert_eq!(ca.ca_pid(), Some(mapped as u16));
     }
 }
 

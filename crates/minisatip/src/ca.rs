@@ -54,7 +54,9 @@ struct AdapterCa {
     ca_active: bool,
     pids_all: bool,
     stats: DescramblerStats,
-    pending_stats: Option<Receiver<DescramblerStats>>,
+    pending_stats: Option<(Receiver<DescramblerStats>, BTreeMap<usize, u64>)>,
+    /// PMT generations the current `stats` reply was requested for.
+    stats_generations: BTreeMap<usize, u64>,
     /// Pid table last sent to the descrambler (pid, active, claiming PMT).
     pid_table: Vec<AdapterPid>,
 }
@@ -259,6 +261,7 @@ impl CaRuntime {
                 pids_all: false,
                 stats: DescramblerStats::default(),
                 pending_stats: None,
+                stats_generations: BTreeMap::new(),
                 pid_table: Vec::new(),
             },
         );
@@ -1009,6 +1012,9 @@ impl CaRuntime {
                 .iter()
                 .filter_map(|s| {
                     let pmt = sched.pmt(s.pmt_id as i32)?;
+                    if ca.stats_generations.get(&s.pmt_id) != Some(&pmt.generation) {
+                        return None;
+                    }
                     Some(PmtStatus {
                         pmt_id: s.pmt_id,
                         adapter: usize::try_from(pmt.adapter).ok()?,
@@ -1025,9 +1031,14 @@ impl CaRuntime {
                 .client
                 .watchdog(*aid, now, &statuses);
             if ca.pending_stats.is_none() {
+                let generations = ca
+                    .services
+                    .iter()
+                    .map(|(&id, &(generation, _))| (id, generation))
+                    .collect();
                 let (tx, rx) = mpsc::channel();
                 if ca.descrambler.send(DescramblerCommand::Query(tx)).is_ok() {
-                    ca.pending_stats = Some(rx);
+                    ca.pending_stats = Some((rx, generations));
                 }
             }
         }
@@ -1037,9 +1048,14 @@ impl CaRuntime {
     fn request_stats(&mut self) {
         for ca in self.adapters.values_mut() {
             if ca.pending_stats.is_none() {
+                let generations = ca
+                    .services
+                    .iter()
+                    .map(|(&id, &(generation, _))| (id, generation))
+                    .collect();
                 let (tx, rx) = mpsc::channel();
                 if ca.descrambler.send(DescramblerCommand::Query(tx)).is_ok() {
-                    ca.pending_stats = Some(rx);
+                    ca.pending_stats = Some((rx, generations));
                 }
             }
         }
@@ -1058,12 +1074,14 @@ impl CaRuntime {
 
     fn collect_stats(&mut self) {
         for ca in self.adapters.values_mut() {
-            let Some(rx) = ca.pending_stats.as_ref() else {
+            let Some((rx, generations)) = ca.pending_stats.as_ref() else {
                 continue;
             };
             match rx.try_recv() {
                 Ok(stats) => {
+                    let generations = generations.clone();
                     ca.stats = stats;
+                    ca.stats_generations = generations;
                     ca.pending_stats = None;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -2177,6 +2195,7 @@ mod wiring_tests {
                 pids_all: false,
                 stats: DescramblerStats::default(),
                 pending_stats: None,
+                stats_generations: BTreeMap::new(),
                 pid_table: Vec::new(),
             },
         );
@@ -2223,6 +2242,7 @@ mod wiring_tests {
                 pids_all: false,
                 stats: DescramblerStats::default(),
                 pending_stats: None,
+                stats_generations: BTreeMap::new(),
                 pid_table: Vec::new(),
             },
         );
@@ -2440,6 +2460,102 @@ mod wiring_tests {
         );
     }
 
+    // F5-3: a stats reply from before a PMT slot was reused must not restart
+    // the replacement service.
+    #[test]
+    fn stale_stats_across_pmt_reuse_do_not_restart_the_new_service() {
+        use ms_ca::{CaDriver, CapmtDiff, CapmtOp};
+        use ms_ca_drivers::descramble::ServiceStats;
+        use ms_ca_drivers::dvbapi::proto;
+
+        let opts = Options {
+            dvbapi_host: "127.0.0.1".to_owned(),
+            dvbapi_port: 9000,
+            ..Options::default()
+        };
+        let mut sched = sched();
+        let mut ca = CaRuntime::new(&opts);
+        let old = sched.pmt_add(0, 0x100, 0x200);
+        sched.pmt_slot_mut(old).unwrap().state = PmtState::Running;
+        let old_generation = sched.pmt(old).unwrap().generation;
+
+        let (descrambler, _rx) = mpsc::channel();
+        ca.adapters.insert(
+            0,
+            AdapterCa {
+                descrambler,
+                services: BTreeMap::new(),
+                ca_active: false,
+                pids_all: false,
+                stats: DescramblerStats::default(),
+                pending_stats: None,
+                stats_generations: BTreeMap::new(),
+                pid_table: Vec::new(),
+            },
+        );
+
+        {
+            let dvbapi = ca.dvbapi.as_mut().unwrap();
+            let mut shared = dvbapi.shared.borrow_mut();
+            shared.client.on_connected(1000);
+            let mut info = proto::DVBAPI_SERVER_INFO.to_be_bytes().to_vec();
+            info.extend_from_slice(&2u16.to_be_bytes());
+            let text = b"OSCam v1.20, build r11720 (x86_64-linux)";
+            info.push(text.len() as u8);
+            info.extend_from_slice(text);
+            shared.client.on_data(&info, 1000);
+            assert_eq!(shared.client.next_event(), Some(CaEvent::Ready));
+            let diff = CapmtDiff {
+                ops: vec![CapmtOp::Add(CaService {
+                    pmt_id: old as usize,
+                    adapter: 0,
+                    sid: 0x100,
+                    pmt_pid: 0x200,
+                    ..CaService::default()
+                })],
+            };
+            shared.client.apply(&diff).unwrap();
+        }
+
+        // The slot is deleted and reused, bumping its generation.
+        sched.pmt_del(old);
+        let reused = sched.pmt_add(0, 0x200, 0x300);
+        assert_eq!(reused, old, "the PMT id is reused");
+        sched.pmt_slot_mut(reused).unwrap().state = PmtState::Running;
+        assert_ne!(sched.pmt(reused).unwrap().generation, old_generation);
+
+        // The reply to the query sent before the reuse arrives now.
+        let (tx, rx) = mpsc::channel();
+        tx.send(DescramblerStats {
+            services: vec![ServiceStats {
+                pmt_id: old as usize,
+                last_decrypt_ok: 1000,
+                last_scrambled_pkt: 19500,
+                parity: 0,
+                cw: None,
+            }],
+            ..DescramblerStats::default()
+        })
+        .unwrap();
+        let adapter = ca.adapters.get_mut(&0).unwrap();
+        adapter.pending_stats = Some((rx, BTreeMap::from([(old as usize, old_generation)])));
+        ca.collect_stats();
+        assert_eq!(
+            ca.adapters[&0].stats_generations.get(&(old as usize)),
+            Some(&old_generation)
+        );
+
+        ca.watchdog(&sched, 20_000);
+        // New scrambled packets keep the stall window open.
+        ca.adapters.get_mut(&0).unwrap().stats.services[0].last_scrambled_pkt = 23_000;
+        ca.watchdog(&sched, 23_500);
+        let mut shared = ca.dvbapi.as_ref().unwrap().shared.borrow_mut();
+        assert!(
+            !matches!(shared.client.next_event(), Some(CaEvent::Restart { .. })),
+            "stale stats must not restart the replacement PMT"
+        );
+    }
+
     #[test]
     fn stale_dvbapi_filter_ids_are_forgotten() {
         let opts = Options {
@@ -2483,6 +2599,7 @@ mod wiring_tests {
                 pids_all: false,
                 stats: DescramblerStats::default(),
                 pending_stats: None,
+                stats_generations: BTreeMap::new(),
                 pid_table: Vec::new(),
             },
         );
@@ -2543,6 +2660,7 @@ mod wiring_tests {
                 pids_all: false,
                 stats: DescramblerStats::default(),
                 pending_stats: None,
+                stats_generations: BTreeMap::new(),
                 pid_table: Vec::new(),
             },
         );
@@ -2898,6 +3016,7 @@ mod window_tests {
             pids_all: false,
             stats: DescramblerStats::default(),
             pending_stats: None,
+            stats_generations: BTreeMap::new(),
             pid_table: Vec::new(),
         });
         adapter.stats.dec_err = dec_err;

@@ -573,9 +573,24 @@ impl CaDevice {
     }
 
     fn write_raw(&mut self, buf: &[u8], eio_closes: bool) -> bool {
-        let rc = match self.link.as_deref_mut() {
-            Some(l) => l.write(buf),
-            None => Err(io::Error::from(io::ErrorKind::NotConnected)),
+        let mut retries = 0;
+        let rc = loop {
+            let rc = match self.link.as_deref_mut() {
+                Some(l) => l.write(buf),
+                None => Err(io::Error::from(io::ErrorKind::NotConnected)),
+            };
+            match &rc {
+                Err(e)
+                    if retries < 3
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                {
+                    retries += 1;
+                }
+                _ => break rc,
+            }
         };
         match rc {
             Ok(n) if n == buf.len() => true,
