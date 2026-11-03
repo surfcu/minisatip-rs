@@ -93,6 +93,10 @@ pub struct PidCounters {
     pub dec_err: u64,
     /// `p->is_decrypted`: a clear packet was seen.
     pub decrypted: bool,
+    /// Cumulative scrambled packets, never reset.
+    pub scrambled_total: u64,
+    /// Cumulative clear packets, never reset.
+    pub clear_total: u64,
 }
 
 /// One entry of [`Descrambler::set_adapter_pids`]: pid, active, claiming PMT.
@@ -284,9 +288,13 @@ impl Descrambler {
             };
             seen[usize::from(pid)] = true;
             if !entry.tracked {
+                let scrambled_total = entry.scrambled_total;
+                let clear_total = entry.clear_total;
                 *entry = PidCounters {
                     tracked: true,
                     claim,
+                    scrambled_total,
+                    clear_total,
                     ..PidCounters::default()
                 };
             } else if entry.claim != claim {
@@ -302,7 +310,13 @@ impl Descrambler {
         }
         for (pid, entry) in self.pids.iter_mut().enumerate() {
             if entry.tracked && !seen[pid] {
-                *entry = PidCounters::default();
+                let scrambled_total = entry.scrambled_total;
+                let clear_total = entry.clear_total;
+                *entry = PidCounters {
+                    scrambled_total,
+                    clear_total,
+                    ..PidCounters::default()
+                };
             }
         }
     }
@@ -336,6 +350,16 @@ impl Descrambler {
     /// Counters of one pid, for tests and diagnostics.
     pub fn pid_counters(&self, pid: u16) -> PidCounters {
         self.pids[usize::from(pid & 0x1FFF)]
+    }
+
+    /// Cumulative scrambled and clear packet totals of every counted pid.
+    pub fn pid_totals(&self) -> Vec<(u16, u64, u64)> {
+        self.pids
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.scrambled_total != 0 || p.clear_total != 0)
+            .map(|(pid, p)| (pid as u16, p.scrambled_total, p.clear_total))
+            .collect()
     }
 
     /// Starts tracking a service and maps its PIDs to it (`pmt_add` + `p->pmt`).
@@ -865,6 +889,12 @@ impl Descrambler {
             let pid = pid_of(b);
             if pid == 0x1FFF || pids_all {
                 continue;
+            }
+            // Cumulative totals are counted for every pid, tracked or not.
+            if b[3] & 0x80 == 0 {
+                self.pids[usize::from(pid)].clear_total += 1;
+            } else {
+                self.pids[usize::from(pid)].scrambled_total += 1;
             }
             if b[3] & 0x80 == 0 {
                 if pid > 0x001F {

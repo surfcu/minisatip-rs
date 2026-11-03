@@ -906,6 +906,45 @@ fn clear_packets_are_counted_for_data_pids_only() {
 }
 
 #[test]
+fn pid_totals_keep_scrambled_packets_after_the_first_clear() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    d.set_adapter_pids(&[(0x100, true, 1)]);
+    pass(&mut d, &[(0x100, true); 3]);
+    assert_eq!(d.pid_totals(), vec![(0x100, 3, 0)]);
+    pass(&mut d, &[(0x100, false); 2]);
+    assert_eq!(d.pid_totals(), vec![(0x100, 3, 2)]);
+    assert_eq!(d.pid_counters(0x100).dec_err, 0);
+}
+
+#[test]
+fn pid_totals_count_untracked_and_psi_pids() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    pass(&mut d, &[(0x200, true), (0x200, false), (0x0010, true)]);
+    assert_eq!(d.pid_totals(), vec![(0x0010, 1, 0), (0x200, 1, 1)]);
+}
+
+#[test]
+fn pid_totals_skip_null_packets() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    pass(&mut d, &[(0x1FFF, true), (0x1FFF, false), (0x100, true)]);
+    assert_eq!(d.pid_totals(), vec![(0x100, 1, 0)]);
+}
+
+#[test]
+fn pid_totals_survive_decerr_resets() {
+    let mut d = Descrambler::new(CipherRegistry::software());
+    d.set_adapter_pids(&[(0x100, true, 1)]);
+    pass(&mut d, &[(0x100, true), (0x100, true), (0x100, false)]);
+    assert_eq!(d.pid_counters(0x100).dec_err, 0);
+    assert_eq!(d.pid_totals(), vec![(0x100, 2, 1)]);
+    d.set_adapter_pids(&[(0x100, false, 1)]);
+    d.set_adapter_pids(&[(0x100, true, 1)]);
+    assert_eq!(d.pid_counters(0x100).dec_err, 0);
+    assert_eq!(d.pid_counters(0x100).packets, 0);
+    assert_eq!(d.pid_totals(), vec![(0x100, 2, 1)]);
+}
+
+#[test]
 fn a_claim_change_rearms_the_reset_and_removed_pids_are_forgotten() {
     let mut d = Descrambler::new(CipherRegistry::software());
     d.set_adapter_pids(&[(0x100, true, 1)]);
@@ -922,7 +961,10 @@ fn a_claim_change_rearms_the_reset_and_removed_pids_are_forgotten() {
     );
 
     d.set_adapter_pids(&[]);
-    assert_eq!(d.pid_counters(0x100), PidCounters::default());
+    let counters = d.pid_counters(0x100);
+    assert!(!counters.tracked);
+    assert_eq!(counters.dec_err, 0);
+    assert_eq!((counters.scrambled_total, counters.clear_total), (2, 2));
     pass(&mut d, &[(0x100, true)]);
     assert_eq!(
         d.pid_counters(0x100).dec_err,
@@ -951,6 +993,7 @@ fn stage_reports_ad_decerr_and_clears_it_once_decrypted() {
         StageConfig {
             drop_encrypted: DropEncrypted::Send,
             pids_all_no_dec: false,
+            report_pid_totals: false,
         },
         std::time::Instant::now(),
     );
@@ -967,6 +1010,27 @@ fn stage_reports_ad_decerr_and_clears_it_once_decrypted() {
     assert_eq!(query(&tx, &mut stage), 4);
     stage.process(&mut batch(&[(0x100, false)]));
     assert_eq!(query(&tx, &mut stage), 0);
+}
+
+// A Query reply carries pid_totals only when the stage is told they are needed.
+#[test]
+fn stage_reports_pid_totals_only_when_configured() {
+    for (report, expected) in [(false, Vec::new()), (true, vec![(0x100, 1, 0)])] {
+        let (tx, mut stage) = DescramblerStage::new(
+            CipherRegistry::software(),
+            StageConfig {
+                report_pid_totals: report,
+                ..StageConfig::default()
+            },
+            std::time::Instant::now(),
+        );
+        tx.send(DescramblerCommand::SetCaActive(true)).unwrap();
+        stage.process(&mut batch(&[(0x100, true)]));
+        let (reply, rx) = mpsc::channel();
+        tx.send(DescramblerCommand::Query(reply)).unwrap();
+        stage.drain_commands();
+        assert_eq!(rx.recv().unwrap().pid_totals, expected);
+    }
 }
 
 // adapter.cpp:1015-1028: a pid turning NEW -> ACTIVE starts its counters at zero.

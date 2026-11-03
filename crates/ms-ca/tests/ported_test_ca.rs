@@ -1039,3 +1039,97 @@ fn resend_capmts_forces_an_update_per_active_slot() {
         "nothing sent without a session"
     );
 }
+
+// --cam-recovery: re-joining one service sends the same leave plus join CAPMTs
+// a manual leave and join do, and leaves the other services alone. No C++ equivalent.
+#[test]
+fn rejoin_pmt_matches_a_manual_leave_and_join() {
+    let mut t = ProgramTable::new();
+    t.track_requested_pids();
+    let add = |t: &mut ProgramTable, sid: u16, pid: u16| {
+        let id = t.add(0, sid, 0x301);
+        let p = t.get_mut(id).unwrap();
+        p.add_caid(0x0B00, 0x570, &[]);
+        p.add_stream(pid, 2, false, true);
+        p.add_stream(pid + 1, 3, true, false);
+        id
+    };
+    let p1 = add(&mut t, 0x2401, 0x401);
+    let p2 = add(&mut t, 0x2402, 0x501);
+
+    let mut manual = CaDevice::new(0, 2, 0);
+    let mut rejoin = CaDevice::new(0, 2, 0);
+    let mut d1 = RecordingDriver::default();
+    let mut d2 = RecordingDriver::default();
+    for id in [p1, p2] {
+        assert_eq!(manual.process_pmt(id, false, &t, &mut d1), TablesResult::Ok);
+        assert_eq!(rejoin.process_pmt(id, false, &t, &mut d2), TablesResult::Ok);
+    }
+    d1.take();
+    d2.take();
+    let slot = rejoin.slot_of(p1).unwrap();
+    let other_before = rejoin.capmt[1 - slot].pmts_str();
+
+    manual.del_pmt(p1, &t, &mut d1);
+    assert_eq!(manual.process_pmt(p1, false, &t, &mut d1), TablesResult::Ok);
+    let expected = d1.take();
+    assert_eq!(expected.len(), 2, "a leave and then a join");
+
+    rejoin.capmt_reason_log = Some(Vec::new());
+    rejoin.rejoin_pmt(usize::try_from(p1).unwrap(), &t, &mut d2);
+    assert_eq!(d2.take(), expected, "the same CAPMTs as a manual re-join");
+    assert_eq!(
+        rejoin.capmt_reason_log.take().unwrap(),
+        ["recovery", "recovery"],
+        "both CAPMTs carry the recovery reason"
+    );
+    assert_eq!(
+        rejoin.capmt[1 - slot].pmts_str(),
+        other_before,
+        "the other service keeps its place"
+    );
+    assert_eq!(rejoin.slot_of(p1), Some(slot), "and p1 is back in its slot");
+}
+
+// --cam-recovery: with two PMTs in one CAPMT, re-joining one matches a manual
+// leave and join and keeps the other PMT in its place. No C++ equivalent.
+#[test]
+fn rejoin_pmt_keeps_the_other_pmt_in_a_shared_capmt() {
+    let mut t = ProgramTable::new();
+    t.track_requested_pids();
+    let add = |t: &mut ProgramTable, sid: u16, pid: u16| {
+        let id = t.add(0, sid, 0x301);
+        let p = t.get_mut(id).unwrap();
+        p.add_caid(0x0B00, 0x570, &[]);
+        p.add_stream(pid, 2, false, true);
+        p.add_stream(pid + 1, 3, true, false);
+        id
+    };
+    let p1 = add(&mut t, 0x2401, 0x401);
+    let p2 = add(&mut t, 0x2402, 0x501);
+
+    let mut manual = CaDevice::new(0, 1, 1);
+    let mut rejoin = CaDevice::new(0, 1, 1);
+    let mut d1 = RecordingDriver::default();
+    let mut d2 = RecordingDriver::default();
+    for id in [p1, p2] {
+        assert_eq!(manual.process_pmt(id, false, &t, &mut d1), TablesResult::Ok);
+        assert_eq!(rejoin.process_pmt(id, false, &t, &mut d2), TablesResult::Ok);
+    }
+    assert_eq!(manual.capmt[0].pmt_count(), 2, "both PMTs share the CAPMT");
+    d1.take();
+    d2.take();
+    let before = rejoin.capmt[0].pmts_str();
+
+    manual.del_pmt(p1, &t, &mut d1);
+    assert_eq!(manual.process_pmt(p1, false, &t, &mut d1), TablesResult::Ok);
+    let expected = d1.take();
+
+    rejoin.rejoin_pmt(usize::try_from(p1).unwrap(), &t, &mut d2);
+    assert_eq!(d2.take(), expected, "the same CAPMTs as a manual re-join");
+    assert_eq!(
+        rejoin.capmt[0].pmts_str(),
+        before,
+        "the other PMT keeps its place"
+    );
+}

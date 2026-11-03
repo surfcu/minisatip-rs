@@ -137,6 +137,8 @@ pub struct DescramblerStats {
     pub clear_pkts: u64,
     /// `ad_decerr`: dec errors of the two busiest active pids.
     pub ad_decerr: u64,
+    /// Cumulative (pid, scrambled, clear) totals, never reset.
+    pub pid_totals: Vec<(u16, u64, u64)>,
 }
 
 /// Settings of one adapter's descrambler.
@@ -146,6 +148,8 @@ pub struct StageConfig {
     pub drop_encrypted: DropEncrypted,
     /// `-o ~` (`opts.pids_all_no_dec`).
     pub pids_all_no_dec: bool,
+    /// Fill `DescramblerStats::pid_totals` (`--cam-recovery` only).
+    pub report_pid_totals: bool,
 }
 
 impl Default for StageConfig {
@@ -153,6 +157,7 @@ impl Default for StageConfig {
         Self {
             drop_encrypted: DropEncrypted::Drop,
             pids_all_no_dec: false,
+            report_pid_totals: false,
         }
     }
 }
@@ -257,6 +262,11 @@ impl DescramblerStage {
                     dec_err: self.descrambler.dec_err(),
                     clear_pkts: self.descrambler.clear_pkts(),
                     ad_decerr: self.descrambler.adapter_decerr(),
+                    pid_totals: if self.config.report_pid_totals {
+                        self.descrambler.pid_totals()
+                    } else {
+                        Vec::new()
+                    },
                 });
             }
             DescramblerCommand::SetAdapterPids(table) => {

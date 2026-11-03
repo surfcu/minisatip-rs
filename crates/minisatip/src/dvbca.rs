@@ -149,6 +149,21 @@ impl WindowRecorder {
             })
             .collect()
     }
+
+    /// The `(adapter, window_ms, services)` service windows sent so far, in order.
+    pub(crate) fn service_windows(&self) -> Vec<ServiceWindowReport> {
+        self.0
+            .try_iter()
+            .filter_map(|request| match request {
+                Request::ServiceWindows {
+                    adapter,
+                    window_ms,
+                    services,
+                } => Some((adapter, window_ms, services)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Messages to the worker.
@@ -176,6 +191,12 @@ enum Request {
         scrambled: u64,
         clear: u64,
         window_ms: i64,
+    },
+    /// One window per service: its `(sid, scrambled, clear)` counts.
+    ServiceWindows {
+        adapter: usize,
+        window_ms: i64,
+        services: Vec<(u16, u64, u64)>,
     },
     Stop,
 }
@@ -338,6 +359,20 @@ impl Dvbca {
             scrambled,
             clear,
             window_ms,
+        });
+    }
+
+    /// Reports one window per service of an adapter (`--cam-recovery`).
+    pub fn report_service_windows(
+        &self,
+        adapter: usize,
+        window_ms: i64,
+        services: Vec<(u16, u64, u64)>,
+    ) {
+        let _ = self.requests.send(Request::ServiceWindows {
+            adapter,
+            window_ms,
+            services,
         });
     }
 
@@ -713,6 +748,51 @@ impl Worker {
                     && let Some(capmt) = self.capmt.get_mut(&adapter)
                 {
                     capmt.resend_capmts(&self.programs, &mut SlotDriver(dev));
+                }
+            }
+            Request::ServiceWindows {
+                adapter,
+                window_ms,
+                services,
+            } => {
+                // Only a real CAM re-init or an empty CAPMT makes a service window inactive.
+                let active = self
+                    .registry
+                    .get(adapter as i32)
+                    .is_some_and(|dev| dev.state == CaState::Initialized)
+                    && self
+                        .capmt
+                        .get(&adapter)
+                        .is_some_and(|capmt| !capmt_pmt_ids(capmt).is_empty());
+                let mut pairs = Vec::new();
+                if let Some(capmt) = self.capmt.get(&adapter) {
+                    for pmt_id in capmt_pmt_ids(capmt) {
+                        if let Some(program) = i32::try_from(pmt_id)
+                            .ok()
+                            .and_then(|id| self.programs.get(id))
+                        {
+                            pairs.push((pmt_id, program.sid, program.generation));
+                        }
+                    }
+                }
+                let Some(dev) = self.registry.get_mut(adapter as i32) else {
+                    return;
+                };
+                dev.cam_recovery_sync_services(&pairs, active);
+                if active {
+                    for &(sid, scrambled, clear) in &services {
+                        dev.cam_recovery_service_window(sid, window_ms, scrambled, clear);
+                    }
+                }
+                // Re-joined here, where `active` was just checked: an initialised CAM with a CAPMT.
+                let due = dev.take_silent_recovery();
+                if due.is_empty() {
+                    return;
+                }
+                if let Some(capmt) = self.capmt.get_mut(&adapter) {
+                    for pmt_id in due {
+                        capmt.rejoin_pmt(pmt_id, &self.programs, &mut SlotDriver(dev));
+                    }
                 }
             }
             Request::Stop => {}
@@ -1617,6 +1697,275 @@ mod tests {
         assert!(!worker.registry.get_mut(1).unwrap().take_cam_recovery());
     }
 
+    /// A worker whose slot 0 holds one CAPMT with room for two programs.
+    fn service_worker() -> (Worker, Arc<ManualClock>, Arc<Mutex<FakeCam>>) {
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let clock = Arc::new(ManualClock::new(0, 0));
+        let (tx, _rx) = mpsc::channel();
+        let mut settings = DvbcaSettings {
+            cam_recovery_ms: 10_000,
+            ..DvbcaSettings::default()
+        };
+        settings.channels.insert(0, (1, 1, Vec::new()));
+        let mut worker = Worker::new(
+            settings,
+            Box::new(CamOpener(Arc::clone(&cam))),
+            clock.clone(),
+            tx,
+        );
+        worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        for _ in 0..500 {
+            let up = worker.registry.get(0).is_some_and(|dev| {
+                dev.state == CaState::Initialized && CaPmtSink::has_ca_session(dev)
+            });
+            if up {
+                break;
+            }
+            clock.advance(10);
+            worker.service();
+        }
+        (worker, clock, cam)
+    }
+
+    /// `--cam-recovery`: one stuck service of a CAPMT is re-joined alone; a clean
+    /// one is left alone, and further stuck windows send nothing more.
+    #[test]
+    fn service_windows_rejoin_only_the_stuck_service() {
+        use ms_ca_drivers::en50221::consts::TAG_CA_PMT;
+        #[cfg(feature = "diag-log")]
+        let lines = super::diag_capture::lines();
+        let (mut worker, clock, cam) = service_worker();
+        worker.add_pmt(zap_program(4, 0x64), false);
+        worker.add_pmt(zap_program(5, 0x65), false);
+        {
+            let capmt = worker.capmt.get_mut(&0).unwrap();
+            assert_eq!(capmt.slot_of(4), Some(0), "both services share the CAPMT");
+            assert_eq!(capmt.slot_of(5), Some(0));
+            capmt.capmt_reason_log = Some(Vec::new());
+        }
+        let before = sent(&cam, TAG_CA_PMT).len();
+        let window = |worker: &mut Worker, a: u64, b: u64| {
+            worker.handle(Request::ServiceWindows {
+                adapter: 0,
+                window_ms: 10_000,
+                services: vec![(0x64, a, 0), (0x65, 0, b)],
+            });
+        };
+        window(&mut worker, 0, 0);
+        clock.advance(12_000);
+        window(&mut worker, 2_000, 2_000);
+        clock.advance(15_000);
+        window(&mut worker, 2_000, 2_000);
+        assert_eq!(sent(&cam, TAG_CA_PMT).len(), before, "no fire yet");
+        clock.advance(10_000);
+        window(&mut worker, 2_000, 2_000);
+        assert_eq!(
+            sent(&cam, TAG_CA_PMT).len(),
+            before + 1,
+            "the stuck service is re-added alone"
+        );
+        assert_eq!(
+            worker.capmt[&0].capmt_reason_log.as_deref(),
+            Some(&["recovery"][..]),
+            "the re-join carries the recovery reason"
+        );
+        let rejoined = sent(&cam, TAG_CA_PMT);
+        let pmt =
+            ms_fakecam::CaPmt::parse(rejoined.last().expect("the re-join")).expect("a CA_PMT body");
+        assert_eq!(
+            pmt.program_number, 0x64,
+            "the stuck service's program number"
+        );
+        #[cfg(feature = "diag-log")]
+        {
+            let thread = std::thread::current().name().unwrap_or_default().to_owned();
+            let captured = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let fires: Vec<&String> = captured
+                .iter()
+                .filter(|line| {
+                    line.contains(&thread) && line.contains("re-sending its CAPMT (CAM recovery)")
+                })
+                .collect();
+            assert_eq!(fires.len(), 1, "{fires:?}");
+            assert!(
+                fires[0].contains("PMT 4 "),
+                "the stuck service: {}",
+                fires[0]
+            );
+            assert!(
+                !fires[0].contains("PMT 5 "),
+                "not the clean one: {}",
+                fires[0]
+            );
+        }
+        clock.advance(30_000);
+        window(&mut worker, 2_000, 2_000);
+        assert_eq!(
+            sent(&cam, TAG_CA_PMT).len(),
+            before + 1,
+            "one re-send per join"
+        );
+    }
+
+    /// A PMT update (version change) of a service that already fired keeps its
+    /// identity: no second re-send, the same generation, one "already re-sent" line.
+    #[test]
+    fn service_windows_pmt_update_keeps_the_service_identity() {
+        use ms_ca_drivers::en50221::consts::TAG_CA_PMT;
+        #[cfg(feature = "diag-log")]
+        let lines = super::diag_capture::lines();
+        let (mut worker, clock, cam) = service_worker();
+        worker.add_pmt(zap_program(4, 0x64), false);
+        {
+            let capmt = worker.capmt.get_mut(&0).unwrap();
+            capmt.capmt_reason_log = Some(Vec::new());
+        }
+        let window = |worker: &mut Worker| {
+            worker.handle(Request::ServiceWindows {
+                adapter: 0,
+                window_ms: 10_000,
+                services: vec![(0x64, 2_000, 0)],
+            });
+        };
+        window(&mut worker);
+        clock.advance(12_000);
+        window(&mut worker);
+        clock.advance(15_000);
+        window(&mut worker);
+        clock.advance(10_000);
+        window(&mut worker);
+        let fired = sent(&cam, TAG_CA_PMT).len();
+        assert_eq!(fired, 3, "the join and its one leave plus re-join");
+
+        let generation = worker.programs.get(4).unwrap().generation;
+        worker.add_pmt(zap_program(4, 0x64), true);
+        assert_eq!(
+            worker.programs.get(4).unwrap().generation,
+            generation,
+            "an update keeps the PMT generation"
+        );
+        let after_update = sent(&cam, TAG_CA_PMT).len();
+        for _ in 0..5 {
+            clock.advance(10_000);
+            window(&mut worker);
+        }
+        assert_eq!(
+            sent(&cam, TAG_CA_PMT).len(),
+            after_update,
+            "a PMT update does not allow a second re-send"
+        );
+        #[cfg(feature = "diag-log")]
+        {
+            let thread = std::thread::current().name().unwrap_or_default().to_owned();
+            let captured = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let warnings: Vec<&String> = captured
+                .iter()
+                .filter(|line| line.contains(&thread) && line.contains("was already re-sent once"))
+                .collect();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("PMT 4 "), "{}", warnings[0]);
+        }
+    }
+
+    /// The ca.rs service path and the worker match the source PMT to the CAPMT
+    /// program by SID, so the re-join uses the CAPMT's own pmt id.
+    #[test]
+    fn service_windows_rejoin_the_capmt_pmt_with_the_same_sid() {
+        use crate::ca::{CaRuntime, ddci_services_for_test};
+        use ms_ca_drivers::ddci::{DdciDevice, Mapping};
+        use ms_ca_drivers::en50221::consts::TAG_CA_PMT;
+        use ms_sched::{AdapterConfig, AdapterTuner, Scheduler, TuneError};
+        use ms_tuner::{DeliverySystem, TuneParams};
+
+        struct NoTune;
+        impl AdapterTuner for NoTune {
+            fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+                Ok(())
+            }
+        }
+        let hub = crate::ddci::DdciHub::new();
+        let mut device = DdciDevice::new(0, 1);
+        device.clear_slots();
+        let source_pmt = 0;
+        device.pmt[0].id = source_pmt;
+        for (pid, ddci_pid) in [(601, 1301), (602, 1302)] {
+            device.mapping.insert(
+                (4, pid),
+                Mapping {
+                    ad: 4,
+                    pid,
+                    ddci_pid,
+                    ddci: 0,
+                    rewrite: false,
+                    pmt: BTreeSet::from([source_pmt]),
+                    filter_id: None,
+                    pid_added: false,
+                },
+            );
+        }
+        hub.lock().ddci.devices.insert(0, device);
+
+        let mut sched = Scheduler::new();
+        let mut config = AdapterConfig::new(DeliverySystem::DvbS2);
+        config.adapter_type = ms_sched::AdapterType::Dvb;
+        sched.add_adapter(4, config, Box::new(NoTune));
+        let id = sched.pmt_add(4, 0x1234, 0x100);
+        assert_eq!(id, source_pmt);
+        sched.pmt_add_stream_pid(id, 601, 2, false, true);
+        sched.pmt_add_stream_pid(id, 602, 6, true, false);
+
+        let services = ddci_services_for_test(&hub, &sched, 0);
+        assert_eq!(services, [(0x1234, vec![1301, 1302])]);
+        let mut base = BTreeMap::new();
+        assert_eq!(
+            CaRuntime::service_window_deltas(
+                &mut base,
+                0,
+                &[(1301, 2_000, 0), (1302, 50, 0)],
+                &services
+            ),
+            [(0x1234, 0, 0)],
+            "the first report seeds"
+        );
+        let deltas = CaRuntime::service_window_deltas(
+            &mut base,
+            0,
+            &[(1301, 4_000, 0), (1302, 100, 0)],
+            &services,
+        );
+        assert_eq!(deltas, [(0x1234, 2_050, 0)]);
+
+        let (mut worker, clock, cam) = resend_worker();
+        worker.add_pmt(zap_program(3, 0x1234), false);
+        worker.capmt.get_mut(&0).unwrap().capmt_reason_log = Some(Vec::new());
+        let before = sent(&cam, TAG_CA_PMT).len();
+        for _ in 0..3 {
+            clock.advance(30_000);
+            worker.handle(Request::ServiceWindows {
+                adapter: 0,
+                window_ms: 10_000,
+                services: deltas.clone(),
+            });
+        }
+        assert_eq!(
+            sent(&cam, TAG_CA_PMT).len(),
+            before + 2,
+            "the CAPMT pmt 3 is left and re-joined"
+        );
+        assert_eq!(
+            worker.capmt[&0].capmt_reason_log.as_deref(),
+            Some(&["recovery", "recovery"][..]),
+            "nothing was aimed at the source pmt"
+        );
+    }
+
     /// A worker whose slot 0 is an initialised CAM with a CA session; the zap
     /// guard is `zap_guard`.
     fn zap_worker(zap_guard: bool) -> (Worker, Arc<ManualClock>) {
@@ -2493,3 +2842,7 @@ mod diag_capture {
         }
     }
 }
+
+/// One `ServiceWindows` request as a test reads it back: adapter, window, services.
+#[cfg(test)]
+type ServiceWindowReport = (usize, i64, Vec<(u16, u64, u64)>);

@@ -71,6 +71,9 @@ pub struct CaDevice {
     pub capmt: [Capmt; MAX_CA_PMT],
     /// CAIDs the CA handles on this adapter (`add_caid_mask`); empty accepts all.
     pub caid_filter: Vec<(u16, u16)>,
+    /// Test hook: when set, records each CAPMT send's diagnostic reason.
+    #[doc(hidden)]
+    pub capmt_reason_log: Option<Vec<&'static str>>,
 }
 
 impl Default for CaDevice {
@@ -83,6 +86,7 @@ impl Default for CaDevice {
             multiple_pmt: 0,
             capmt: Default::default(),
             caid_filter: Vec::new(),
+            capmt_reason_log: None,
         }
     }
 }
@@ -353,7 +357,16 @@ impl CaDevice {
 
     /// Emits `capmt` for one send attempt; the hash and PMT list are built
     /// only when the event is actually emitted.
-    fn diag_capmt(&self, slot: usize, reason: &str, hash: impl FnOnce() -> u32, skipped: bool) {
+    fn diag_capmt(
+        &mut self,
+        slot: usize,
+        reason: &'static str,
+        hash: impl FnOnce() -> u32,
+        skipped: bool,
+    ) {
+        if let Some(reasons) = self.capmt_reason_log.as_mut() {
+            reasons.push(reason);
+        }
         let c = &self.capmt[slot];
         let version = i64::from(c.version);
         ms_log::diag::events::capmt(i64::from(self.id), hash, version, reason, skipped, || {
@@ -370,6 +383,17 @@ impl CaDevice {
         &mut self,
         pmt_id: i32,
         update: bool,
+        programs: &ProgramTable,
+        driver: &mut dyn CaDriver,
+    ) -> TablesResult {
+        self.process_pmt_reason(pmt_id, update, None, programs, driver)
+    }
+
+    fn process_pmt_reason(
+        &mut self,
+        pmt_id: i32,
+        update: bool,
+        recovery: Option<&'static str>,
         programs: &ProgramTable,
         driver: &mut dyn CaDriver,
     ) -> TablesResult {
@@ -446,13 +470,13 @@ impl CaDevice {
         }
         // Only a new join forces the send; an update or a kept-place rejoin
         // sends only when the built CAPMT changed, decided in send_capmt.
-        let diag_reason = if update {
+        let diag_reason = recovery.unwrap_or(if update {
             "update"
         } else if rejoined {
             "rejoin"
         } else {
             "join"
-        };
+        });
         let cmd = SendCmd {
             command: CMD_ID_OK_DESCRAMBLING,
             diag_reason,
@@ -472,8 +496,43 @@ impl CaDevice {
         TablesResult::Ok
     }
 
+    /// `--cam-recovery`: re-sends one service's CAPMT as a leave plus a join, like
+    /// a manual re-join, with the `recovery` reason. Does nothing without a place.
+    pub fn rejoin_pmt(
+        &mut self,
+        pmt_id: usize,
+        programs: &ProgramTable,
+        driver: &mut dyn CaDriver,
+    ) {
+        let Ok(pmt_id) = i32::try_from(pmt_id) else {
+            return;
+        };
+        if self.slot_of(pmt_id).is_none() {
+            return;
+        }
+        self.del_pmt_reason(pmt_id, "recovery", programs, driver);
+        let result = self.process_pmt_reason(pmt_id, false, Some("recovery"), programs, driver);
+        if result != TablesResult::Ok {
+            ms_log::log!(
+                "CA {}: PMT {} re-join after recovery failed: {result:?}",
+                self.id,
+                pmt_id
+            );
+        }
+    }
+
     /// `dvbca_del_pmt`: the last program of a CAPMT is released as not_selected.
     pub fn del_pmt(&mut self, pmt_id: i32, programs: &ProgramTable, driver: &mut dyn CaDriver) {
+        self.del_pmt_reason(pmt_id, "leave", programs, driver);
+    }
+
+    fn del_pmt_reason(
+        &mut self,
+        pmt_id: i32,
+        diag_reason: &'static str,
+        programs: &ProgramTable,
+        driver: &mut dyn CaDriver,
+    ) {
         if !self.enabled || self.state != CaState::Initialized {
             ms_log::log!("CAPMT not found for pmt {}", pmt_id);
             return;
@@ -491,7 +550,7 @@ impl CaDevice {
                     CLM_UPDATE,
                     SendCmd {
                         command: CMD_ID_NOT_SELECTED,
-                        diag_reason: "leave",
+                        diag_reason,
                     },
                     true,
                     programs,
