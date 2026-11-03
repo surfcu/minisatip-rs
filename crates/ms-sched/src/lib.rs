@@ -448,6 +448,11 @@ impl PidEntry {
     pub fn has_stream(&self, sid: StreamId) -> bool {
         self.sids.contains(&sid)
     }
+
+    /// Whether a real client stream (below `MAX_STREAMS`) owns this PID.
+    pub(crate) fn has_client_sid(&self) -> bool {
+        self.sids.iter().any(|sid| (0..MAX_STREAMS).contains(sid))
+    }
 }
 
 /// Adapter table and allocation policy.
@@ -1241,9 +1246,9 @@ impl Scheduler {
                 entry.state as i32
             );
             if sid != PID_STREAM_ID_UNDEFINED {
-                let had_client = !entry.sids.is_empty();
+                let had_client = entry.has_client_sid();
                 entry.sids.insert(sid);
-                if !had_client && !entry.sids.is_empty() {
+                if !had_client && entry.has_client_sid() {
                     entry.order = pid_order.next_pid_order();
                 }
             }
@@ -1277,7 +1282,7 @@ impl Scheduler {
         if sid != PID_STREAM_ID_UNDEFINED {
             entry.sids.insert(sid);
         }
-        if !entry.sids.is_empty() {
+        if entry.has_client_sid() {
             entry.order = pid_order.next_pid_order();
         }
         0
@@ -1330,7 +1335,7 @@ impl Scheduler {
                     entry.order = 0;
                 } else {
                     entry.sids.remove(&sid);
-                    if !entry.sids.iter().any(|sid| (0..MAX_STREAMS).contains(sid)) {
+                    if !entry.has_client_sid() {
                         entry.order = 0;
                     }
                     // adapter.cpp:1183-1191: an active FILTER_ADD_REMOVE filter

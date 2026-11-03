@@ -1212,6 +1212,16 @@ fn pid_order_reset_on_remove() {
     sched.update_pids(0);
 }
 
+// F4-4: a PID added only for DDCI_SID must not take a subscription order.
+#[test]
+fn ddci_sid_does_not_take_subscription_order() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    assert_eq!(sched.mark_pid_add(0, DDCI_SID, 500), 0);
+    assert_eq!(sched.find_pid(0, 500).unwrap().order, 0);
+    assert_eq!(sched.mark_pid_add(0, 0, 500), 0);
+    assert!(sched.find_pid(0, 500).unwrap().order > 0);
+}
+
 // Ported from tests/test_pmt.cpp:1521
 #[test]
 fn d8_shared_pid() {
@@ -1243,13 +1253,13 @@ fn d8_shared_pid() {
     sched.start_active_pmts(0);
     assert_eq!(
         pmt_state(&sched, m1),
-        PmtState::Running,
-        "first set should run"
+        PmtState::Stopped,
+        "less complete set should wait"
     );
     assert_eq!(
         pmt_state(&sched, m2),
         PmtState::Running,
-        "second set should run"
+        "more complete set should run"
     );
     assert_eq!(
         pmt_state(&sched, m3),
@@ -1261,7 +1271,11 @@ fn d8_shared_pid() {
         PmtState::Stopped,
         "duplicate should wait"
     );
-    assert_eq!(claim(&sched, 701), m1, "shared video goes to the first");
+    assert_eq!(
+        claim(&sched, 701),
+        m2,
+        "shared video goes to the more complete"
+    );
     assert_eq!(claim(&sched, 712), m2, "own audio goes to the second");
     assert!(
         pmt_best(&sched, m1) && pmt_best(&sched, m2),
@@ -1282,7 +1296,7 @@ fn d8_shared_pid() {
     assert_eq!(
         pmt_state(&sched, m1),
         PmtState::Running,
-        "m1 should keep running"
+        "more complete set takes over"
     );
     assert_eq!(
         pmt_state(&sched, m2),
@@ -1293,7 +1307,107 @@ fn d8_shared_pid() {
         pmt_best(&sched, m1) && pmt_best(&sched, m2),
         "waiter stays in the set"
     );
-    assert_eq!(claim(&sched, 701), m1, "shared video should not move");
+    assert_eq!(claim(&sched, 701), m1, "shared video should move to m1");
+
+    sched.free_all_pmts();
+}
+
+// F4-6: an unordered holder (order 0) yields to an ordered subscriber.
+#[test]
+fn unordered_holder_yields_to_ordered_subscriber() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let m1 = sched.pmt_add(0, 100, 60);
+    let m2 = sched.pmt_add(0, 200, 61);
+    sched.pmt_add_stream_pid(m1, 701, 2, false, true);
+    sched.pmt_add_stream_pid(m2, 701, 2, false, true);
+    {
+        let adapter = sched.adapter_mut(0).unwrap();
+        adapter.active_pmts = 2;
+        adapter.active_pmt[0] = m1;
+        adapter.active_pmt[1] = m2;
+    }
+    set_pid_slot(&mut sched, 0, 60, &[0], 0);
+    set_pid_slot(&mut sched, 1, 61, &[0], 1);
+    set_pid_slot(&mut sched, 2, 701, &[0], 2);
+    sched.find_pid_mut(0, 701).unwrap().pmt = m1;
+    sched.pmt_slot_mut(m1).unwrap().state = PmtState::Running;
+
+    sched.start_active_pmts(0);
+    assert_eq!(
+        claim(&sched, 701),
+        m2,
+        "ordered newcomer should steal the claim"
+    );
+    assert_eq!(
+        pmt_state(&sched, m2),
+        PmtState::Running,
+        "ordered newcomer should start"
+    );
+    assert_eq!(
+        pmt_state(&sched, m1),
+        PmtState::Stopped,
+        "unordered holder should stop"
+    );
+
+    sched.free_all_pmts();
+}
+
+// F7-1: completeness tie-break picks the PMT whose ECM is subscribed.
+#[test]
+fn completeness_tiebreak_selects_matching_ecm_service() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let m1 = sched.pmt_add(0, 100, 817);
+    let m2 = sched.pmt_add(0, 200, 817);
+    for id in [m1, m2] {
+        sched.pmt_add_stream_pid(id, 7472, 2, false, true);
+        sched.pmt_add_stream_pid(id, 7473, 3, true, false);
+    }
+    sched.pmt_add_caid(m1, 0x0b00, 1231, &[]);
+    sched.pmt_add_caid(m2, 0x0b00, 1603, &[]);
+    {
+        let adapter = sched.adapter_mut(0).unwrap();
+        adapter.active_pmts = 2;
+        adapter.active_pmt[0] = m1;
+        adapter.active_pmt[1] = m2;
+    }
+    set_pid_slot(&mut sched, 0, 817, &[0], 1);
+    set_pid_slot(&mut sched, 1, 7472, &[0], 2);
+    set_pid_slot(&mut sched, 2, 7473, &[0], 3);
+    set_pid_slot(&mut sched, 3, 1603, &[0], 4);
+
+    sched.start_active_pmts(0);
+    assert_eq!(
+        pmt_state(&sched, m2),
+        PmtState::Running,
+        "matching ECM elects the second PMT"
+    );
+    assert_eq!(
+        pmt_state(&sched, m1),
+        PmtState::Stopped,
+        "incomplete ECM set should wait"
+    );
+    assert_eq!(claim(&sched, 7472), m2, "shared video goes to m2");
+    assert_eq!(claim(&sched, 7473), m2, "shared audio goes to m2");
+
+    {
+        let entry = sched.find_pid_mut(0, 1603).unwrap();
+        entry.sids.clear();
+        entry.order = 0;
+    }
+    set_pid_slot(&mut sched, 4, 1231, &[0], 5);
+    sched.start_active_pmts(0);
+    assert_eq!(
+        pmt_state(&sched, m1),
+        PmtState::Running,
+        "switching the ECM hands over to the first PMT"
+    );
+    assert_eq!(
+        pmt_state(&sched, m2),
+        PmtState::Stopped,
+        "m2 loses its ECM and stops"
+    );
+    assert_eq!(claim(&sched, 7472), m1, "shared video moves to m1");
+    assert_eq!(claim(&sched, 7473), m1, "shared audio moves to m1");
 
     sched.free_all_pmts();
 }
