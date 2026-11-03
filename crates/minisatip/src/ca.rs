@@ -88,6 +88,8 @@ pub struct CaRuntime {
     next_decrypt_window: i64,
     /// Cumulative `dec_err` already reported per adapter.
     diag_dec_err: BTreeMap<usize, u64>,
+    /// Cumulative `clear_pkts` already reported per adapter.
+    diag_clear_pkts: BTreeMap<usize, u64>,
     /// `--ddci-capture`: rolling DDCI TS buffers and the MMI-triggered writer.
     #[cfg(feature = "diag-log")]
     capture: Option<std::sync::Arc<crate::ddci_capture::CaptureTap>>,
@@ -146,6 +148,7 @@ impl CaRuntime {
             next_stats: 0,
             next_decrypt_window: 0,
             diag_dec_err: BTreeMap::new(),
+            diag_clear_pkts: BTreeMap::new(),
             window_base: BTreeMap::new(),
         }
     }
@@ -1030,11 +1033,16 @@ impl CaRuntime {
             let keys = ca.stats.services.iter().filter(|s| s.cw.is_some()).count();
             let total = ca.stats.dec_err;
             let clear_total = ca.stats.clear_pkts;
-            let previous = self.diag_dec_err.insert(aid, total).unwrap_or(0);
-            let errors = total.saturating_sub(previous);
+            let (errors, packets) = self.decrypt_deltas(aid, total, clear_total);
             if cfg!(feature = "diag-log") && (keys > 0 || errors > 0) {
                 let period_s = (DECRYPT_WINDOW_MS / 1000) as u64;
-                ms_log::diag::events::ci_decrypt(aid as i64, keys as u64, errors, period_s);
+                ms_log::diag::events::ci_decrypt(
+                    aid as i64,
+                    keys as u64,
+                    errors,
+                    packets,
+                    period_s,
+                );
             }
             if let Some(sample) = self.window_sample(aid, total, clear_total, now) {
                 windows.push((aid, sample));
@@ -1051,6 +1059,15 @@ impl CaRuntime {
                     .report_scrambled(aid, scrambled, clear, window_ms);
             }
         }
+    }
+
+    /// The `(errors, packets)` deltas since this adapter's last window.
+    fn decrypt_deltas(&mut self, aid: usize, scrambled: u64, clear: u64) -> (u64, u64) {
+        let previous_err = self.diag_dec_err.insert(aid, scrambled).unwrap_or(0);
+        let previous_clear = self.diag_clear_pkts.insert(aid, clear).unwrap_or(0);
+        let errors = scrambled.saturating_sub(previous_err);
+        let packets = errors.saturating_add(clear.saturating_sub(previous_clear));
+        (errors, packets)
     }
 
     /// The `(scrambled, clear, window_ms)` counts since the last window; the first
@@ -2472,6 +2489,14 @@ mod window_tests {
                 "--cam-recovery {cam_recovery_ms} ms"
             );
         }
+    }
+
+    // The packet delta counts both scrambled and clear packets since the last window.
+    #[test]
+    fn decrypt_deltas_add_clear_packets_to_errors() {
+        let mut ca = CaRuntime::new(&Options::default());
+        assert_eq!(ca.decrypt_deltas(1, 100, 900), (100, 1_000));
+        assert_eq!(ca.decrypt_deltas(1, 130, 1_050), (30, 180));
     }
 
     // Each CI adapter has its own baseline, so two adapters' windows do not mix.
