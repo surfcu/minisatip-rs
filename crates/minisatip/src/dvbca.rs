@@ -784,7 +784,7 @@ impl Worker {
                         dev.cam_recovery_service_window(sid, window_ms, scrambled, clear);
                     }
                 }
-                // Re-joined here, where `active` was just checked: the CAM has a CA session.
+                // Re-joined here, where `active` was just checked: an initialised CAM with a CAPMT.
                 let due = dev.take_silent_recovery();
                 if due.is_empty() {
                     return;
@@ -1771,6 +1771,13 @@ mod tests {
             worker.capmt[&0].capmt_reason_log.as_deref(),
             Some(&["recovery"][..]),
             "the re-join carries the recovery reason"
+        );
+        let rejoined = sent(&cam, TAG_CA_PMT);
+        let pmt =
+            ms_fakecam::CaPmt::parse(rejoined.last().expect("the re-join")).expect("a CA_PMT body");
+        assert_eq!(
+            pmt.program_number, 0x64,
+            "the stuck service's program number"
         );
         #[cfg(feature = "diag-log")]
         {

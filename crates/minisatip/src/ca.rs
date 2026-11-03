@@ -2810,6 +2810,39 @@ mod ci_stage_tests {
             assert_eq!(packet, scrambled.as_slice(), "not nulled");
         }
     }
+
+    // `--cam-recovery` asks the CI adapter's descrambler for per-pid totals, and only then.
+    #[test]
+    fn ci_stage_reports_pid_totals_only_with_cam_recovery() {
+        const PID: u16 = 0x103;
+        for (recovery_s, expected) in [(0, Vec::new()), (10, vec![(PID, 1, 0)])] {
+            let opts = Options {
+                cam_recovery: recovery_s,
+                ..Options::default()
+            };
+            let mut sched = Scheduler::new();
+            let mut ca = CaRuntime::new(&opts);
+            let hub = DdciHub::new();
+            ca.attach_ddci(&mut sched, hub.clone());
+            hub.open_device(1, Box::new(Sink));
+            let mut stages = ca.ci_stages(1);
+            let descrambler = ca.adapters.get(&1).unwrap().descrambler.clone();
+            descrambler
+                .send(DescramblerCommand::SetCaActive(true))
+                .unwrap();
+            let mut packet = vec![0u8; 188];
+            packet[..4].copy_from_slice(&[0x47, (PID >> 8) as u8, PID as u8, 0x90]);
+            stages[0].process(&mut packet);
+            let (reply, rx) = mpsc::channel();
+            descrambler.send(DescramblerCommand::Query(reply)).unwrap();
+            stages[0].process(&mut []);
+            assert_eq!(
+                rx.recv().unwrap().pid_totals,
+                expected,
+                "--cam-recovery {recovery_s} s"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3009,17 +3042,17 @@ mod window_tests {
         set_pid_totals(&mut ca, 0, vec![(1301, 2_000, 0), (1302, 50, 0)]);
         ca.decrypt_windows(&sched, 1_000);
         set_pid_totals(&mut ca, 0, vec![(1301, 4_000, 0), (1302, 100, 0)]);
-        ca.decrypt_windows(&sched, 11_000);
+        ca.decrypt_windows(&sched, 2_000);
         assert_eq!(
             recorder.service_windows(),
-            vec![(0, 10_000, vec![(0x1234, 0, 0)])],
+            vec![(0, 1_000, vec![(0x1234, 0, 0)])],
             "the first window seeds the per-pid totals"
         );
         set_pid_totals(&mut ca, 0, vec![(1301, 5_000, 0), (1302, 150, 0)]);
-        ca.decrypt_windows(&sched, 21_000);
+        ca.decrypt_windows(&sched, 15_500);
         assert_eq!(
             recorder.service_windows(),
-            vec![(0, 10_000, vec![(0x1234, 1_050, 0)])]
+            vec![(0, 13_500, vec![(0x1234, 1_050, 0)])]
         );
     }
 

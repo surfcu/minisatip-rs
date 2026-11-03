@@ -46,7 +46,8 @@ Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
   that stays at least 90% scrambled for 30 s, or for the longer timeout, after a
   2 s join lag gets its own CAPMT re-sent once per join, with no MMI message and no
   10-minute gap. A window counts as stuck only with at least 1000 scrambled ES packets,
-  so very low-rate services such as radio do not trigger it; a SID on more than one PMT
+  so very low-rate services (for example a 64 kbit/s audio-only service) do not trigger it;
+  a SID on more than one PMT
   of the CAM is excluded, and the join lag runs from the first service window after the
   CAPMT join. A CAPMT change (a zap) needs a clean window before the MMI message to arm it, unless
   `--cam-recovery-no-zap-guard` is given; with the guard, a CAM error right after a
