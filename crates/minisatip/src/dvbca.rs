@@ -2332,6 +2332,13 @@ mod ciplus_worker_tests {
             disable < key_pos,
             "the SAC data request disables descrambling first"
         );
+        let Notice::DisableCws(disabled) = &notices[disable] else {
+            panic!("matched above")
+        };
+        assert!(
+            disabled.contains(&(program.id as usize, program.generation)),
+            "the disabled PMT keeps its generation: {disabled:?}"
+        );
         let Notice::CcKey {
             pmt_ids,
             parity,
@@ -2375,6 +2382,59 @@ mod ciplus_worker_tests {
             assert!(event.contains("\"target_adapters\":[0]"), "{event}");
         }
         pki.remove();
+    }
+
+    #[test]
+    fn released_notice_keeps_the_generation() {
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let clock = Arc::new(ManualClock::new(0, UNIX));
+        let worker_clock: Arc<dyn Clock> = clock.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            DvbcaSettings::default(),
+            Box::new(CiOpener {
+                cam: Arc::clone(&cam),
+                cert_dir: PathBuf::new(),
+            }),
+            worker_clock,
+            tx,
+        );
+        worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        worker.service();
+        let _ = drain(&rx);
+
+        let program = program_from_service(&service());
+        let mut offered = false;
+        for _ in 0..10 {
+            let (reply, answers) = mpsc::channel();
+            worker.handle(Request::AddPmt {
+                program: Box::new(program.clone()),
+                update: false,
+                reply,
+            });
+            if answers.recv().ok() == Some(TablesResult::Ok) {
+                offered = true;
+                break;
+            }
+            worker.service();
+        }
+        assert!(offered, "the CAM accepts the offered PMT");
+        let _ = drain(&rx);
+
+        worker.registry.get_mut(0).unwrap().teardown();
+        worker.forward_events(0);
+        let released = drain(&rx);
+        assert!(
+            released.iter().any(|notice| matches!(
+                notice,
+                Notice::Released(pmts)
+                    if pmts == &[(program.id, program.generation)]
+            )),
+            "a released PMT keeps its generation: {released:?}"
+        );
     }
 }
 
