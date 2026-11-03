@@ -132,6 +132,7 @@ impl CaRuntime {
             stage_config: StageConfig {
                 drop_encrypted: opts.drop_encrypted,
                 pids_all_no_dec: opts.pids_all_no_dec != 0,
+                report_pid_totals: false,
             },
             adapters: BTreeMap::new(),
             section_pids: BTreeMap::new(),
@@ -310,6 +311,7 @@ impl CaRuntime {
         // ddci.cpp:1678: DDCI adapters never drop encrypted packets.
         let config = StageConfig {
             drop_encrypted: DropEncrypted::Send,
+            report_pid_totals: self.dvbca_settings.cam_recovery_ms > 0,
             ..self.stage_config
         };
         vec![
@@ -1104,9 +1106,13 @@ impl CaRuntime {
             }
             if let Some(sample) = self.window_sample(aid, total, clear_total, now) {
                 windows.push((aid, sample));
+                let is_ddci = self
+                    .ddci
+                    .as_ref()
+                    .is_some_and(|link| link.hub.lock().ddci.devices.contains_key(&aid));
                 if let Some(pid_totals) = pid_totals.as_ref()
+                    && is_ddci
                     && let Some(link) = self.ddci.as_ref()
-                    && link.hub.lock().ddci.devices.contains_key(&aid)
                 {
                     let services = ddci_services(link, sched, aid);
                     let deltas = Self::service_window_deltas(
@@ -2929,6 +2935,124 @@ mod window_tests {
             recorder.windows(),
             vec![(1, 3_000, 40, 10_000), (2, 7_000, 90, 10_000)]
         );
+    }
+
+    /// Sets the cumulative pid totals `decrypt_windows` reads for `aid`.
+    fn set_pid_totals(ca: &mut CaRuntime, aid: usize, totals: Vec<(u16, u64, u64)>) {
+        set_counters(ca, aid, 0, 0);
+        ca.adapters.get_mut(&aid).unwrap().stats.pid_totals = totals;
+    }
+
+    /// A runtime with a DDCI link to `hub`.
+    fn ddci_runtime(cam_recovery_ms: i64, hub: DdciHub) -> (CaRuntime, WindowRecorder) {
+        let (mut ca, recorder) = recording_runtime(cam_recovery_ms);
+        ca.ddci = Some(DdciLink {
+            hub,
+            ca_id: 0,
+            mirrored: BTreeSet::new(),
+            cat_filters: BTreeMap::new(),
+        });
+        (ca, recorder)
+    }
+
+    /// A CI adapter 0 with a DDCI device 0 mirroring one scheduler PMT on adapter 4.
+    fn ddci_window_sched() -> (DdciHub, Scheduler) {
+        use ms_ca_drivers::ddci::{DdciDevice, Mapping};
+
+        struct NoTune;
+        impl AdapterTuner for NoTune {
+            fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+                Ok(())
+            }
+        }
+        let hub = DdciHub::new();
+        let mut device = DdciDevice::new(0, 1);
+        device.clear_slots();
+        let source_pmt = 0;
+        device.pmt[0].id = source_pmt;
+        for (pid, ddci_pid) in [(601, 1301), (602, 1302)] {
+            device.mapping.insert(
+                (4, pid),
+                Mapping {
+                    ad: 4,
+                    pid,
+                    ddci_pid,
+                    ddci: 0,
+                    rewrite: false,
+                    pmt: BTreeSet::from([source_pmt]),
+                    filter_id: None,
+                    pid_added: false,
+                },
+            );
+        }
+        hub.lock().ddci.devices.insert(0, device);
+
+        let mut sched = Scheduler::new();
+        let mut ci = AdapterConfig::new(DeliverySystem::DvbS2);
+        ci.adapter_type = AdapterType::Ci;
+        sched.add_adapter(0, ci, Box::new(NoTune));
+        let mut dvb = AdapterConfig::new(DeliverySystem::DvbS2);
+        dvb.adapter_type = AdapterType::Dvb;
+        sched.add_adapter(4, dvb, Box::new(NoTune));
+        let id = sched.pmt_add(4, 0x1234, 0x100);
+        assert_eq!(id, source_pmt);
+        sched.pmt_add_stream_pid(id, 601, 2, false, true);
+        sched.pmt_add_stream_pid(id, 602, 6, true, false);
+        (hub, sched)
+    }
+
+    // The silent path reports a service window per DDCI device with the sample's length.
+    #[test]
+    fn decrypt_windows_report_ddci_service_windows() {
+        let (hub, sched) = ddci_window_sched();
+        let (mut ca, recorder) = ddci_runtime(10_000, hub);
+        set_pid_totals(&mut ca, 0, vec![(1301, 2_000, 0), (1302, 50, 0)]);
+        ca.decrypt_windows(&sched, 1_000);
+        set_pid_totals(&mut ca, 0, vec![(1301, 4_000, 0), (1302, 100, 0)]);
+        ca.decrypt_windows(&sched, 11_000);
+        assert_eq!(
+            recorder.service_windows(),
+            vec![(0, 10_000, vec![(0x1234, 0, 0)])],
+            "the first window seeds the per-pid totals"
+        );
+        set_pid_totals(&mut ca, 0, vec![(1301, 5_000, 0), (1302, 150, 0)]);
+        ca.decrypt_windows(&sched, 21_000);
+        assert_eq!(
+            recorder.service_windows(),
+            vec![(0, 10_000, vec![(0x1234, 1_050, 0)])]
+        );
+    }
+
+    // `--cam-recovery` off: no service window reaches the CAM.
+    #[test]
+    fn decrypt_windows_skip_service_windows_without_cam_recovery() {
+        let (hub, sched) = ddci_window_sched();
+        for cam_recovery_ms in [0, -5_000] {
+            let (mut ca, recorder) = ddci_runtime(cam_recovery_ms, hub.clone());
+            set_pid_totals(&mut ca, 0, vec![(1301, 2_000, 0)]);
+            ca.decrypt_windows(&sched, 1_000);
+            set_pid_totals(&mut ca, 0, vec![(1301, 4_000, 0)]);
+            ca.decrypt_windows(&sched, 11_000);
+            assert!(
+                recorder.service_windows().is_empty(),
+                "--cam-recovery {cam_recovery_ms} ms"
+            );
+        }
+    }
+
+    // An adapter without a DDCI device gets no service window.
+    #[test]
+    fn decrypt_windows_skip_service_windows_for_non_ddci_adapters() {
+        use ms_ca_drivers::ddci::DdciDevice;
+        let hub = DdciHub::new();
+        hub.lock().ddci.devices.insert(0, DdciDevice::new(0, 1));
+        let (mut ca, recorder) = ddci_runtime(10_000, hub);
+        let sched = ci_sched(&[1]);
+        set_pid_totals(&mut ca, 1, vec![(1301, 2_000, 0)]);
+        ca.decrypt_windows(&sched, 1_000);
+        set_pid_totals(&mut ca, 1, vec![(1301, 4_000, 0)]);
+        ca.decrypt_windows(&sched, 11_000);
+        assert!(recorder.service_windows().is_empty());
     }
 
     // `adapter_removed` drops the baseline, so a later sample of that adapter reseeds.

@@ -148,6 +148,8 @@ pub struct StageConfig {
     pub drop_encrypted: DropEncrypted,
     /// `-o ~` (`opts.pids_all_no_dec`).
     pub pids_all_no_dec: bool,
+    /// Fill `DescramblerStats::pid_totals` (`--cam-recovery` only).
+    pub report_pid_totals: bool,
 }
 
 impl Default for StageConfig {
@@ -155,6 +157,7 @@ impl Default for StageConfig {
         Self {
             drop_encrypted: DropEncrypted::Drop,
             pids_all_no_dec: false,
+            report_pid_totals: false,
         }
     }
 }
@@ -259,7 +262,11 @@ impl DescramblerStage {
                     dec_err: self.descrambler.dec_err(),
                     clear_pkts: self.descrambler.clear_pkts(),
                     ad_decerr: self.descrambler.adapter_decerr(),
-                    pid_totals: self.descrambler.pid_totals(),
+                    pid_totals: if self.config.report_pid_totals {
+                        self.descrambler.pid_totals()
+                    } else {
+                        Vec::new()
+                    },
                 });
             }
             DescramblerCommand::SetAdapterPids(table) => {

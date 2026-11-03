@@ -993,6 +993,7 @@ fn stage_reports_ad_decerr_and_clears_it_once_decrypted() {
         StageConfig {
             drop_encrypted: DropEncrypted::Send,
             pids_all_no_dec: false,
+            report_pid_totals: false,
         },
         std::time::Instant::now(),
     );
@@ -1009,6 +1010,27 @@ fn stage_reports_ad_decerr_and_clears_it_once_decrypted() {
     assert_eq!(query(&tx, &mut stage), 4);
     stage.process(&mut batch(&[(0x100, false)]));
     assert_eq!(query(&tx, &mut stage), 0);
+}
+
+// A Query reply carries pid_totals only when the stage is told they are needed.
+#[test]
+fn stage_reports_pid_totals_only_when_configured() {
+    for (report, expected) in [(false, Vec::new()), (true, vec![(0x100, 1, 0)])] {
+        let (tx, mut stage) = DescramblerStage::new(
+            CipherRegistry::software(),
+            StageConfig {
+                report_pid_totals: report,
+                ..StageConfig::default()
+            },
+            std::time::Instant::now(),
+        );
+        tx.send(DescramblerCommand::SetCaActive(true)).unwrap();
+        stage.process(&mut batch(&[(0x100, true)]));
+        let (reply, rx) = mpsc::channel();
+        tx.send(DescramblerCommand::Query(reply)).unwrap();
+        stage.drain_commands();
+        assert_eq!(rx.recv().unwrap().pid_totals, expected);
+    }
 }
 
 // adapter.cpp:1015-1028: a pid turning NEW -> ACTIVE starts its counters at zero.

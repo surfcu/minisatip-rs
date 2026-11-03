@@ -356,7 +356,7 @@ const CI_PLUS_USAGE: &str = "\
 
 /// Help line for `--cam-recovery`, printed in every build.
 const CAM_RECOVERY_USAGE: &str = "\
-* --cam-recovery seconds: re-send the CAPMTs to a CAM whose CI output stays scrambled after an MMI message; on a DDCI CAM also re-send one service's CAPMT when its own ES pids stay at least 90% scrambled for that long (at least 30 s) after a 2 s join lag, once per join; 0 disables it (default 0)
+* --cam-recovery seconds: re-send the CAPMTs to a CAM whose CI output stays scrambled after an MMI message; on a DDCI CAM also re-send one service's CAPMT when its own ES pids stay at least 90% scrambled for that long (at least 30 s) after a 2 s join lag from the first service window after the CAPMT join, once per join; stuck needs at least 1000 scrambled ES packets, so low-rate services such as radio are left alone, and a SID on more than one PMT of the CAM is excluded; 0 disables it (default 0)
 * --cam-recovery-no-zap-guard: with --cam-recovery, let any clean window before an MMI message arm, even one before a zap (default off)
 
 ";

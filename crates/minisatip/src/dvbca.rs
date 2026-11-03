@@ -149,6 +149,21 @@ impl WindowRecorder {
             })
             .collect()
     }
+
+    /// The `(adapter, window_ms, services)` service windows sent so far, in order.
+    pub(crate) fn service_windows(&self) -> Vec<ServiceWindowReport> {
+        self.0
+            .try_iter()
+            .filter_map(|request| match request {
+                Request::ServiceWindows {
+                    adapter,
+                    window_ms,
+                    services,
+                } => Some((adapter, window_ms, services)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Messages to the worker.
@@ -1720,6 +1735,8 @@ mod tests {
     #[test]
     fn service_windows_rejoin_only_the_stuck_service() {
         use ms_ca_drivers::en50221::consts::TAG_CA_PMT;
+        #[cfg(feature = "diag-log")]
+        let lines = super::diag_capture::lines();
         let (mut worker, clock, cam) = service_worker();
         worker.add_pmt(zap_program(4, 0x64), false);
         worker.add_pmt(zap_program(5, 0x65), false);
@@ -1755,6 +1772,30 @@ mod tests {
             Some(&["recovery"][..]),
             "the re-join carries the recovery reason"
         );
+        #[cfg(feature = "diag-log")]
+        {
+            let thread = std::thread::current().name().unwrap_or_default().to_owned();
+            let captured = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let fires: Vec<&String> = captured
+                .iter()
+                .filter(|line| {
+                    line.contains(&thread) && line.contains("re-sending its CAPMT (CAM recovery)")
+                })
+                .collect();
+            assert_eq!(fires.len(), 1, "{fires:?}");
+            assert!(
+                fires[0].contains("PMT 4 "),
+                "the stuck service: {}",
+                fires[0]
+            );
+            assert!(
+                !fires[0].contains("PMT 5 "),
+                "not the clean one: {}",
+                fires[0]
+            );
+        }
         clock.advance(30_000);
         window(&mut worker, 2_000, 2_000);
         assert_eq!(
@@ -1762,15 +1803,68 @@ mod tests {
             before + 1,
             "one re-send per join"
         );
+    }
+
+    /// A PMT update (version change) of a service that already fired keeps its
+    /// identity: no second re-send, the same generation, one "already re-sent" line.
+    #[test]
+    fn service_windows_pmt_update_keeps_the_service_identity() {
+        use ms_ca_drivers::en50221::consts::TAG_CA_PMT;
+        #[cfg(feature = "diag-log")]
+        let lines = super::diag_capture::lines();
+        let (mut worker, clock, cam) = service_worker();
+        worker.add_pmt(zap_program(4, 0x64), false);
+        {
+            let capmt = worker.capmt.get_mut(&0).unwrap();
+            capmt.capmt_reason_log = Some(Vec::new());
+        }
+        let window = |worker: &mut Worker| {
+            worker.handle(Request::ServiceWindows {
+                adapter: 0,
+                window_ms: 10_000,
+                services: vec![(0x64, 2_000, 0)],
+            });
+        };
+        window(&mut worker);
+        clock.advance(12_000);
+        window(&mut worker);
+        clock.advance(15_000);
+        window(&mut worker);
+        clock.advance(10_000);
+        window(&mut worker);
+        let fired = sent(&cam, TAG_CA_PMT).len();
+        assert_eq!(fired, 3, "the join and its one leave plus re-join");
+
+        let generation = worker.programs.get(4).unwrap().generation;
         worker.add_pmt(zap_program(4, 0x64), true);
+        assert_eq!(
+            worker.programs.get(4).unwrap().generation,
+            generation,
+            "an update keeps the PMT generation"
+        );
         let after_update = sent(&cam, TAG_CA_PMT).len();
-        clock.advance(30_000);
-        window(&mut worker, 2_000, 2_000);
+        for _ in 0..5 {
+            clock.advance(10_000);
+            window(&mut worker);
+        }
         assert_eq!(
             sent(&cam, TAG_CA_PMT).len(),
             after_update,
             "a PMT update does not allow a second re-send"
         );
+        #[cfg(feature = "diag-log")]
+        {
+            let thread = std::thread::current().name().unwrap_or_default().to_owned();
+            let captured = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let warnings: Vec<&String> = captured
+                .iter()
+                .filter(|line| line.contains(&thread) && line.contains("was already re-sent once"))
+                .collect();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("PMT 4 "), "{}", warnings[0]);
+        }
     }
 
     /// The ca.rs service path and the worker match the source PMT to the CAPMT
@@ -2741,3 +2835,7 @@ mod diag_capture {
         }
     }
 }
+
+/// One `ServiceWindows` request as a test reads it back: adapter, window, services.
+#[cfg(test)]
+type ServiceWindowReport = (usize, i64, Vec<(u16, u64, u64)>);
