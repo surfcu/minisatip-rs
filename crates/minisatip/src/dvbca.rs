@@ -883,7 +883,7 @@ impl Worker {
             }
         }
         // ca.cpp:1265,1276: a PMT that found no place puts the CI back.
-        if result == TablesResult::Retry && capmt.slot_of(pmt_id).is_none() {
+        if result != TablesResult::Ok && capmt.slot_of(pmt_id).is_none() {
             self.restore_ci_link(device, adapter as i32, prev_linked);
         }
         result
@@ -2184,7 +2184,7 @@ mod tests {
         worker.linked.insert(0, 5);
         assert_eq!(
             worker.add_pmt(program_on(3, 0x0604), false),
-            TablesResult::Retry
+            TablesResult::NoRetry
         );
         assert_eq!(worker.capmt[&0].slot_of(3), None);
         assert_eq!(
