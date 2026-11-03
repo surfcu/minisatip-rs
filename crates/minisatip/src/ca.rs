@@ -95,6 +95,8 @@ pub struct CaRuntime {
     capture: Option<std::sync::Arc<crate::ddci_capture::CaptureTap>>,
     /// Counters of each CI adapter at its last decrypt window (`--cam-recovery`).
     window_base: BTreeMap<usize, WindowBase>,
+    /// Per-DDCI-pid totals at the last service window (`--cam-recovery`).
+    service_window_base: BTreeMap<(usize, u16), (u64, u64)>,
 }
 
 /// Cumulative counters of one CI adapter and when they were read (ms).
@@ -150,6 +152,7 @@ impl CaRuntime {
             diag_dec_err: BTreeMap::new(),
             diag_clear_pkts: BTreeMap::new(),
             window_base: BTreeMap::new(),
+            service_window_base: BTreeMap::new(),
         }
     }
 
@@ -716,6 +719,7 @@ impl CaRuntime {
         self.hw_nodes.remove(&aid);
         self.ca_views.remove(&aid);
         self.window_base.remove(&aid);
+        self.service_window_base.retain(|&(a, _), _| a != aid);
         self.router.forget_adapter(aid as i32);
     }
 
@@ -1071,6 +1075,7 @@ impl CaRuntime {
     fn decrypt_windows(&mut self, sched: &Scheduler, now: i64) {
         let aids: Vec<usize> = self.adapters.keys().copied().collect();
         let mut windows = Vec::new();
+        let mut service_windows = Vec::new();
         for aid in aids {
             let is_ci = sched
                 .adapter(aid)
@@ -1084,6 +1089,8 @@ impl CaRuntime {
             let keys = ca.stats.services.iter().filter(|s| s.cw.is_some()).count();
             let total = ca.stats.dec_err;
             let clear_total = ca.stats.clear_pkts;
+            let pid_totals =
+                (self.dvbca_settings.cam_recovery_ms > 0).then(|| ca.stats.pid_totals.clone());
             let (errors, packets) = self.decrypt_deltas(aid, total, clear_total);
             if cfg!(feature = "diag-log") && (keys > 0 || errors > 0) {
                 let period_s = (DECRYPT_WINDOW_MS / 1000) as u64;
@@ -1097,6 +1104,19 @@ impl CaRuntime {
             }
             if let Some(sample) = self.window_sample(aid, total, clear_total, now) {
                 windows.push((aid, sample));
+                if let Some(pid_totals) = pid_totals.as_ref()
+                    && let Some(link) = self.ddci.as_ref()
+                    && link.hub.lock().ddci.devices.contains_key(&aid)
+                {
+                    let services = ddci_services(link, sched, aid);
+                    let deltas = Self::service_window_deltas(
+                        &mut self.service_window_base,
+                        aid,
+                        pid_totals,
+                        &services,
+                    );
+                    service_windows.push((aid, sample.2, deltas));
+                }
             }
         }
         self.diag_tables();
@@ -1109,7 +1129,50 @@ impl CaRuntime {
                     .dvbca
                     .report_scrambled(aid, scrambled, clear, window_ms);
             }
+            for (aid, window_ms, services) in service_windows {
+                state.dvbca.report_service_windows(aid, window_ms, services);
+            }
         }
+    }
+
+    /// Window deltas per service from cumulative per-pid totals; a pid is
+    /// counted once and a new, missing or rewound pid only reseeds.
+    pub(crate) fn service_window_deltas(
+        base: &mut BTreeMap<(usize, u16), (u64, u64)>,
+        aid: usize,
+        totals: &[(u16, u64, u64)],
+        services: &[(u16, Vec<u16>)],
+    ) -> Vec<(u16, u64, u64)> {
+        let mut deltas: BTreeMap<u16, (u64, u64)> = BTreeMap::new();
+        let mut reported = BTreeSet::new();
+        for &(pid, scrambled, clear) in totals {
+            reported.insert(pid);
+            if let Some((previous_scrambled, previous_clear)) =
+                base.insert((aid, pid), (scrambled, clear))
+                && scrambled >= previous_scrambled
+                && clear >= previous_clear
+            {
+                deltas.insert(
+                    pid,
+                    (scrambled - previous_scrambled, clear - previous_clear),
+                );
+            }
+        }
+        base.retain(|&(a, pid), _| a != aid || reported.contains(&pid));
+        services
+            .iter()
+            .map(|(sid, pids)| {
+                let mut scrambled = 0;
+                let mut clear = 0;
+                for pid in pids {
+                    if let Some(&(s, c)) = deltas.get(pid) {
+                        scrambled += s;
+                        clear += c;
+                    }
+                }
+                (*sid, scrambled, clear)
+            })
+            .collect()
     }
 
     /// The `(errors, packets)` deltas since this adapter's last window.
@@ -1575,6 +1638,50 @@ struct DdciLink {
     mirrored: BTreeSet<(usize, u16)>,
     /// Scheduler filter id -> DDCI CAT filter id and its adapter.
     cat_filters: BTreeMap<i32, (usize, i32)>,
+}
+
+/// The `(sid, DDCI pids)` of each service on a DDCI device; the hub lock is
+/// released before the scheduler is read.
+fn ddci_services(link: &DdciLink, sched: &Scheduler, aid: usize) -> Vec<(u16, Vec<u16>)> {
+    let slots = link.hub.lock().ddci.slot_pmts(aid);
+    let mut services = Vec::new();
+    for id in slots {
+        let Some(pmt) = sched.pmt(id) else {
+            continue;
+        };
+        let es: Vec<u16> = pmt
+            .stream_pids
+            .iter()
+            .filter(|stream| stream.stream_type != 0 && (stream.is_audio || stream.is_video))
+            .filter_map(|stream| u16::try_from(stream.pid).ok())
+            .collect();
+        let pids = if es.is_empty() {
+            Vec::new()
+        } else {
+            link.hub
+                .lock()
+                .ddci
+                .es_ddci_pids(aid, pmt.adapter as u16, id, &es)
+        };
+        services.push((pmt.sid as u16, pids));
+    }
+    services
+}
+
+/// [`ddci_services`] over a bare hub, for the worker tests.
+#[cfg(test)]
+pub(crate) fn ddci_services_for_test(
+    hub: &DdciHub,
+    sched: &Scheduler,
+    aid: usize,
+) -> Vec<(u16, Vec<u16>)> {
+    let link = DdciLink {
+        hub: hub.clone(),
+        ca_id: 0,
+        mirrored: BTreeSet::new(),
+        cat_filters: BTreeMap::new(),
+    };
+    ddci_services(&link, sched, aid)
 }
 
 /// The registered EN 50221 CA.
@@ -2834,6 +2941,55 @@ mod window_tests {
             ca.window_sample(3, 150, 40, 11_000),
             None,
             "a removed adapter reseeds"
+        );
+    }
+
+    fn service_deltas(
+        base: &mut BTreeMap<(usize, u16), (u64, u64)>,
+        totals: &[(u16, u64, u64)],
+        services: &[(u16, Vec<u16>)],
+    ) -> Vec<(u16, u64, u64)> {
+        CaRuntime::service_window_deltas(base, 1, totals, services)
+    }
+
+    // A service window is the per-pid delta since the previous report; a shared
+    // pid counts for each service from one delta, and a rewound pid only reseeds.
+    #[test]
+    fn service_window_deltas_are_per_pid_and_per_service() {
+        let mut base = BTreeMap::new();
+        let services = [(0x64, vec![100, 101]), (0x65, vec![100])];
+        assert_eq!(
+            service_deltas(&mut base, &[(100, 10, 5), (101, 3, 7)], &services),
+            [(0x64, 0, 0), (0x65, 0, 0)],
+            "the first report seeds"
+        );
+        assert_eq!(
+            service_deltas(&mut base, &[(100, 20, 15), (101, 10, 9)], &services),
+            [(0x64, 17, 12), (0x65, 10, 10)],
+            "pid 100 counts for both services"
+        );
+        assert_eq!(
+            service_deltas(&mut base, &[(100, 5, 15), (101, 12, 9)], &services),
+            [(0x64, 2, 0), (0x65, 0, 0)],
+            "a rewound pid reseeds and contributes nothing"
+        );
+    }
+
+    // A pid missing from a report is dropped, so its next appearance only reseeds.
+    #[test]
+    fn service_window_deltas_drop_missing_pids() {
+        let mut base = BTreeMap::new();
+        let services = [(0x64, vec![100, 101]), (0x65, vec![100])];
+        service_deltas(&mut base, &[(100, 10, 5), (101, 3, 7)], &services);
+        assert_eq!(
+            service_deltas(&mut base, &[(101, 15, 10)], &services),
+            [(0x64, 12, 3), (0x65, 0, 0)]
+        );
+        assert!(!base.contains_key(&(1, 100)), "the missing pid is dropped");
+        assert_eq!(
+            service_deltas(&mut base, &[(100, 99, 99), (101, 20, 11)], &services),
+            [(0x64, 5, 1), (0x65, 0, 0)],
+            "the returning pid seeds"
         );
     }
 }
