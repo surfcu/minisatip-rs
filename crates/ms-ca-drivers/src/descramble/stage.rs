@@ -137,6 +137,8 @@ pub struct DescramblerStats {
     pub clear_pkts: u64,
     /// `ad_decerr`: dec errors of the two busiest active pids.
     pub ad_decerr: u64,
+    /// Cumulative (pid, scrambled, clear) totals, never reset.
+    pub pid_totals: Vec<(u16, u64, u64)>,
 }
 
 /// Settings of one adapter's descrambler.
@@ -257,6 +259,7 @@ impl DescramblerStage {
                     dec_err: self.descrambler.dec_err(),
                     clear_pkts: self.descrambler.clear_pkts(),
                     ad_decerr: self.descrambler.adapter_decerr(),
+                    pid_totals: self.descrambler.pid_totals(),
                 });
             }
             DescramblerCommand::SetAdapterPids(table) => {
