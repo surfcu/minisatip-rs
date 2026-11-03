@@ -11,7 +11,8 @@ use std::collections::BTreeSet;
 
 use ms_ca::TablesResult;
 use ms_ca::{
-    CaDescriptor as CaServiceDescriptor, CaService, SdtInfo, StreamPid as CaServiceStream,
+    CaDescriptor as CaServiceDescriptor, CaService, RawDescriptor as CaRawDescriptor, SdtInfo,
+    StreamPid as CaServiceStream,
 };
 use ms_psi::{CrcCheck, Pmt as ParsedPmt, SDT_ACTUAL_TABLE_ID, Sdt};
 
@@ -1564,6 +1565,20 @@ impl Scheduler {
                 .map(|stream| CaServiceStream {
                     stream_type: stream.stream_type as u8,
                     pid: stream.pid as u16,
+                })
+                .collect(),
+            stream_descriptors: pmt
+                .stream_pids
+                .iter()
+                .map(|stream| {
+                    stream
+                        .descriptors
+                        .iter()
+                        .map(|d| CaRawDescriptor {
+                            tag: d.tag,
+                            data: d.data.clone(),
+                        })
+                        .collect()
                 })
                 .collect(),
             av_pids: pmt

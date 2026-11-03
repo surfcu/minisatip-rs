@@ -46,6 +46,8 @@ pub struct CaService {
     pub ca: Vec<CaDescriptor>,
     /// Elementary streams in PMT order, plus an independent PCR entry.
     pub streams: Vec<StreamPid>,
+    /// ES descriptors in `streams` order, for DDCI PMT forwarding.
+    pub stream_descriptors: Vec<Vec<RawDescriptor>>,
     /// Streams the C++ parser classifies as audio or video (CAPMT ES filter).
     pub av_pids: Vec<u16>,
     /// Service name from the SDT (`SPMT::name`), empty until it arrives.
@@ -79,6 +81,19 @@ impl CaService {
             .map(|s| StreamPid {
                 stream_type: s.stream_type,
                 pid: s.elementary_pid,
+            })
+            .collect();
+        service.stream_descriptors = pmt
+            .streams
+            .iter()
+            .map(|s| {
+                s.descriptors
+                    .iter()
+                    .map(|d| RawDescriptor {
+                        tag: d.tag,
+                        data: d.data.clone(),
+                    })
+                    .collect()
             })
             .collect();
         service.av_pids = pmt
