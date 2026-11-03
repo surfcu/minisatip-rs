@@ -633,8 +633,10 @@ impl Ddci {
         };
         let dev_id = d.id;
         let mut released = Vec::new();
+        // EMM pids belong to the adapter, not to slot 0's PMT (DEV-290).
+        let emm = &d.emm_pids;
         for m in d.mapping.values_mut() {
-            if m.ad != ad {
+            if m.ad != ad || emm.contains(&(ad, m.pid)) {
                 continue;
             }
             m.pmt.remove(&pmt);
@@ -647,6 +649,44 @@ impl Ddci {
         }
         for m in released {
             self.release_mapping_entry(dev_id, ad, pmt, &m);
+        }
+        self.drop_orphan_emm(dev, ad);
+    }
+
+    /// Unmaps an adapter's EMM pids with its last PMT (DEV-290); C++ ties them to slot 0's
+    /// PMT, which may be another adapter's, and a stale entry blocks every later CAT.
+    fn drop_orphan_emm(&mut self, dev: usize, ad: u16) {
+        let Some(d) = self.devices.get_mut(&dev) else {
+            return;
+        };
+        if !d.emm_pids.iter().any(|&(a, _)| a == ad)
+            || d.mapping
+                .values()
+                .any(|m| m.ad == ad && !d.emm_pids.contains(&(ad, m.pid)))
+        {
+            return;
+        }
+        let dev_id = d.id;
+        let pids: Vec<u16> = d
+            .emm_pids
+            .iter()
+            .filter(|&&(a, _)| a == ad)
+            .map(|&(_, p)| p)
+            .collect();
+        d.emm_pids.retain(|&(a, _)| a != ad);
+        d.cat_processed = false;
+        ms_log::log!(
+            "DDCI {}: adapter {} has no PMT left, dropping its EMM pids {:?}",
+            dev_id,
+            ad,
+            pids
+        );
+        let released: Vec<Mapping> = pids
+            .iter()
+            .filter_map(|&p| d.mapping.remove(&(ad, p)))
+            .collect();
+        for m in released {
+            self.release_mapping_entry(dev_id, ad, -1, &m);
         }
     }
 

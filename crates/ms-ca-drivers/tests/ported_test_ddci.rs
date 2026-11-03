@@ -936,15 +936,17 @@ fn test_create_pmt_maps_es_ecm_pids() {
     assert_eq!(found, 1, "expected one ES CA descriptor");
 }
 
+// Copied from Wireshark, PID 1 from 10934V @ 0.8W: EMM pids 48, 193, 194, 49
+const CAT: [u8; 36] = [
+    0x01, 0xb0, 0x21, 0xff, 0xff, 0xc5, 0x00, 0x00, 0x09, 0x04, 0x0b, 0x00, 0xe0, 0x30, 0x09, 0x04,
+    0x09, 0x3e, 0xe0, 0xc1, 0x09, 0x04, 0x09, 0x40, 0xe0, 0xc2, 0x09, 0x04, 0x18, 0x8a, 0xe0, 0x31,
+    0xd9, 0x66, 0x34, 0x3b,
+];
+
 // Ported from tests/test_ddci.cpp:1168
 #[test]
 fn test_process_cat() {
-    // Copied from Wireshark, PID 1 from 10934V @ 0.8W
-    let cat = [
-        0x01, 0xb0, 0x21, 0xff, 0xff, 0xc5, 0x00, 0x00, 0x09, 0x04, 0x0b, 0x00, 0xe0, 0x30, 0x09,
-        0x04, 0x09, 0x3e, 0xe0, 0xc1, 0x09, 0x04, 0x09, 0x40, 0xe0, 0xc2, 0x09, 0x04, 0x18, 0x8a,
-        0xe0, 0x31, 0xd9, 0x66, 0x34, 0x3b,
-    ];
+    let cat = CAT;
     let mut x = Ddci::new();
     x.devices.insert(0, DdciDevice::new(0, 0));
     x.process_cat(0, &cat, 0);
@@ -1412,4 +1414,60 @@ fn test_multiple_pmt_maps_only_requested_pids() {
         [audio],
         "an unowned entry does not fall back to 8192"
     );
+}
+
+// DEV-290: the CAT came in on adapter 2 while slot 0 held adapter 1's PMT, so C++
+// maps the EMM pids under that PMT; once both leave they stay and block every later CAT.
+#[test]
+fn test_emm_pids_leave_with_their_adapter() {
+    let (mut x, mut t) = one_ddci(2);
+    for a in [1, 2, 3] {
+        x.create_adapter(a);
+    }
+    let a = create_pmt(&mut t, 1, 100, 101, 102, 0x100, 0x100);
+    let b = create_pmt(&mut t, 2, 200, 201, 202, 0x100, 0x100);
+    let c = create_pmt(&mut t, 3, 300, 301, 302, 0x100, 0x100);
+    assert_eq!(x.process_pmt(1, &prog(&t, a), false), TablesResult::Ok);
+    assert_eq!(x.process_pmt(2, &prog(&t, b), false), TablesResult::Ok);
+    assert_eq!(x.devices[&0].pmt[0].id, a, "adapter 1's PMT holds slot 0");
+    x.process_cat(2, &CAT, 0);
+    assert!(mapped(&x, 2, 48), "EMM pid mapped for adapter 2");
+
+    x.del_pmt(2, &prog(&t, b));
+    assert!(!mapped(&x, 2, 48), "adapter 2 is gone, so are its EMM pids");
+    assert!(x.devices[&0].emm_pids.is_empty());
+    assert!(
+        x.find_pid(2, 48).is_none_or(|p| p.deleted),
+        "EMM pid off adapter 2"
+    );
+    x.process_cat(1, &CAT, 0);
+    assert!(
+        mapped(&x, 1, 48),
+        "adapter 1's next CAT section takes the EMM pids"
+    );
+    x.del_pmt(1, &prog(&t, a));
+    assert!(x.devices[&0].mapping.is_empty(), "nothing left mapped");
+
+    assert_eq!(x.process_pmt(3, &prog(&t, c), false), TablesResult::Ok);
+    x.process_cat(3, &CAT, 0);
+    for pid in [48, 193, 194, 49] {
+        assert!(mapped(&x, 3, pid), "the next CAT maps EMM pid {pid} again");
+    }
+}
+
+// DEV-290: an adapter that still has a PMT keeps its EMM pids.
+#[test]
+fn test_emm_pids_stay_while_their_adapter_has_a_pmt() {
+    let (mut x, mut t) = one_ddci(2);
+    x.create_adapter(1);
+    let a = create_pmt(&mut t, 1, 100, 101, 102, 0x100, 0x100);
+    let b = create_pmt(&mut t, 1, 200, 201, 202, 0x100, 0x100);
+    assert_eq!(x.process_pmt(1, &prog(&t, a), false), TablesResult::Ok);
+    assert_eq!(x.process_pmt(1, &prog(&t, b), false), TablesResult::Ok);
+    x.process_cat(1, &CAT, 0);
+    x.del_pmt(1, &prog(&t, a));
+    assert!(mapped(&x, 1, 48), "PMT b still runs on adapter 1");
+    assert!(x.devices[&0].emm_pids.contains(&(1, 48)));
+    x.del_pmt(1, &prog(&t, b));
+    assert!(x.devices[&0].mapping.is_empty(), "nothing left mapped");
 }
