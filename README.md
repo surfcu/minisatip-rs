@@ -24,35 +24,37 @@ has not yet passed the 7-day soak test, so it is not a recommended replacement y
 | Feature | State |
 |---|---|
 | Linux DVB (8 DVB-S2 tuners) | verified: FTA through tvheadend |
-| DDCI (DuoFlex CI, Irdeto CAM, `-c 8:**2`) | verified: 3 channels descrambled without glitches, including rejoin |
+| DDCI (DuoFlex CI, a CI+ CAM in plain-CI mode, `-c 8:**2`) | verified: 3 channels descrambled without glitches, including rejoin |
 | DVBAPI / oscam | fake oscam only |
 | Multi-CAM | fake CAM only |
 | SAT>IP client, netceiver, unicable/JESS, hardware descrambler | unit tests only |
-| Enigma2 paths | deferred |
+| Enigma2 (armv7, demux mode 3, `-k`) | verified: FTA and pids=all; CI routing untested (no CAM in that box) |
 
 Details are in [docs/hardware-matrix.md](docs/hardware-matrix.md).
 
 ### Known limitations
 
 - CI+ content control (DEV-151) is experimental and only built with the `ci-plus`
-  cargo feature; it has not been validated on a real CAM. A default build has no
+  cargo feature; it was validated once on a real CI+ CAM (2026-10-24, see PLAN.md), but
+  needs more testers. A default build has no
   CI+ support and forces plain CI on every slot, so CI+ CAMs work in CI-compatible
   mode and CI+-protected channels will not descramble.
 - In `ci-plus` builds, `--ci-plus-recovery seconds` (off by default) resets a CAM
   that stops delivering CI+ keys after an MMI message (DEV-281).
-- `--cam-recovery seconds` (off by default, every build) re-sends the CAPMTs of a CI
-  adapter whose output stays mostly scrambled for that long after an MMI message
-  (DEV-284). On a DDCI CAM each service is also judged by its own ES pids: a service
-  that stays at least 90% scrambled for 30 s, or for the longer timeout, after a
-  2 s join lag gets its own CAPMT re-sent once per join, with no MMI message and no
-  10-minute gap. A window counts as stuck only with at least 1000 scrambled ES packets,
-  so very low-rate services (for example a 64 kbit/s audio-only service) do not trigger it;
-  a SID on more than one PMT
-  of the CAM is excluded, and the join lag runs from the first service window after the
-  CAPMT join. A CAPMT change (a zap) needs a clean window before the MMI message to arm it, unless
-  `--cam-recovery-no-zap-guard` is given; with the guard, a CAM error right after a
-  zap, before the new service has descrambled, gets no automatic recovery until a clean
-  window that starts after the zap is seen.
+- `--cam-recovery seconds` (off by default, every build; DEV-284) re-sends the CAPMTs
+  of a CI adapter whose output stays mostly scrambled for that long after an MMI
+  message, at most once per 10 minutes. A CAPMT change (a zap) needs a clean window
+  before the MMI message to arm it, unless `--cam-recovery-no-zap-guard` is given;
+  with the guard, a CAM error right after a zap, before the new service has
+  descrambled, gets no automatic recovery until a clean window that starts after the
+  zap is seen.
+- On a DDCI CAM, `--cam-recovery` also judges each service by its own ES pids: a
+  service that stays at least 90% scrambled for 30 s, or for the longer timeout, gets
+  one leave-and-rejoin of its own CAPMT per join, with no MMI message needed and
+  outside the 10-minute gap. The join lag (2 s) runs from the first service window
+  after the CAPMT join. A window counts as stuck only with at least 1000 scrambled ES
+  packets, so very low-rate services (for example a 64 kbit/s audio-only service) do
+  not trigger it, and a SID on more than one PMT of the CAM is excluded.
 - DDCI CAPMTs are not in the harness yet (#36 phase C); they are compared with C++
   by the ported unit tests and by the real-CAM check.
 - The runtime drives `ms_ca::CaDevice` directly, one PMT at a time as the scheduler offers
@@ -108,6 +110,7 @@ Cargo features of the `minisatip` crate:
 | `srt` | no | SRT output; links `libsrt` |
 | `ci-plus` | no | CI+ content control (DEV-151); needs OpenSSL (`libssl-dev`) |
 | `ci-plus-vendored` | no | `ci-plus` with a statically built OpenSSL (musl builds) |
+| `diag-log` | no | JSON diagnostic events, a remote syslog sink, a flight recorder, and the CAM diagnostics `--ddci-capture`, `--cam-menu`, `--cam-menu-unsolicited`, `--cam-ecm-trace` and `--cam-menu-snapshot` (DEV-280, DEV-285 to DEV-289; see [docs/logging-setup.md](docs/logging-setup.md)) |
 
 ```sh
 cargo build --release -p minisatip --features dvbcsa,srt
