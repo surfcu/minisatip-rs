@@ -2206,7 +2206,11 @@ fn spawn_ddci_adapters(
         };
         // `--ddci-capture` wraps both ends; without it they pass through unchanged.
         let (writer, reader) = ca.ci_io(aid, Box::new(writer), Box::new(reader));
-        hub.open_device(aid, writer);
+        hub.open_device(
+            aid,
+            writer,
+            u8::try_from(aid).is_ok_and(|id| opts.disable_cat.contains(&id)),
+        );
         let buffer = usize::try_from(opts.adapter_buffer)
             .ok()
             .filter(|size| *size > 0)
