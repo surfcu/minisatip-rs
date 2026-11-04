@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use ms_config::{DropEncrypted, Options};
+use ms_config::{DVB_CHARSET_LATIN1, DropEncrypted, Options};
 use ms_net::bandwidth::Bandwidth;
 use ms_net::bind::{BindOptions, resolve_bind_opts};
 use ms_net::dataplane::{AdapterHandle, Command, DataPlaneConfig, DataPlaneTuner};
@@ -263,6 +263,12 @@ impl Runtime {
         scheduler.set_pmt_scan(opts.pmt_scan != 0);
         scheduler.set_emulate_pids_all(opts.emulate_pids_all);
         scheduler.set_drop_encrypted(opts.drop_encrypted != DropEncrypted::Send);
+        let sdt_charset = if opts.sdt_charset == DVB_CHARSET_LATIN1 {
+            ms_psi::CharsetOverride::Latin1
+        } else {
+            ms_psi::CharsetOverride::Auto
+        };
+        scheduler.set_sdt_charset(sdt_charset);
         let replay = std::env::var_os("MINISATIP_REPLAY").map(PathBuf::from);
         let replay_enabled = replay.is_some();
         let adapter_ids = adapter_ids(opts);

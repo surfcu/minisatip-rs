@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use ms_ca::CaService;
 use ms_ca::TablesResult;
+use ms_psi::CharsetOverride;
 use ms_tuner::{DeliverySystem, TuneParams};
 
 use super::*;
@@ -2946,6 +2947,20 @@ fn sdt_names_a_pmt_once_and_tracks_its_fields() {
     let pmt = sched.pmt(id).unwrap();
     assert_eq!(pmt.name, "Service 1", "the name is kept once set");
     assert_eq!(pmt.sdt.unwrap().tsid, 43306, "the fields follow the SDT");
+}
+
+#[test]
+fn sdt_charset_override_reaches_service_names() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let id = sched.pmt_add(0, 0x409E, 67);
+    let filter = sched.add_filter(0, 17, FilterTarget::Sdt, FILTER_CRC);
+    // 0x15 is the UTF-8 prefix; Latin1 decodes the following bytes verbatim.
+    sched.set_sdt_charset(CharsetOverride::Latin1);
+    sched.process_sdt(
+        filter,
+        &build_sdt(0x42, 43305, 1, &[(0x409E, "p", "\u{15}é")]),
+    );
+    assert_eq!(sched.pmt(id).unwrap().name, "Ã©");
 }
 
 #[test]

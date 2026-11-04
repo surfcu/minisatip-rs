@@ -1626,7 +1626,7 @@ impl Scheduler {
         let Some(aid) = self.filter_slot(filter).map(|f| f.adapter) else {
             return 0;
         };
-        let Ok(sdt) = Sdt::parse(section, CrcCheck::Skip) else {
+        let Ok(sdt) = Sdt::parse_with(section, CrcCheck::Skip, self.sdt_charset) else {
             return 0;
         };
         ms_log::debugm!(

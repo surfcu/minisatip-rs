@@ -52,6 +52,15 @@ pub struct Sdt {
 impl Sdt {
     /// Parses an actual or other-transport-stream SDT; CRC follows `crc`.
     pub fn parse(section: &[u8], crc: CrcCheck) -> Result<Self, PsiError> {
+        Self::parse_with(section, crc, CharsetOverride::Auto)
+    }
+
+    /// Parses an SDT, forcing the given name charset override.
+    pub fn parse_with(
+        section: &[u8],
+        crc: CrcCheck,
+        charset: CharsetOverride,
+    ) -> Result<Self, PsiError> {
         let header = parse_header(section)?;
         if header.table_id != SDT_ACTUAL_TABLE_ID && header.table_id != SDT_OTHER_TABLE_ID {
             return Err(PsiError::BadTableId {
@@ -82,7 +91,7 @@ impl Sdt {
                 return Err(PsiError::Truncated);
             }
             let descriptors = parse_descriptors(&section[descriptors_start..descriptors_end])?;
-            let decoded = decode_service_descriptor(&descriptors)?;
+            let decoded = decode_service_descriptor(&descriptors, charset)?;
             services.push(SdtService {
                 service_id,
                 eit_schedule: flags & 0x02 != 0,
@@ -112,7 +121,10 @@ struct ServiceDescriptor {
     service_name: Option<Vec<u8>>,
 }
 
-fn decode_service_descriptor(descriptors: &[Descriptor]) -> Result<ServiceDescriptor, PsiError> {
+fn decode_service_descriptor(
+    descriptors: &[Descriptor],
+    charset: CharsetOverride,
+) -> Result<ServiceDescriptor, PsiError> {
     let mut decoded = ServiceDescriptor {
         service_type: None,
         provider_name: None,
@@ -126,8 +138,8 @@ fn decode_service_descriptor(descriptors: &[Descriptor]) -> Result<ServiceDescri
         decoded.service_type = Some(*kind);
         let (provider, rest) = split_dvb_string(rest)?;
         let (name, _) = split_dvb_string(rest)?;
-        decoded.provider_name = dvb_get_string(provider, NAME_LENGTH, CharsetOverride::Auto);
-        decoded.service_name = dvb_get_string(name, NAME_LENGTH, CharsetOverride::Auto);
+        decoded.provider_name = dvb_get_string(provider, NAME_LENGTH, charset);
+        decoded.service_name = dvb_get_string(name, NAME_LENGTH, charset);
     }
     Ok(decoded)
 }
@@ -145,10 +157,16 @@ mod tests {
     use crate::test_util::build_section;
 
     fn sdt_section(table_id: u8) -> Vec<u8> {
-        let mut service_descriptor = vec![0x48, 0x0B, 0x01, 0x04];
-        service_descriptor.extend_from_slice(b"PROV");
-        service_descriptor.push(0x04);
-        service_descriptor.extend_from_slice(b"NAME");
+        sdt_section_with_name(table_id, b"PROV", b"NAME")
+    }
+
+    fn sdt_section_with_name(table_id: u8, provider: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut service_data = vec![0x01, provider.len() as u8];
+        service_data.extend_from_slice(provider);
+        service_data.push(name.len() as u8);
+        service_data.extend_from_slice(name);
+        let mut service_descriptor = vec![0x48, service_data.len() as u8];
+        service_descriptor.extend_from_slice(&service_data);
 
         let mut payload = vec![0x00, 0x01, 0xFF]; // ONID, reserved
         payload.extend_from_slice(&0x0001u16.to_be_bytes()); // service_id
@@ -177,6 +195,22 @@ mod tests {
         assert_eq!(service.provider_name.as_deref(), Some(b"PROV".as_slice()));
         assert_eq!(service.service_name.as_deref(), Some(b"NAME".as_slice()));
         assert_eq!(service.descriptors.len(), 1);
+    }
+
+    #[test]
+    fn latin1_override_ignores_charset_prefix() {
+        // 0x15 is the UTF-8 prefix; the bytes after it are "é" in UTF-8.
+        let section = sdt_section_with_name(SDT_ACTUAL_TABLE_ID, b"PROV", &[0x15, 0xC3, 0xA9]);
+        let auto = Sdt::parse_with(&section, CrcCheck::Verify, CharsetOverride::Auto).unwrap();
+        let latin1 = Sdt::parse_with(&section, CrcCheck::Verify, CharsetOverride::Latin1).unwrap();
+        assert_eq!(
+            auto.services[0].service_name.as_deref(),
+            Some("é".as_bytes())
+        );
+        assert_eq!(
+            latin1.services[0].service_name.as_deref(),
+            Some("Ã©".as_bytes())
+        );
     }
 
     #[test]
