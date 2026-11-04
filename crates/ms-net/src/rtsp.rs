@@ -147,6 +147,15 @@ pub fn parse_request_logged(
     parse_request_inner(buf, http, Some((socket_id, stream_id)))
 }
 
+/// minisatip.cpp:1213-1222 (RTSP) and 1496-1503 (HTTP).
+fn log_discard(len: usize) {
+    ms_log::log!(
+        "Discarding {} bytes from the socket buffer, request > {}, consider increasing  RBUF",
+        len,
+        MAX_REQUEST_LEN
+    );
+}
+
 fn parse_request_inner(buf: &[u8], http: bool, log_ids: Option<(i32, i32)>) -> ParseOutcome {
     if buf.is_empty() {
         return ParseOutcome::Incomplete { consumed: 0 };
@@ -194,11 +203,7 @@ fn parse_request_inner(buf: &[u8], http: bool, log_ids: Option<(i32, i32)>) -> P
         if let Some((id, _)) = log_ids {
             // minisatip.cpp:1213-1222 (RTSP) and 1496-1503 (HTTP).
             if rest.len() > DISCARD_THRESHOLD {
-                ms_log::log!(
-                    "Discarding {} bytes from the socket buffer, request > {}, consider increasing  RBUF",
-                    rest.len(),
-                    MAX_REQUEST_LEN
-                );
+                log_discard(rest.len());
             }
             if http {
                 ms_log::log!("HTTP header not complete: {}\n{}", id, c_string_lossy(rest));
@@ -276,6 +281,12 @@ fn parse_request_inner(buf: &[u8], http: bool, log_ids: Option<(i32, i32)>) -> P
     // A request is therefore accepted four bytes before the declared body is
     // complete. Match that threshold, which withdraws DEV-026.
     if rest.len() < terminator + content_length {
+        // minisatip.cpp:1213-1225 also discards a header-complete request whose
+        // body cannot fit RBUF.
+        if rest.len() > DISCARD_THRESHOLD {
+            log_discard(rest.len());
+            return ParseOutcome::Discarded;
+        }
         return ParseOutcome::Incomplete { consumed: offset };
     }
 
