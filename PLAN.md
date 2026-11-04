@@ -206,7 +206,7 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 ### M8 — Remaining backends
 - [x] SAT>IP client (port `test_satipc.cpp`, `test_satipc_rtsp.cpp`, `fake_satip_server.h`)
 - [x] Netceiver, hardware descrambler (port `test_hw_descrambler.cpp`)
-- [ ] Status/variables API parity
+- [x] Status/variables API parity
 - **Exit:** ported tests pass; satipc against at least one real SAT>IP server
 
 ### M9 — Parity hardening
@@ -283,14 +283,37 @@ Unvalidated rows must be called out in release notes.
 
 ## Status
 
-- **Current milestone:** M9 (parity hardening). M0–M8 items are in place except the
-  M8 status API item; the open exit criteria are listed below.
-- **Deployed (2026-10-24):** minisatip-rs replaces the C++ build on both boxes.
-  - The main box (8 DVB-S2 tuners, DuoFlex CI) runs it as a systemd unit behind
-    tvheadend since 02:37; this started a 7-day soak (M9), later ended (see "Soak").
-  - The enigma2 box (armv7) runs it with `-E -g` since 02:05.
+- **Current milestone:** M9 (parity hardening). M0–M8 items are in place; the open exit
+  criteria are listed below.
+- **Deployed (2026-10-24, updated 2026-11-04):** minisatip-rs replaces the C++ build on both boxes.
+  - The main box (8 DVB-S2 tuners, DuoFlex CI) runs `main` `da3d104` (sha `f0e38bfc`) as a
+    systemd unit behind tvheadend since 2026-11-04 11:41:54 +03 (official 7-day M9 soak start).
+  - The enigma2 box (armv7) runs `main` `da3d104` (sha `ae46c836`) with `-E` and `diag-log`
+    since 2026-11-04 11:41:48 +03 (09:41:48 +01), after 10 days of continuous uptime on its
+    previous build.
   - Logs from both boxes and tvheadend go to a central Loki/Grafana host.
-- **Last sessions (2026-11-02/03):** merged:
+- **Last session (2026-11-04):** merged:
+  - #95 PLAN and README update; #96 `scripts/decerr.py` bitrate-weighted decrypt-error
+    comparison tool.
+  - #97–#99 the remaining 13 findings from the first port review against C++ (all 18 findings
+    now closed): `DDCI_SID` excluded from `entry.order`, `order == 0` normalised to
+    `u32::MAX`, upstream #1533 (`11fcf4a`) PMT completeness tie-break (#97); ES descriptor
+    forwarding into DDCI CAPMTs, `WouldBlock`/`Interrupted` `POLLOUT` retry on EN50221 CA link
+    writes, `SendOutcome::result` aligned with C++ `send_capmt`, descrambler `ServiceStats`
+    guarded by PMT `generation` (#98); per-PID continuity counters and two-busiest-PID
+    `ad_ccerr`, `st_overflow` and `st_buffered` wired into `WebSnapshot`, `ad_allsys` using
+    `DeliverySystem::name()`, `TuneParams::src` widened to `i32`, `DEV-291` documenting the
+    bounded 5 s `satipc` RTSP connect timeout, and full 16-byte CI+ CC key check (#99).
+  - #100–#103 nine additional parity and robustness fixes from a second codebase review:
+    `SendOutcome::WriteFailed` and `SendOutcome::NoSession` mapped to `TablesResult::Retry`
+    like upstream `3d42bee` (#100); `--sdt-charset` wired into SDT parsing and `-C`/
+    `--disable-cat` wired into `DdciHub::open_device` (#101); `DISCARD_THRESHOLD` enforced on
+    incomplete RTSP/HTTP `Content-Length` bodies, non-blocking `POLLPRI` polled in
+    `LinkMode::Enigma` for CAM removal, and `SIGHUP` ignored via `SIG_IGN` (#102);
+    `SatipXml::servers` capped at `MAX_ADAPTERS`, `SessionManager::disable_stream` releasing
+    per-stream UDP and SRT sockets, and periodic `--satip-xml` refreshes moved onto a
+    background thread (#103).
+- **Sessions (2026-11-02/03):** merged:
   - #87 PLAN status; #88 `--cam-recovery` re-sends the CAPMTs instead of resetting the CAM
     (DEV-284).
   - #89 `--cam-menu-snapshot` (DEV-289, diag-log): reads the CAM's status pages after a menu
@@ -309,8 +332,6 @@ Unvalidated rows must be called out in release notes.
     1.1 s send timeout on stream sockets.
   - #94 `--cam-recovery` also re-joins, once per join, a service on a DDCI CAM whose own ES
     pids stay scrambled for max(N, 30 s) with no MMI message (DEV-284).
-  - The port review itself (branch `rs/port-review`, not merged) lists 18 findings; the five
-    high ones are fixed, the medium and low ones are open.
 - **Sessions (2026-11-01/02):** merged:
   - #80 `--cam-recovery` (DEV-284): recovers a plain-CI CAM whose output stays scrambled after
     an MMI message (a reset then; a CAPMT re-send since #88); `--cam-recovery-no-zap-guard`
@@ -368,25 +389,22 @@ Unvalidated rows must be called out in release notes.
     timer, as `sockets_timeout`, ca.cpp:3829). The real CAM works through the CI path.
   - M8: satipc against a real SAT>IP server. SAT>IP client adapters report `ad_type` 2
     (`ADAPTER_SATIP`, DEV-053), so the status page scales their SNR as C++ does.
-  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); no valid 7-day soak is running
-    (see "Soak"); resource comparison.
+  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); 7-day standard-mix soak started
+    2026-11-04 11:42:00 +03 (target completion 2026-11-11 11:42:00 +03, see "Soak"); resource
+    comparison and `scripts/decerr.py` bitrate-weighted decrypt-error comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - #63: wait for the next stuck episode under `--cam-recovery` (now a CAPMT re-send),
-    `--cam-ecm-trace`, `--ddci-capture` and `--cam-menu-snapshot`, and see whether the
-    re-send clears it.
-  - Watch the per-service recovery (#94) on the main box.
-  - Port review: the medium and low findings, and a C++ vs Rust decrypt-error comparison
-    weighted by bitrate.
-  - Soak with evidence: no valid 7-day soak is running on the main box (see "Soak"
-    below); the enigma2 box runs the armv7 `diag-log` build since 2026-10-25 09:08 +03
-    and passed its 12 h validation (see "Logging ... Part B").
+  - Finish the 7-day standard-mix soak started 2026-11-04 11:42:00 +03 (both boxes running
+    `main` `da3d104`).
+  - #63 / #94: watch `--cam-recovery` (CAPMT re-send on MMI lock + silent per-service re-join),
+    `--cam-ecm-trace`, `--ddci-capture` and `--cam-menu-snapshot` during the 7-day soak.
+  - C++ vs Rust decrypt-error comparison weighted by bitrate (`scripts/decerr.py`) and resource
+    comparison.
   - CA scenarios in the harness (#36).
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
     is in that box.
-  - Resource comparison; finish the soak.
 - **Blockers:** no SAT>IP server (M8 exit).
 - **CI+ (2026-10-24):** content control runs behind the `ci-plus` feature: a slot
   keeps CI+ when `{cert_dir}/root.pem` exists and `-C` was not given, and CI+ keys
@@ -414,6 +432,17 @@ Unvalidated rows must be called out in release notes.
     watchdog resetting the two empty CI slots as in C++ (ca.cpp:3679-3693), plus 60
     heartbeats and the stream events. The -F file reached 2.2 MB, so it did not
     rotate.
+- **Soak (M9), started 2026-11-04 11:42:00 +03 (08:42:00 UTC): official 7-day standard-mix soak.**
+  Both boxes run `main` `da3d104` (#88–#103 included): the enigma2 box (armv7 musl with
+  `diag-log`, sha `ae46c836`, compile time Nov 4 2026 08:16:32 UTC) started at 11:41:48 +03
+  (09:41:48 +01), and the main box (x86_64 musl with `diag-log`, sha `f0e38bfc`, plain CI with
+  `--ddci-capture`, `--cam-recovery 10`, `--cam-recovery-no-zap-guard`, `--cam-ecm-trace`,
+  `--cam-menu` and `--cam-menu-snapshot`) restarted at 11:41:54 +03. The load generator on the
+  logging host restored the standard M9 soak mix (`steady` `[2, 3]` with `scrambled_share = 0.5`,
+  `zap` `scrambled_share = 0.5`, `rejoin`, `parallel`, `spread` `weight = 2` across both boxes,
+  `quiet` hours `00:00–07:00` with 1 idle hour and at most 1 stream, `main_max_adapters = 2`
+  for tuner thermal protection) and started at 11:42:00 +03. Target 7-day completion:
+  **2026-11-11 11:42:00 +03**.
 - **Soak (M9), status 2026-11-03 23:40 +03: a #63 soak, not the standard one.** The load
   generator restarted on 2026-11-03 09:51:38 +03 under the same scrambled-only zapping load,
   with quiet hours off, so it does not count for the 7-day criterion. Deploys restarted
