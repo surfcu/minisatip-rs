@@ -114,6 +114,10 @@ impl CaLink for DvbCaLink {
         }
     }
 
+    fn priority_pending(&mut self) -> bool {
+        self.poll(0).map(|(_, pri)| pri).unwrap_or(false)
+    }
+
     fn reset(&mut self) -> io::Result<()> {
         let mut info = CaSlotInfo::default();
         // SAFETY: CA_RESET takes no argument; the zeroed struct pointer mirrors ca_slot_reset.

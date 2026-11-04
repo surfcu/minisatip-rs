@@ -626,6 +626,26 @@ fn oversized_incomplete_buffer_is_discarded() {
 }
 
 #[test]
+fn oversized_pending_body_is_discarded() {
+    let mut buffer = b"POST /x HTTP/1.0\r\nContent-Length: 100000\r\n\r\n".to_vec();
+    buffer.extend(std::iter::repeat_n(
+        b'x',
+        ms_net::rtsp::DISCARD_THRESHOLD + 1,
+    ));
+    assert_eq!(parse_request(&buffer), ParseOutcome::Discarded);
+}
+
+#[test]
+fn small_pending_body_waits_for_more_data() {
+    let mut buffer = b"POST /x HTTP/1.0\r\nContent-Length: 100\r\n\r\n".to_vec();
+    buffer.extend_from_slice(b"short");
+    assert_eq!(
+        parse_request(&buffer),
+        ParseOutcome::Incomplete { consumed: 0 }
+    );
+}
+
+#[test]
 fn malformed_request_line_is_rejected() {
     assert_eq!(parse_request(b"garbage\r\n\r\n"), ParseOutcome::Malformed);
     assert_eq!(parse_request(b"OPTIONS\r\n\r\n"), ParseOutcome::Malformed);

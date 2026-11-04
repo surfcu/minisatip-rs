@@ -17,6 +17,8 @@ struct Mock {
     /// Return `WouldBlock` for the next write before accepting one.
     write_block_once: Arc<Mutex<bool>>,
     dropped: Arc<AtomicBool>,
+    /// Report `POLLPRI` from the link.
+    priority: bool,
 }
 
 impl Mock {
@@ -69,6 +71,9 @@ impl CaLink for Mock {
         Ok(SlotInfo::default())
     }
     fn sleep_ms(&mut self, _: u32) {}
+    fn priority_pending(&mut self) -> bool {
+        self.priority
+    }
 }
 
 struct NoDevices;
@@ -652,6 +657,28 @@ fn ca_read_enigma_removal() {
         "inactive stays quiet"
     );
     assert!(!d.take_close_request(), "no close when inactive");
+}
+
+// C++ ca_read_enigma polls POLLPRI instead of passing a fixed false (ca.cpp:3695-3717).
+#[test]
+fn service_enigma_priority_requests_close() {
+    let (_, mut d) = dev(62);
+    d.mode = LinkMode::Enigma;
+    d.enabled = true;
+    d.state = CaState::Active;
+    let m = Mock::default();
+    d.set_link(m.boxed());
+    assert!(d.service(), "quiet service stays up");
+    assert!(!d.take_close_request(), "no close without PRI");
+
+    let mut m = Mock::default();
+    m.priority = true;
+    d.set_link(m.boxed());
+    assert!(d.service(), "service stays up while closing");
+    assert!(
+        d.take_close_request(),
+        "PRI on an active device requests close"
+    );
 }
 
 // Ported from tests/test_ca.cpp:1637 (the tables CA bit is set by ms-sched `init_ca_for_adapter`)

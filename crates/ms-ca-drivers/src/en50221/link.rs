@@ -30,6 +30,10 @@ pub trait CaLink: Send {
     fn reset(&mut self) -> io::Result<()>;
     /// `CA_GET_SLOT_INFO` for slot 0.
     fn slot_info(&mut self) -> io::Result<SlotInfo>;
+    /// Non-blocking `POLLPRI`; enigma reports device removal this way.
+    fn priority_pending(&mut self) -> bool {
+        false
+    }
     fn sleep_ms(&mut self, ms: u32) {
         std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
     }

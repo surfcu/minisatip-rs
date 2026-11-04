@@ -835,7 +835,13 @@ impl CaDevice {
         loop {
             let r = match self.mode {
                 LinkMode::Tpdu => self.read_tpdu(),
-                LinkMode::Enigma => self.read_enigma(false),
+                LinkMode::Enigma => {
+                    let pri = self
+                        .link
+                        .as_deref_mut()
+                        .is_some_and(|l| l.priority_pending());
+                    self.read_enigma(pri)
+                }
             };
             match r {
                 ReadOutcome::Data(d) if !d.is_empty() => {
