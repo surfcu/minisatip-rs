@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAdd
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -152,12 +152,62 @@ struct SatipAdapter {
     delsys: DeliverySystem,
 }
 
+/// Result of one background `--satip-xml` fetch: `(url, over_tcp, host, xml)`.
+type SatipXmlFetch = (String, bool, String, String);
+
 /// `--satip-xml` polling state (`satip_getxml` timer).
 struct SatipXmlPoll {
     urls: Vec<String>,
     over_tcp: bool,
     next: Instant,
     interval: Duration,
+    /// Results of the fetch thread, present while a fetch is in flight.
+    fetched: Option<Receiver<SatipXmlFetch>>,
+}
+
+impl SatipXmlPoll {
+    /// Collects completed fetches; a disconnected worker clears the slot.
+    fn drain(&mut self) -> Vec<SatipXmlFetch> {
+        let mut results = Vec::new();
+        let mut disconnected = false;
+        if let Some(receiver) = self.fetched.as_ref() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => results.push(result),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.fetched = None;
+        }
+        results
+    }
+
+    /// Spawns the fetch thread when due and none is already in flight.
+    fn fetch_due(&mut self, now: Instant) {
+        if now < self.next || self.fetched.is_some() {
+            return;
+        }
+        self.next = now + self.interval;
+        let urls = self.urls.clone();
+        let over_tcp = self.over_tcp;
+        let (sender, receiver) = mpsc::channel();
+        self.fetched = Some(receiver);
+        thread::spawn(move || {
+            for url in urls {
+                if let Ok((host, xml)) = fetch_satip_xml(&url)
+                    && sender.send((url, over_tcp, host, xml)).is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
 }
 
 /// An RTSP connection request forwarded by a reader thread.
@@ -411,6 +461,7 @@ impl Runtime {
                 over_tcp: opts.satip_rtsp_over_tcp != 0,
                 next: Instant::now() + interval,
                 interval,
+                fetched: None,
             })
         });
 
@@ -617,34 +668,23 @@ impl Runtime {
             .retain(|entry| entry.host != host || entry.port != port);
     }
 
-    /// `satip_getxml`: fetches every URL once the 120 s timer elapsed.
+    /// `satip_getxml`: drains background fetches and starts a new pass when due.
     fn poll_satip_xml(&mut self) {
-        let Some(poll) = self.xml_poll.as_ref() else {
+        let Some(poll) = self.xml_poll.as_mut() else {
             return;
         };
-        let now = Instant::now();
-        if now < poll.next {
-            return;
-        }
-        let urls = poll.urls.clone();
-        let over_tcp = poll.over_tcp;
-        let interval = poll.interval;
-        if let Some(poll) = self.xml_poll.as_mut() {
-            poll.next = now + interval;
-        }
-        for url in urls {
-            self.reconcile_satip_xml(&url, over_tcp);
+        let fetched = poll.drain();
+        poll.fetch_due(Instant::now());
+        for (url, over_tcp, host, xml) in fetched {
+            self.reconcile_satip_xml(&url, over_tcp, host, xml);
         }
     }
 
     /// `satip_getxml_data`: compares the advertised tuners with the configured
     /// adapters and replaces them when the counts differ.
-    fn reconcile_satip_xml(&mut self, url: &str, over_tcp: bool) {
+    fn reconcile_satip_xml(&mut self, url: &str, over_tcp: bool, host: String, xml: String) {
         // Fetch failures and unparsable XML are logged at their source
         // (httpc.cpp:88-144, satipc.cpp:2223).
-        let Ok((host, xml)) = fetch_satip_xml(url) else {
-            return;
-        };
         let Some(description) = parse_satip_xml(&xml, &host) else {
             return;
         };
@@ -2938,5 +2978,61 @@ mod tests {
         assert_eq!((config.phy_adapter, config.phy_frontend), (0, 0));
         set_phy_numbers(&mut config, 3, 1);
         assert_eq!((config.phy_adapter, config.phy_frontend), (3, 1));
+    }
+
+    /// Serves one HTTP/1.0 response after `delay`, then closes the connection.
+    fn serve_satip_xml(delay: Duration, body: &str) -> (String, JoinHandle<()>) {
+        use std::io::Write as _;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let body = body.to_owned();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            thread::sleep(delay);
+            let response = format!("HTTP/1.0 200 OK\r\n\r\n{body}");
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://127.0.0.1:{port}/"), handle)
+    }
+
+    // httpc.cpp:129-144 fetches off the control loop; the poll must return
+    // before the server answers and deliver the result through the channel.
+    #[test]
+    fn satip_xml_poll_fetches_without_blocking_the_caller() {
+        let body = "<satip:X_SATIPCAP xmlns:satip=\"urn:ses-com:satip\">DVBS2-1</satip:X_SATIPCAP>";
+        let (url, server) = serve_satip_xml(Duration::from_secs(1), body);
+        let mut poll = SatipXmlPoll {
+            urls: vec![url.clone()],
+            over_tcp: false,
+            next: Instant::now(),
+            interval: Duration::from_secs(120),
+            fetched: None,
+        };
+
+        let started = Instant::now();
+        poll.fetch_due(Instant::now());
+        assert!(poll.fetched.is_some(), "fetch thread started");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "poll returned before the server answered"
+        );
+        poll.fetch_due(Instant::now());
+        assert!(poll.fetched.is_some(), "no second fetch while in flight");
+
+        let mut results = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while poll.fetched.is_some() && Instant::now() < deadline {
+            results.extend(poll.drain());
+            thread::sleep(Duration::from_millis(10));
+        }
+        server.join().expect("server");
+        let (got_url, over_tcp, host, xml) = results.into_iter().next().expect("fetch result");
+        assert_eq!(got_url, url);
+        assert!(!over_tcp);
+        assert_eq!(host, "127.0.0.1");
+        let parsed = parse_satip_xml(&xml, &host).expect("caps");
+        assert_eq!(parsed.tuners_for(ms_tuner::DeliverySystem::DvbS2), 1);
     }
 }
