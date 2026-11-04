@@ -38,7 +38,7 @@ extern "C" fn on_signal(_signal: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-/// Installs handlers for SIGINT and SIGTERM.
+/// Installs handlers for SIGINT and SIGTERM and ignores SIGHUP.
 pub fn install_shutdown_handlers() {
     // SAFETY: the handler only touches an atomic and `signal` accepts any
     // function with the C signal signature.
@@ -51,6 +51,10 @@ pub fn install_shutdown_handlers() {
         // utils.cpp:228
         if libc::signal(libc::SIGTERM, handler) == libc::SIG_ERR {
             ms_log::log!("Could not set signal SIGTERM");
+        }
+        // utils.cpp:231
+        if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+            ms_log::log!("Could not ignore signal SIGHUP");
         }
     }
 }
