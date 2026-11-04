@@ -871,10 +871,23 @@ impl SessionManager {
             return;
         };
         self.diag_close(index);
+        #[cfg(feature = "srt")]
+        let srt_socket = self.streams[index].as_ref().and_then(|stream| {
+            (stream.stream_type == StreamType::RtspSrt && stream.srt_sock != SRT_INVALID_SOCK)
+                .then(|| (stream.srt_sock, stream.srt_streamid.clone()))
+        });
         if let Some(stream) = self.streams[index].as_mut() {
             stream.enabled = false;
             stream.adapter = -1;
             stream.do_play = false;
+            stream.srt_sock = -1;
+        }
+        self.udp_sockets.remove(&id);
+        // C++ frees the sockets and returns a connected SRT socket
+        // (adapter.cpp:1113-1115 -> stream.cpp:652-659).
+        #[cfg(feature = "srt")]
+        if let (Some((sock, streamid)), Some(listener)) = (srt_socket, self.srt.as_ref()) {
+            listener.return_socket(sock, &streamid);
         }
     }
 
@@ -1950,6 +1963,24 @@ mod tests {
 
         // stream.cpp:1346: `sid->timeout == 1` closes without waiting.
         assert_eq!(manager.expired_streams(), vec![id]);
+    }
+
+    #[test]
+    fn disable_stream_releases_udp_sockets() {
+        let clock = Arc::new(ManualClock::new(0));
+        let mut manager = manual_manager(&clock);
+        let id = manager.add_stream().expect("slot");
+        let rtp = UdpSocket::bind("127.0.0.1:0").expect("rtp");
+        let rtcp = UdpSocket::bind("127.0.0.1:0").expect("rtcp");
+        manager.udp_sockets.insert(id, (rtp, rtcp));
+
+        manager.disable_stream(id);
+
+        assert!(!manager.udp_sockets.contains_key(&id));
+        assert!(manager.udp_sockets(id).is_none());
+        let stream = manager.streams[id as usize].as_ref().expect("stream");
+        assert!(!stream.enabled);
+        assert_eq!(stream.srt_sock, -1);
     }
 
     #[test]
