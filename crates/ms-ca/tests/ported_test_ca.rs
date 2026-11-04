@@ -717,10 +717,10 @@ fn failed_write_is_tracked_per_capmt_slot() {
     drv.fail_writes = true;
     assert_eq!(
         dev.process_pmt(p2, false, &t, &mut drv),
-        TablesResult::Ok,
-        "a failed write keeps the slot without asking for a retry"
+        TablesResult::Retry,
+        "a failed join asks for a retry"
     );
-    assert_eq!(dev.slot_of(p2), Some(1), "the program keeps its place");
+    assert_eq!(dev.slot_of(p2), None, "a failed join keeps no place");
     assert!(!dev.capmt[0].diag_retry, "the sent slot is not marked");
     assert!(dev.capmt[1].diag_retry, "the failed slot is marked");
 
@@ -933,20 +933,22 @@ fn test_capmt_changed_rejoin_still_sends() {
     );
 }
 
-// Ported from tests/test_ca.cpp:2316 (minisatip 3d42bee)
-// A failed CAPMT write keeps its place and returns Ok (C++ send_capmt:1021);
-// a missing CA session returns NoRetry and drops a new offer (ca.cpp:1309).
+// A failed CAPMT join returns Retry and drops its place (ca.cpp:1323-1329);
+// a failed update keeps its place. A missing CA session is also Retry.
 #[test]
-fn test_capmt_write_failure_keeps_place() {
+fn test_capmt_write_failure_returns_retry() {
     let mut cam = PackingCam::open();
     let p1 = cam.program(0x2b01);
     cam.drv.fail_writes = true;
     assert_eq!(
         cam.join(p1, false),
-        TablesResult::Ok,
-        "a failed write is not retried"
+        TablesResult::Retry,
+        "a failed write is retried"
     );
-    assert!(cam.dev.capmt[0].has_pmt(p1), "the place is kept");
+    assert!(
+        cam.dev.slot_of(p1).is_none(),
+        "a failed join keeps no place"
+    );
     assert_eq!(cam.read_capmts().0, 0, "nothing reached the CAM");
 
     cam.drv.fail_writes = false;
@@ -954,18 +956,70 @@ fn test_capmt_write_failure_keeps_place() {
     assert_eq!(cam.read_capmts().0, 1, "sends the CAPMT");
     assert!(cam.dev.capmt[0].has_pmt(p1), "and registers it");
 
-    // A failed update also keeps its place.
+    // A failed update also returns Retry, but keeps its place.
     cam.drv.fail_writes = true;
     cam.dev.capmt[0].sid = 0x2b0f;
-    assert_eq!(cam.join(p1, true), TablesResult::Ok);
+    assert_eq!(cam.join(p1, true), TablesResult::Retry);
     assert!(cam.dev.capmt[0].has_pmt(p1), "an update keeps its place");
     cam.drv.fail_writes = false;
 
-    // Without a CA session a new offer is not retried and keeps no place.
+    // Without a CA session a new offer is retried and keeps no place.
     let p2 = cam.program(0x2b02);
     cam.drv.no_session = true;
-    assert_eq!(cam.join(p2, false), TablesResult::NoRetry);
+    assert_eq!(cam.join(p2, false), TablesResult::Retry);
     assert!(cam.dev.slot_of(p2).is_none(), "no place is kept");
+}
+
+// (a) A failed `send_ca_pmt` makes process_pmt return Retry and drop the place.
+#[test]
+fn failed_write_returns_retry_and_drops_the_place() {
+    let mut t = ProgramTable::new();
+    let mut dev = device(1, 0);
+    dev.state = CaState::Initialized;
+    let mut drv = RecordingDriver {
+        fail_writes: true,
+        ..RecordingDriver::default()
+    };
+    let p = t.add(0, 0x2401, 0x401);
+    t.get_mut(p).unwrap().add_stream(0x501, 2, false, true);
+    assert_eq!(dev.process_pmt(p, false, &t, &mut drv), TablesResult::Retry);
+    assert!(dev.slot_of(p).is_none(), "a failed add keeps no place");
+}
+
+// (b) Without a CA session process_pmt returns Retry.
+#[test]
+fn missing_ca_session_returns_retry() {
+    let mut t = ProgramTable::new();
+    let mut dev = device(1, 0);
+    dev.state = CaState::Initialized;
+    let mut drv = RecordingDriver {
+        no_session: true,
+        ..RecordingDriver::default()
+    };
+    let p = t.add(0, 0x2501, 0x501);
+    t.get_mut(p).unwrap().add_stream(0x601, 2, false, true);
+    assert_eq!(dev.process_pmt(p, false, &t, &mut drv), TablesResult::Retry);
+    assert!(dev.slot_of(p).is_none(), "no place is kept");
+}
+
+// (c) The next join after a failed write sends the CAPMT, not "unchanged".
+#[test]
+fn failed_write_is_resent_by_the_next_join() {
+    let mut t = ProgramTable::new();
+    let mut dev = device(1, 0);
+    dev.state = CaState::Initialized;
+    let mut drv = RecordingDriver {
+        fail_writes: true,
+        ..RecordingDriver::default()
+    };
+    let p = t.add(0, 0x2601, 0x601);
+    t.get_mut(p).unwrap().add_stream(0x701, 2, false, true);
+    assert_eq!(dev.process_pmt(p, false, &t, &mut drv), TablesResult::Retry);
+    assert!(drv.sent.is_empty(), "nothing reached the CAM");
+
+    drv.fail_writes = false;
+    assert_eq!(dev.process_pmt(p, false, &t, &mut drv), TablesResult::Ok);
+    assert_eq!(drv.sent.len(), 1, "the retry is sent, not suppressed");
 }
 
 // Ported from tests/test_ca.cpp:2292

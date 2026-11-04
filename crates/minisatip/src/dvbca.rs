@@ -2179,12 +2179,12 @@ mod tests {
         );
         assert_eq!(worker.linked.get(&0), Some(&0));
 
-        // A free slot but no CA session: the failed first send also restores.
+        // A free slot but no CA session: the failed send is retried and restores.
         worker.capmt.get_mut(&0).unwrap().capmt[0].pmt_id = -1;
         worker.linked.insert(0, 5);
         assert_eq!(
             worker.add_pmt(program_on(3, 0x0604), false),
-            TablesResult::NoRetry
+            TablesResult::Retry
         );
         assert_eq!(worker.capmt[&0].slot_of(3), None);
         assert_eq!(
