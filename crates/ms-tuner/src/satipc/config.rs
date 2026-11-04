@@ -16,6 +16,8 @@ const DEFAULT_LOG: u32 = ms_log::LOG_SATIPC;
 
 /// `MAX_DVBAPI_SYSTEMS`: size of the per-delivery-system tuner table.
 pub const MAX_DVBAPI_SYSTEMS: usize = 22;
+/// `MAX_ADAPTERS`: `add_satip_server` stops allocating beyond this many adapters.
+pub const MAX_ADAPTERS: usize = 100;
 /// `sizeof(Ssatip_xml_data::xml)`.
 const XML_SIZE: usize = 4000;
 /// `http_client` socket timeout.
@@ -181,6 +183,9 @@ impl SatipXml {
         let mut fe = 0;
         for sys in &self.order {
             for _ in 0..self.tuners_for(*sys) {
+                if servers.len() >= MAX_ADAPTERS {
+                    return servers;
+                }
                 servers.push(SatipServer {
                     host: self.host.clone(),
                     port: self.port,
@@ -408,5 +413,14 @@ mod tests {
         assert_eq!(servers[2].fe, 2);
         assert_eq!(servers[2].delsys, DeliverySystem::DvbT);
         assert!(parse_satip_xml("<root/>", "h").is_none());
+    }
+
+    #[test]
+    fn xml_servers_capped_at_max_adapters() {
+        let xml = "<satip:X_SATIPCAP xmlns:satip=\"urn:ses-com:satip\">DVBS2-2147483647</satip:X_SATIPCAP>";
+        let parsed = parse_satip_xml(xml, "1.2.3.4").expect("caps");
+        let servers = parsed.servers(false);
+        assert_eq!(servers.len(), MAX_ADAPTERS);
+        assert_eq!(servers[MAX_ADAPTERS - 1].fe, MAX_ADAPTERS as i32 - 1);
     }
 }
