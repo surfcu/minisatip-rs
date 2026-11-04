@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use ms_psi::CharsetOverride;
 use ms_tuner::{DeliverySystem, PidSet, Polarization, TuneParams};
 
 pub mod pmt;
@@ -462,6 +463,7 @@ pub struct Scheduler {
     disabled: [bool; MAX_ADAPTERS],
     absolute_switch: bool,
     pmt_generation: u64,
+    sdt_charset: CharsetOverride,
     pub(crate) pmt: pmt::PmtTables,
 }
 
@@ -482,6 +484,7 @@ impl Scheduler {
             disabled: [false; MAX_ADAPTERS],
             absolute_switch: false,
             pmt_generation: 0,
+            sdt_charset: CharsetOverride::Auto,
             pmt: pmt::PmtTables::new(),
         }
     }
@@ -527,6 +530,11 @@ impl Scheduler {
     /// Enables the `--satip-abs` source mapping.
     pub fn set_absolute_switch(&mut self, enabled: bool) {
         self.absolute_switch = enabled;
+    }
+
+    /// Selects the forced charset for SDT service names (`--sdt-charset`).
+    pub fn set_sdt_charset(&mut self, charset: CharsetOverride) {
+        self.sdt_charset = charset;
     }
 
     /// Creates PAT->PMT filters with `FILTER_ADD_REMOVE` (`opts.pmt_scan`).

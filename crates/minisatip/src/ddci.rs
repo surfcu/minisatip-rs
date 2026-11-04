@@ -44,10 +44,12 @@ impl DdciHub {
     }
 
     /// `ddci_open_device`: CI adapter `aid` writes to its CAM through `writer`.
-    pub fn open_device(&self, aid: usize, writer: Box<dyn CiWriter + Send>) {
+    pub fn open_device(&self, aid: usize, writer: Box<dyn CiWriter + Send>, disable_cat: bool) {
         let mut state = self.lock();
         state.ddci.create_adapter(aid as u16);
-        let device = ms_ca_drivers::ddci::DdciDevice::opened(aid as i32);
+        let mut device = ms_ca_drivers::ddci::DdciDevice::opened(aid as i32);
+        // The option parser already logged it, as `disable_cat_adapters` does.
+        device.disable_cat = disable_cat;
         state.ddci.devices.insert(aid, device);
         state.ddci.post_tune_ci(aid as u16);
         state.writers.insert(aid, writer);
@@ -369,6 +371,37 @@ mod tests {
     use std::time::Duration;
 
     type Cam = Arc<Mutex<FakeCam>>;
+
+    struct SinkWriter;
+
+    impl CiWriter for SinkWriter {
+        fn writev(&mut self, iov: &[&[u8]]) -> isize {
+            iov.iter().map(|part| part.len()).sum::<usize>() as isize
+        }
+    }
+
+    /// One PID-1 CAT section: EMM pids 48, 193, 194 and 49.
+    const CAT: [u8; 36] = [
+        0x01, 0xb0, 0x21, 0xff, 0xff, 0xc5, 0x00, 0x00, 0x09, 0x04, 0x0b, 0x00, 0xe0, 0x30, 0x09,
+        0x04, 0x09, 0x3e, 0xe0, 0xc1, 0x09, 0x04, 0x09, 0x40, 0xe0, 0xc2, 0x09, 0x04, 0x18, 0x8a,
+        0xe0, 0x31, 0xd9, 0x66, 0x34, 0x3b,
+    ];
+
+    #[test]
+    fn disable_cat_skips_cat_for_the_listed_adapter_only() {
+        let hub = DdciHub::new();
+        hub.open_device(1, Box::new(SinkWriter), true);
+        hub.open_device(2, Box::new(SinkWriter), false);
+        let mut state = hub.lock();
+        state.ddci.process_cat(1, &CAT, 1);
+        state.ddci.process_cat(2, &CAT, 2);
+        let disabled = &state.ddci.devices[&1];
+        assert!(!disabled.cat_processed);
+        assert!(disabled.emm_pids.is_empty());
+        let enabled = &state.ddci.devices[&2];
+        assert!(enabled.cat_processed);
+        assert_eq!(enabled.emm_pids.len(), 4);
+    }
 
     /// The CAM's CI slot (EN 50221 TPDUs).
     struct SlotLink {
@@ -821,7 +854,7 @@ mod tests {
         );
         ca.adapter_added(&mut sched, 0);
 
-        hub.open_device(1, Box::new(CamWriter(Arc::clone(&cam))));
+        hub.open_device(1, Box::new(CamWriter(Arc::clone(&cam))), false);
         let reader = CamReader {
             cam: Arc::clone(&cam),
             pending: Vec::new(),
@@ -1091,7 +1124,7 @@ mod growth_tests {
         const BATCHES: usize = 200;
         let hub = DdciHub::new();
         let sent = Arc::new(Mutex::new(Vec::new()));
-        hub.open_device(1, Box::new(Loopback(Arc::clone(&sent))));
+        hub.open_device(1, Box::new(Loopback(Arc::clone(&sent))), false);
         let mut stage = DdciStage::new(hub.clone(), 0);
         hub.lock().ddci.add_pid_mapping_table(0, 1000, 0, 1, false);
         let mut delivered = 0;

@@ -2720,7 +2720,7 @@ mod ci_stage_tests {
         });
         let hub = DdciHub::new();
         ca.attach_ddci(&mut sched, hub.clone());
-        hub.open_device(8, Box::new(Sink));
+        hub.open_device(8, Box::new(Sink), false);
         hub.lock().ddci.create_adapter(2);
         let mut program = ms_ca::Program {
             id: 8,
@@ -2794,7 +2794,7 @@ mod ci_stage_tests {
         let mut ca = CaRuntime::new(&Options::default());
         let hub = DdciHub::new();
         ca.attach_ddci(&mut sched, hub.clone());
-        hub.open_device(1, Box::new(Sink));
+        hub.open_device(1, Box::new(Sink), false);
         let mut stages = ca.ci_stages(1);
         assert_eq!(stages.len(), 2, "descrambler, then the FIFO capture");
         let descrambler = ca
@@ -2895,7 +2895,7 @@ mod ci_stage_tests {
         let mut ca = CaRuntime::new(&Options::default());
         let hub = DdciHub::new();
         ca.attach_ddci(&mut sched, hub.clone());
-        hub.open_device(1, Box::new(Sink));
+        hub.open_device(1, Box::new(Sink), false);
         let mut stages = ca.ci_stages(1);
         let descrambler = ca.adapters.get(&1).unwrap().descrambler.clone();
         for command in [
@@ -2942,7 +2942,7 @@ mod ci_stage_tests {
             let mut ca = CaRuntime::new(&opts);
             let hub = DdciHub::new();
             ca.attach_ddci(&mut sched, hub.clone());
-            hub.open_device(1, Box::new(Sink));
+            hub.open_device(1, Box::new(Sink), false);
             let mut stages = ca.ci_stages(1);
             let descrambler = ca.adapters.get(&1).unwrap().descrambler.clone();
             descrambler
