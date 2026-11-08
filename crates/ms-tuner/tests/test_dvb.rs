@@ -1957,4 +1957,10 @@ fn wait_readable_polls_stream_and_pes_section_fds_and_checks_buffered_packets() 
         WaitReadable::Ready
     );
     assert!(tuner.device().calls.is_empty(), "psi still has a packet");
+    assert_eq!(
+        tuner.open_demux_fds(),
+        Some(vec![(0, 100), (18, 101), (100, 102)])
+    );
+    tuner.set_pids(&PidSet::new()).unwrap();
+    assert_eq!(tuner.open_demux_fds(), Some(vec![]));
 }

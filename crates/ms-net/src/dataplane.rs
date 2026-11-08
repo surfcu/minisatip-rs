@@ -35,6 +35,9 @@ const CC_REPORT_MS: i64 = 1000;
 const DIAG_SIGNAL_STEP: u16 = 13;
 /// Minimum interval between `signal` events for one adapter.
 const DIAG_SIGNAL_PERIOD_MS: i64 = 10_000;
+/// Period of the `diag-log` idle PID snapshot while an adapter has no streams.
+#[cfg(feature = "diag-log")]
+const IDLE_PID_LOG_MS: i64 = 60_000;
 /// DVB frontend status bit the tuner abstraction can report.
 const DIAG_FE_HAS_LOCK: i64 = 0x10;
 /// Minimum interval between `Event::Signal` reports for one adapter.
@@ -728,6 +731,8 @@ struct DataPlane {
     diag_signal: Option<(u16, u16, u32)>,
     /// Time of the last `signal` event.
     diag_signal_ms: i64,
+    #[cfg(feature = "diag-log")]
+    last_idle_pids_ms: i64,
 }
 
 impl DataPlane {
@@ -771,6 +776,8 @@ impl DataPlane {
             diag_lock: None,
             diag_signal: None,
             diag_signal_ms: 0,
+            #[cfg(feature = "diag-log")]
+            last_idle_pids_ms: 0,
             signal_read: false,
             reported_signal: None,
             last_signal_ms: None,
@@ -819,6 +826,21 @@ impl DataPlane {
             self.diag_signal_ms = now;
             ms_log::diag::events::signal(adapter, current.0, current.1, current.2);
         }
+    }
+
+    #[cfg(feature = "diag-log")]
+    fn log_idle_pids(&mut self, reason: &str, now: i64) {
+        let active: Vec<u16> = self.active_pids.iter().collect();
+        let demux = self.tuner.open_demux_fds();
+        ms_log::log!(
+            "adapter {} idle_pids ({}): outputs={} active_pids={:?} open_demux_fds={:?}",
+            self.config.adapter_id,
+            reason,
+            self.outputs.len(),
+            active,
+            demux
+        );
+        self.last_idle_pids_ms = now;
     }
 
     fn mono_us(&self) -> i64 {
@@ -967,6 +989,11 @@ impl DataPlane {
                             .send(Event::OutputStopped(stream_id, stats, subscriber.epoch));
                     self.update_tuner_pids();
                     self.standby_if_idle();
+                    #[cfg(feature = "diag-log")]
+                    {
+                        let now = self.mono_us() / 1000;
+                        self.log_idle_pids("stream_stop", now);
+                    }
                 }
             }
             Command::WritePriority { stream_id, data } => {
@@ -1248,6 +1275,13 @@ impl DataPlane {
             self.diag_status(&signal, now);
         }
         self.report_signal(signal, now);
+        #[cfg(feature = "diag-log")]
+        if self.outputs.is_empty()
+            && !self.keep_reading
+            && now - self.last_idle_pids_ms >= IDLE_PID_LOG_MS
+        {
+            self.log_idle_pids("idle", now);
+        }
         let mut closed = Vec::new();
         for (stream_id, subscriber) in &mut self.outputs {
             // stream.cpp:1337-1340: a failed send (`sid->timeout = 1`) closes now.
@@ -1343,6 +1377,11 @@ impl DataPlane {
                 .send(Event::OutputClosed(stream_id, subscriber.epoch));
             self.update_tuner_pids();
             self.standby_if_idle();
+            #[cfg(feature = "diag-log")]
+            {
+                let now = self.mono_us() / 1000;
+                self.log_idle_pids("stream_stop", now);
+            }
         }
     }
 
@@ -1791,6 +1830,113 @@ mod tests {
         assert!(
             poll_cnt <= 25,
             "persistent POLLERR backed off instead of spinning ({poll_cnt} polls in 55 ms)"
+        );
+    }
+
+    #[cfg(feature = "diag-log")]
+    #[test]
+    fn periodic_idle_pids_log_emits_once_per_minute_when_idle() {
+        use std::sync::OnceLock;
+
+        struct LogCapture(std::sync::Arc<Mutex<Vec<String>>>);
+        impl ms_log::Backend for LogCapture {
+            fn timestamp(&self) -> ms_log::Timestamp {
+                ms_log::Timestamp::new(1, 1, 0, 0, 0, 0)
+            }
+            fn syslog(&self, _: &str) {}
+            fn stdout(&self, line: &str) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(line.to_owned());
+            }
+        }
+
+        static LINES: OnceLock<std::sync::Arc<Mutex<Vec<String>>>> = OnceLock::new();
+        let lines = LINES.get_or_init(|| {
+            let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+            ms_log::init(ms_log::Config {
+                log: ms_log::ALL_LOG_MODULES | ms_log::LOG_GENERAL,
+                debug: 0,
+                slog: 0,
+                file_line: false,
+                backend: Box::new(LogCapture(std::sync::Arc::clone(&buf))),
+            });
+            buf
+        });
+
+        struct IdleDemuxTuner(Vec<u16>);
+        impl Tuner for IdleDemuxTuner {
+            fn tune(&mut self, _: &TuneParams) -> TunerResult<()> {
+                Ok(())
+            }
+            fn set_pids(&mut self, pids: &PidSet) -> TunerResult<()> {
+                self.0 = pids.iter().collect();
+                Ok(())
+            }
+            fn status(&self) -> SignalStatus {
+                SignalStatus::default()
+            }
+            fn read(&mut self, _: &mut TsBuf) -> TunerResult<usize> {
+                Ok(0)
+            }
+            fn open_demux_fds(&self) -> Option<Vec<(u16, u32)>> {
+                Some(self.0.iter().map(|&p| (p, u32::from(p) + 300)).collect())
+            }
+        }
+
+        let (_cmd_tx, commands) = mpsc::channel::<Command>();
+        let (events_tx, _events_rx) = mpsc::channel::<Event>();
+        let cfg = DataPlaneConfig {
+            adapter_id: 6,
+            ..DataPlaneConfig::default()
+        };
+        let mut plane = DataPlane::new(
+            Box::new(IdleDemuxTuner(Vec::new())),
+            cfg,
+            commands,
+            events_tx,
+            None,
+        );
+        plane.handle(Command::SetBasePids(PidSet::from_pids([0u16, 17])));
+
+        let count_idle = || {
+            lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|l| l.contains("adapter 6 idle_pids (idle):"))
+                .count()
+        };
+
+        // Before 60 s or while `keep_reading` is set, `timers()` does not emit the periodic idle log.
+        plane.timers();
+        assert_eq!(count_idle(), 0);
+        plane.last_idle_pids_ms = -IDLE_PID_LOG_MS;
+        plane.keep_reading = true;
+        plane.timers();
+        assert_eq!(count_idle(), 0);
+
+        // Once truly idle (`outputs` empty, `!keep_reading`) and 60 s elapsed, it logs once and rate-limits.
+        plane.keep_reading = false;
+        plane.timers();
+        assert_eq!(count_idle(), 1);
+        plane.timers();
+        assert_eq!(count_idle(), 1, "suppressed until another 60 s pass");
+
+        let logged = lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|l| l.contains("adapter 6 idle_pids (idle):"))
+            .cloned()
+            .unwrap();
+        assert!(logged.contains("outputs=0"), "{logged}");
+        assert!(logged.contains("active_pids=[0, 17]"), "{logged}");
+        assert!(
+            logged.contains("open_demux_fds=Some([(0, 300), (17, 317)])"),
+            "{logged}"
         );
     }
 }

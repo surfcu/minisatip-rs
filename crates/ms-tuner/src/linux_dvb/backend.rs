@@ -649,6 +649,22 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
         std::mem::take(&mut self.status_refreshed)
     }
 
+    fn open_demux_fds(&self) -> Option<Vec<(u16, u32)>> {
+        let stream_fd = self.dev.stream_fd().0;
+        let pairs = self
+            .pids
+            .iter()
+            .map(|(&pid, open)| {
+                let fd = match open {
+                    OpenPid::Tap(fd) | OpenPid::Section(fd, _) => fd.0,
+                    OpenPid::Shared => stream_fd,
+                };
+                (pid, fd)
+            })
+            .collect();
+        Some(pairs)
+    }
+
     fn wait_readable(&mut self, timeout: std::time::Duration) -> WaitReadable {
         if self.psi.len() >= TS_PACKET_SIZE || self.partial.len() >= TS_PACKET_SIZE {
             return WaitReadable::Ready;

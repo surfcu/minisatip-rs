@@ -529,4 +529,8 @@ pub trait Tuner {
     fn wait_readable(&mut self, _timeout: std::time::Duration) -> WaitReadable {
         WaitReadable::Unsupported
     }
+    /// Currently open `(pid, demux_fd)` pairs on the kernel demux, if backed by one.
+    fn open_demux_fds(&self) -> Option<Vec<(u16, u32)>> {
+        None
+    }
 }
