@@ -183,4 +183,9 @@ pub trait DvbDevice: SecDevice {
     fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize>;
     /// Monotonic milliseconds (`getTick`).
     fn now_ms(&self) -> i64;
+    /// Polls `fds` for readability up to `timeout_ms`.
+    fn poll_fds(&mut self, fds: &[DemuxFd], timeout_ms: i32) -> crate::WaitReadable {
+        let _ = (fds, timeout_ms);
+        crate::WaitReadable::Unsupported
+    }
 }

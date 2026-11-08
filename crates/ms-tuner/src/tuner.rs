@@ -488,6 +488,19 @@ impl TsBuf {
     }
 }
 
+/// Outcome of [`Tuner::wait_readable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitReadable {
+    /// Backend has no pollable fd; caller waits on its command channel.
+    Unsupported,
+    /// Buffered data is ready or an input fd reported `POLLIN`.
+    Ready,
+    /// No input fd became readable before the timeout elapsed.
+    TimedOut,
+    /// An input fd reported `POLLERR`, `POLLHUP` or `POLLNVAL`.
+    ErrOrHup,
+}
+
 /// A tuning backend.
 pub trait Tuner {
     /// Applies tuning parameters.
@@ -507,5 +520,13 @@ pub trait Tuner {
     /// (`satipc_handle_play`, src_satipc.cpp:211-216).
     fn take_wait_new_stream(&mut self) -> bool {
         false
+    }
+    /// Whether `read` refreshed cached frontend status since the last check.
+    fn take_status_refreshed(&mut self) -> bool {
+        true
+    }
+    /// Waits up to `timeout` for input readability; default uses channel wait.
+    fn wait_readable(&mut self, _timeout: std::time::Duration) -> WaitReadable {
+        WaitReadable::Unsupported
     }
 }
