@@ -199,7 +199,7 @@ pub fn cam_state(ca: i64, state: &str, mode: &str) {
     emit("cam_state", &cam_state_fields(ca, state, mode, 0));
 }
 
-/// One CA slot's `cam_state` changes: a repeat is dropped (but not `cam_recovery`); a reset right after `init`
+/// One CA slot's `cam_state` changes: a repeat is dropped (but not `cam_recovery` or `cam_stuck`); a reset right after `init`
 /// mutes that slot's init/reset loop, counted in `suppressed` on its next event.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CamStateFilter {
@@ -226,6 +226,10 @@ impl CamStateFilter {
         if matches!(state, "init" | "reset") && self.muted && self.mode == mode {
             self.suppressed += 1;
             return None;
+        }
+        // `cam_stuck` alerts are always reported without overwriting the slot state.
+        if state == "cam_stuck" {
+            return Some(std::mem::take(&mut self.suppressed));
         }
         // Every `--cam-recovery` re-send is reported; it changes no other state.
         if self.state == state && self.mode == mode && state != "cam_recovery" {
@@ -549,6 +553,15 @@ mod tests {
         assert_eq!(
             sent(&states),
             ["init", "ready", "cam_recovery", "cam_recovery", "ready"]
+        );
+    }
+
+    #[test]
+    fn every_cam_stuck_is_reported_without_overwriting_last_state() {
+        let states = ["init", "ready", "cam_stuck", "cam_stuck", "ready", "reset"];
+        assert_eq!(
+            sent(&states),
+            ["init", "ready", "cam_stuck", "cam_stuck", "reset"]
         );
     }
 

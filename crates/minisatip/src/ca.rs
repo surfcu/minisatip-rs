@@ -99,6 +99,8 @@ pub struct CaRuntime {
     window_base: BTreeMap<usize, WindowBase>,
     /// Per-DDCI-pid totals at the last service window (`--cam-recovery`).
     service_window_base: BTreeMap<(usize, u16), (u64, u64)>,
+    /// Per-adapter window sequence number shared by `ScrambledWindow` and `ServiceWindows`.
+    window_seq: BTreeMap<usize, u64>,
     sync_dirty: bool,
     synced_sched_version: u64,
     synced_ddci_version: u64,
@@ -162,6 +164,7 @@ impl CaRuntime {
             diag_clear_pkts: BTreeMap::new(),
             window_base: BTreeMap::new(),
             service_window_base: BTreeMap::new(),
+            window_seq: BTreeMap::new(),
             sync_dirty: true,
             synced_sched_version: 0,
             synced_ddci_version: 0,
@@ -1172,7 +1175,14 @@ impl CaRuntime {
                 );
             }
             if let Some(sample) = self.window_sample(aid, total, clear_total, now) {
-                windows.push((aid, sample));
+                let seq = if self.dvbca_settings.cam_recovery_ms > 0 {
+                    let s = self.window_seq.entry(aid).or_insert(0);
+                    *s = s.wrapping_add(1);
+                    *s
+                } else {
+                    0
+                };
+                windows.push((aid, seq, sample));
                 let is_ddci = self
                     .ddci
                     .as_ref()
@@ -1188,7 +1198,7 @@ impl CaRuntime {
                         pid_totals,
                         &services,
                     );
-                    service_windows.push((aid, sample.2, deltas));
+                    service_windows.push((aid, seq, sample.2, deltas));
                 }
             }
         }
@@ -1197,15 +1207,67 @@ impl CaRuntime {
             return;
         }
         if let Some(state) = self.dvbca.as_ref() {
-            for (aid, (scrambled, clear, window_ms)) in windows {
+            for (aid, seq, (scrambled, clear, window_ms)) in windows {
                 state
                     .dvbca
-                    .report_scrambled(aid, scrambled, clear, window_ms);
+                    .report_scrambled(aid, seq, scrambled, clear, window_ms);
             }
-            for (aid, window_ms, services) in service_windows {
-                state.dvbca.report_service_windows(aid, window_ms, services);
+            for (aid, seq, window_ms, services) in service_windows {
+                state
+                    .dvbca
+                    .report_service_windows(aid, seq, window_ms, services);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ci_window_totals_for_test(
+        &mut self,
+        aid: usize,
+        dec_err: u64,
+        clear_pkts: u64,
+        pid_totals: Vec<(u16, u64, u64)>,
+    ) {
+        let (descrambler, _rx) = mpsc::channel();
+        let adapter = self.adapters.entry(aid).or_insert_with(|| AdapterCa {
+            descrambler,
+            services: BTreeMap::new(),
+            ca_active: false,
+            pids_all: false,
+            stats: DescramblerStats::default(),
+            pending_stats: None,
+            stats_generations: BTreeMap::new(),
+            pid_table: Vec::new(),
+        });
+        adapter.stats.dec_err = dec_err;
+        adapter.stats.clear_pkts = clear_pkts;
+        adapter.stats.pid_totals = pid_totals;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reanchor_ci_window_for_test(&mut self, aid: usize, now: i64) {
+        let (scrambled, clear) = self
+            .adapters
+            .get(&aid)
+            .map_or((0, 0), |ca| (ca.stats.dec_err, ca.stats.clear_pkts));
+        self.window_base.insert(
+            aid,
+            WindowBase {
+                scrambled,
+                clear,
+                at: now,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_service_pid_for_test(&mut self, aid: usize, pid: u16, totals: (u64, u64)) {
+        self.service_window_base.insert((aid, pid), totals);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_decrypt_windows_for_test(&mut self, sched: &Scheduler, now: i64) {
+        self.decrypt_windows(sched, now);
     }
 
     /// Window deltas per service from cumulative per-pid totals; a pid is
@@ -1214,8 +1276,17 @@ impl CaRuntime {
         base: &mut BTreeMap<(usize, u16), (u64, u64)>,
         aid: usize,
         totals: &[(u16, u64, u64)],
-        services: &[(u16, Vec<u16>)],
-    ) -> Vec<(u16, u64, u64)> {
+        services: &[(
+            u16,
+            Option<ms_ca_drivers::en50221::TransponderKey>,
+            Vec<u16>,
+        )],
+    ) -> Vec<(
+        u16,
+        Option<ms_ca_drivers::en50221::TransponderKey>,
+        u64,
+        u64,
+    )> {
         let mut deltas: BTreeMap<u16, (u64, u64)> = BTreeMap::new();
         let mut reported = BTreeSet::new();
         for &(pid, scrambled, clear) in totals {
@@ -1234,7 +1305,7 @@ impl CaRuntime {
         base.retain(|&(a, pid), _| a != aid || reported.contains(&pid));
         services
             .iter()
-            .map(|(sid, pids)| {
+            .map(|(sid, tp_key, pids)| {
                 let mut scrambled = 0;
                 let mut clear = 0;
                 for pid in pids {
@@ -1243,7 +1314,7 @@ impl CaRuntime {
                         clear += c;
                     }
                 }
-                (*sid, scrambled, clear)
+                (*sid, *tp_key, scrambled, clear)
             })
             .collect()
     }
@@ -1724,15 +1795,58 @@ struct DdciLink {
     cat_filters: BTreeMap<i32, (usize, i32)>,
 }
 
-/// The `(sid, DDCI pids)` of each service on a DDCI device; the hub lock is
-/// released before the scheduler is read.
-fn ddci_services(link: &DdciLink, sched: &Scheduler, aid: usize) -> Vec<(u16, Vec<u16>)> {
+/// Builds the host adapter's transponder key, or `None` when default/unknown.
+fn host_transponder_key(
+    sched: &Scheduler,
+    host_aid: i32,
+) -> Option<ms_ca_drivers::en50221::TransponderKey> {
+    let aid = usize::try_from(host_aid).ok()?;
+    let adapter = sched.adapter(aid)?;
+    if !adapter.config.enabled {
+        return None;
+    }
+    let tp = &adapter.params;
+    if tp.freq <= 0 || tp.sys_number() <= 0 {
+        return None;
+    }
+    if matches!(
+        tp.msys,
+        ms_tuner::DeliverySystem::DvbS | ms_tuner::DeliverySystem::DvbS2
+    ) && tp.pol == ms_tuner::Polarization::None
+    {
+        return None;
+    }
+    if tp.src_specified && tp.src <= 0 {
+        return None;
+    }
+    let src = if tp.src_specified { tp.src } else { 1 };
+    Some(ms_ca_drivers::en50221::TransponderKey {
+        src,
+        freq: tp.freq,
+        pol: tp.pol_number(),
+        msys: tp.sys_number(),
+        tsid: sched.adapter_transponder_id(aid),
+    })
+}
+
+/// The `(sid, tp_key, DDCI pids)` of each service on a DDCI device; the hub
+/// lock is released before the scheduler is read.
+fn ddci_services(
+    link: &DdciLink,
+    sched: &Scheduler,
+    aid: usize,
+) -> Vec<(
+    u16,
+    Option<ms_ca_drivers::en50221::TransponderKey>,
+    Vec<u16>,
+)> {
     let slots = link.hub.lock().ddci.slot_pmts(aid);
     let mut services = Vec::new();
     for id in slots {
         let Some(pmt) = sched.pmt(id) else {
             continue;
         };
+        let tp_key = host_transponder_key(sched, pmt.adapter);
         let es: Vec<u16> = pmt
             .stream_pids
             .iter()
@@ -1747,7 +1861,7 @@ fn ddci_services(link: &DdciLink, sched: &Scheduler, aid: usize) -> Vec<(u16, Ve
                 .ddci
                 .es_ddci_pids(aid, pmt.adapter as u16, id, &es)
         };
-        services.push((pmt.sid as u16, pids));
+        services.push((pmt.sid as u16, tp_key, pids));
     }
     services
 }
@@ -1758,7 +1872,11 @@ pub(crate) fn ddci_services_for_test(
     hub: &DdciHub,
     sched: &Scheduler,
     aid: usize,
-) -> Vec<(u16, Vec<u16>)> {
+) -> Vec<(
+    u16,
+    Option<ms_ca_drivers::en50221::TransponderKey>,
+    Vec<u16>,
+)> {
     let link = DdciLink {
         hub: hub.clone(),
         ca_id: 0,
@@ -3213,7 +3331,7 @@ mod window_tests {
         (hub, sched)
     }
 
-    // The silent path reports a service window per DDCI device with the sample's length.
+    // The silent path reports a service window per DDCI device sharing an incrementing seq with ScrambledWindow.
     #[test]
     fn decrypt_windows_report_ddci_service_windows() {
         let (hub, sched) = ddci_window_sched();
@@ -3222,16 +3340,34 @@ mod window_tests {
         ca.decrypt_windows(&sched, 1_000);
         set_pid_totals(&mut ca, 0, vec![(1301, 4_000, 0), (1302, 100, 0)]);
         ca.decrypt_windows(&sched, 2_000);
+        let scr1 = recorder.windows_with_seq();
+        let svc1 = recorder.service_windows_with_seq();
+        assert_eq!(scr1.len(), 1);
+        assert_eq!(svc1.len(), 1);
+        assert_eq!(scr1[0].1, 1);
         assert_eq!(
-            recorder.service_windows(),
-            vec![(0, 1_000, vec![(0x1234, 0, 0)])],
+            scr1[0].1, svc1[0].1,
+            "ScrambledWindow and ServiceWindows share seq"
+        );
+        assert_eq!(
+            (svc1[0].0, svc1[0].2, svc1[0].3.as_slice()),
+            (0, 1_000, &[(0x1234, None, 0, 0)][..]),
             "the first window seeds the per-pid totals"
         );
         set_pid_totals(&mut ca, 0, vec![(1301, 5_000, 0), (1302, 150, 0)]);
         ca.decrypt_windows(&sched, 15_500);
+        let scr2 = recorder.windows_with_seq();
+        let svc2 = recorder.service_windows_with_seq();
+        assert_eq!(scr2.len(), 1);
+        assert_eq!(svc2.len(), 1);
+        assert_eq!(scr2[0].1, 2, "window seq increments");
         assert_eq!(
-            recorder.service_windows(),
-            vec![(0, 13_500, vec![(0x1234, 1_050, 0)])]
+            scr2[0].1, svc2[0].1,
+            "ScrambledWindow and ServiceWindows share seq"
+        );
+        assert_eq!(
+            (svc2[0].0, svc2[0].2, svc2[0].3.as_slice()),
+            (0, 13_500, &[(0x1234, None, 1_050, 0)][..])
         );
     }
 
@@ -3267,16 +3403,31 @@ mod window_tests {
         assert!(recorder.service_windows().is_empty());
     }
 
-    // `adapter_removed` drops the baseline, so a later sample of that adapter reseeds.
+    // `adapter_removed` drops the baseline so a later sample reseeds, while `window_seq` keeps increasing.
     #[test]
     fn adapter_removed_forgets_its_window_baseline() {
-        let mut ca = CaRuntime::new(&Options::default());
-        assert_eq!(ca.window_sample(3, 100, 10, 1_000), None);
+        let sched = ci_sched(&[3]);
+        let (mut ca, recorder) = recording_runtime(10_000);
+        set_counters(&mut ca, 3, 100, 10);
+        ca.decrypt_windows(&sched, 1_000);
+        assert!(recorder.windows_with_seq().is_empty());
+        set_counters(&mut ca, 3, 200, 20);
+        ca.decrypt_windows(&sched, 11_000);
+        assert_eq!(recorder.windows_with_seq(), vec![(3, 1, 100, 10, 10_000)]);
+
         ca.adapter_removed(3);
-        assert_eq!(
-            ca.window_sample(3, 150, 40, 11_000),
-            None,
+        set_counters(&mut ca, 3, 150, 40);
+        ca.decrypt_windows(&sched, 21_000);
+        assert!(
+            recorder.windows_with_seq().is_empty(),
             "a removed adapter reseeds"
+        );
+        set_counters(&mut ca, 3, 250, 60);
+        ca.decrypt_windows(&sched, 31_000);
+        assert_eq!(
+            recorder.windows_with_seq(),
+            vec![(3, 2, 100, 20, 10_000)],
+            "window_seq keeps increasing after adapter_removed"
         );
     }
 
@@ -3285,7 +3436,14 @@ mod window_tests {
         totals: &[(u16, u64, u64)],
         services: &[(u16, Vec<u16>)],
     ) -> Vec<(u16, u64, u64)> {
-        CaRuntime::service_window_deltas(base, 1, totals, services)
+        let with_keys: Vec<_> = services
+            .iter()
+            .map(|(sid, pids)| (*sid, None, pids.clone()))
+            .collect();
+        CaRuntime::service_window_deltas(base, 1, totals, &with_keys)
+            .into_iter()
+            .map(|(sid, _, scr, clr)| (sid, scr, clr))
+            .collect()
     }
 
     // A service window is the per-pid delta since the previous report; a shared

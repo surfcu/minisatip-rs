@@ -241,6 +241,7 @@ impl CaRegistry {
             LinkMode::Tpdu
         };
         c.state = CaState::Inactive;
+        c.ready_since = -1;
         c.sock = None;
         c.pending_tag = 0;
         c.pending_session = 0;
