@@ -51,6 +51,7 @@ impl DdciHub {
         // The option parser already logged it, as `disable_cat_adapters` does.
         device.disable_cat = disable_cat;
         state.ddci.devices.insert(aid, device);
+        state.ddci.bump_sync_version();
         state.ddci.post_tune_ci(aid as u16);
         state.writers.insert(aid, writer);
     }
@@ -174,6 +175,7 @@ impl CaSink for DdciSink {
         let state = &mut *guard;
         state.ddci.now_ms = state.origin.elapsed().as_millis() as u64;
         state.programs.insert(program.clone());
+        state.ddci.bump_sync_version();
         state
             .ddci
             .process_pmt(service.adapter as u16, &program, update)
@@ -387,6 +389,16 @@ pub mod linux {
             use std::os::unix::io::AsRawFd;
             self.file.as_raw_fd()
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct NullWriter;
+
+#[cfg(test)]
+impl CiWriter for NullWriter {
+    fn writev(&mut self, iov: &[&[u8]]) -> isize {
+        iov.iter().map(|p| p.len()).sum::<usize>() as isize
     }
 }
 

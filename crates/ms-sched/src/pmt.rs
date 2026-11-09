@@ -328,9 +328,17 @@ impl Scheduler {
         self.pmt.pmts.get(index)
     }
 
+    pub(crate) fn pmt_slot_mut_inner(&mut self, id: i32) -> Option<&mut Pmt> {
+        let index = usize::try_from(id).ok()?;
+        self.pmt.pmts.get_mut(index)
+    }
+
     /// Mutable raw PMT slot.
     pub fn pmt_slot_mut(&mut self, id: i32) -> Option<&mut Pmt> {
         let index = usize::try_from(id).ok()?;
+        if index < self.pmt.pmts.len() {
+            self.bump_sync_version();
+        }
         self.pmt.pmts.get_mut(index)
     }
 
@@ -370,6 +378,7 @@ impl Scheduler {
         pmt.ca.clear();
         pmt.descriptors.clear();
         pmt.stream_pids.clear();
+        self.bump_sync_version();
         ms_log::log!(
             "returning new pmt {} for adapter {}, pmt pid {}, sid {} {:04X}",
             id,
@@ -390,7 +399,7 @@ impl Scheduler {
         let adapter = pmt.adapter;
         self.close_pmt_for_cas(adapter, id);
         let (allocated, filter) = {
-            let Some(pmt) = self.pmt_slot_mut(id) else {
+            let Some(pmt) = self.pmt_slot_mut_inner(id) else {
                 return;
             };
             if !pmt.enabled {
@@ -412,9 +421,10 @@ impl Scheduler {
         if filter >= 0 {
             self.del_filter(filter);
         }
-        if let Some(pmt) = self.pmt_slot_mut(id) {
+        if let Some(pmt) = self.pmt_slot_mut_inner(id) {
             pmt.filter = -1;
         }
+        self.bump_sync_version();
     }
 
     /// The adapter's active PMT ids (`ad->active_pmt[0..active_pmts]`).
@@ -432,7 +442,7 @@ impl Scheduler {
         let revive = pmt.state == PmtState::Cached;
         let Some(adapter) = usize::try_from(aid)
             .ok()
-            .and_then(|index| self.adapter_mut(index))
+            .and_then(|index| self.adapter_mut_inner(index))
         else {
             return;
         };
@@ -449,8 +459,9 @@ impl Scheduler {
         }
         adapter.active_pmt[adapter.active_pmts] = pmt_id;
         adapter.active_pmts += 1;
-        if revive && let Some(pmt) = self.pmt_slot_mut(pmt_id) {
+        if revive && let Some(pmt) = self.pmt_slot_mut_inner(pmt_id) {
             pmt.state = PmtState::Stopped;
+            self.bump_sync_version();
         }
     }
 
@@ -626,14 +637,19 @@ impl Scheduler {
     pub(crate) fn release_pmt_claims(&mut self, aid: i32, pmt_id: i32) {
         let Some(adapter) = usize::try_from(aid)
             .ok()
-            .and_then(|index| self.adapter_mut(index))
+            .and_then(|index| self.adapter_mut_inner(index))
         else {
             return;
         };
+        let mut changed = false;
         for entry in &mut adapter.pids {
             if entry.pmt == pmt_id {
                 entry.pmt = -1;
+                changed = true;
             }
+        }
+        if changed {
+            self.bump_sync_version();
         }
     }
 
@@ -882,7 +898,7 @@ impl Scheduler {
             None => return,
         };
         for id in &active {
-            if let Some(pmt) = self.pmt_slot_mut(*id) {
+            if let Some(pmt) = self.pmt_slot_mut_inner(*id) {
                 pmt.best = false;
             }
         }
@@ -904,13 +920,13 @@ impl Scheduler {
                 continue;
             }
             let id = choices[i].2;
-            if let Some(pmt) = self.pmt_slot_mut(id) {
+            if let Some(pmt) = self.pmt_slot_mut_inner(id) {
                 pmt.best = true;
             }
             for j in i + 1..choices.len() {
                 if alive[j] && self.same_stream_pids(id, choices[j].2) {
                     alive[j] = false;
-                    if let Some(pmt) = self.pmt_slot_mut(choices[j].2) {
+                    if let Some(pmt) = self.pmt_slot_mut_inner(choices[j].2) {
                         pmt.best = false;
                     }
                 }
@@ -959,9 +975,10 @@ impl Scheduler {
                     }
                     ms_log::logm!("PMT {} steals pid {} from PMT {}", id, pid, holder_id);
                 }
-                if let Some(entry) = self.find_pid_mut(aid, pid) {
+                if let Some(entry) = self.find_pid_mut_inner(aid, pid) {
                     entry.pmt = id;
                     entry.is_decrypted = false;
+                    self.bump_sync_version();
                 }
                 ms_log::logm!("PMT {} claimed pid {}", id, pid);
                 if state != PmtState::Stopped {
@@ -978,10 +995,11 @@ impl Scheduler {
             if state == PmtState::Stopped {
                 self.start_pmt(id);
             }
-            if let Some(pmt) = self.pmt_slot_mut(id)
+            if let Some(pmt) = self.pmt_slot_mut_inner(id)
                 && pmt.state == PmtState::Starting
             {
                 pmt.state = PmtState::Running;
+                self.bump_sync_version();
             }
         }
     }
@@ -1028,8 +1046,11 @@ impl Scheduler {
             }
             None => return,
         };
-        if let Some(pmt) = self.pmt_slot_mut(id) {
+        if let Some(pmt) = self.pmt_slot_mut_inner(id)
+            && pmt.state != PmtState::Starting
+        {
             pmt.state = PmtState::Starting;
+            self.bump_sync_version();
         }
         if filter >= 0 {
             self.set_filter_flags(filter, FILTER_CRC);
@@ -1056,16 +1077,17 @@ impl Scheduler {
             }
             None => return,
         };
-        if let Some(pmt) = self.pmt_slot_mut(id) {
+        if let Some(pmt) = self.pmt_slot_mut_inner(id) {
             pmt.state = PmtState::Stopping;
         }
         if filter >= 0 {
             self.set_filter_flags(filter, 0);
         }
         self.close_pmt_for_cas(adapter, id);
-        if let Some(pmt) = self.pmt_slot_mut(id) {
+        if let Some(pmt) = self.pmt_slot_mut_inner(id) {
             pmt.state = PmtState::Stopped;
         }
+        self.bump_sync_version();
     }
 
     /// Tells every registered CA to drop this PMT (`pmt_pid_del`/stop path).
@@ -1225,8 +1247,15 @@ impl Scheduler {
         }
         self.pmt.ca[slot] = None;
         let mask = 1u64 << slot;
+        let mut changed = false;
         for adapter in self.adapters.iter_mut().flatten() {
-            adapter.ca_mask &= !mask;
+            if adapter.ca_mask & mask != 0 {
+                adapter.ca_mask &= !mask;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump_sync_version();
         }
         for pmt in &mut self.pmt.pmts {
             if pmt.enabled {
@@ -1243,19 +1272,23 @@ impl Scheduler {
             .ok()
             .and_then(|slot| self.pmt.ca.get(slot))
             .is_some_and(Option::is_some);
-        if let Some(adapter) = self.adapter_mut(aid)
+        if let Some(adapter) = self.adapter_mut_inner(aid)
             && registered
             && adapter.ca_mask & (1u64 << ca) == 0
         {
             ms_log::logl!(ms_log::LOG_TABLES, "CA {} will handle adapter {}", ca, aid);
             adapter.ca_mask |= 1u64 << ca;
+            self.bump_sync_version();
         }
     }
 
     /// Clears every CA of the adapter (`tables_close_device`).
     pub fn close_ca_for_adapter(&mut self, aid: usize) {
-        if let Some(adapter) = self.adapter_mut(aid) {
+        if let Some(adapter) = self.adapter_mut_inner(aid)
+            && adapter.ca_mask != 0
+        {
             adapter.ca_mask = 0;
+            self.bump_sync_version();
         }
     }
 
@@ -1612,9 +1645,11 @@ impl Scheduler {
         if pmt.id as i32 == source || pmt.name == name {
             return None;
         }
+        let id = pmt.id as i32;
         pmt.name = name.to_owned();
         pmt.provider = provider.to_owned();
-        Some(pmt.id as i32)
+        self.bump_sync_version();
+        Some(id)
     }
 
     /// `process_sdt` (pmt.cpp:2246-2291): SDT fields and, once, the service and
@@ -1636,6 +1671,7 @@ impl Scheduler {
             section.len(),
             section.get(5).copied().unwrap_or(0)
         );
+        let mut changed = false;
         for service in &sdt.services {
             let sid = i32::from(service.service_id);
             let Some(pmt) = self
@@ -1648,7 +1684,7 @@ impl Scheduler {
                 continue;
             };
             let previous = pmt.sdt.map_or(0, |s| s.service_type);
-            pmt.sdt = Some(SdtInfo {
+            let next_sdt = Some(SdtInfo {
                 service_type: service.service_type.unwrap_or(previous),
                 running_status: service.running_status,
                 ca_mode: u8::from(service.free_ca_mode),
@@ -1657,6 +1693,10 @@ impl Scheduler {
                 tsid: sdt.transport_stream_id,
                 onid: sdt.original_network_id,
             });
+            if pmt.sdt != next_sdt {
+                pmt.sdt = next_sdt;
+                changed = true;
+            }
             if pmt.name.is_empty()
                 && let Some(name) = &service.service_name
             {
@@ -1665,6 +1705,7 @@ impl Scheduler {
                     .as_deref()
                     .map_or_else(String::new, |p| String::from_utf8_lossy(p).into_owned());
                 pmt.name = String::from_utf8_lossy(name).into_owned();
+                changed = true;
                 ms_log::log!(
                     "SDT PMT {}: name {} provider {}, sid: {} ({:X})",
                     pmt.id,
@@ -1674,6 +1715,9 @@ impl Scheduler {
                     sid
                 );
             }
+        }
+        if changed {
+            self.bump_sync_version();
         }
         0
     }
@@ -1719,9 +1763,10 @@ impl Scheduler {
                 id,
                 |entry| if entry.filter >= 0 { entry.filter } else { id },
             );
-        if let Some(pid_entry) = self.find_pid_mut(aid, pid) {
+        if let Some(pid_entry) = self.find_pid_mut_inner(aid, pid) {
             pid_entry.filter = id;
         }
+        self.bump_sync_version();
         let mask_len = mask
             .iter()
             .rposition(|&byte| byte != 0)
@@ -1758,11 +1803,12 @@ impl Scheduler {
             filter.target = FilterTarget::Other;
             filter.flags = 0;
         }
-        if let Some(entry) = self.find_pid_mut(aid, pid)
+        if let Some(entry) = self.find_pid_mut_inner(aid, pid)
             && entry.filter == id
         {
             entry.filter = -1;
         }
+        self.bump_sync_version();
         let max_filters = self
             .pmt
             .filters
@@ -1858,18 +1904,22 @@ impl Scheduler {
         self.close_pmt_for_cas(aid, pmt_id);
         self.release_pmt_claims(aid, pmt_id);
         let filter = {
-            let Some(pmt) = self.pmt_slot_mut(pmt_id) else {
+            let Some(pmt) = self.pmt_slot_mut_inner(pmt_id) else {
                 return;
             };
+            if pmt.state != PmtState::Cached {
+                pmt.state = PmtState::Cached;
+                self.bump_sync_version();
+            }
+            let pmt = self.pmt_slot_mut_inner(pmt_id).unwrap();
             pmt.disabled_ca_mask = 0;
             pmt.ca_mask = 0;
             pmt.ca_registered_mask = 0;
-            pmt.state = PmtState::Cached;
             pmt.filter
         };
         if let Some(adapter) = usize::try_from(aid)
             .ok()
-            .and_then(|index| self.adapter_mut(index))
+            .and_then(|index| self.adapter_mut_inner(index))
         {
             for entry in &mut adapter.active_pmt[..adapter.active_pmts] {
                 if *entry == pmt_id {
@@ -1880,7 +1930,7 @@ impl Scheduler {
         if filter >= 0 {
             self.del_filter(filter);
         }
-        if let Some(pmt) = self.pmt_slot_mut(pmt_id) {
+        if let Some(pmt) = self.pmt_slot_mut_inner(pmt_id) {
             pmt.filter = -1;
         }
     }
@@ -1914,19 +1964,23 @@ impl Scheduler {
         for id in permanent {
             self.del_filter(id);
         }
-        let (pat_filter, sdt_filter) = match self.adapter_index(aid) {
+        let (pat_filter, sdt_filter, tid_cleared) = match self.adapter_index(aid) {
             Some(index) => match self.adapters[index].as_mut() {
                 Some(adapter) => {
+                    let cleared = adapter.transponder_id != 0;
                     adapter.active_pmts = 0;
                     adapter.pat_processed = false;
                     adapter.transponder_id = 0;
                     adapter.pat_ver = 0;
-                    (adapter.pat_filter, adapter.sdt_filter)
+                    (adapter.pat_filter, adapter.sdt_filter, cleared)
                 }
                 None => return,
             },
             None => return,
         };
+        if tid_cleared {
+            self.bump_sync_version();
+        }
         for filter in [pat_filter, sdt_filter] {
             if filter >= 0 {
                 self.set_filter_mask(filter, &[0; 16], &[0; 16]);
@@ -1983,9 +2037,14 @@ impl Scheduler {
             );
             self.clear_pmt_for_adapter(aid);
         }
+        let mut tid_changed = false;
         if let Some(adapter) = self.adapters[index].as_mut() {
             adapter.pat_ver = ver;
+            tid_changed = adapter.transponder_id != tid;
             adapter.transponder_id = tid;
+        }
+        if tid_changed {
+            self.bump_sync_version();
         }
         let mut match_bytes = [0u8; 16];
         let mut match_mask = [0u8; 16];
@@ -2059,7 +2118,7 @@ impl Scheduler {
                     );
                     if let Some(existing) = existing
                         && id >= 0
-                        && let Some(pmt) = self.pmt_slot_mut(existing as i32)
+                        && let Some(pmt) = self.pmt_slot_mut_inner(existing as i32)
                     {
                         pmt.filter = id;
                     }
@@ -2144,7 +2203,7 @@ impl Scheduler {
             ms_log::log!("PMT {} does not exist", pmt_id);
             return 0;
         }
-        if let Some(pmt) = self.pmt_slot_mut(pmt_id) {
+        if let Some(pmt) = self.pmt_slot_mut_inner(pmt_id) {
             pmt.filter = filter;
         }
         self.pmt_add_active_pmt(aid, pmt_id);
@@ -2285,7 +2344,9 @@ impl Scheduler {
 
     /// Drops every PMT slot (`free_all_pmts`).
     pub fn free_all_pmts(&mut self) {
+        let mut changed = false;
         for pmt in &mut self.pmt.pmts {
+            changed |= pmt.enabled || pmt.allocated;
             pmt.enabled = false;
             pmt.allocated = false;
             pmt.caids = 0;
@@ -2293,14 +2354,22 @@ impl Scheduler {
             pmt.descriptors.clear();
             pmt.stream_pids.clear();
         }
+        if changed {
+            self.bump_sync_version();
+        }
     }
 
     /// Drops every filter slot (`free_filters`).
     pub fn free_filters(&mut self) {
+        let mut changed = false;
         for filter in &mut self.pmt.filters {
+            changed |= filter.enabled || filter.allocated;
             filter.enabled = false;
             filter.allocated = false;
             filter.target = FilterTarget::Other;
+        }
+        if changed {
+            self.bump_sync_version();
         }
     }
 }

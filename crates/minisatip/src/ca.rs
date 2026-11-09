@@ -99,6 +99,12 @@ pub struct CaRuntime {
     window_base: BTreeMap<usize, WindowBase>,
     /// Per-DDCI-pid totals at the last service window (`--cam-recovery`).
     service_window_base: BTreeMap<(usize, u16), (u64, u64)>,
+    sync_dirty: bool,
+    synced_sched_version: u64,
+    synced_ddci_version: u64,
+    synced_handles_mask: u64,
+    #[cfg(test)]
+    sync_runs: u64,
 }
 
 /// Cumulative counters of one CI adapter and when they were read (ms).
@@ -156,6 +162,12 @@ impl CaRuntime {
             diag_clear_pkts: BTreeMap::new(),
             window_base: BTreeMap::new(),
             service_window_base: BTreeMap::new(),
+            sync_dirty: true,
+            synced_sched_version: 0,
+            synced_ddci_version: 0,
+            synced_handles_mask: 0,
+            #[cfg(test)]
+            sync_runs: 0,
         }
     }
 
@@ -265,6 +277,7 @@ impl CaRuntime {
                 pid_table: Vec::new(),
             },
         );
+        self.sync_dirty = true;
         Box::new(stage)
     }
 
@@ -303,6 +316,7 @@ impl CaRuntime {
             mirrored: BTreeSet::new(),
             cat_filters: BTreeMap::new(),
         });
+        self.sync_dirty = true;
     }
 
     /// Stages of a DDCI adapter: decrypt, then the device FIFO
@@ -354,10 +368,11 @@ impl CaRuntime {
 
     /// Mirrors DDCI's PID subscriptions and CAT filters into the scheduler
     /// (DDCI calls `mark_pid_add`/`add_filter` directly in C++).
-    fn sync_ddci(&mut self, sched: &mut Scheduler) {
+    fn sync_ddci(&mut self, sched: &mut Scheduler) -> bool {
         let Some(link) = self.ddci.as_mut() else {
-            return;
+            return true;
         };
+        let mut ok = true;
         {
             let mut state = link.hub.lock();
             for (aid, adapter) in state.ddci.adapters.iter_mut() {
@@ -405,11 +420,6 @@ impl CaRuntime {
             sched.unmark_pid(aid, DDCI_SID, i32::from(pid));
             touched.insert(aid);
         }
-        // The multiple-PMT filter of `ddci_create_pmt` reads the real pid table,
-        // including the pids DDCI itself owns (marked just above).
-        for (aid, adapter) in link.hub.lock().ddci.adapters.iter_mut() {
-            adapter.client_pids = adapter_pid_table(sched, usize::from(*aid));
-        }
         link.mirrored = wanted;
         let filters: BTreeMap<usize, u16> = link
             .hub
@@ -425,6 +435,8 @@ impl CaRuntime {
                 let fid = sched.add_filter(i32::from(aid), 1, FilterTarget::Other, FILTER_CRC);
                 if fid >= 0 {
                     link.cat_filters.insert(fid, (id, i32::from(aid)));
+                } else {
+                    ok = false;
                 }
             }
         }
@@ -441,6 +453,11 @@ impl CaRuntime {
         for aid in touched {
             sched.update_adapter_pids(aid);
         }
+        // Refresh after `update_adapter_pids` so removed DDCI-only pids are gone, not `(pid, false)`.
+        for (aid, adapter) in link.hub.lock().ddci.adapters.iter_mut() {
+            adapter.client_pids = adapter_pid_table(sched, usize::from(*aid));
+        }
+        ok
     }
 
     /// CAM state of a DDCI adapter as `ddci.cpp` reads it from `ca_devices[]`.
@@ -485,6 +502,7 @@ impl CaRuntime {
             ca_id,
             requested: None,
         });
+        self.sync_dirty = true;
     }
 
     /// `dvbca_init_dev` for an opened DVB adapter.
@@ -726,6 +744,7 @@ impl CaRuntime {
         self.window_base.remove(&aid);
         self.service_window_base.retain(|&(a, _), _| a != aid);
         self.router.forget_adapter(aid as i32);
+        self.sync_dirty = true;
     }
 
     /// Packets tapped from a batch (`process_filters`), then `start_active_pmts`.
@@ -885,9 +904,39 @@ impl CaRuntime {
             };
             self.handle_dvbapi_event(sched, event);
         }
-        self.sync_ddci(sched);
-        self.sync_requested_pids(sched);
-        self.sync(sched, handles);
+        let ddci_ver = self
+            .ddci
+            .as_ref()
+            .map_or(0, |link| link.hub.lock().ddci.sync_version());
+        let handles_mask = handles.iter().enumerate().fold(0u64, |mask, (i, h)| {
+            if h.is_some() && i < 64 {
+                mask | (1u64 << i)
+            } else {
+                mask
+            }
+        });
+        if self.sync_dirty
+            || sched.sync_version() != self.synced_sched_version
+            || ddci_ver != self.synced_ddci_version
+            || handles_mask != self.synced_handles_mask
+        {
+            #[cfg(test)]
+            {
+                self.sync_runs += 1;
+            }
+            let ddci_ok = self.sync_ddci(sched);
+            self.sync_requested_pids(sched);
+            let sync_ok = self.sync(sched, handles);
+            if ddci_ok && sync_ok {
+                self.sync_dirty = false;
+                self.synced_sched_version = sched.sync_version();
+                self.synced_ddci_version = ddci_ver;
+                self.synced_handles_mask = handles_mask;
+            } else {
+                // Retry next 20 ms tick if a CAT filter slot or section-pid send failed.
+                self.sync_dirty = true;
+            }
+        }
         let offered: Vec<(usize, usize)> = self.offered.borrow_mut().drain(..).collect();
         for (aid, pmt_id) in offered {
             if let Some(ca) = self.adapters.get(&aid) {
@@ -1272,32 +1321,38 @@ impl CaRuntime {
         }
     }
 
-    fn sync(&mut self, sched: &Scheduler, handles: &[Option<AdapterHandle>]) {
+    fn sync(&mut self, sched: &Scheduler, handles: &[Option<AdapterHandle>]) -> bool {
+        let mut ok = true;
         let aids: Vec<usize> = self.adapters.keys().copied().collect();
         for aid in aids {
             self.sync_adapter(sched, aid);
         }
-        self.forget_stale_filters(sched);
+        if !self.forget_stale_filters(sched) {
+            ok = false;
+        }
         // Every data plane with a handle taps its filtered PIDs, CI adapters included.
         for (aid, handle) in handles.iter().enumerate() {
             let Some(handle) = handle else {
                 continue;
             };
             let pids = sched.section_pids(aid as i32);
-            if self.section_pids.get(&aid) != Some(&pids)
-                && handle.send(Command::SetSectionPids(PidSet::from_pids(
+            if self.section_pids.get(&aid) != Some(&pids) {
+                if handle.send(Command::SetSectionPids(PidSet::from_pids(
                     pids.iter().copied(),
-                )))
-            {
-                self.section_pids.insert(aid, pids);
+                ))) {
+                    self.section_pids.insert(aid, pids);
+                } else {
+                    ok = false;
+                }
             }
         }
         self.router.retain(sched);
+        ok
     }
 
     /// Drops filter mappings whose scheduler slot was freed or reused, e.g. by
     /// `clear_pmt_for_adapter` on a tune; C++ keeps dangling ids that never fire.
-    fn forget_stale_filters(&mut self, sched: &Scheduler) {
+    fn forget_stale_filters(&mut self, sched: &Scheduler) -> bool {
         let live = |fid: i32, aid: i32, pid: i32| {
             sched.filter_slot(fid).is_some_and(|f| {
                 f.enabled && f.target == FilterTarget::Other && f.adapter == aid && f.pid == pid
@@ -1318,8 +1373,13 @@ impl CaRuntime {
             }
         }
         if let Some(link) = self.ddci.as_mut() {
+            let before = link.cat_filters.len();
             link.cat_filters.retain(|fid, (_, aid)| live(*fid, *aid, 1));
+            if link.cat_filters.len() != before {
+                return false;
+            }
         }
+        true
     }
 
     /// Pushes claims (`SPid::pmt`), the CA mask and the section PIDs of one adapter.
@@ -3267,5 +3327,374 @@ mod window_tests {
             [(0x64, 5, 1), (0x65, 0, 0)],
             "the returning pid seeds"
         );
+    }
+
+    struct NullSchedTuner;
+    impl ms_sched::AdapterTuner for NullSchedTuner {
+        fn tune(&mut self, _params: &ms_tuner::TuneParams) -> Result<(), ms_sched::TuneError> {
+            Ok(())
+        }
+    }
+
+    struct ExitOnRunTuner;
+    impl ms_tuner::Tuner for ExitOnRunTuner {
+        fn tune(&mut self, _: &ms_tuner::TuneParams) -> ms_tuner::Result<()> {
+            Ok(())
+        }
+        fn set_pids(&mut self, _: &PidSet) -> ms_tuner::Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> ms_tuner::SignalStatus {
+            ms_tuner::SignalStatus::default()
+        }
+        fn read(&mut self, _: &mut ms_tuner::TsBuf) -> ms_tuner::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn idle_tick_skips_sync_while_each_versioned_mutation_syncs() {
+        use ms_net::rtsp::Protocol;
+        use ms_net::session::{Clock, ManualClock, SessionManager};
+        use std::sync::Arc;
+
+        let packet = |pid: u16, payload: &[u8]| -> Vec<u8> {
+            let mut b = vec![0xFF; 188];
+            b[..5].copy_from_slice(&[0x47, 0x40 | (pid >> 8) as u8, pid as u8, 0x10, 0]);
+            b[5..5 + payload.len()].copy_from_slice(payload);
+            b
+        };
+        let section = |mut body: Vec<u8>| -> Vec<u8> {
+            let len = body.len() + 1;
+            body[1] = 0xB0 | (len >> 8) as u8;
+            body[2] = len as u8;
+            let crc = crc32_mpeg2(&body);
+            body.extend_from_slice(&crc.to_be_bytes());
+            body
+        };
+        let pat = || section(vec![0, 0, 0, 0, 1, 0xC1, 0, 0, 0, 0x64, 0xE1, 0x00]);
+        let pmt = || {
+            section(vec![
+                2, 0, 0, 0, 0x64, 0xC1, 0, 0, 0xE1, 0x01, 0xF0, 0x06, //
+                9, 4, 0x0B, 0x00, 0xE5, 0x00, //
+                2, 0xE1, 0x01, 0xF0, 0,
+            ])
+        };
+
+        let clock = Arc::new(ManualClock::new(1_000));
+        let mut sched = Scheduler::new();
+        sched.add_adapter(
+            0,
+            ms_sched::AdapterConfig::new(ms_tuner::DeliverySystem::DvbS2),
+            Box::new(NullSchedTuner),
+        );
+        let mut session = SessionManager::with_scheduler(sched);
+        session.set_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+
+        let opts = Options {
+            dvbapi_host: "127.0.0.1".to_owned(),
+            dvbapi_port: 9_000,
+            ..Options::default()
+        };
+        let mut ca = CaRuntime::new(&opts);
+        ca.next_poll = i64::MAX;
+        ca.adapter_added(session.scheduler_mut(), 0);
+        let hub = DdciHub::new();
+        hub.lock().ddci.create_adapter(0);
+        ca.attach_ddci(session.scheduler_mut(), hub.clone());
+        let _stage = ca.stages(0);
+        let handles: Vec<Option<AdapterHandle>> = vec![None];
+
+        ca.tick(session.scheduler_mut(), &handles);
+        let mut expected = ca.sync_runs;
+        assert_eq!(expected, 1);
+
+        // Idle ticks and per-batch DDCI hub touches (`now_ms`) do zero sync passes.
+        ca.tick(session.scheduler_mut(), &handles);
+        ca.tick(session.scheduler_mut(), &handles);
+        hub.lock().ddci.now_ms += 50;
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected, "idle ticks do no sync work");
+
+        // 1) Stream setup + play (`SessionManager`) bumps `sched.sync_version()` and syncs.
+        let url =
+            "rtsp://127.0.0.1:554/?src=1&freq=11494&pol=h&msys=dvbs2&sr=22000&pids=0,17,256,257";
+        let s1 = session.setup_stream_request(url, None, "SETUP").unwrap();
+        session
+            .decode_transport(s1, "RTP/AVP/TCP;interleaved=0-1")
+            .unwrap();
+        session.start_play(s1, Protocol::Rtsp).expect("play s1");
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "stream play synced");
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected);
+
+        // 2) `drain_events` / `on_table_packets`: PAT, PMT (+ repeated PMT dedup), SDT (+ repeated SDT dedup).
+        ca.on_table_packets(session.scheduler_mut(), &handles, 0, 0, &packet(0, &pat()));
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "PAT synced");
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected);
+
+        ca.on_table_packets(
+            session.scheduler_mut(),
+            &handles,
+            0,
+            0,
+            &packet(0x100, &pmt()),
+        );
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "first PMT synced");
+        let ver_after_pmt = session.scheduler().sync_version();
+        ca.on_table_packets(
+            session.scheduler_mut(),
+            &handles,
+            0,
+            0,
+            &packet(0x100, &pmt()),
+        );
+        assert_eq!(
+            session.scheduler().sync_version(),
+            ver_after_pmt,
+            "repeated identical PMT does not bump sync_version"
+        );
+        assert_eq!(ca.sync_runs, expected, "repeated PMT does not sync");
+
+        let sdt = section(vec![
+            0x42, 0, 0, 0x00, 0x01, 0xC1, 0, 0, 0x00, 0x01, 0xFF, //
+            0x00, 0x64, 0xFC, 0x90, 0x0B, //
+            0x48, 0x09, 0x01, 0x03, b'P', b'r', b'v', 0x03, b'S', b'v', b'c',
+        ]);
+        ca.on_table_packets(session.scheduler_mut(), &handles, 0, 0, &packet(17, &sdt));
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "first SDT synced");
+        let ver_after_sdt = session.scheduler().sync_version();
+        ca.on_table_packets(session.scheduler_mut(), &handles, 0, 0, &packet(17, &sdt));
+        assert_eq!(
+            session.scheduler().sync_version(),
+            ver_after_sdt,
+            "repeated identical SDT does not bump sync_version"
+        );
+        assert_eq!(ca.sync_runs, expected, "repeated SDT does not sync");
+
+        // 3) DVBAPI Ready + offered drain, SetFilter (`DMX_SET_FILTER`), StopFilter (`DMX_STOP`), Closed.
+        {
+            let dvbapi = ca.dvbapi.as_ref().unwrap();
+            let mut sh = dvbapi.shared.borrow_mut();
+            sh.client.on_connected(1_000);
+            let info = b"test-dvbapi";
+            let mut srv = Vec::from(0xFFFF_0002u32.to_be_bytes());
+            srv.extend_from_slice(&2u16.to_be_bytes());
+            srv.push(info.len() as u8);
+            srv.extend_from_slice(info);
+            sh.client.on_data(&srv, 1_001);
+        }
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "DVBAPI Ready + offer synced");
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected);
+
+        let mut set_f = [0u8; 65];
+        set_f[0..4].copy_from_slice(&0x403C_6F2Bu32.to_be_bytes());
+        set_f[7..9].copy_from_slice(&0x0500u16.to_be_bytes());
+        set_f[9] = 0x80;
+        set_f[25] = 0xF0;
+        ca.dvbapi
+            .as_ref()
+            .unwrap()
+            .shared
+            .borrow_mut()
+            .client
+            .on_data(&set_f, 1_010);
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "DVBAPI SetFilter synced");
+        assert!(session.scheduler().find_pid(0, 0x0500).is_some());
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected);
+
+        let mut stop_f = [0u8; 9];
+        stop_f[0..4].copy_from_slice(&0x0000_6F2Au32.to_be_bytes());
+        stop_f[7..9].copy_from_slice(&0x0500u16.to_be_bytes());
+        ca.dvbapi
+            .as_ref()
+            .unwrap()
+            .shared
+            .borrow_mut()
+            .client
+            .on_data(&stop_f, 1_020);
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "DVBAPI StopFilter synced");
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected);
+
+        ca.dvbapi.as_mut().unwrap().close(1_030);
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "DVBAPI Closed synced");
+
+        // 4) Stream close (`close_connection` / TEARDOWN) bumps `sched.sync_version()` and syncs.
+        session.close_stream(s1);
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "stream close synced");
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected);
+
+        // 5) Stream expire (`expire_streams`) bumps `sched.sync_version()` and syncs.
+        let s2 = session.setup_stream_request(url, None, "SETUP").unwrap();
+        session
+            .decode_transport(s2, "RTP/AVP/TCP;interleaved=0-1")
+            .unwrap();
+        session.start_play(s2, Protocol::Rtsp).expect("play s2");
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected);
+        clock.advance(60_000);
+        let expired = session.expired_streams();
+        assert_eq!(expired, vec![s2]);
+        for id in expired {
+            session.close_stream(id);
+        }
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected, "expired stream close synced");
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected);
+
+        // 6) Scheduler filter add/del bumps `sched.sync_version()` and syncs.
+        let fid = session
+            .scheduler_mut()
+            .add_filter(0, 18, FilterTarget::Other, FILTER_CRC);
+        assert!(fid >= 0);
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected);
+        session.scheduler_mut().del_filter(fid);
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected);
+
+        // 7) DDCI hub PID add/delete bumps `ddci.sync_version()` and refreshes `client_pids` after update.
+        hub.lock().ddci.mark_pid_add(DDCI_SID, 0, 500);
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected);
+        assert!(session.scheduler().find_pid(0, 500).is_some());
+        assert_eq!(
+            hub.lock().ddci.adapters[&0].client_pids.get(&500),
+            Some(&true)
+        );
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected, "settled after DDCI PID add");
+
+        hub.lock().ddci.mark_pid_deleted(0, DDCI_SID, 500);
+        ca.tick(session.scheduler_mut(), &handles);
+        expected += 1;
+        assert_eq!(ca.sync_runs, expected);
+        assert!(session.scheduler().find_pid(0, 500).is_none());
+        assert_eq!(
+            hub.lock().ddci.adapters[&0].client_pids.get(&500),
+            None,
+            "removed DDCI-only pid is purged from client_pids, not left as (500, false)"
+        );
+        ca.tick(session.scheduler_mut(), &handles);
+        assert_eq!(ca.sync_runs, expected, "settled after DDCI PID delete");
+    }
+
+    #[test]
+    fn failed_cat_filter_and_failed_section_pid_send_stay_dirty_and_retry() {
+        let mut sched = Scheduler::new();
+        sched.add_adapter(
+            0,
+            ms_sched::AdapterConfig::new(ms_tuner::DeliverySystem::DvbS2),
+            Box::new(NullSchedTuner),
+        );
+        let mut ca = CaRuntime::new(&Options::default());
+        let hub = DdciHub::new();
+        hub.open_device(1, Box::new(crate::ddci::NullWriter), false);
+        hub.lock().ddci.devices.get_mut(&1).unwrap().enabled = true;
+        ca.attach_ddci(&mut sched, hub.clone());
+        let _stage = ca.stages(0);
+
+        // Exhaust all scheduler filter slots so DDCI's CAT `add_filter` fails (`fid < 0`).
+        let mut filled = Vec::new();
+        loop {
+            let fid = sched.add_filter(0, 20, FilterTarget::Other, FILTER_CRC);
+            if fid < 0 {
+                break;
+            }
+            filled.push(fid);
+        }
+        hub.lock().ddci.add_pid_mapping_table(0, 1, 0, 1, true);
+
+        let handles: Vec<Option<AdapterHandle>> = vec![None];
+        ca.tick(&mut sched, &handles);
+        assert!(ca.sync_dirty, "failed CAT add_filter leaves sync dirty");
+        let runs_after_fail = ca.sync_runs;
+        ca.tick(&mut sched, &handles);
+        assert_eq!(
+            ca.sync_runs,
+            runs_after_fail + 1,
+            "retried on next tick without new changes"
+        );
+
+        // Free one filter slot: the next retry installs the CAT filter and settles.
+        sched.del_filter(filled.pop().unwrap());
+        ca.tick(&mut sched, &handles);
+        assert!(!ca.sync_dirty, "CAT filter installed on retry");
+        let settled = ca.sync_runs;
+        ca.tick(&mut sched, &handles);
+        assert_eq!(ca.sync_runs, settled);
+
+        // Now test a failed `SetSectionPids` send on a stopped `AdapterHandle`.
+        let dead = AdapterHandle::spawn(
+            Box::new(ExitOnRunTuner),
+            ms_net::dataplane::DataPlaneConfig::default(),
+        )
+        .unwrap();
+        dead.send(Command::Stop);
+        // Wait until the worker thread drops its receiver so `handle.send` returns `false`.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while dead.send(Command::KeepReading(false)) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let bad_handles = vec![Some(dead)];
+        ca.tick(&mut sched, &bad_handles);
+        assert!(
+            ca.sync_dirty,
+            "failed SetSectionPids send leaves sync dirty"
+        );
+        let before_retry = ca.sync_runs;
+        ca.tick(&mut sched, &bad_handles);
+        assert_eq!(
+            ca.sync_runs,
+            before_retry + 1,
+            "failed send retried on next tick"
+        );
+    }
+
+    #[test]
+    fn decrypt_windows_still_run_on_idle_ticks_with_fresh_counts() {
+        let mut sched = ci_sched(&[1]);
+        let (mut ca, recorder) = recording_runtime(10_000);
+        let handles: Vec<Option<AdapterHandle>> = vec![None, None];
+        ca.tick(&mut sched, &handles);
+        let settled = ca.sync_runs;
+
+        // Advance descrambler stats while scheduler and DDCI stay completely idle.
+        set_counters(&mut ca, 1, 0, 0);
+        ca.decrypt_windows(&sched, 0);
+        set_counters(&mut ca, 1, 1_500, 100);
+        ca.next_decrypt_window = 0;
+        ca.tick(&mut sched, &handles);
+
+        assert_eq!(ca.sync_runs, settled, "no sync ran on idle tick");
+        let windows = recorder.windows();
+        assert_eq!(windows.len(), 1, "decrypt_windows still ran on idle tick");
+        assert_eq!(windows[0].1, 1_500);
     }
 }

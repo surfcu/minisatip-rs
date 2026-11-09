@@ -675,7 +675,16 @@ impl Worker {
 
     fn run(mut self, requests: &Receiver<Request>) {
         loop {
-            match requests.recv_timeout(POLL) {
+            let poll = if self
+                .adapters
+                .keys()
+                .any(|&id| self.registry.get(id as i32).is_some_and(CiDevice::has_link))
+            {
+                POLL
+            } else {
+                Duration::from_millis(250)
+            };
+            match requests.recv_timeout(poll) {
                 Ok(Request::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                 Ok(request) => self.handle(request),
                 Err(RecvTimeoutError::Timeout) => {}

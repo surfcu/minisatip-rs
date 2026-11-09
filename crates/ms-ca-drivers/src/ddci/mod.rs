@@ -359,6 +359,7 @@ pub struct Ddci {
     pub eit_start: LocalTime,
     /// `--cam-ecm-trace` (diag-log); `None` adds one branch per mapped packet.
     pub table_trace: Option<TableTrace>,
+    sync_version: u64,
 }
 
 impl Default for Ddci {
@@ -380,11 +381,25 @@ impl Ddci {
             now_ms: 0,
             eit_start: LocalTime::default(),
             table_trace: None,
+            sync_version: 1,
         }
     }
 
+    /// Monotonic counter of DDCI state read by `CaRuntime::sync_ddci`.
+    pub fn sync_version(&self) -> u64 {
+        self.sync_version
+    }
+
+    /// Marks `sync_ddci`-visible hub state changed.
+    pub fn bump_sync_version(&mut self) {
+        self.sync_version = self.sync_version.wrapping_add(1);
+    }
+
     pub fn create_adapter(&mut self, id: u16) {
-        self.adapters.entry(id).or_default();
+        if let std::collections::btree_map::Entry::Vacant(e) = self.adapters.entry(id) {
+            e.insert(AdapterState::default());
+            self.bump_sync_version();
+        }
     }
 
     /// `set_ca_channels`: CAPMT count and programs per CAPMT of each `-c` CA.
@@ -450,10 +465,15 @@ impl Ddci {
             return;
         };
         let p = a.pids.entry(pid).or_default();
+        let was_ddci = !p.deleted && p.sids.contains(&DDCI_SID);
         if sid != PID_STREAM_ID_UNDEFINED {
             p.sids.insert(sid);
         }
         p.deleted = false;
+        let now_ddci = !p.deleted && p.sids.contains(&DDCI_SID);
+        if was_ddci != now_ddci {
+            self.bump_sync_version();
+        }
     }
 
     /// `mark_pid_deleted` (no filter keep-alive).
@@ -465,14 +485,22 @@ impl Ddci {
         else {
             return;
         };
+        let was_ddci = !p.deleted && p.sids.contains(&DDCI_SID);
         if sid == PID_STREAM_ID_UNDEFINED {
             p.sids.clear();
             p.deleted = true;
+            if was_ddci {
+                self.bump_sync_version();
+            }
             return;
         }
         p.sids.remove(&sid);
         if p.sids.is_empty() {
             p.deleted = true;
+        }
+        let now_ddci = !p.deleted && p.sids.contains(&DDCI_SID);
+        if was_ddci != now_ddci {
+            self.bump_sync_version();
         }
     }
 
@@ -561,6 +589,7 @@ impl Ddci {
                 let f = self.next_filter;
                 self.next_filter += 1;
                 self.filters.insert(f, (ad, dev));
+                self.bump_sync_version();
                 self.devices
                     .get_mut(&dev)
                     .unwrap()
@@ -635,8 +664,10 @@ impl Ddci {
         if self.find_pid(dev_id as u16, ddci_pid as u16).is_some() {
             self.mark_pid_deleted(dev_id as u16, DDCI_SID, ddci_pid as u16);
         }
-        if let Some(f) = m.filter_id {
-            self.filters.remove(&f);
+        if let Some(f) = m.filter_id
+            && self.filters.remove(&f).is_some()
+        {
+            self.bump_sync_version();
         }
         if m.pid_added {
             ms_log::logm!(
@@ -965,8 +996,12 @@ impl Ddci {
                 d_id
             );
         };
+        let slot_changed = d.pmt[pos].id != pmt.id;
         d.pmt[pos].id = pmt.id;
         d.pmt[pos].last_pmt = 0;
+        if slot_changed {
+            self.sync_version = self.sync_version.wrapping_add(1);
+        }
         d.bump_versions();
         if !already_registered {
             if d.channels == 0 {
@@ -1081,10 +1116,12 @@ impl Ddci {
                 pmt.pid
             );
             // No mapping: still free a slot this PMT holds, or it leaks.
+            let mut freed = false;
             for d in self.devices.values_mut().filter(|d| d.enabled) {
                 for j in d.slots() {
                     if d.pmt[j].id == pmt.id {
                         d.pmt[j].id = -1;
+                        freed = true;
                         if d.channels > 0 {
                             d.channels -= 1;
                         }
@@ -1092,6 +1129,9 @@ impl Ddci {
                         d.psi_changed = true;
                     }
                 }
+            }
+            if freed {
+                self.bump_sync_version();
             }
             return;
         };
@@ -1114,6 +1154,7 @@ impl Ddci {
                 d.channels -= 1;
             }
             d.psi_changed = true;
+            self.sync_version = self.sync_version.wrapping_add(1);
         }
         ms_log::log!(
             "ddci_del_pmt: deleting pmt id {}, sid {} ({:X}), pid {}, ddci {}, name {}, held a slot {}, running channels {}",

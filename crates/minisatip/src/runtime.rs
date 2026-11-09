@@ -57,7 +57,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(1100);
 const LOOP_TICK: Duration = Duration::from_millis(20);
 /// Poll interval while replies are waiting for the socket to drain.
 const PENDING_POLL: Duration = Duration::from_millis(2);
-const ACCEPT_POLL: Duration = Duration::from_millis(20);
+const ACCEPT_POLL: Duration = Duration::from_millis(200);
 /// `set_linux_socket_timeout`: 1 s 100 ms (socketworks.cpp:374-386).
 const SSDP_READ_TIMEOUT: Duration = Duration::from_millis(1100);
 const OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(1100);
@@ -2587,7 +2587,17 @@ fn accept_loop(
                     );
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = ms_net::sys::poll_wait_readable(
+                        listener.as_raw_fd(),
+                        ACCEPT_POLL.as_millis() as i32,
+                    );
+                }
+                #[cfg(not(target_os = "linux"))]
+                thread::sleep(ACCEPT_POLL);
+            }
             Err(error) => {
                 // socketworks.cpp:551-553.
                 ms_log::log!(
