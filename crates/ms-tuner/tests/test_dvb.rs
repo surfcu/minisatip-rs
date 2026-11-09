@@ -7,6 +7,7 @@ use std::io;
 use ms_tuner::linux_dvb::*;
 use ms_tuner::{
     DeliverySystem, PID_ALL, PidSet, Polarization, TsBuf, TuneParams, Tuner, TunerError,
+    WaitReadable,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,7 @@ enum Call {
     SetBufferSize(DemuxFd, i32),
     SetDemuxSource(DemuxFd, i32),
     SetProcData(i32, String, i32),
+    PollFds(Vec<DemuxFd>, i32),
 }
 
 struct FakeDevice {
@@ -59,6 +61,10 @@ struct FakeDevice {
     sections: BTreeMap<DemuxFd, VecDeque<Vec<u8>>>,
     /// errno returned by every `add_pid`.
     add_pid_errno: Option<i32>,
+    /// One-shot errno returned by the next `read_stream` (e.g. `EOVERFLOW`).
+    stream_errno_once: Option<i32>,
+    /// Scripted outcomes returned by `poll_fds`.
+    poll_results: VecDeque<WaitReadable>,
 }
 
 impl FakeDevice {
@@ -82,6 +88,8 @@ impl FakeDevice {
             next_fd: 100,
             sections: BTreeMap::new(),
             add_pid_errno: None,
+            stream_errno_once: None,
+            poll_results: VecDeque::new(),
         }
     }
 
@@ -306,6 +314,9 @@ impl DvbDevice for FakeDevice {
     }
 
     fn read_stream(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(errno) = self.stream_errno_once.take() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         let available = self.stream.len() - self.stream_pos;
         let count = available.min(buf.len());
         buf[..count].copy_from_slice(&self.stream[self.stream_pos..self.stream_pos + count]);
@@ -315,6 +326,13 @@ impl DvbDevice for FakeDevice {
 
     fn now_ms(&self) -> i64 {
         self.now
+    }
+
+    fn poll_fds(&mut self, fds: &[DemuxFd], timeout_ms: i32) -> WaitReadable {
+        self.calls.push(Call::PollFds(fds.to_vec(), timeout_ms));
+        self.poll_results
+            .pop_front()
+            .unwrap_or(WaitReadable::Unsupported)
     }
 }
 
@@ -1804,4 +1822,145 @@ fn post_open_links_fbc_and_sets_the_demux_source() {
     tuner.device_mut().calls.clear();
     tuner.post_open(false, -1, -1);
     assert!(tuner.device().calls.is_empty());
+}
+
+#[test]
+fn status_ioctls_skip_first_tick_and_rate_limit_to_300ms_even_without_dvr_data() {
+    let count_status = |tuner: &LinuxDvbTuner<FakeDevice>| {
+        tuner
+            .device()
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::ReadStatus))
+            .count()
+    };
+    let mut dev = FakeDevice::new();
+    dev.now = 1_000;
+    dev.status = Some(FE_HAS_LOCK);
+    dev.stats = Some(FakeDevice::stats(
+        1,
+        FE_SCALE_DECIBEL,
+        FE_SCALE_DECIBEL,
+        0,
+        12_000,
+    ));
+    let mut tuner = LinuxDvbTuner::with_device(dev, backend_state());
+    tuner.device_mut().calls.clear();
+
+    let mut buf = TsBuf::with_packets(4);
+    assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+    assert!(!tuner.take_status_refreshed(), "untuned read does not poll");
+    assert_eq!(count_status(&tuner), 0);
+
+    let params = TuneParams {
+        freq: 11_494_000,
+        sr: 22_000_000,
+        pol: Polarization::Horizontal,
+        pol_specified: true,
+        msys: DeliverySystem::DvbS2,
+        ..TuneParams::default()
+    };
+    tuner.tune(&params).expect("tune");
+    tuner.device_mut().calls.clear();
+
+    for t in [1_000, 1_100, 1_299] {
+        tuner.device_mut().now = t;
+        assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+        assert!(
+            !tuner.take_status_refreshed(),
+            "skipped before 300 ms at {t}"
+        );
+        assert_eq!(count_status(&tuner), 0);
+    }
+
+    // Empty dvr (loss of lock / no packets) still refreshes once at 300 ms.
+    tuner.device_mut().status = Some(0);
+    tuner.device_mut().now = 1_300;
+    assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+    assert!(tuner.take_status_refreshed());
+    assert!(!tuner.take_status_refreshed(), "flag clears once taken");
+    assert!(!tuner.status().locked);
+    assert_eq!(count_status(&tuner), 1);
+
+    for t in [1_350, 1_599] {
+        tuner.device_mut().now = t;
+        assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+        assert!(!tuner.take_status_refreshed());
+        assert_eq!(count_status(&tuner), 1);
+    }
+
+    // Retune at 1_700 while next tick is 1_900: 1_900 is skipped (`status_cnt`), first poll at 2_200 (+500 ms).
+    tuner.device_mut().now = 1_600;
+    assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+    assert!(tuner.take_status_refreshed());
+    assert_eq!(count_status(&tuner), 2);
+
+    tuner.device_mut().now = 1_700;
+    tuner.device_mut().status = Some(FE_HAS_LOCK);
+    tuner.tune(&params).expect("retune");
+    tuner.device_mut().calls.clear();
+
+    tuner.device_mut().now = 1_900;
+    assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+    assert!(
+        !tuner.take_status_refreshed(),
+        "first tick after retune skipped"
+    );
+    assert_eq!(count_status(&tuner), 0);
+
+    tuner.device_mut().now = 2_200;
+    assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+    assert!(tuner.take_status_refreshed(), "second tick (+500 ms) polls");
+    assert!(tuner.status().locked);
+    assert_eq!(count_status(&tuner), 1);
+}
+
+#[test]
+fn wait_readable_polls_stream_and_pes_section_fds_and_checks_buffered_packets() {
+    let mut dev = FakeDevice::new();
+    dev.poll_results.push_back(WaitReadable::TimedOut);
+    dev.poll_results.push_back(WaitReadable::Ready);
+    let mut tuner = LinuxDvbTuner::with_device(dev, backend_state())
+        .with_demux_mode(DemuxMode::PesFiltersAndDvr);
+    tuner.set_section_pids(&PidSet::from_pids([0u16, 18]));
+    tuner.set_pids(&PidSet::from_pids([0u16, 18, 100])).unwrap();
+    tuner.device_mut().calls.clear();
+
+    assert_eq!(
+        tuner.wait_readable(std::time::Duration::from_millis(50)),
+        WaitReadable::TimedOut
+    );
+    assert_eq!(
+        tuner.device().calls,
+        [Call::PollFds(
+            vec![DemuxFd(42), DemuxFd(100), DemuxFd(101)],
+            20
+        )]
+    );
+
+    // A multi-packet section leaves a full packet in `psi`; `wait_readable` returns Ready without polling.
+    let mut pat_sec = vec![0u8; 300];
+    pat_sec[0] = 0x00;
+    pat_sec[1] = 0xB1;
+    pat_sec[2] = 0x29;
+    tuner
+        .device_mut()
+        .sections
+        .entry(DemuxFd(100))
+        .or_default()
+        .push_back(pat_sec);
+    let mut one_pkt = TsBuf::with_packets(1);
+    assert_eq!(tuner.read(&mut one_pkt).unwrap(), 188);
+    tuner.device_mut().calls.clear();
+    assert_eq!(
+        tuner.wait_readable(std::time::Duration::from_millis(20)),
+        WaitReadable::Ready
+    );
+    assert!(tuner.device().calls.is_empty(), "psi still has a packet");
+    assert_eq!(
+        tuner.open_demux_fds(),
+        Some(vec![(0, 100), (18, 101), (100, 102)])
+    );
+    tuner.set_pids(&PidSet::new()).unwrap();
+    assert_eq!(tuner.open_demux_fds(), Some(vec![]));
 }

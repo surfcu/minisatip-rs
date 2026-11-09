@@ -51,6 +51,7 @@ impl DdciHub {
         // The option parser already logged it, as `disable_cat_adapters` does.
         device.disable_cat = disable_cat;
         state.ddci.devices.insert(aid, device);
+        state.ddci.bump_sync_version();
         state.ddci.post_tune_ci(aid as u16);
         state.writers.insert(aid, writer);
     }
@@ -101,23 +102,27 @@ impl TsStage for DdciStage {
         if state.ddci.devices.contains_key(&usize::from(self.aid)) {
             return;
         }
-        let devices: Vec<usize> = state
-            .ddci
-            .devices
-            .iter()
-            .filter(|(_, d)| d.enabled)
-            .map(|(id, _)| *id)
-            .collect();
+        let mut devices = Vec::new();
+        let mut has_rewrite = false;
+        for (&id, d) in &state.ddci.devices {
+            if !d.enabled {
+                continue;
+            }
+            devices.push(id);
+            if !has_rewrite && d.mapping.values().any(|m| m.ad == self.aid && m.rewrite) {
+                has_rewrite = true;
+            }
+        }
         if devices.is_empty() {
             return;
         }
         state.ddci.now_ms = state.origin.elapsed().as_millis() as u64;
-        // CAM output fills null slots and may grow the batch up to the adapter
-        // buffer (`ad->rlen` up to `ad->lbuf`, ddci.cpp:1105). The zeroed tail
-        // (about 376 KB) reuses the batch allocation.
+        // Grow `buf` up to `ad->lbuf` (`ddci.cpp:1105`) only when an enabled device maps `self.aid`.
         let rlen = buf.len();
         let mut data = std::mem::take(buf);
-        data.resize(capacity.max(rlen), 0);
+        if has_rewrite {
+            data.resize(capacity.max(rlen), 0);
+        }
         let mut ts = TsBuffer {
             id: self.aid,
             buf: data,
@@ -170,6 +175,7 @@ impl CaSink for DdciSink {
         let state = &mut *guard;
         state.ddci.now_ms = state.origin.elapsed().as_millis() as u64;
         state.programs.insert(program.clone());
+        state.ddci.bump_sync_version();
         state
             .ddci
             .process_pmt(service.adapter as u16, &program, update)
@@ -271,11 +277,39 @@ pub mod linux {
             CiWriter::fd(&writer),
             reader.as_raw_fd()
         );
-        Ok((DdciReader(reader), writer))
+        Ok((DdciReader::new(reader), writer))
     }
 
     /// The CAM output as the CI adapter's tuner (`ad->dvr`).
-    pub struct DdciReader(File);
+    pub struct DdciReader {
+        file: File,
+        scratch: Vec<u8>,
+        #[cfg(test)]
+        polls: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    }
+
+    impl DdciReader {
+        pub fn new(file: File) -> Self {
+            Self {
+                file,
+                scratch: Vec::new(),
+                #[cfg(test)]
+                polls: None,
+            }
+        }
+
+        #[cfg(test)]
+        pub fn with_poll_counter(
+            file: File,
+            polls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        ) -> Self {
+            Self {
+                file,
+                scratch: Vec::new(),
+                polls: Some(polls),
+            }
+        }
+    }
 
     impl Tuner for DdciReader {
         fn tune(&mut self, _params: &TuneParams) -> Result<(), TunerError> {
@@ -290,10 +324,22 @@ pub mod linux {
             SignalStatus::default()
         }
 
+        fn wait_readable(&mut self, timeout: std::time::Duration) -> ms_tuner::WaitReadable {
+            #[cfg(test)]
+            if let Some(polls) = &self.polls {
+                polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let ms = timeout.as_millis().min(20) as i32;
+            ms_net::sys::poll_wait_readable(self.file.as_raw_fd(), ms)
+        }
+
         fn read(&mut self, buf: &mut TsBuf) -> Result<usize, TunerError> {
-            let mut chunk = vec![0u8; buf.remaining_bytes()];
-            match self.0.read(&mut chunk) {
-                Ok(n) => Ok(buf.push_data(&chunk[..n])),
+            let want = buf.remaining_bytes();
+            if self.scratch.len() < want {
+                self.scratch.resize(want, 0);
+            }
+            match self.file.read(&mut self.scratch[..want]) {
+                Ok(n) => Ok(buf.push_data(&self.scratch[..n])),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
                 Err(e) => Err(TunerError::Io(e)),
             }
@@ -343,6 +389,16 @@ pub mod linux {
             use std::os::unix::io::AsRawFd;
             self.file.as_raw_fd()
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct NullWriter;
+
+#[cfg(test)]
+impl CiWriter for NullWriter {
+    fn writev(&mut self, iov: &[&[u8]]) -> isize {
+        iov.iter().map(|p| p.len()).sum::<usize>() as isize
     }
 }
 
@@ -1158,5 +1214,177 @@ mod growth_tests {
         // first read, which starts at the write index (ddci.cpp:1179), and the
         // last batch is still at the CAM.
         assert_eq!(delivered, BATCH * (BATCHES - 2));
+    }
+
+    #[test]
+    fn unmap_then_remap_does_not_replay_old_cam_packets_and_grows_without_nulls() {
+        let hub = DdciHub::new();
+        hub.open_device(
+            1,
+            Box::new(Loopback(Arc::new(Mutex::new(Vec::new())))),
+            true,
+        );
+        let mut stage = DdciStage::new(hub.clone(), 0);
+        hub.lock().ddci.devices.get_mut(&1).unwrap().enabled = true;
+
+        // Map pid 1000 on adapter 0 -> device 1, seed read_index, and push stale CAM packet (marker 0xAA).
+        let ddci_pid = hub.lock().ddci.add_pid_mapping_table(0, 1000, 7, 1, false) as u16;
+        let mut seed_batch = vec![0u8; 188];
+        seed_batch[0] = 0x47;
+        seed_batch[3] = 0x10;
+        set_pid_ts(&mut seed_batch, 1000);
+        stage.process_buf(&mut seed_batch, 4 * 188);
+
+        let mut stale = vec![0xAAu8; 188];
+        stale[0] = 0x47;
+        stale[3] = 0x11;
+        set_pid_ts(&mut stale, ddci_pid);
+        hub.lock().ddci.push_from_cam(1, &stale);
+
+        // Unmap adapter 0 completely, then run an unmapped batch: `process_ts` must still reset `read_index`.
+        {
+            let mut state = hub.lock();
+            state.ddci.devices.get_mut(&1).unwrap().mapping.clear();
+        }
+        let mut fta = vec![0x11u8; 188];
+        fta[0] = 0x47;
+        fta[3] = 0x10;
+        set_pid_ts(&mut fta, 500);
+        let fta_cap = 16 * 188;
+        fta.reserve_exact(188);
+        stage.process_buf(&mut fta, fta_cap);
+        assert_eq!(
+            fta.len(),
+            188,
+            "unmapped batch does not append stale CAM data"
+        );
+        assert_eq!(
+            hub.lock().ddci.devices[&1].read_index[0],
+            0,
+            "process_ts reset read_index on unmap"
+        );
+
+        // Remap pid 1000: first batch with NO null packets seeds read_index without replaying `stale`.
+        let ddci_pid = hub.lock().ddci.add_pid_mapping_table(0, 1000, 8, 1, false) as u16;
+        let mut first = vec![0x22u8; 188];
+        first[0] = 0x47;
+        first[3] = 0x10;
+        set_pid_ts(&mut first, 1000);
+        stage.process_buf(&mut first, 8 * 188);
+        assert!(
+            !first.chunks(188).any(|p| p[4] == 0xAA),
+            "stale packet from before unmap was not replayed"
+        );
+
+        // Push fresh CAM packet (marker 0xBB) and feed a batch with zero null slots: output grows past rlen.
+        let mut fresh = vec![0xBBu8; 188];
+        fresh[0] = 0x47;
+        fresh[3] = 0x12;
+        set_pid_ts(&mut fresh, ddci_pid);
+        hub.lock().ddci.push_from_cam(1, &fresh);
+
+        let mut no_nulls = vec![0x33u8; 188];
+        no_nulls[0] = 0x47;
+        no_nulls[3] = 0x10;
+        set_pid_ts(&mut no_nulls, 500);
+        stage.process_buf(&mut no_nulls, 8 * 188);
+        assert_eq!(
+            no_nulls.len(),
+            2 * 188,
+            "CAM output appended past rlen even with no null packets"
+        );
+        assert_eq!(pid_from_ts(&no_nulls[188..376]), 1000);
+        assert_eq!(no_nulls[188 + 4], 0xBB);
+    }
+
+    #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
+    #[test]
+    fn ddci_reader_keeps_reading_across_cam_reset_and_backs_off_on_pollhup() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        use ms_net::dataplane::{AdapterHandle, Command, DataPlaneConfig};
+        use ms_tuner::{Tuner, WaitReadable};
+
+        let (rx_sock, mut writer_sock) = UnixStream::pair().unwrap();
+        rx_sock.set_nonblocking(true).unwrap();
+        let reader_file = std::fs::File::from(OwnedFd::from(rx_sock));
+
+        let hub = DdciHub::new();
+        hub.open_device(
+            1,
+            Box::new(Loopback(Arc::new(Mutex::new(Vec::new())))),
+            true,
+        );
+        let stage = Box::new(DdciCapture::new(hub.clone(), 1));
+        let handle = AdapterHandle::spawn_with_stages(
+            Box::new(super::linux::DdciReader::new(reader_file)),
+            DataPlaneConfig::default(),
+            None,
+            vec![stage],
+        )
+        .expect("spawn ddci reader");
+        handle.send(Command::KeepReading(true));
+
+        let mut pkt = [0x47u8; 188];
+        pkt[1] = 0x01;
+        pkt[2] = 0x00;
+        pkt[3] = 0x10;
+        std::io::Write::write_all(&mut writer_sock, &pkt).unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while hub.lock().ddci.devices[&1].fifo.write_index < 188 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(hub.lock().ddci.devices[&1].fifo.write_index, 188);
+
+        // Simulate CAM teardown + re-init without resending KeepReading: reader still captures packets.
+        hub.lock().ddci.devices.get_mut(&1).unwrap().clear_slots();
+        std::io::Write::write_all(&mut writer_sock, &pkt).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while hub.lock().ddci.devices[&1].fifo.write_index < 376 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            hub.lock().ddci.devices[&1].fifo.write_index,
+            376,
+            "reading continues after CAM reset without toggling KeepReading"
+        );
+        drop(handle);
+        drop(writer_sock);
+
+        // Closed pipe writer causes immediate POLLHUP (`ErrOrHup`) and backs off on `DdciReader`.
+        let (rx_pipe, tx_pipe) = std::io::pipe().unwrap();
+        drop(tx_pipe);
+        let mut reader = super::linux::DdciReader::new(std::fs::File::from(OwnedFd::from(rx_pipe)));
+        assert_eq!(
+            reader.wait_readable(Duration::from_millis(20)),
+            WaitReadable::ErrOrHup
+        );
+
+        let (rx_hup, tx_hup) = std::io::pipe().unwrap();
+        drop(tx_hup);
+        let polls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let hup_reader = super::linux::DdciReader::with_poll_counter(
+            std::fs::File::from(OwnedFd::from(rx_hup)),
+            Arc::clone(&polls),
+        );
+        let hup_handle = AdapterHandle::spawn_with_stages(
+            Box::new(hup_reader),
+            DataPlaneConfig::default(),
+            None,
+            vec![Box::new(DdciCapture::new(hub.clone(), 1))],
+        )
+        .expect("spawn hup reader");
+        hup_handle.send(Command::KeepReading(true));
+        std::thread::sleep(Duration::from_millis(55));
+        drop(hup_handle);
+        let poll_cnt = polls.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(poll_cnt >= 2, "DdciReader polled closed pipe ({poll_cnt})");
+        assert!(
+            poll_cnt <= 25,
+            "DdciReader backed off on persistent POLLHUP ({poll_cnt} polls in 55 ms)"
+        );
     }
 }

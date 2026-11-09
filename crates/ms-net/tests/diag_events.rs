@@ -127,3 +127,83 @@ fn playback_emits_session_open_and_close() {
         assert!(event.contains("\"adapter\":0"), "{event}");
     }
 }
+
+#[test]
+fn stream_stop_logs_dataplane_active_pids_and_open_demux_fds() {
+    use std::time::{Duration, Instant};
+
+    use ms_net::dataplane::{AdapterHandle, Command, DataPlaneConfig};
+    use ms_net::output::{OutputConfig, StreamOutput};
+    use ms_tuner::{PidSet, Result as TunerResult, SignalStatus, TsBuf, Tuner};
+
+    struct DemuxReportTuner {
+        pids: Vec<u16>,
+    }
+
+    impl Tuner for DemuxReportTuner {
+        fn tune(&mut self, _params: &TuneParams) -> TunerResult<()> {
+            Ok(())
+        }
+        fn set_pids(&mut self, pids: &PidSet) -> TunerResult<()> {
+            self.pids = pids.iter().collect();
+            Ok(())
+        }
+        fn status(&self) -> SignalStatus {
+            SignalStatus::default()
+        }
+        fn read(&mut self, _buf: &mut TsBuf) -> TunerResult<usize> {
+            Ok(0)
+        }
+        fn open_demux_fds(&self) -> Option<Vec<(u16, u32)>> {
+            Some(
+                self.pids
+                    .iter()
+                    .map(|&pid| (pid, u32::from(pid) + 200))
+                    .collect(),
+            )
+        }
+    }
+
+    let lines = captured_lines();
+    let cfg = DataPlaneConfig {
+        adapter_id: 5,
+        ..DataPlaneConfig::default()
+    };
+    let handle =
+        AdapterHandle::spawn(Box::new(DemuxReportTuner { pids: Vec::new() }), cfg).expect("spawn");
+    handle.send(Command::SetBasePids(PidSet::from_pids([0u16, 18])));
+    let output = StreamOutput::http(Box::new(std::io::sink()), None, OutputConfig::new(1), 0);
+    handle.send(Command::StartOutput {
+        stream_id: 9,
+        epoch: 1,
+        output: Box::new(output),
+        pids: PidSet::from_pids([100u16]),
+        setup_age_ms: 0,
+    });
+    handle.send(Command::StopOutput(9));
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let found = loop {
+        let snapshot = lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|l| l.contains("adapter 5 idle_pids (stream_stop):"))
+            .cloned();
+        if let Some(line) = snapshot {
+            break line;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing idle_pids log on stream_stop"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(found.contains("outputs=0"), "{found}");
+    assert!(found.contains("active_pids=[0, 18]"), "{found}");
+    assert!(
+        found.contains("open_demux_fds=Some([(0, 200), (18, 218)])"),
+        "{found}"
+    );
+}

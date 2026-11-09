@@ -10,6 +10,7 @@ use super::sys::LinuxDvbDevice;
 use super::transponder::DvbTransponder;
 use crate::tuner::{
     PID_ALL, PidSet, Result, SignalStatus, TS_PACKET_SIZE, TsBuf, TuneParams, Tuner, TunerError,
+    WaitReadable,
 };
 
 /// `opts.use_demux_device` (`-?`, dvb.h:265-275): where the stream is read
@@ -62,6 +63,11 @@ enum OpenPid {
 /// Largest section read from a section filter (`dvb_psi_read`).
 const SECTION_BUF: usize = 4096;
 
+/// Frontend status timer period (`minisatip.cpp:1989`, `adapter.cpp:2262`).
+pub const STATUS_POLL_MS: i64 = 300;
+/// Cap on `poll(2)` wait so mpsc commands stay responsive.
+const MAX_WAIT_MS: u128 = 20;
+
 /// Open DVB frontend with per-PID demux filters in one of the `DemuxMode`s.
 pub struct LinuxDvbTuner<D: DvbDevice = LinuxDvbDevice> {
     dev: D,
@@ -72,6 +78,9 @@ pub struct LinuxDvbTuner<D: DvbDevice = LinuxDvbDevice> {
     active_demux_pids: usize,
     section_pids: PidSet,
     status: SignalStatus,
+    next_status_ms: Option<i64>,
+    status_cnt: u32,
+    status_refreshed: bool,
     partial: Vec<u8>,
     /// Whole TS packets built from sections, delivered before the stream.
     psi: Vec<u8>,
@@ -159,6 +168,9 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
             active_demux_pids: 0,
             section_pids: PidSet::new(),
             status: SignalStatus::default(),
+            next_status_ms: None,
+            status_cnt: 0,
+            status_refreshed: false,
             partial: Vec::with_capacity(TS_PACKET_SIZE),
             psi: Vec::new(),
             read_buf: vec![0u8; 64 * 1024],
@@ -249,8 +261,21 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
         &mut self.dev
     }
 
-    /// Keeps the cached status in sync with the frontend (`dvb_get_signal`).
-    fn refresh_status(&mut self) {
+    /// Polls frontend status every 300 ms, skipping the first tick (`adapter.cpp:2262, 2278`).
+    fn maybe_refresh_status(&mut self) {
+        let Some(due) = self.next_status_ms else {
+            return;
+        };
+        let now = self.dev.now_ms();
+        if now < due {
+            return;
+        }
+        self.next_status_ms = Some(now + STATUS_POLL_MS);
+        if self.status_cnt == 0 {
+            self.status_cnt = 1;
+            return;
+        }
+        self.status_cnt = self.status_cnt.saturating_add(1);
         let _ = self.state.get_signal(&mut self.dev);
         self.status = SignalStatus {
             locked: self.state.status & FE_HAS_LOCK != 0,
@@ -260,6 +285,7 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
             db: self.state.db,
             status_valid: self.state.status_valid,
         };
+        self.status_refreshed = true;
     }
 }
 
@@ -548,6 +574,21 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
             status_valid: false,
             ..SignalStatus::default()
         };
+        self.status_refreshed = false;
+        // Skip the first 300 ms tick after tune (`status_cnt`, adapter.cpp:1096, 2278).
+        if self.state.tp.freq.unwrap_or(0) > 0 {
+            let now = self.dev.now_ms();
+            match self.next_status_ms {
+                Some(due) if due > now => self.status_cnt = 0,
+                _ => {
+                    self.next_status_ms = Some(now + STATUS_POLL_MS);
+                    self.status_cnt = 1;
+                }
+            }
+        } else {
+            self.next_status_ms = None;
+            self.status_cnt = 0;
+        }
         // Sections of the previous transponder are not delivered after a retune.
         self.psi.clear();
         Ok(())
@@ -604,8 +645,44 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
         self.status
     }
 
+    fn take_status_refreshed(&mut self) -> bool {
+        std::mem::take(&mut self.status_refreshed)
+    }
+
+    fn open_demux_fds(&self) -> Option<Vec<(u16, u32)>> {
+        let stream_fd = self.dev.stream_fd().0;
+        let pairs = self
+            .pids
+            .iter()
+            .map(|(&pid, open)| {
+                let fd = match open {
+                    OpenPid::Tap(fd) | OpenPid::Section(fd, _) => fd.0,
+                    OpenPid::Shared => stream_fd,
+                };
+                (pid, fd)
+            })
+            .collect();
+        Some(pairs)
+    }
+
+    fn wait_readable(&mut self, timeout: std::time::Duration) -> WaitReadable {
+        if self.psi.len() >= TS_PACKET_SIZE || self.partial.len() >= TS_PACKET_SIZE {
+            return WaitReadable::Ready;
+        }
+        let mut fds = vec![self.dev.stream_fd()];
+        if self.mode.pes_filters() {
+            for open in self.pids.values() {
+                if let OpenPid::Section(fd, _) = open {
+                    fds.push(*fd);
+                }
+            }
+        }
+        let ms = timeout.as_millis().min(MAX_WAIT_MS) as i32;
+        self.dev.poll_fds(&fds, ms)
+    }
+
     fn read(&mut self, buf: &mut TsBuf) -> Result<usize> {
-        self.refresh_status();
+        self.maybe_refresh_status();
         let mut appended = 0;
         if self.mode.pes_filters() {
             self.read_sections();

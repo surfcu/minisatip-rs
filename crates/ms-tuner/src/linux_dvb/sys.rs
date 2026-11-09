@@ -551,6 +551,38 @@ impl DvbDevice for LinuxDvbDevice {
     fn now_ms(&self) -> i64 {
         self.base.elapsed().as_millis() as i64
     }
+
+    fn poll_fds(&mut self, fds: &[DemuxFd], timeout_ms: i32) -> crate::WaitReadable {
+        if fds.is_empty() {
+            return crate::WaitReadable::Unsupported;
+        }
+        let mut pfds: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|fd| libc::pollfd {
+                fd: fd.0 as libc::c_int,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `pfds` is a valid slice of `pollfd` entries for `poll`.
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                return crate::WaitReadable::TimedOut;
+            }
+            return crate::WaitReadable::ErrOrHup;
+        }
+        if rc == 0 {
+            return crate::WaitReadable::TimedOut;
+        }
+        if pfds
+            .iter()
+            .any(|p| (p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0)
+        {
+            return crate::WaitReadable::ErrOrHup;
+        }
+        crate::WaitReadable::Ready
+    }
 }
 
 #[cfg(test)]

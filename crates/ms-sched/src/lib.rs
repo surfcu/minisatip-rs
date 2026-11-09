@@ -463,6 +463,7 @@ pub struct Scheduler {
     disabled: [bool; MAX_ADAPTERS],
     absolute_switch: bool,
     pmt_generation: u64,
+    sync_version: u64,
     sdt_charset: CharsetOverride,
     pub(crate) pmt: pmt::PmtTables,
 }
@@ -484,22 +485,37 @@ impl Scheduler {
             disabled: [false; MAX_ADAPTERS],
             absolute_switch: false,
             pmt_generation: 0,
+            sync_version: 1,
             sdt_charset: CharsetOverride::Auto,
             pmt: pmt::PmtTables::new(),
         }
+    }
+
+    /// Monotonic counter of scheduler changes read by `CaRuntime` sync.
+    pub fn sync_version(&self) -> u64 {
+        self.sync_version
+    }
+
+    pub(crate) fn bump_sync_version(&mut self) {
+        self.sync_version = self.sync_version.wrapping_add(1);
     }
 
     /// Installs an adapter at `aid`.
     pub fn add_adapter(&mut self, aid: usize, config: AdapterConfig, tuner: Box<dyn AdapterTuner>) {
         if aid < MAX_ADAPTERS {
             self.adapters[aid] = Some(Adapter::new(config, tuner));
+            self.bump_sync_version();
         }
     }
 
     /// Removes the adapter at `aid` (`disable_satip_server`: `a[i]->type = 0`).
     pub fn remove_adapter(&mut self, aid: usize) -> Option<Adapter> {
         if aid < MAX_ADAPTERS {
-            self.adapters[aid].take()
+            let removed = self.adapters[aid].take();
+            if removed.is_some() {
+                self.bump_sync_version();
+            }
+            removed
         } else {
             None
         }
@@ -510,9 +526,16 @@ impl Scheduler {
         self.adapters.get(aid).and_then(Option::as_ref)
     }
 
+    pub(crate) fn adapter_mut_inner(&mut self, aid: usize) -> Option<&mut Adapter> {
+        self.adapters.get_mut(aid).and_then(Option::as_mut)
+    }
+
     /// Mutable adapter at `aid`.
     pub fn adapter_mut(&mut self, aid: usize) -> Option<&mut Adapter> {
-        self.adapters.get_mut(aid).and_then(Option::as_mut)
+        if self.adapters.get(aid).is_some_and(Option::is_some) {
+            self.bump_sync_version();
+        }
+        self.adapter_mut_inner(aid)
     }
 
     /// Maps frontend number `fe` (zero-based) to an adapter, or `-1`.
@@ -554,7 +577,7 @@ impl Scheduler {
 
     /// Sets the absolute-source table of `aid`.
     pub fn set_absolute_table(&mut self, aid: usize, table: [u8; MAX_SOURCES]) {
-        if let Some(adapter) = self.adapter_mut(aid) {
+        if let Some(adapter) = self.adapter_mut_inner(aid) {
             adapter.config.absolute_table = table;
         }
     }
@@ -581,7 +604,7 @@ impl Scheduler {
     fn enabled_adapter_mut(&mut self, aid: i32) -> Option<&mut Adapter> {
         usize::try_from(aid)
             .ok()
-            .and_then(|index| self.adapter_mut(index))
+            .and_then(|index| self.adapter_mut_inner(index))
             .filter(|adapter| adapter.config.enabled)
     }
 
@@ -1249,15 +1272,20 @@ impl Scheduler {
                 pid,
                 entry.state as i32
             );
+            let mut changed = false;
             if sid != PID_STREAM_ID_UNDEFINED {
                 let had_client = entry.has_client_sid();
-                entry.sids.insert(sid);
+                changed |= entry.sids.insert(sid);
                 if !had_client && entry.has_client_sid() {
                     entry.order = pid_order.next_pid_order();
                 }
             }
             if entry.state == PidState::Deleted {
                 entry.state = PidState::New;
+                changed = true;
+            }
+            if changed {
+                self.bump_sync_version();
             }
             return 0;
         }
@@ -1289,6 +1317,7 @@ impl Scheduler {
         if entry.has_client_sid() {
             entry.order = pid_order.next_pid_order();
         }
+        self.bump_sync_version();
         0
     }
 
@@ -1310,8 +1339,7 @@ impl Scheduler {
             .filter(|entry| entry.state != PidState::Inactive)
     }
 
-    /// Mutable PID entry lookup, same scan as [`Self::find_pid`].
-    pub fn find_pid_mut(&mut self, aid: i32, pid: i32) -> Option<&mut PidEntry> {
+    pub(crate) fn find_pid_mut_inner(&mut self, aid: i32, pid: i32) -> Option<&mut PidEntry> {
         let adapter = self.enabled_adapter_mut(aid)?;
         adapter
             .pids
@@ -1319,8 +1347,17 @@ impl Scheduler {
             .find(|entry| entry.state != PidState::Inactive && entry.pid == pid)
     }
 
+    /// Mutable PID entry lookup, same scan as [`Self::find_pid`].
+    pub fn find_pid_mut(&mut self, aid: i32, pid: i32) -> Option<&mut PidEntry> {
+        if self.find_pid(aid, pid).is_some() {
+            self.bump_sync_version();
+        }
+        self.find_pid_mut_inner(aid, pid)
+    }
+
     fn mark_pid_deleted(&mut self, index: usize, sid: StreamId, pid: Option<i32>) {
         let mut deleted = Vec::new();
+        let mut changed = false;
         {
             let Some(adapter) = self.adapters[index].as_mut() else {
                 return;
@@ -1334,11 +1371,12 @@ impl Scheduler {
                 }
                 let was_live = entry.state != PidState::Deleted;
                 if sid == PID_STREAM_ID_UNDEFINED {
+                    changed |= was_live || !entry.sids.is_empty();
                     entry.state = PidState::Deleted;
                     entry.sids.clear();
                     entry.order = 0;
                 } else {
-                    entry.sids.remove(&sid);
+                    changed |= entry.sids.remove(&sid);
                     if !entry.has_client_sid() {
                         entry.order = 0;
                     }
@@ -1351,14 +1389,18 @@ impl Scheduler {
                                 && filter.pid == entry.pid
                                 && filter.flags & pmt::FILTER_ADD_REMOVE != 0
                         });
-                    if entry.sids.is_empty() && !keep {
+                    if entry.sids.is_empty() && !keep && entry.state != PidState::Deleted {
                         entry.state = PidState::Deleted;
+                        changed = true;
                     }
                 }
                 if was_live && entry.state == PidState::Deleted {
                     deleted.push(entry.pid);
                 }
             }
+        }
+        if changed {
+            self.bump_sync_version();
         }
         // C++ mark_pid_deleted() closes CA PIDs and stops PMTs that lost
         // their last live stream before update_pids() runs.
@@ -1478,6 +1520,7 @@ impl Scheduler {
         self.emulate_add_all_pids(index);
         let emulate = self.pmt.emulate_pids_all;
         let section_pids = PidSet::from_pids(self.section_pids(index as i32));
+        let mut changed = false;
         {
             let Some(adapter) = self.adapters[index].as_mut() else {
                 return 1;
@@ -1486,6 +1529,7 @@ impl Scheduler {
                 if adapter.pids[slot].state != PidState::Deleted {
                     continue;
                 }
+                changed = true;
                 if adapter.pids[slot].fd > 0 {
                     if adapter.active_pids > 0 {
                         adapter.active_pids -= 1;
@@ -1553,6 +1597,7 @@ impl Scheduler {
                 }
                 adapter.pids[slot].state = PidState::Active;
                 adapter.pids[slot].packets = 0;
+                changed = true;
             }
 
             // The C++ drives each PID through set_pid/del_filters above; also
@@ -1568,6 +1613,9 @@ impl Scheduler {
             if adapter.tuner.set_pids(&pids).is_err() {
                 rv = 1;
             }
+        }
+        if changed {
+            self.bump_sync_version();
         }
         self.sort_pids(index);
         // C++ update_pids() tail: settle claims and PMT states even when no

@@ -542,6 +542,31 @@ impl BindDevQuery for RawBindDev {
     }
 }
 
+/// Polls `fd` for readability up to `timeout_ms` (`POLLERR`/`POLLHUP` -> `ErrOrHup`).
+#[cfg(target_os = "linux")]
+pub fn poll_wait_readable(fd: RawFd, timeout_ms: i32) -> ms_tuner::WaitReadable {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a valid single-element `pollfd`.
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc < 0 {
+        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            return ms_tuner::WaitReadable::TimedOut;
+        }
+        return ms_tuner::WaitReadable::ErrOrHup;
+    }
+    if rc == 0 {
+        return ms_tuner::WaitReadable::TimedOut;
+    }
+    if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+        return ms_tuner::WaitReadable::ErrOrHup;
+    }
+    ms_tuner::WaitReadable::Ready
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

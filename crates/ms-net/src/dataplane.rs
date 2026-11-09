@@ -8,7 +8,7 @@ use crate::output::{OutputStats, STREAM_TIMER_MS, StreamOutput};
 use crate::rtp::DVB_FRAME;
 use ms_sched::{AdapterTuner, TuneError};
 use ms_ts::TsStage;
-use ms_tuner::{PID_ALL, PidSet, SignalStatus, TsBuf, TuneParams, Tuner, TunerError};
+use ms_tuner::{PID_ALL, PidSet, SignalStatus, TsBuf, TuneParams, Tuner, TunerError, WaitReadable};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::UdpSocket;
@@ -35,6 +35,9 @@ const CC_REPORT_MS: i64 = 1000;
 const DIAG_SIGNAL_STEP: u16 = 13;
 /// Minimum interval between `signal` events for one adapter.
 const DIAG_SIGNAL_PERIOD_MS: i64 = 10_000;
+/// Period of the `diag-log` idle PID snapshot while an adapter has no streams.
+#[cfg(feature = "diag-log")]
+const IDLE_PID_LOG_MS: i64 = 60_000;
 /// DVB frontend status bit the tuner abstraction can report.
 const DIAG_FE_HAS_LOCK: i64 = 0x10;
 /// Minimum interval between `Event::Signal` reports for one adapter.
@@ -713,6 +716,7 @@ struct DataPlane {
     section_pids: PidSet,
     tune_generation: Arc<Mutex<u64>>,
     keep_reading: bool,
+    poll_backoff: bool,
     /// Whether a tune was applied; lock events start after it.
     diag_tuned: bool,
     /// A tuner read has succeeded since the last tune, so `status()` is a real reading.
@@ -727,6 +731,8 @@ struct DataPlane {
     diag_signal: Option<(u16, u16, u32)>,
     /// Time of the last `signal` event.
     diag_signal_ms: i64,
+    #[cfg(feature = "diag-log")]
+    last_idle_pids_ms: i64,
 }
 
 impl DataPlane {
@@ -765,10 +771,13 @@ impl DataPlane {
             section_pids: PidSet::new(),
             tune_generation: Arc::new(Mutex::new(0)),
             keep_reading: false,
+            poll_backoff: false,
             diag_tuned: false,
             diag_lock: None,
             diag_signal: None,
             diag_signal_ms: 0,
+            #[cfg(feature = "diag-log")]
+            last_idle_pids_ms: 0,
             signal_read: false,
             reported_signal: None,
             last_signal_ms: None,
@@ -819,8 +828,57 @@ impl DataPlane {
         }
     }
 
+    #[cfg(feature = "diag-log")]
+    fn log_idle_pids(&mut self, reason: &str, now: i64) {
+        let active: Vec<u16> = self.active_pids.iter().collect();
+        let demux = self.tuner.open_demux_fds();
+        ms_log::log!(
+            "adapter {} idle_pids ({}): outputs={} active_pids={:?} open_demux_fds={:?}",
+            self.config.adapter_id,
+            reason,
+            self.outputs.len(),
+            active,
+            demux
+        );
+        self.last_idle_pids_ms = now;
+    }
+
     fn mono_us(&self) -> i64 {
         self.origin.elapsed().as_micros() as i64
+    }
+
+    fn wait_when_idle(&mut self) {
+        if self.outputs.is_empty() && !self.keep_reading {
+            self.poll_backoff = false;
+            self.wait_commands(Duration::from_millis(STREAM_TIMER_MS as u64));
+            return;
+        }
+        // Back off after POLLERR/POLLHUP or an empty read after Ready so persistent errors never spin.
+        if std::mem::take(&mut self.poll_backoff) {
+            self.wait_commands(IDLE_POLL);
+            return;
+        }
+        let mut cap_ms = STREAM_TIMER_MS;
+        if !self.buf.is_empty() && !self.wait_new_stream {
+            cap_ms = cap_ms.min(FORCE_SEND_MS);
+        }
+        match self
+            .tuner
+            .wait_readable(Duration::from_millis(cap_ms as u64))
+        {
+            WaitReadable::Unsupported => self.wait_commands(IDLE_POLL),
+            WaitReadable::TimedOut => {}
+            // Run the next read immediately (clears dvr overflow on POLLERR), then back off if still empty.
+            WaitReadable::Ready | WaitReadable::ErrOrHup => self.poll_backoff = true,
+        }
+    }
+
+    fn wait_commands(&mut self, wait: Duration) {
+        match self.commands.recv_timeout(wait) {
+            Ok(command) => self.handle(command),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => self.running = false,
+        }
     }
 
     fn run(mut self) {
@@ -836,16 +894,7 @@ impl DataPlane {
             self.flush_queues();
             self.sync_bandwidth();
             if !got_data {
-                let wait = if self.outputs.is_empty() && !self.keep_reading {
-                    Duration::from_millis(STREAM_TIMER_MS as u64)
-                } else {
-                    IDLE_POLL
-                };
-                match self.commands.recv_timeout(wait) {
-                    Ok(command) => self.handle(command),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => self.running = false,
-                }
+                self.wait_when_idle();
             }
         }
     }
@@ -940,6 +989,11 @@ impl DataPlane {
                             .send(Event::OutputStopped(stream_id, stats, subscriber.epoch));
                     self.update_tuner_pids();
                     self.standby_if_idle();
+                    #[cfg(feature = "diag-log")]
+                    {
+                        let now = self.mono_us() / 1000;
+                        self.log_idle_pids("stream_stop", now);
+                    }
                 }
             }
             Command::WritePriority { stream_id, data } => {
@@ -1053,15 +1107,20 @@ impl DataPlane {
         }
         let read = match self.tuner.read(&mut self.buf) {
             Ok(read) => {
-                // The tuner refreshes its cached status inside `read`.
-                self.signal_read = true;
+                if self.tuner.take_status_refreshed() {
+                    self.signal_read = true;
+                }
                 read
             }
             Err(error) => {
+                self.poll_backoff = true;
                 let _ = self.events.send(Event::TunerError(error.to_string()));
                 return false;
             }
         };
+        if read > 0 {
+            self.poll_backoff = false;
+        }
         // stream.cpp:1172,1193-1194: `bw_dmx += rlen`, `nsecs += ...`, `reads++`.
         if let Some(bandwidth) = &self.bandwidth {
             bandwidth.record_read(read, started.elapsed().as_micros() as i64);
@@ -1212,8 +1271,17 @@ impl DataPlane {
         let now = mono / 1000;
         let wall = SystemTime::now();
         let signal = self.tuner.status();
-        self.diag_status(&signal, now);
+        if self.signal_read {
+            self.diag_status(&signal, now);
+        }
         self.report_signal(signal, now);
+        #[cfg(feature = "diag-log")]
+        if self.outputs.is_empty()
+            && !self.keep_reading
+            && now - self.last_idle_pids_ms >= IDLE_PID_LOG_MS
+        {
+            self.log_idle_pids("idle", now);
+        }
         let mut closed = Vec::new();
         for (stream_id, subscriber) in &mut self.outputs {
             // stream.cpp:1337-1340: a failed send (`sid->timeout = 1`) closes now.
@@ -1309,6 +1377,11 @@ impl DataPlane {
                 .send(Event::OutputClosed(stream_id, subscriber.epoch));
             self.update_tuner_pids();
             self.standby_if_idle();
+            #[cfg(feature = "diag-log")]
+            {
+                let now = self.mono_us() / 1000;
+                self.log_idle_pids("stream_stop", now);
+            }
         }
     }
 
@@ -1482,5 +1555,388 @@ mod tests {
         assert_eq!(u16::from(suffix[8]) * 256 + u16::from(suffix[9]), 2);
         // An already-recorded transponder is not new.
         assert_eq!(check_new_transponder(suffix, &mut id), None);
+    }
+
+    struct DeferredStatusTuner {
+        reads: std::sync::Arc<Mutex<u64>>,
+        refresh_on_read: u64,
+        status: SignalStatus,
+        refreshed: bool,
+        polls: std::sync::Arc<Mutex<u64>>,
+        poll_mode: WaitReadable,
+        overflow_once: bool,
+    }
+
+    impl Tuner for DeferredStatusTuner {
+        fn tune(&mut self, _params: &TuneParams) -> TunerResult<()> {
+            self.status = SignalStatus {
+                locked: false,
+                status_valid: false,
+                ..SignalStatus::default()
+            };
+            self.refreshed = false;
+            Ok(())
+        }
+
+        fn set_pids(&mut self, _pids: &PidSet) -> TunerResult<()> {
+            Ok(())
+        }
+
+        fn status(&self) -> SignalStatus {
+            self.status
+        }
+
+        fn take_status_refreshed(&mut self) -> bool {
+            std::mem::take(&mut self.refreshed)
+        }
+
+        fn wait_readable(&mut self, _timeout: Duration) -> WaitReadable {
+            *lock_counter(&self.polls) += 1;
+            self.poll_mode
+        }
+
+        fn read(&mut self, _buf: &mut TsBuf) -> TunerResult<usize> {
+            let count = {
+                let mut r = lock_counter(&self.reads);
+                *r += 1;
+                *r
+            };
+            if self.overflow_once {
+                self.overflow_once = false;
+                return Err(TunerError::Io(io::Error::from_raw_os_error(75)));
+            }
+            if count >= self.refresh_on_read {
+                self.status = SignalStatus::locked(210, 180);
+                self.refreshed = true;
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn no_signal_or_lock_report_before_first_refresh_and_no_read_without_session() {
+        // Spawn a real DataPlane thread with no outputs and `!keep_reading` to exercise the `:892` guard.
+        let spawn_reads = std::sync::Arc::new(Mutex::new(0u64));
+        let spawn_polls = std::sync::Arc::new(Mutex::new(0u64));
+        let spawn_tuner = DeferredStatusTuner {
+            reads: std::sync::Arc::clone(&spawn_reads),
+            refresh_on_read: 1,
+            status: SignalStatus::default(),
+            refreshed: false,
+            polls: std::sync::Arc::clone(&spawn_polls),
+            poll_mode: WaitReadable::Ready,
+            overflow_once: false,
+        };
+        let idle_handle = AdapterHandle::spawn(Box::new(spawn_tuner), DataPlaneConfig::default())
+            .expect("spawn idle");
+        let (reply_tx, reply_rx) = mpsc::channel();
+        idle_handle.send(Command::Tune {
+            params: Box::new(TuneParams::default()),
+            reply: Some(reply_tx),
+        });
+        assert!(
+            reply_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        thread::sleep(Duration::from_millis(65));
+        drop(idle_handle);
+        assert_eq!(
+            *lock_counter(&spawn_reads),
+            0,
+            "DataPlane::run skips read() without outputs or keep_reading"
+        );
+        assert_eq!(
+            *lock_counter(&spawn_polls),
+            0,
+            "DataPlane::run skips wait_readable() without outputs or keep_reading"
+        );
+
+        let (_cmd_tx, commands) = mpsc::channel::<Command>();
+        let (events_tx, events_rx) = mpsc::channel::<Event>();
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let tuner = DeferredStatusTuner {
+            reads: std::sync::Arc::clone(&reads),
+            refresh_on_read: 2,
+            status: SignalStatus::default(),
+            refreshed: false,
+            polls: std::sync::Arc::clone(&polls),
+            poll_mode: WaitReadable::TimedOut,
+            overflow_once: false,
+        };
+        let mut plane = DataPlane::new(
+            Box::new(tuner),
+            DataPlaneConfig::default(),
+            commands,
+            events_tx,
+            None,
+        );
+        plane.handle(Command::Tune {
+            params: Box::new(TuneParams::default()),
+            reply: None,
+        });
+        assert!(matches!(events_rx.try_recv(), Ok(Event::Signal(None))));
+
+        // First active read skips status refresh: neither `diag_lock` nor `Event::Signal` fires.
+        plane.read_once();
+        plane.timers();
+        assert_eq!(plane.diag_lock, None, "no false lock loss on skipped tick");
+        assert!(events_rx.try_recv().is_err());
+
+        // Second active read refreshes status even with 0 TS bytes: both report now.
+        plane.read_once();
+        plane.timers();
+        assert_eq!(plane.diag_lock, Some(true));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(Event::Signal(Some(s))) if s.locked && s.strength == 210
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pollerr_runs_immediate_read_then_backs_off_on_linux_dvb_tuner() {
+        use ms_tuner::linux_dvb::{
+            AdapterState, DemuxFd, DtvProperty, DtvStat, DvbDevice, FrontendInfo, LinuxDvbTuner,
+            MiniCmd, PesOutput, SecDevice, Tone, Voltage,
+        };
+
+        struct ErrLoopDevice {
+            polls: std::sync::Arc<Mutex<u64>>,
+            reads: std::sync::Arc<Mutex<u64>>,
+            overflow_first: bool,
+        }
+
+        impl SecDevice for ErrLoopDevice {
+            fn set_tone(&mut self, _: Tone) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_voltage(&mut self, _: Voltage) -> io::Result<()> {
+                Ok(())
+            }
+            fn send_master_cmd(
+                &mut self,
+                _: &ms_tuner::linux_dvb::DiseqcMessage,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn send_burst(&mut self, _: MiniCmd) -> io::Result<()> {
+                Ok(())
+            }
+            fn sleep_ms(&mut self, _: i32) {}
+        }
+
+        impl DvbDevice for ErrLoopDevice {
+            fn frontend_open(&self) -> bool {
+                true
+            }
+            fn set_properties(&mut self, _: &[DtvProperty]) -> io::Result<()> {
+                Ok(())
+            }
+            fn get_stats(&mut self) -> io::Result<[DtvStat; 3]> {
+                Err(io::ErrorKind::Unsupported.into())
+            }
+            fn enum_delsys(&mut self) -> io::Result<Vec<u32>> {
+                Ok(vec![])
+            }
+            fn get_info(&mut self) -> io::Result<FrontendInfo> {
+                Err(io::ErrorKind::Unsupported.into())
+            }
+            fn get_event(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            fn read_status(&mut self) -> io::Result<i32> {
+                Ok(0)
+            }
+            fn read_ber(&mut self) -> io::Result<u32> {
+                Ok(0)
+            }
+            fn read_signal_strength(&mut self) -> io::Result<u16> {
+                Ok(0)
+            }
+            fn read_snr(&mut self) -> io::Result<u16> {
+                Ok(0)
+            }
+            fn stream_fd(&self) -> DemuxFd {
+                DemuxFd(7)
+            }
+            fn open_demux(&mut self) -> io::Result<DemuxFd> {
+                Ok(DemuxFd(8))
+            }
+            fn close_demux(&mut self, _: DemuxFd) {}
+            fn set_pes_filter(&mut self, _: DemuxFd, _: u16, _: PesOutput) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_section_filter(&mut self, _: DemuxFd, _: u16) -> io::Result<()> {
+                Ok(())
+            }
+            fn read_demux(&mut self, _: DemuxFd, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            fn add_pid(&mut self, _: DemuxFd, _: u16) -> io::Result<()> {
+                Ok(())
+            }
+            fn remove_pid(&mut self, _: DemuxFd, _: u16) -> io::Result<()> {
+                Ok(())
+            }
+            fn demux_stop(&mut self, _: DemuxFd) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_buffer_size(&mut self, _: DemuxFd, _: i32) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_demux_source(&mut self, _: DemuxFd, _: i32) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_proc_data(&mut self, _: i32, _: &str, _: i32) -> io::Result<()> {
+                Ok(())
+            }
+            fn read_stream(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                *lock_counter(&self.reads) += 1;
+                if self.overflow_first {
+                    self.overflow_first = false;
+                    return Err(io::Error::from_raw_os_error(75));
+                }
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            fn now_ms(&self) -> i64 {
+                0
+            }
+            fn poll_fds(&mut self, _: &[DemuxFd], _: i32) -> WaitReadable {
+                *lock_counter(&self.polls) += 1;
+                WaitReadable::ErrOrHup
+            }
+        }
+
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let dev = ErrLoopDevice {
+            polls: std::sync::Arc::clone(&polls),
+            reads: std::sync::Arc::clone(&reads),
+            overflow_first: true,
+        };
+        let tuner = LinuxDvbTuner::with_device(dev, AdapterState::alloc());
+        let handle =
+            AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).expect("spawn");
+        handle.send(Command::KeepReading(true));
+        thread::sleep(Duration::from_millis(55));
+        drop(handle);
+
+        let poll_cnt = *lock_counter(&polls);
+        let read_cnt = *lock_counter(&reads);
+        assert!(read_cnt >= 2, "next read after POLLERR ran ({read_cnt})");
+        assert!(
+            poll_cnt <= 25,
+            "persistent POLLERR backed off instead of spinning ({poll_cnt} polls in 55 ms)"
+        );
+    }
+
+    #[cfg(feature = "diag-log")]
+    #[test]
+    fn periodic_idle_pids_log_emits_once_per_minute_when_idle() {
+        use std::sync::OnceLock;
+
+        struct LogCapture(std::sync::Arc<Mutex<Vec<String>>>);
+        impl ms_log::Backend for LogCapture {
+            fn timestamp(&self) -> ms_log::Timestamp {
+                ms_log::Timestamp::new(1, 1, 0, 0, 0, 0)
+            }
+            fn syslog(&self, _: &str) {}
+            fn stdout(&self, line: &str) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(line.to_owned());
+            }
+        }
+
+        static LINES: OnceLock<std::sync::Arc<Mutex<Vec<String>>>> = OnceLock::new();
+        let lines = LINES.get_or_init(|| {
+            let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+            ms_log::init(ms_log::Config {
+                log: ms_log::ALL_LOG_MODULES | ms_log::LOG_GENERAL,
+                debug: 0,
+                slog: 0,
+                file_line: false,
+                backend: Box::new(LogCapture(std::sync::Arc::clone(&buf))),
+            });
+            buf
+        });
+
+        struct IdleDemuxTuner(Vec<u16>);
+        impl Tuner for IdleDemuxTuner {
+            fn tune(&mut self, _: &TuneParams) -> TunerResult<()> {
+                Ok(())
+            }
+            fn set_pids(&mut self, pids: &PidSet) -> TunerResult<()> {
+                self.0 = pids.iter().collect();
+                Ok(())
+            }
+            fn status(&self) -> SignalStatus {
+                SignalStatus::default()
+            }
+            fn read(&mut self, _: &mut TsBuf) -> TunerResult<usize> {
+                Ok(0)
+            }
+            fn open_demux_fds(&self) -> Option<Vec<(u16, u32)>> {
+                Some(self.0.iter().map(|&p| (p, u32::from(p) + 300)).collect())
+            }
+        }
+
+        let (_cmd_tx, commands) = mpsc::channel::<Command>();
+        let (events_tx, _events_rx) = mpsc::channel::<Event>();
+        let cfg = DataPlaneConfig {
+            adapter_id: 6,
+            ..DataPlaneConfig::default()
+        };
+        let mut plane = DataPlane::new(
+            Box::new(IdleDemuxTuner(Vec::new())),
+            cfg,
+            commands,
+            events_tx,
+            None,
+        );
+        plane.handle(Command::SetBasePids(PidSet::from_pids([0u16, 17])));
+
+        let count_idle = || {
+            lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|l| l.contains("adapter 6 idle_pids (idle):"))
+                .count()
+        };
+
+        // Before 60 s or while `keep_reading` is set, `timers()` does not emit the periodic idle log.
+        plane.timers();
+        assert_eq!(count_idle(), 0);
+        plane.last_idle_pids_ms = -IDLE_PID_LOG_MS;
+        plane.keep_reading = true;
+        plane.timers();
+        assert_eq!(count_idle(), 0);
+
+        // Once truly idle (`outputs` empty, `!keep_reading`) and 60 s elapsed, it logs once and rate-limits.
+        plane.keep_reading = false;
+        plane.timers();
+        assert_eq!(count_idle(), 1);
+        plane.timers();
+        assert_eq!(count_idle(), 1, "suppressed until another 60 s pass");
+
+        let logged = lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|l| l.contains("adapter 6 idle_pids (idle):"))
+            .cloned()
+            .unwrap();
+        assert!(logged.contains("outputs=0"), "{logged}");
+        assert!(logged.contains("active_pids=[0, 17]"), "{logged}");
+        assert!(
+            logged.contains("open_demux_fds=Some([(0, 300), (17, 317)])"),
+            "{logged}"
+        );
     }
 }

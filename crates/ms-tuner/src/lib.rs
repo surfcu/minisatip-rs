@@ -12,5 +12,5 @@ pub mod linux_dvb;
 pub use file::{FileReplayConfig, FileReplayTuner, Pacing};
 pub use tuner::{
     DeliverySystem, PID_ALL, PidSet, Polarization, Result, SignalStatus, TS_PACKET_SIZE, TsBuf,
-    TuneParams, Tuner, TunerError, delsys_name,
+    TuneParams, Tuner, TunerError, WaitReadable, delsys_name,
 };

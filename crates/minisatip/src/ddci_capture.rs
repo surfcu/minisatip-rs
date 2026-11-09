@@ -551,6 +551,18 @@ impl Tuner for TapReader {
     fn take_wait_new_stream(&mut self) -> bool {
         self.inner.take_wait_new_stream()
     }
+
+    fn take_status_refreshed(&mut self) -> bool {
+        self.inner.take_status_refreshed()
+    }
+
+    fn wait_readable(&mut self, timeout: std::time::Duration) -> ms_tuner::WaitReadable {
+        self.inner.wait_readable(timeout)
+    }
+
+    fn open_demux_fds(&self) -> Option<Vec<(u16, u32)>> {
+        self.inner.open_demux_fds()
+    }
 }
 
 /// One capture being written by the writer thread.
