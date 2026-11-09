@@ -881,7 +881,20 @@ impl DataPlane {
         }
     }
 
+    fn wait_after_read(&mut self, got_data: bool, pace_wait: &mut bool) {
+        if got_data {
+            // Pace the first empty-read wait after a partial-buffer burst via IDLE_POLL.
+            *pace_wait = self.full_reads == 0;
+        } else if std::mem::take(pace_wait) && (self.keep_reading || !self.outputs.is_empty()) {
+            self.poll_backoff = false;
+            self.wait_commands(IDLE_POLL);
+        } else {
+            self.wait_when_idle();
+        }
+    }
+
     fn run(mut self) {
+        let mut pace_wait = false;
         while self.running {
             while let Ok(command) = self.commands.try_recv() {
                 self.handle(command);
@@ -893,9 +906,7 @@ impl DataPlane {
             self.timers();
             self.flush_queues();
             self.sync_bandwidth();
-            if !got_data {
-                self.wait_when_idle();
-            }
+            self.wait_after_read(got_data, &mut pace_wait);
         }
     }
 
@@ -1564,7 +1575,37 @@ mod tests {
         refreshed: bool,
         polls: std::sync::Arc<Mutex<u64>>,
         poll_mode: WaitReadable,
-        overflow_once: bool,
+        error_on_read: Option<u64>,
+        scripted_reads: Vec<usize>,
+        alternate_small_reads: bool,
+        poll_sleep: Duration,
+        poll_reads: std::sync::Arc<Mutex<Vec<u64>>>,
+        read_notify: Option<Sender<u64>>,
+        poll_notify: Option<Sender<u64>>,
+    }
+
+    impl DeferredStatusTuner {
+        fn new(
+            reads: std::sync::Arc<Mutex<u64>>,
+            polls: std::sync::Arc<Mutex<u64>>,
+            poll_mode: WaitReadable,
+        ) -> Self {
+            Self {
+                reads,
+                refresh_on_read: 1,
+                status: SignalStatus::default(),
+                refreshed: false,
+                polls,
+                poll_mode,
+                error_on_read: None,
+                scripted_reads: Vec::new(),
+                alternate_small_reads: false,
+                poll_sleep: Duration::ZERO,
+                poll_reads: std::sync::Arc::new(Mutex::new(Vec::new())),
+                read_notify: None,
+                poll_notify: None,
+            }
+        }
     }
 
     impl Tuner for DeferredStatusTuner {
@@ -1591,25 +1632,54 @@ mod tests {
         }
 
         fn wait_readable(&mut self, _timeout: Duration) -> WaitReadable {
-            *lock_counter(&self.polls) += 1;
+            let poll_count = {
+                let mut p = lock_counter(&self.polls);
+                *p += 1;
+                *p
+            };
+            let current_reads = *lock_counter(&self.reads);
+            self.poll_reads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(current_reads);
+            if let Some(tx) = &self.poll_notify {
+                let _ = tx.send(poll_count);
+            }
+            if !self.poll_sleep.is_zero() {
+                thread::sleep(self.poll_sleep);
+            }
             self.poll_mode
         }
 
-        fn read(&mut self, _buf: &mut TsBuf) -> TunerResult<usize> {
+        fn read(&mut self, buf: &mut TsBuf) -> TunerResult<usize> {
             let count = {
                 let mut r = lock_counter(&self.reads);
                 *r += 1;
                 *r
             };
-            if self.overflow_once {
-                self.overflow_once = false;
+            if let Some(tx) = &self.read_notify {
+                let _ = tx.send(count);
+            }
+            if self.error_on_read == Some(count) {
                 return Err(TunerError::Io(io::Error::from_raw_os_error(75)));
             }
             if count >= self.refresh_on_read {
                 self.status = SignalStatus::locked(210, 180);
                 self.refreshed = true;
             }
-            Ok(0)
+            let idx = (count - 1) as usize;
+            let packets = if idx < self.scripted_reads.len() {
+                self.scripted_reads[idx]
+            } else if self.alternate_small_reads && count % 2 == 1 {
+                1
+            } else {
+                0
+            };
+            let mut written = 0;
+            for _ in 0..packets {
+                written += buf.push_data(&pat(1));
+            }
+            Ok(written)
         }
     }
 
@@ -1618,15 +1688,11 @@ mod tests {
         // Spawn a real DataPlane thread with no outputs and `!keep_reading` to exercise the `:892` guard.
         let spawn_reads = std::sync::Arc::new(Mutex::new(0u64));
         let spawn_polls = std::sync::Arc::new(Mutex::new(0u64));
-        let spawn_tuner = DeferredStatusTuner {
-            reads: std::sync::Arc::clone(&spawn_reads),
-            refresh_on_read: 1,
-            status: SignalStatus::default(),
-            refreshed: false,
-            polls: std::sync::Arc::clone(&spawn_polls),
-            poll_mode: WaitReadable::Ready,
-            overflow_once: false,
-        };
+        let spawn_tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&spawn_reads),
+            std::sync::Arc::clone(&spawn_polls),
+            WaitReadable::Ready,
+        );
         let idle_handle = AdapterHandle::spawn(Box::new(spawn_tuner), DataPlaneConfig::default())
             .expect("spawn idle");
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -1657,15 +1723,12 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel::<Event>();
         let reads = std::sync::Arc::new(Mutex::new(0u64));
         let polls = std::sync::Arc::new(Mutex::new(0u64));
-        let tuner = DeferredStatusTuner {
-            reads: std::sync::Arc::clone(&reads),
-            refresh_on_read: 2,
-            status: SignalStatus::default(),
-            refreshed: false,
-            polls: std::sync::Arc::clone(&polls),
-            poll_mode: WaitReadable::TimedOut,
-            overflow_once: false,
-        };
+        let mut tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&polls),
+            WaitReadable::TimedOut,
+        );
+        tuner.refresh_on_read = 2;
         let mut plane = DataPlane::new(
             Box::new(tuner),
             DataPlaneConfig::default(),
@@ -1693,6 +1756,267 @@ mod tests {
             events_rx.try_recv(),
             Ok(Event::Signal(Some(s))) if s.locked && s.strength == 210
         ));
+    }
+
+    #[test]
+    fn repeated_small_reads_with_ready_tuner_pace_without_wait_readable() {
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let (read_tx, read_rx) = mpsc::channel();
+        let mut tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&polls),
+            WaitReadable::Ready,
+        );
+        tuner.alternate_small_reads = true;
+        tuner.read_notify = Some(read_tx);
+        let handle =
+            AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).expect("spawn");
+        let started = Instant::now();
+        handle.send(Command::KeepReading(true));
+        while read_rx.recv_timeout(Duration::from_secs(2)).unwrap() < 6 {}
+        thread::sleep(Duration::from_millis(40));
+        drop(handle);
+        let elapsed = started.elapsed();
+
+        let poll_cnt = *lock_counter(&polls);
+        let paced_waits = *lock_counter(&reads) / 2;
+        let max_waits = (elapsed.as_millis() as u64 / IDLE_POLL.as_millis() as u64) + 5;
+        assert_eq!(poll_cnt, 0, "small-read bursts must not call wait_readable");
+        assert!(
+            (3..=max_waits).contains(&paced_waits),
+            "paced waits bounded by elapsed time ({paced_waits} in {elapsed:?}, max {max_waits})"
+        );
+    }
+
+    #[test]
+    fn full_buffer_read_uses_wait_readable_without_paced_wait() {
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let (poll_tx, poll_rx) = mpsc::channel();
+        let mut tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&polls),
+            WaitReadable::TimedOut,
+        );
+        tuner.scripted_reads = vec![4];
+        tuner.poll_sleep = Duration::from_millis(10);
+        tuner.poll_notify = Some(poll_tx);
+        let poll_reads = std::sync::Arc::clone(&tuner.poll_reads);
+        let cfg = DataPlaneConfig {
+            adapter_buffer: 4 * DVB_FRAME,
+            ..DataPlaneConfig::default()
+        };
+        let handle = AdapterHandle::spawn(Box::new(tuner), cfg).expect("spawn");
+        handle.send(Command::KeepReading(true));
+        assert!(poll_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        drop(handle);
+
+        let recorded = poll_reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(!recorded.is_empty(), "wait_readable must be called");
+        assert_eq!(
+            recorded[0], 2,
+            "wait_readable runs immediately on the empty read after a full-buffer read"
+        );
+    }
+
+    #[test]
+    fn silence_after_data_paces_once_then_uses_wait_readable() {
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let (poll_tx, poll_rx) = mpsc::channel();
+        let mut tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&polls),
+            WaitReadable::TimedOut,
+        );
+        tuner.scripted_reads = vec![1];
+        tuner.poll_sleep = Duration::from_millis(10);
+        tuner.poll_notify = Some(poll_tx);
+        let poll_reads = std::sync::Arc::clone(&tuner.poll_reads);
+        let handle =
+            AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).expect("spawn");
+        handle.send(Command::KeepReading(true));
+        while poll_rx.recv_timeout(Duration::from_secs(2)).unwrap() < 2 {}
+        drop(handle);
+
+        let recorded = poll_reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(
+            recorded.len() >= 2,
+            "expected at least two wait_readable calls: {recorded:?}"
+        );
+        assert_eq!(
+            recorded[0], 3,
+            "read 2 paced via IDLE_POLL; read 3 was the first to call wait_readable"
+        );
+        assert_eq!(recorded[1], 4, "subsequent silent reads use wait_readable");
+    }
+
+    #[test]
+    fn silence_from_start_uses_wait_readable_only() {
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let (poll_tx, poll_rx) = mpsc::channel();
+        let mut tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&polls),
+            WaitReadable::TimedOut,
+        );
+        tuner.poll_sleep = Duration::from_millis(10);
+        tuner.poll_notify = Some(poll_tx);
+        let poll_reads = std::sync::Arc::clone(&tuner.poll_reads);
+        let handle =
+            AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).expect("spawn");
+        handle.send(Command::KeepReading(true));
+        while poll_rx.recv_timeout(Duration::from_secs(2)).unwrap() < 2 {}
+        drop(handle);
+
+        let recorded = poll_reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(
+            recorded.len() >= 2,
+            "expected wait_readable calls: {recorded:?}"
+        );
+        assert_eq!(recorded[0], 1, "first empty read calls wait_readable");
+        assert_eq!(recorded[1], 2, "second empty read calls wait_readable");
+    }
+
+    #[test]
+    fn pollerr_backs_off_and_runs_next_read_on_mock_tuner() {
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let (poll_tx, poll_rx) = mpsc::channel();
+        let mut tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&polls),
+            WaitReadable::ErrOrHup,
+        );
+        tuner.error_on_read = Some(1);
+        tuner.poll_notify = Some(poll_tx);
+        let poll_reads = std::sync::Arc::clone(&tuner.poll_reads);
+        let handle =
+            AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).expect("spawn");
+        let started = Instant::now();
+        handle.send(Command::KeepReading(true));
+        while poll_rx.recv_timeout(Duration::from_secs(2)).unwrap() < 2 {}
+        thread::sleep(Duration::from_millis(30));
+        drop(handle);
+        let elapsed = started.elapsed();
+
+        let read_cnt = *lock_counter(&reads);
+        let poll_cnt = *lock_counter(&polls);
+        let max_polls = (elapsed.as_millis() as u64 / IDLE_POLL.as_millis() as u64) + 5;
+        let recorded = poll_reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(read_cnt >= 3, "next read after ErrOrHup ran ({read_cnt})");
+        assert!(
+            (2..=max_polls).contains(&poll_cnt),
+            "ErrOrHup backed off via IDLE_POLL ({poll_cnt} polls in {elapsed:?}, max {max_polls})"
+        );
+        assert_eq!(recorded[0], 2, "read 1 overflow backed off before polling");
+        assert_eq!(
+            recorded[1], 4,
+            "read 3 ran immediately after ErrOrHup and backed off before read 4 polled"
+        );
+    }
+
+    #[test]
+    fn read_err_while_pacing_pending_waits_one_idle_poll_and_does_not_spin() {
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let (poll_tx, poll_rx) = mpsc::channel();
+        let mut tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&polls),
+            WaitReadable::Ready,
+        );
+        tuner.scripted_reads = vec![1];
+        tuner.error_on_read = Some(2);
+        tuner.poll_notify = Some(poll_tx);
+        let poll_reads = std::sync::Arc::clone(&tuner.poll_reads);
+        let handle =
+            AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).expect("spawn");
+        let started = Instant::now();
+        handle.send(Command::KeepReading(true));
+        while poll_rx.recv_timeout(Duration::from_secs(2)).unwrap() < 2 {}
+        thread::sleep(Duration::from_millis(30));
+        drop(handle);
+        let elapsed = started.elapsed();
+
+        let read_cnt = *lock_counter(&reads);
+        let poll_cnt = *lock_counter(&polls);
+        let max_polls = (elapsed.as_millis() as u64 / IDLE_POLL.as_millis() as u64) + 5;
+        let recorded = poll_reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(read_cnt >= 4, "next read after error ran ({read_cnt})");
+        assert!(
+            (2..=max_polls).contains(&poll_cnt),
+            "loop did not spin ({poll_cnt} polls in {elapsed:?}, max {max_polls})"
+        );
+        assert_eq!(
+            recorded[0], 3,
+            "error on read 2 waited one IDLE_POLL, then read 3 ran and called wait_readable"
+        );
+        assert_eq!(
+            recorded[1], 5,
+            "read 4 ran after Ready and backed off before read 5 polled"
+        );
+    }
+
+    #[test]
+    fn command_sent_during_paced_wait_is_handled_in_that_wait() {
+        let (cmd_tx, commands) = mpsc::channel::<Command>();
+        let (events_tx, _events_rx) = mpsc::channel::<Event>();
+        let reads = std::sync::Arc::new(Mutex::new(0u64));
+        let polls = std::sync::Arc::new(Mutex::new(0u64));
+        let mut tuner = DeferredStatusTuner::new(
+            std::sync::Arc::clone(&reads),
+            std::sync::Arc::clone(&polls),
+            WaitReadable::Ready,
+        );
+        tuner.scripted_reads = vec![1];
+        let mut plane = DataPlane::new(
+            Box::new(tuner),
+            DataPlaneConfig::default(),
+            commands,
+            events_tx,
+            None,
+        );
+        plane.keep_reading = true;
+        let mut pace_wait = false;
+        assert!(plane.read_once());
+        plane.wait_after_read(true, &mut pace_wait);
+        assert!(pace_wait, "partial read arms pacing");
+        assert_eq!(*lock_counter(&reads), 1);
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        cmd_tx
+            .send(Command::Tune {
+                params: Box::new(TuneParams::default()),
+                reply: Some(reply_tx),
+            })
+            .unwrap();
+        plane.wait_after_read(false, &mut pace_wait);
+
+        assert!(!pace_wait, "paced wait consumed");
+        assert!(
+            matches!(reply_rx.try_recv(), Ok(Ok(()))),
+            "command handled inside the paced wait"
+        );
+        assert_eq!(*lock_counter(&reads), 1, "tuner saw no further read");
+        assert_eq!(*lock_counter(&polls), 0, "wait_readable was not called");
     }
 
     #[cfg(target_os = "linux")]
