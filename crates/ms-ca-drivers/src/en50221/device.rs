@@ -154,6 +154,38 @@ pub enum MmiPage {
 /// A menu request or a held unsolicited page ends after this long without activity.
 pub const MENU_IDLE_MS: i64 = 120_000;
 
+/// Host adapter tuned identity for `cam_stuck` cross-transponder comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransponderKey {
+    pub src: i32,
+    pub freq: i32,
+    pub pol: i32,
+    pub msys: i32,
+    pub tsid: u16,
+}
+
+impl TransponderKey {
+    /// Same source + known PAT `tsid`, else all tuned parameters equal.
+    pub fn same_transponder(self, other: Self) -> bool {
+        if self.tsid != 0 && other.tsid != 0 {
+            self.src == other.src && self.tsid == other.tsid
+        } else {
+            (self.src, self.freq, self.pol, self.msys)
+                == (other.src, other.freq, other.pol, other.msys)
+        }
+    }
+}
+
+impl std::fmt::Display for TransponderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "src={}/freq={}/pol={}/msys={}/tsid={}",
+            self.src, self.freq, self.pol, self.msys, self.tsid
+        )
+    }
+}
+
 /// `--cam-recovery` state of one service on the DDCI path, keyed by SID.
 struct ServiceRun {
     pmt_id: usize,
@@ -162,6 +194,16 @@ struct ServiceRun {
     stuck_since: i64,
     used: bool,
     warned: bool,
+    tp_key: Option<TransponderKey>,
+    ever_clean: bool,
+    regressed_at: i64,
+    regressed_seq: u64,
+    last_tier1_at: i64,
+    last_tier1_seq: u64,
+    last_tier1_kind: &'static str,
+    post_windows: u32,
+    latest_stuck: bool,
+    latest_clean_100: bool,
 }
 
 /// One CI slot, host side.
@@ -240,6 +282,15 @@ pub struct CaDevice {
     silent_due: Vec<usize>,
     /// SIDs warned about being on more than one PMT.
     cam_recovery_duplicates: BTreeSet<u16>,
+    /// When `state` transitioned to `Initialized` (ms; -1 while not initialised).
+    pub ready_since: i64,
+    /// Start of the current `cam_stuck` episode (ms; -1 none).
+    pub cam_stuck_episode_since: i64,
+    /// Whether the current `cam_stuck` episode has already alerted or logged held.
+    pub cam_stuck_episode_alerted: bool,
+    /// Time of the last emitted `cam_stuck` alert; survives `teardown` (ms; -1 none).
+    pub cam_stuck_last_alert_ms: i64,
+    cam_stuck_batch_clean: bool,
     /// This slot's `cam_state` changes; kept across reconnects.
     cam_states: ms_log::diag::events::CamStateFilter,
     close_requested: bool,
@@ -306,6 +357,11 @@ impl CaDevice {
             cam_recovery_services: BTreeMap::new(),
             silent_due: Vec::new(),
             cam_recovery_duplicates: BTreeSet::new(),
+            ready_since: -1,
+            cam_stuck_episode_since: -1,
+            cam_stuck_episode_alerted: false,
+            cam_stuck_last_alert_ms: -1,
+            cam_stuck_batch_clean: false,
             cam_states: Default::default(),
             close_requested: false,
             events: VecDeque::new(),
@@ -491,6 +547,10 @@ impl CaDevice {
         self.cam_recovery_services.clear();
         self.silent_due.clear();
         self.cam_recovery_duplicates.clear();
+        self.ready_since = -1;
+        self.cam_stuck_episode_since = -1;
+        self.cam_stuck_episode_alerted = false;
+        self.cam_stuck_batch_clean = false;
         self.link = None;
         self.sock = None;
         self.close_requested = false;
@@ -512,6 +572,7 @@ impl CaDevice {
         self.link = None;
         self.sock = None;
         self.state = CaState::Inactive;
+        self.ready_since = -1;
         self.enabled = true;
     }
 
@@ -1214,10 +1275,21 @@ impl CaDevice {
         self.cam_recovery_changed = self.now();
     }
 
-    /// Judges one window: `scrambled` and `clear` are its packet counts, `window_ms`
-    /// its length, `active` a CAPMT in place. Only windows after the anchor plus lag count.
+    /// Judges one window without a sequence tag (unit tests).
     pub fn cam_recovery_window(
         &mut self,
+        window_ms: i64,
+        scrambled: u64,
+        clear: u64,
+        active: bool,
+    ) {
+        self.cam_recovery_window_seq(0, window_ms, scrambled, clear, active);
+    }
+
+    /// Judges one window (`seq` tags any MMI CAPMT re-send for `cam_stuck`).
+    pub fn cam_recovery_window_seq(
+        &mut self,
+        seq: u64,
         window_ms: i64,
         scrambled: u64,
         clear: u64,
@@ -1240,6 +1312,8 @@ impl CaDevice {
         let judged =
             self.cam_recovery_since >= 0 && start >= self.cam_recovery_since + CAM_RECOVERY_LAG_MS;
         if clean {
+            self.cam_stuck_episode_since = -1;
+            self.cam_stuck_episode_alerted = false;
             // A window that starts before the last CAPMT change does not re-arm.
             let after_change = self.cam_recovery_changed < 0
                 || start >= self.cam_recovery_changed + CAM_RECOVERY_LAG_MS;
@@ -1290,6 +1364,12 @@ impl CaDevice {
         self.cam_recovery_since = -1;
         self.cam_recovery_stuck_since = -1;
         self.cam_recovery_due = true;
+        for svc in self.cam_recovery_services.values_mut() {
+            svc.last_tier1_at = now;
+            svc.last_tier1_seq = seq;
+            svc.last_tier1_kind = "mmi";
+            svc.post_windows = 0;
+        }
     }
 
     /// Whether `--cam-recovery` fired since the last call; the worker then re-sends the CAPMTs.
@@ -1343,25 +1423,57 @@ impl CaDevice {
                         stuck_since: -1,
                         used: false,
                         warned: false,
+                        tp_key: None,
+                        ever_clean: false,
+                        regressed_at: -1,
+                        regressed_seq: 0,
+                        last_tier1_at: -1,
+                        last_tier1_seq: 0,
+                        last_tier1_kind: "none",
+                        post_windows: 0,
+                        latest_stuck: false,
+                        latest_clean_100: false,
                     },
                 );
             }
         }
-        if !active {
-            for run in self.cam_recovery_services.values_mut() {
+        self.cam_stuck_batch_clean = false;
+        for run in self.cam_recovery_services.values_mut() {
+            run.latest_stuck = false;
+            run.latest_clean_100 = false;
+            if !active {
                 run.joined = now;
                 run.stuck_since = -1;
                 run.used = false;
                 run.warned = false;
+                run.ever_clean = false;
+                run.regressed_at = -1;
+                run.regressed_seq = 0;
+                run.last_tier1_at = -1;
+                run.last_tier1_seq = 0;
+                run.last_tier1_kind = "none";
+                run.post_windows = 0;
             }
         }
     }
 
-    /// Judges one service's window by its own ES pids; a sustained stuck run
-    /// queues that service's CAPMT for a silent re-send, once per join.
+    /// Judges one service's window without sequence or transponder key (unit tests).
     pub fn cam_recovery_service_window(
         &mut self,
         sid: u16,
+        window_ms: i64,
+        scrambled: u64,
+        clear: u64,
+    ) {
+        self.cam_recovery_service_window_seq(0, sid, None, window_ms, scrambled, clear);
+    }
+
+    /// Judges one service's window by its ES pids and updates `cam_stuck` confirmation state.
+    pub fn cam_recovery_service_window_seq(
+        &mut self,
+        seq: u64,
+        sid: u16,
+        tp_key: Option<TransponderKey>,
         window_ms: i64,
         scrambled: u64,
         clear: u64,
@@ -1372,55 +1484,207 @@ impl CaDevice {
             }
             return;
         }
-        let Some(run) = self.cam_recovery_services.get(&sid) else {
-            return;
-        };
-        let now = self.now();
-        let start = now - window_ms;
-        if start < run.joined + CAM_RECOVERY_LAG_MS {
-            return;
-        }
         let total = scrambled + clear;
+        let clean_1000 = clear >= SERVICE_CLEAN_MIN_PKTS
+            && scrambled * 100 < total * SERVICE_CLEAN_MAX_SCRAMBLED_PCT;
+        let clean_100 = clear >= VETO_CLEAN_MIN_PKTS
+            && scrambled * 100 < total * SERVICE_CLEAN_MAX_SCRAMBLED_PCT;
         let stuck =
             scrambled >= CAM_RECOVERY_MIN_PKTS && scrambled * 100 >= total * CAM_RECOVERY_SHARE;
-        if !stuck {
-            if let Some(run) = self.cam_recovery_services.get_mut(&sid) {
-                run.stuck_since = -1;
-            }
-            return;
+        if clean_100
+            && (self.cam_recovery_services.contains_key(&sid)
+                || self.cam_recovery_duplicates.contains(&sid))
+        {
+            self.cam_stuck_batch_clean = true;
         }
+        let now = self.now();
+        let start = now - window_ms;
+        let slot_id = self.id;
         let timeout = self.cam_recovery_timeout_ms.max(SILENT_MIN_RUN_MS);
-        let run = self.cam_recovery_services.get_mut(&sid).expect("present");
-        if run.stuck_since < 0 {
-            run.stuck_since = start;
-        }
-        let run_ms = now - run.stuck_since;
-        if run_ms < timeout {
+        let Some(run) = self.cam_recovery_services.get_mut(&sid) else {
             return;
+        };
+        run.tp_key = tp_key;
+        run.latest_clean_100 = clean_100;
+        run.latest_stuck = stuck;
+        let clean_in_join = clean_1000 && start >= run.joined;
+        if clean_in_join {
+            run.ever_clean = true;
+            run.regressed_at = -1;
+            run.regressed_seq = 0;
+            run.post_windows = 0;
+        } else if stuck && run.ever_clean && run.regressed_at < 0 {
+            run.regressed_at = start;
+            run.regressed_seq = seq;
+            run.post_windows = 0;
         }
-        let pmt_id = run.pmt_id;
-        if run.used {
-            if !run.warned {
-                ms_log::log!(
-                    "CA {}: PMT {} ES packets still scrambled; its CAPMT was already re-sent once",
-                    self.id,
-                    pmt_id
-                );
-                run.warned = true;
+        let mut silent_pmt = None;
+        if start >= run.joined + CAM_RECOVERY_LAG_MS {
+            if !stuck {
+                run.stuck_since = -1;
+            } else {
+                if run.stuck_since < 0 {
+                    run.stuck_since = start;
+                }
+                let run_ms = now - run.stuck_since;
+                if run_ms >= timeout {
+                    let pmt_id = run.pmt_id;
+                    if run.used {
+                        if !run.warned {
+                            ms_log::log!(
+                                "CA {}: PMT {} ES packets still scrambled; its CAPMT was already re-sent once",
+                                slot_id,
+                                pmt_id
+                            );
+                            run.warned = true;
+                        }
+                    } else {
+                        run.used = true;
+                        run.last_tier1_at = now;
+                        run.last_tier1_seq = seq;
+                        run.last_tier1_kind = "rejoin";
+                        run.post_windows = 0;
+                        ms_log::log!(
+                            "CA {}: PMT {} {} of {} ES packets still scrambled for {} ms with no CAM message, re-sending its CAPMT (CAM recovery)",
+                            slot_id,
+                            pmt_id,
+                            scrambled,
+                            total,
+                            run_ms
+                        );
+                        silent_pmt = Some(pmt_id);
+                    }
+                }
             }
+        }
+        if run.regressed_at >= 0 && !clean_in_join {
+            let anchor_seq = run.regressed_seq.max(run.last_tier1_seq);
+            if seq > anchor_seq {
+                run.post_windows = run.post_windows.saturating_add(1);
+            }
+        }
+        if let Some(pmt_id) = silent_pmt {
+            self.silent_due.push(pmt_id);
+            self.report_state("cam_recovery");
+        }
+    }
+
+    /// Checks `cam_stuck` alert conditions after a `ServiceWindows` batch on an active CAM.
+    pub fn cam_recovery_check_stuck(&mut self) {
+        if self.cam_recovery_timeout_ms <= 0 || self.state != CaState::Initialized {
             return;
         }
-        run.used = true;
+        let now = self.now();
+        if self.cam_stuck_episode_since >= 0
+            && now - self.cam_stuck_episode_since >= CAM_STUCK_EPISODE_MS
+        {
+            self.cam_stuck_episode_since = -1;
+            self.cam_stuck_episode_alerted = false;
+        }
+        if self.ready_since < 0 || now - self.ready_since < CAM_STUCK_READY_MIN_MS {
+            return;
+        }
+        if self.cam_stuck_batch_clean
+            || self
+                .cam_recovery_services
+                .values()
+                .any(|run| run.latest_clean_100)
+        {
+            return;
+        }
+        struct Qualified {
+            pmt_id: usize,
+            sid: u16,
+            tp: TransponderKey,
+            regressed_at: i64,
+            regressed_seq: u64,
+            last_tier1_at: i64,
+            last_tier1_seq: u64,
+            last_tier1_kind: &'static str,
+        }
+        let mut qualified = Vec::new();
+        for (&sid, run) in &self.cam_recovery_services {
+            let Some(tp) = run.tp_key else {
+                continue;
+            };
+            if !run.ever_clean
+                || run.regressed_at < 0
+                || now - run.regressed_at > CAM_STUCK_REGRESSION_MAX_MS
+            {
+                continue;
+            }
+            let tier1_done =
+                run.used || (run.regressed_seq > 0 && run.last_tier1_seq >= run.regressed_seq);
+            if !tier1_done || run.post_windows < CAM_STUCK_POST_WINDOWS || !run.latest_stuck {
+                continue;
+            }
+            qualified.push(Qualified {
+                pmt_id: run.pmt_id,
+                sid,
+                tp,
+                regressed_at: run.regressed_at,
+                regressed_seq: run.regressed_seq,
+                last_tier1_at: run.last_tier1_at,
+                last_tier1_seq: run.last_tier1_seq,
+                last_tier1_kind: run.last_tier1_kind,
+            });
+        }
+        let has_distinct_muxes = qualified.iter().enumerate().any(|(i, a)| {
+            qualified[i + 1..]
+                .iter()
+                .any(|b| !a.tp.same_transponder(b.tp))
+        });
+        if !has_distinct_muxes {
+            return;
+        }
+        if self.cam_stuck_episode_since < 0 {
+            self.cam_stuck_episode_since = now;
+            self.cam_stuck_episode_alerted = false;
+        }
+        if self.cam_stuck_episode_alerted {
+            return;
+        }
+        self.cam_stuck_episode_alerted = true;
+        let detail = qualified
+            .iter()
+            .map(|q| {
+                let regressed_s = now.saturating_sub(q.regressed_at) / 1000;
+                let kind = if q.regressed_seq > 0 && q.last_tier1_seq >= q.regressed_seq {
+                    q.last_tier1_kind
+                } else {
+                    "used"
+                };
+                let tier1 = if q.last_tier1_at >= 0 {
+                    let tier1_s = now.saturating_sub(q.last_tier1_at) / 1000;
+                    format!("{}({}s_ago,seq={})", kind, tier1_s, q.last_tier1_seq)
+                } else {
+                    format!("{}(seq={})", kind, q.last_tier1_seq)
+                };
+                format!(
+                    "PMT {} sid 0x{:04x} ({}) regressed={}s_ago tier1={}",
+                    q.pmt_id, q.sid, q.tp, regressed_s, tier1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.cam_stuck_last_alert_ms >= 0
+            && now - self.cam_stuck_last_alert_ms < CAM_STUCK_HOLD_MS
+        {
+            ms_log::log!(
+                "CA {}: cam_stuck held ({}s since last alert): [{}]",
+                self.id,
+                now.saturating_sub(self.cam_stuck_last_alert_ms) / 1000,
+                detail
+            );
+            return;
+        }
+        self.cam_stuck_last_alert_ms = now;
         ms_log::log!(
-            "CA {}: PMT {} {} of {} ES packets still scrambled for {} ms with no CAM message, re-sending its CAPMT (CAM recovery)",
+            "CA {}: cam_stuck: [{}]; manual CAM reset may be needed",
             self.id,
-            pmt_id,
-            scrambled,
-            total,
-            run_ms
+            detail
         );
-        self.silent_due.push(pmt_id);
-        self.report_state("cam_recovery");
+        self.report_state("cam_stuck");
     }
 
     /// The CAPMT pmt ids queued by the silent path since the last call.
@@ -1433,6 +1697,14 @@ impl CaDevice {
 /// scrambled at CAM_RECOVERY_SHARE percent or more; clean is the reverse. No C++ equivalent.
 pub const CAM_RECOVERY_MIN_PKTS: u64 = 1000;
 pub const CAM_RECOVERY_SHARE: u64 = 90;
+const SERVICE_CLEAN_MIN_PKTS: u64 = 1000;
+const VETO_CLEAN_MIN_PKTS: u64 = 100;
+const SERVICE_CLEAN_MAX_SCRAMBLED_PCT: u64 = 10;
+const CAM_STUCK_POST_WINDOWS: u32 = 3;
+const CAM_STUCK_READY_MIN_MS: i64 = 5 * 60_000;
+const CAM_STUCK_REGRESSION_MAX_MS: i64 = 15 * 60_000;
+const CAM_STUCK_EPISODE_MS: i64 = 15 * 60_000;
+const CAM_STUCK_HOLD_MS: i64 = 30 * 60_000;
 /// Minimum time between two recoveries of one slot (ms), against a recovery loop.
 pub const CAM_RECOVERY_MIN_GAP_MS: i64 = 600_000;
 /// Stats reach the watchdog up to two STATS_MS late, so a window must start this long after the anchor.

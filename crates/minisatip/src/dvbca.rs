@@ -11,7 +11,9 @@ use ms_ca::{CaCaps, CaDriver, CaService, EsStream, Program, ProgramTable, Tables
 use ms_ca_drivers::en50221::device::{
     ApduSink, CaDevice as CiDevice, CaPmtSink, CaState, CcKeyBytes, HostEvent, UnsolicitedMmi,
 };
-use ms_ca_drivers::en50221::{AdapterInfo, CaOpener, CaRegistry, Clock, InitResult};
+use ms_ca_drivers::en50221::{
+    AdapterInfo, CaOpener, CaRegistry, Clock, InitResult, TransponderKey,
+};
 use ms_config::Options;
 use ms_net::web::CamMenuOp;
 
@@ -128,41 +130,95 @@ impl DvbcaSettings {
     }
 }
 
-/// Reads back the scrambled windows a test `Dvbca` was sent.
 #[cfg(test)]
-pub(crate) struct WindowRecorder(Receiver<Request>);
+pub(crate) type SequencedScrambledWindow = (usize, u64, u64, u64, i64);
+
+#[cfg(test)]
+pub(crate) type ServiceWindowItem = (u16, Option<TransponderKey>, u64, u64);
+
+#[cfg(test)]
+pub(crate) type SequencedServiceWindowReport = (usize, u64, i64, Vec<ServiceWindowItem>);
+
+/// Reads back the scrambled and service windows a test `Dvbca` was sent without dropping either.
+#[cfg(test)]
+pub(crate) struct WindowRecorder {
+    rx: Receiver<Request>,
+    scrambled: std::cell::RefCell<Vec<SequencedScrambledWindow>>,
+    services: std::cell::RefCell<Vec<SequencedServiceWindowReport>>,
+}
 
 #[cfg(test)]
 impl WindowRecorder {
-    /// The `(adapter, scrambled, clear, window_ms)` windows sent so far, in order.
-    pub(crate) fn windows(&self) -> Vec<(usize, u64, u64, i64)> {
-        self.0
-            .try_iter()
-            .filter_map(|request| match request {
+    fn new(rx: Receiver<Request>) -> Self {
+        Self {
+            rx,
+            scrambled: std::cell::RefCell::new(Vec::new()),
+            services: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn pump(&self) {
+        for request in self.rx.try_iter() {
+            match request {
                 Request::ScrambledWindow {
                     adapter,
+                    seq,
                     scrambled,
                     clear,
                     window_ms,
-                } => Some((adapter, scrambled, clear, window_ms)),
-                _ => None,
+                } => self
+                    .scrambled
+                    .borrow_mut()
+                    .push((adapter, seq, scrambled, clear, window_ms)),
+                Request::ServiceWindows {
+                    adapter,
+                    seq,
+                    window_ms,
+                    services,
+                } => self
+                    .services
+                    .borrow_mut()
+                    .push((adapter, seq, window_ms, services)),
+                _ => {}
+            }
+        }
+    }
+
+    /// The `(adapter, scrambled, clear, window_ms)` windows sent since the last drain, in order.
+    pub(crate) fn windows(&self) -> Vec<(usize, u64, u64, i64)> {
+        self.windows_with_seq()
+            .into_iter()
+            .map(|(adapter, _, scrambled, clear, window_ms)| (adapter, scrambled, clear, window_ms))
+            .collect()
+    }
+
+    /// The `(adapter, seq, scrambled, clear, window_ms)` windows sent since the last drain.
+    pub(crate) fn windows_with_seq(&self) -> Vec<SequencedScrambledWindow> {
+        self.pump();
+        std::mem::take(&mut *self.scrambled.borrow_mut())
+    }
+
+    /// The `(adapter, window_ms, services)` service windows sent since the last drain, in order.
+    pub(crate) fn service_windows(&self) -> Vec<ServiceWindowReport> {
+        self.service_windows_with_seq()
+            .into_iter()
+            .map(|(adapter, _, window_ms, services)| {
+                (
+                    adapter,
+                    window_ms,
+                    services
+                        .into_iter()
+                        .map(|(sid, _, scr, clr)| (sid, scr, clr))
+                        .collect(),
+                )
             })
             .collect()
     }
 
-    /// The `(adapter, window_ms, services)` service windows sent so far, in order.
-    pub(crate) fn service_windows(&self) -> Vec<ServiceWindowReport> {
-        self.0
-            .try_iter()
-            .filter_map(|request| match request {
-                Request::ServiceWindows {
-                    adapter,
-                    window_ms,
-                    services,
-                } => Some((adapter, window_ms, services)),
-                _ => None,
-            })
-            .collect()
+    /// The `(adapter, seq, window_ms, services)` service windows sent since the last drain.
+    pub(crate) fn service_windows_with_seq(&self) -> Vec<SequencedServiceWindowReport> {
+        self.pump();
+        std::mem::take(&mut *self.services.borrow_mut())
     }
 }
 
@@ -188,15 +244,17 @@ enum Request {
     /// One window of an adapter's output: packets left scrambled and clear.
     ScrambledWindow {
         adapter: usize,
+        seq: u64,
         scrambled: u64,
         clear: u64,
         window_ms: i64,
     },
-    /// One window per service: its `(sid, scrambled, clear)` counts.
+    /// One window per service: its `(sid, tp_key, scrambled, clear)` counts.
     ServiceWindows {
         adapter: usize,
+        seq: u64,
         window_ms: i64,
-        services: Vec<(u16, u64, u64)>,
+        services: Vec<(u16, Option<TransponderKey>, u64, u64)>,
     },
     Stop,
 }
@@ -327,7 +385,7 @@ impl Dvbca {
             thread: None,
             serial: 0,
         };
-        (dvbca, WindowRecorder(rx))
+        (dvbca, WindowRecorder::new(rx))
     }
 
     /// Queues `dvbca_process_pmt`; `None` when the worker is gone.
@@ -353,9 +411,17 @@ impl Dvbca {
     }
 
     /// Reports one window of an adapter's output to its CAM (`--cam-recovery`).
-    pub fn report_scrambled(&self, adapter: usize, scrambled: u64, clear: u64, window_ms: i64) {
+    pub fn report_scrambled(
+        &self,
+        adapter: usize,
+        seq: u64,
+        scrambled: u64,
+        clear: u64,
+        window_ms: i64,
+    ) {
         let _ = self.requests.send(Request::ScrambledWindow {
             adapter,
+            seq,
             scrambled,
             clear,
             window_ms,
@@ -366,11 +432,13 @@ impl Dvbca {
     pub fn report_service_windows(
         &self,
         adapter: usize,
+        seq: u64,
         window_ms: i64,
-        services: Vec<(u16, u64, u64)>,
+        services: Vec<(u16, Option<TransponderKey>, u64, u64)>,
     ) {
         let _ = self.requests.send(Request::ServiceWindows {
             adapter,
+            seq,
             window_ms,
             services,
         });
@@ -740,6 +808,7 @@ impl Worker {
             Request::Cam { ca, op } => self.cam_menu(ca, op),
             Request::ScrambledWindow {
                 adapter,
+                seq,
                 scrambled,
                 clear,
                 window_ms,
@@ -756,7 +825,7 @@ impl Worker {
                 let Some(dev) = self.registry.get_mut(adapter as i32) else {
                     return;
                 };
-                dev.cam_recovery_window(window_ms, scrambled, clear, active);
+                dev.cam_recovery_window_seq(seq, window_ms, scrambled, clear, active);
                 // Re-sent here, where `active` was just checked: the CAM has a CA session.
                 if dev.take_cam_recovery()
                     && let Some(capmt) = self.capmt.get_mut(&adapter)
@@ -766,6 +835,7 @@ impl Worker {
             }
             Request::ServiceWindows {
                 adapter,
+                seq,
                 window_ms,
                 services,
             } => {
@@ -794,19 +864,23 @@ impl Worker {
                 };
                 dev.cam_recovery_sync_services(&pairs, active);
                 if active {
-                    for &(sid, scrambled, clear) in &services {
-                        dev.cam_recovery_service_window(sid, window_ms, scrambled, clear);
+                    for &(sid, tp_key, scrambled, clear) in &services {
+                        dev.cam_recovery_service_window_seq(
+                            seq, sid, tp_key, window_ms, scrambled, clear,
+                        );
                     }
                 }
                 // Re-joined here, where `active` was just checked: an initialised CAM with a CAPMT.
                 let due = dev.take_silent_recovery();
-                if due.is_empty() {
-                    return;
-                }
-                if let Some(capmt) = self.capmt.get_mut(&adapter) {
+                if !due.is_empty()
+                    && let Some(capmt) = self.capmt.get_mut(&adapter)
+                {
                     for pmt_id in due {
                         capmt.rejoin_pmt(pmt_id, &self.programs, &mut SlotDriver(dev));
                     }
+                }
+                if active && let Some(dev) = self.registry.get_mut(adapter as i32) {
+                    dev.cam_recovery_check_stuck();
                 }
             }
             Request::Stop => {}
@@ -1595,6 +1669,7 @@ mod tests {
         dev.cam_recovery_since = 0;
         worker.handle(Request::ScrambledWindow {
             adapter: 1,
+            seq: 1,
             scrambled: 50_000,
             clear: 0,
             window_ms: 10_000,
@@ -1636,6 +1711,7 @@ mod tests {
         clock.advance(20_000);
         worker.handle(Request::ScrambledWindow {
             adapter: 0,
+            seq: 1,
             scrambled: 50_000,
             clear: 0,
             window_ms: 10_000,
@@ -1699,6 +1775,7 @@ mod tests {
         clock.advance(20_000);
         worker.handle(Request::ScrambledWindow {
             adapter: 1,
+            seq: 1,
             scrambled: 50_000,
             clear: 0,
             window_ms: 10_000,
@@ -1764,8 +1841,9 @@ mod tests {
         let window = |worker: &mut Worker, a: u64, b: u64| {
             worker.handle(Request::ServiceWindows {
                 adapter: 0,
+                seq: 1,
                 window_ms: 10_000,
-                services: vec![(0x64, a, 0), (0x65, 0, b)],
+                services: vec![(0x64, None, a, 0), (0x65, None, 0, b)],
             });
         };
         window(&mut worker, 0, 0);
@@ -1842,8 +1920,9 @@ mod tests {
         let window = |worker: &mut Worker| {
             worker.handle(Request::ServiceWindows {
                 adapter: 0,
+                seq: 1,
                 window_ms: 10_000,
-                services: vec![(0x64, 2_000, 0)],
+                services: vec![(0x64, None, 2_000, 0)],
             });
         };
         window(&mut worker);
@@ -1936,7 +2015,7 @@ mod tests {
         sched.pmt_add_stream_pid(id, 602, 6, true, false);
 
         let services = ddci_services_for_test(&hub, &sched, 0);
-        assert_eq!(services, [(0x1234, vec![1301, 1302])]);
+        assert_eq!(services, [(0x1234, None, vec![1301, 1302])]);
         let mut base = BTreeMap::new();
         assert_eq!(
             CaRuntime::service_window_deltas(
@@ -1945,7 +2024,7 @@ mod tests {
                 &[(1301, 2_000, 0), (1302, 50, 0)],
                 &services
             ),
-            [(0x1234, 0, 0)],
+            [(0x1234, None, 0, 0)],
             "the first report seeds"
         );
         let deltas = CaRuntime::service_window_deltas(
@@ -1954,16 +2033,17 @@ mod tests {
             &[(1301, 4_000, 0), (1302, 100, 0)],
             &services,
         );
-        assert_eq!(deltas, [(0x1234, 2_050, 0)]);
+        assert_eq!(deltas, [(0x1234, None, 2_050, 0)]);
 
         let (mut worker, clock, cam) = resend_worker();
         worker.add_pmt(zap_program(3, 0x1234), false);
         worker.capmt.get_mut(&0).unwrap().capmt_reason_log = Some(Vec::new());
         let before = sent(&cam, TAG_CA_PMT).len();
-        for _ in 0..3 {
+        for seq in 1..=3 {
             clock.advance(30_000);
             worker.handle(Request::ServiceWindows {
                 adapter: 0,
+                seq,
                 window_ms: 10_000,
                 services: deltas.clone(),
             });
@@ -2135,14 +2215,18 @@ mod tests {
             thread: None,
             serial: 0,
         };
-        dvbca.report_scrambled(3, 9, 1, 10_000);
+        dvbca.report_scrambled(3, 7, 9, 1, 10_000);
         match rx.try_recv() {
             Ok(Request::ScrambledWindow {
                 adapter,
+                seq,
                 scrambled,
                 clear,
                 window_ms,
-            }) => assert_eq!((adapter, scrambled, clear, window_ms), (3, 9, 1, 10_000)),
+            }) => assert_eq!(
+                (adapter, seq, scrambled, clear, window_ms),
+                (3, 7, 9, 1, 10_000)
+            ),
             _ => panic!("no scrambled window request"),
         }
     }
@@ -2405,6 +2489,860 @@ mod tests {
             .find(|d| d.is_ca())
             .expect("ES-level CA descriptor");
         assert_eq!(ca.ca_pid(), Some(mapped as u16));
+    }
+
+    struct CamStuckRig {
+        worker: Worker,
+        clock: Arc<ManualClock>,
+        cam: Arc<Mutex<FakeCam>>,
+        hub: crate::ddci::DdciHub,
+        sched: ms_sched::Scheduler,
+        ca: crate::ca::CaRuntime,
+        recorder: WindowRecorder,
+        cam_cum: (u64, u64),
+        cum: BTreeMap<u16, (u64, u64)>,
+        expected_seq: u64,
+    }
+
+    impl CamStuckRig {
+        fn new(max_programs: usize) -> Self {
+            use ms_ca_drivers::ddci::DdciDevice;
+
+            struct NoTune;
+            impl ms_sched::AdapterTuner for NoTune {
+                fn tune(&mut self, _: &ms_tuner::TuneParams) -> Result<(), ms_sched::TuneError> {
+                    Ok(())
+                }
+            }
+
+            let cam = Arc::new(Mutex::new(FakeCam::new(
+                CamConfig::default(),
+                Arc::new(ms_fakecam::ManualClock::new(0)),
+            )));
+            let clock = Arc::new(ManualClock::new(0, 0));
+            let (tx, _rx) = mpsc::channel();
+            let mut settings = DvbcaSettings {
+                cam_recovery_ms: 10_000,
+                ..DvbcaSettings::default()
+            };
+            settings.channels.insert(0, (max_programs, 1, Vec::new()));
+            let mut worker = Worker::new(
+                settings,
+                Box::new(CamOpener(Arc::clone(&cam))),
+                clock.clone(),
+                tx,
+            );
+            worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+            for _ in 0..500 {
+                let up = worker.registry.get(0).is_some_and(|dev| {
+                    dev.state == CaState::Initialized && CaPmtSink::has_ca_session(dev)
+                });
+                if up {
+                    break;
+                }
+                clock.advance(10);
+                worker.service();
+            }
+
+            let hub = crate::ddci::DdciHub::new();
+            let mut ddci_dev = DdciDevice::new(0, max_programs);
+            ddci_dev.clear_slots();
+            hub.lock().ddci.devices.insert(0, ddci_dev);
+
+            let mut sched = ms_sched::Scheduler::new();
+            let mut ci_cfg = ms_sched::AdapterConfig::new(ms_tuner::DeliverySystem::DvbS2);
+            ci_cfg.adapter_type = ms_sched::AdapterType::Ci;
+            sched.add_adapter(0, ci_cfg, Box::new(NoTune));
+
+            let opts = ms_config::Options {
+                cam_recovery: 10,
+                ..ms_config::Options::default()
+            };
+            let mut ca = crate::ca::CaRuntime::new(&opts);
+            ca.attach_ddci(&mut sched, hub.clone());
+            let (dvbca, recorder) = Dvbca::recording();
+            ca.attach_dvbca(&mut sched, dvbca);
+            ca.set_ci_window_totals_for_test(0, 0, 0, Vec::new());
+
+            let mut rig = Self {
+                worker,
+                clock,
+                cam,
+                hub,
+                sched,
+                ca,
+                recorder,
+                cam_cum: (0, 0),
+                cum: BTreeMap::new(),
+                expected_seq: 0,
+            };
+            // Advance past the 5-minute readiness floor unless a test checks under-5-min behavior.
+            rig.advance_idle(360_000);
+            rig
+        }
+
+        /// Fast-forwards idle time while keeping the CI window baseline anchored at `now`.
+        fn advance_idle(&mut self, ms: i64) {
+            self.clock.advance(ms);
+            self.ca.reanchor_ci_window_for_test(0, self.clock.tick_ms());
+        }
+
+        fn add_host_adapter(
+            &mut self,
+            aid: usize,
+            params: Option<ms_tuner::TuneParams>,
+            tsid: u16,
+        ) {
+            struct NoTune;
+            impl ms_sched::AdapterTuner for NoTune {
+                fn tune(&mut self, _: &ms_tuner::TuneParams) -> Result<(), ms_sched::TuneError> {
+                    Ok(())
+                }
+            }
+            let mut cfg = ms_sched::AdapterConfig::new(ms_tuner::DeliverySystem::DvbS2);
+            cfg.adapter_type = ms_sched::AdapterType::Dvb;
+            self.sched.add_adapter(aid, cfg, Box::new(NoTune));
+            if let Some(tp) = params {
+                self.sched.adapter_mut(aid).unwrap().params = tp;
+            }
+            if tsid != 0 {
+                let fid = self
+                    .sched
+                    .add_filter(aid as i32, 0, ms_sched::pmt::FilterTarget::Pat, 0);
+                let mut pat = vec![
+                    0x00,
+                    0xB0,
+                    0x09,
+                    (tsid >> 8) as u8,
+                    tsid as u8,
+                    0xC1,
+                    0x00,
+                    0x00,
+                ];
+                let crc = ms_ts::crc32_mpeg2(&pat);
+                pat.extend_from_slice(&crc.to_be_bytes());
+                self.sched.process_pat(fid, &pat);
+                assert_eq!(self.sched.adapter_transponder_id(aid), tsid);
+            }
+        }
+
+        /// Maps a host PMT into DDCI device 0 and adds the corresponding CI CAPMT program.
+        fn add_service(
+            &mut self,
+            slot: usize,
+            host_aid: usize,
+            capmt_pmt_id: i32,
+            sid: u16,
+            es_pid: u16,
+            ddci_pid: u16,
+        ) {
+            use ms_ca_drivers::ddci::Mapping;
+
+            let src_pmt = self
+                .sched
+                .pmt_add(host_aid as i32, i32::from(sid), 0x100 + slot as i32);
+            self.sched
+                .pmt_add_stream_pid(src_pmt, i32::from(es_pid), 2, false, true);
+            {
+                let mut state = self.hub.lock();
+                let dev = state.ddci.devices.get_mut(&0).unwrap();
+                dev.pmt[slot].id = src_pmt;
+                dev.mapping.insert(
+                    (host_aid as u16, es_pid),
+                    Mapping {
+                        ad: host_aid as u16,
+                        pid: es_pid,
+                        ddci_pid: i32::from(ddci_pid),
+                        ddci: 0,
+                        rewrite: false,
+                        pmt: BTreeSet::from([src_pmt]),
+                        filter_id: None,
+                        pid_added: false,
+                    },
+                );
+            }
+            self.worker
+                .add_pmt(zap_program(capmt_pmt_id as usize, sid), false);
+            let cur = *self.cum.entry(ddci_pid).or_insert((0, 0));
+            self.ca.seed_service_pid_for_test(0, ddci_pid, cur);
+        }
+
+        /// Runs `CaRuntime::decrypt_windows` at the current clock tick and forwards the recorded pair.
+        fn step_window_at_current_time(&mut self, pid_deltas: &[(u16, u64, u64)]) {
+            for &(ddci_pid, scr, clr) in pid_deltas {
+                self.cam_cum.0 += scr;
+                self.cam_cum.1 += clr;
+                let entry = self.cum.entry(ddci_pid).or_insert((0, 0));
+                entry.0 += scr;
+                entry.1 += clr;
+            }
+            let totals: Vec<(u16, u64, u64)> =
+                self.cum.iter().map(|(&p, &(s, c))| (p, s, c)).collect();
+            self.ca
+                .set_ci_window_totals_for_test(0, self.cam_cum.0, self.cam_cum.1, totals);
+            self.ca
+                .run_decrypt_windows_for_test(&self.sched, self.clock.tick_ms());
+            let scr_reqs = self.recorder.windows_with_seq();
+            let svc_reqs = self.recorder.service_windows_with_seq();
+            assert_eq!(scr_reqs.len(), 1);
+            assert_eq!(svc_reqs.len(), 1);
+            self.expected_seq += 1;
+            let (ad_a, seq_a, scrambled, clear, window_ms) = scr_reqs[0];
+            let (ad_b, seq_b, svc_window_ms, services) =
+                svc_reqs.into_iter().next().expect("service window");
+            assert_eq!(seq_a, self.expected_seq, "decrypt_windows seq increments");
+            assert_eq!(
+                seq_a, seq_b,
+                "decrypt_windows shares seq across both requests"
+            );
+            assert_eq!(
+                (ad_a, ad_b, window_ms, svc_window_ms),
+                (0, 0, 10_000, 10_000)
+            );
+            self.worker.handle(Request::ScrambledWindow {
+                adapter: ad_a,
+                seq: seq_a,
+                scrambled,
+                clear,
+                window_ms,
+            });
+            self.worker.handle(Request::ServiceWindows {
+                adapter: ad_b,
+                seq: seq_b,
+                window_ms: svc_window_ms,
+                services,
+            });
+        }
+
+        /// Advances 10 s and feeds one window through `CaRuntime::decrypt_windows` -> `Worker`.
+        fn step_window(&mut self, pid_deltas: &[(u16, u64, u64)]) {
+            self.clock.advance(10_000);
+            self.step_window_at_current_time(pid_deltas);
+        }
+    }
+
+    fn sat_tp(src: i32, freq: i32, pol: ms_tuner::Polarization) -> ms_tuner::TuneParams {
+        ms_tuner::TuneParams {
+            src,
+            src_specified: true,
+            freq,
+            pol,
+            pol_specified: true,
+            msys: ms_tuner::DeliverySystem::DvbS2,
+            sr: 27_500_000,
+            ..ms_tuner::TuneParams::default()
+        }
+    }
+
+    // 1) 11-07 sequence alerts once in the window ending +100 s (:30:41), never resets, and holds 30 min.
+    #[test]
+    fn cam_stuck_11_07_sequence_alerts_once_and_holds_for_30_minutes() {
+        #[cfg(feature = "diag-log")]
+        let lines = super::diag_capture::lines();
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+
+        // Anchor clock so :29:11 is +10 s from t0: set base at t0 (`ready_since` > 5 min earlier).
+        let t_29_01 = rig.clock.tick_ms();
+        // :29:11 (seq 1) and :29:21 (seq 2): both services clean (`ever_clean` set on seq 2 once `start >= joined`).
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        assert_eq!(rig.clock.tick_ms() - t_29_01, 20_000);
+
+        // Unsolicited MMI arrives right after :29:21 (arms MMI recovery).
+        rig.clock.advance(4_000);
+        rig.worker
+            .registry
+            .get_mut(0)
+            .unwrap()
+            .note_cam_recovery_mmi();
+        rig.clock.advance(6_000);
+        // :29:31 (seq 3): service A regresses (stuck), service B still clean through :30.
+        rig.step_window_at_current_time(&[(1301, 25_000, 0), (1401, 0, 20_000)]);
+
+        // :29:41 (seq 4): A stuck, B neutral (absent :31-:35, <1000 pkts); CAM-wide MMI re-send fires at :29:41.
+        rig.step_window(&[(1301, 25_000, 0), (1401, 500, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_recovery_last,
+            t_29_01 + 40_000
+        );
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // :29:51 (seq 5): A silent re-join fires; B first full stuck window.
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // :30:01 (seq 6), :30:11 (seq 7: B silent re-join fires), :30:21 (seq 8), :30:31 (seq 9): no alert yet.
+        for expected_offset in [60_000, 70_000, 80_000, 90_000] {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+            assert_eq!(rig.clock.tick_ms() - t_29_01, expected_offset);
+            assert_eq!(
+                rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+                -1,
+                "must not alert before :30:41 (offset {expected_offset})"
+            );
+        }
+
+        // :30:41 (seq 10, 3 full windows after B's :30:11 re-join): alerts once, never requests close.
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        let t_30_41 = t_29_01 + 100_000;
+        assert_eq!(rig.clock.tick_ms(), t_30_41);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            t_30_41
+        );
+        assert!(!rig.worker.registry.get_mut(0).unwrap().take_close_request());
+
+        // :30:51 (seq 11): same episode does not re-alert.
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            t_30_41
+        );
+
+        // Teardown ends the episode, but the 30-minute hold survives teardown.
+        rig.worker.registry.get_mut(0).unwrap().teardown();
+        rig.worker.forward_events(0);
+        rig.worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        for _ in 0..500 {
+            let up = rig.worker.registry.get(0).is_some_and(|dev| {
+                dev.state == CaState::Initialized && CaPmtSink::has_ca_session(dev)
+            });
+            if up {
+                break;
+            }
+            rig.clock.advance(10);
+            rig.worker.service();
+        }
+        rig.worker.add_pmt(zap_program(10, 0x0101), false);
+        rig.worker.add_pmt(zap_program(11, 0x0202), false);
+        rig.advance_idle(360_000);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        }
+        assert!(
+            rig.worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_stuck_episode_alerted
+        );
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            t_30_41,
+            "second episode within 30 minutes is held across teardown"
+        );
+
+        // End held episode via CAM-wide clean window, advance past 30 min since t_30_41, and trigger again.
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.advance_idle(1_800_000);
+        for _ in 0..4 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        }
+        assert!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms >= t_30_41 + 1_800_000,
+            "alert fires again once 30-minute hold has elapsed"
+        );
+
+        #[cfg(feature = "diag-log")]
+        {
+            let cam_states: Vec<String> = super::diag_capture::events("cam_state")
+                .into_iter()
+                .filter(|e| e.contains(r#""state":"cam_stuck""#))
+                .collect();
+            assert_eq!(
+                cam_states.len(),
+                2,
+                "one initial + one post-30-min cam_stuck: {cam_states:?}"
+            );
+            let thread = std::thread::current().name().unwrap_or_default().to_owned();
+            let captured = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let alerts: Vec<&String> = captured
+                .iter()
+                .filter(|l| l.contains(&thread) && l.contains("manual CAM reset may be needed"))
+                .collect();
+            assert_eq!(alerts.len(), 2, "{alerts:?}");
+            assert!(alerts[0].contains("PMT 10 sid 0x0101"), "{}", alerts[0]);
+            assert!(alerts[0].contains("PMT 11 sid 0x0202"), "{}", alerts[0]);
+            assert!(alerts[0].contains("freq=11000000"), "{}", alerts[0]);
+            assert!(
+                alerts[0].contains("regressed=80s_ago tier1=rejoin(50s_ago,seq=5)"),
+                "{}",
+                alerts[0]
+            );
+            assert!(
+                alerts[0].contains("regressed=60s_ago tier1=rejoin(30s_ago,seq=7)"),
+                "{}",
+                alerts[0]
+            );
+            let held: Vec<&String> = captured
+                .iter()
+                .filter(|l| l.contains(&thread) && l.contains("cam_stuck held"))
+                .collect();
+            assert_eq!(held.len(), 1, "{held:?}");
+        }
+    }
+
+    // 2) Pre-join clear window (`start < joined`), never-clear, single service, HD+SD (10:1), low-rate clear (100-999), and recovered third service never alert.
+    #[test]
+    fn cam_stuck_never_alerts_for_never_clear_single_or_alongside_clean_service() {
+        // 2a: First window starting before `joined` (`start < run.joined`) does not mark `ever_clean`, so 8 stuck windows after it never alert.
+        let mut rig = CamStuckRig::new(3);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_host_adapter(
+            6,
+            Some(sat_tp(1, 12_000_000, ms_tuner::Polarization::Horizontal)),
+            303,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        for _ in 0..8 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "window starting before joined must not set ever_clean"
+        );
+
+        // 2b: One regressed service alone (other never clear in this join) never alerts.
+        rig.step_window(&[(1301, 0, 20_000), (1401, 25_000, 0)]);
+        for _ in 0..8 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // 2c: Stuck HD services (50_000 scr each) next to a clear SD service (5_000 clr, ~10:1) or low-rate clear (150 clr) never alert.
+        rig.add_service(2, 6, 12, 0x0303, 801, 1501);
+        rig.step_window(&[(1301, 0, 50_000), (1401, 0, 50_000), (1501, 0, 5_000)]);
+        rig.step_window(&[(1301, 0, 50_000), (1401, 0, 50_000), (1501, 0, 5_000)]);
+        for _ in 0..7 {
+            rig.step_window(&[(1301, 50_000, 0), (1401, 50_000, 0), (1501, 0, 5_000)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+        rig.step_window(&[(1301, 50_000, 0), (1401, 50_000, 0), (1501, 0, 150)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // 2d: Third service regresses first, then is clear again (150 clear pkts) while the other two stay stuck: vetoes alert.
+        for _ in 0..4 {
+            rig.step_window(&[(1301, 0, 50_000), (1401, 0, 50_000), (1501, 5_000, 0)]);
+        }
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 50_000, 0), (1401, 50_000, 0), (1501, 0, 150)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+    }
+
+    // 3) Same transponder (one adapter, two adapters equal params, or slight freq offset + same PAT tsid) and missing key never alert.
+    #[test]
+    fn cam_stuck_same_transponder_and_missing_key_never_alert() {
+        // 3a: One adapter carrying two services.
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 12_000_000, ms_tuner::Polarization::Horizontal)),
+            0,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 4, 11, 0x0202, 602, 1302);
+        rig.step_window(&[(1301, 0, 20_000), (1302, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1302, 0, 20_000)]);
+        for _ in 0..8 {
+            rig.step_window(&[(1301, 25_000, 0), (1302, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // 3b: Two adapters with identical tuned params and unknown tsid (0).
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 12_000_000, ms_tuner::Polarization::Horizontal)),
+            0,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 12_000_000, ms_tuner::Polarization::Horizontal)),
+            0,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        for _ in 0..8 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // 3c: Two adapters at slightly different frequencies (12000 vs 12001 MHz) with same PAT tsid.
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 12_000_000, ms_tuner::Polarization::Horizontal)),
+            0x0401,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 12_001_000, ms_tuner::Polarization::Horizontal)),
+            0x0401,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        for _ in 0..8 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // 3d: Default/unknown TuneParams -> no transponder key -> never counts.
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(5, None, 202);
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        for _ in 0..8 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+    }
+
+    // 4) Clean window restarts the 3-window count; neutral windows advance it, and the latest window must be stuck.
+    #[test]
+    fn cam_stuck_neutral_counts_toward_three_clean_restarts_and_latest_must_be_stuck() {
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        // 3 stuck windows after join lag trigger silent re-join on both services (used = true).
+        for _ in 0..3 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        // 2 stuck windows after Tier 1, then 1 clean window restarts the regression and 3-window count.
+        for _ in 0..2 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        rig.step_window(&[(1301, 0, 1_500), (1401, 0, 1_500)]);
+
+        // 3 stuck windows (re-regress + 2 post windows): no alert yet (without the reset, count would be 5).
+        for _ in 0..3 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // 3rd post window is neutral: count reaches 3, but latest is not stuck -> no alert.
+        rig.step_window(&[(1301, 0, 0), (1401, 0, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // 4th post window is stuck: neutral window did not restart the count, so it alerts now.
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            rig.clock.tick_ms()
+        );
+    }
+
+    // 5) Check runs on a batch with no re-join due; no alert while inactive or within 5 min of ready (repeat CA_INFO keeps ready_since).
+    #[test]
+    fn cam_stuck_waits_five_minutes_from_initial_ready_and_skips_inactive_cam() {
+        use ms_ca_drivers::en50221::consts::{EN50221_APP_CA_RESOURCEID, TAG_CA_INFO};
+
+        let mut rig = CamStuckRig::new(2);
+        // Re-anchor `ready_since` right at `now` via a fresh teardown + init.
+        rig.worker.registry.get_mut(0).unwrap().teardown();
+        rig.worker.forward_events(0);
+        rig.worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        for _ in 0..500 {
+            let up = rig.worker.registry.get(0).is_some_and(|dev| {
+                dev.state == CaState::Initialized && CaPmtSink::has_ca_session(dev)
+            });
+            if up {
+                break;
+            }
+            rig.clock.advance(10);
+            rig.worker.service();
+        }
+        let ready_at = rig.worker.registry.get(0).unwrap().ready_since;
+        assert!(ready_at >= 0);
+
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+
+        // Advance to 210 s after ready; 2 clean (230 s) + 6 stuck reach 3 post-rejoin windows at 290 s (< 300 s): no alert yet.
+        rig.advance_idle(210_000);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(rig.clock.tick_ms() - ready_at, 290_000);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // At 300 s (>= 5 min ready), mark CAM `CaState::Active` (inactive CA session): neither a direct
+        // check before `cam_recovery_sync_services(..., false)` nor an inactive `ServiceWindows` batch alerts.
+        rig.advance_idle(10_000);
+        assert_eq!(rig.clock.tick_ms() - ready_at, 300_000);
+        rig.worker.registry.get_mut(0).unwrap().state = CaState::Active;
+        rig.worker
+            .registry
+            .get_mut(0)
+            .unwrap()
+            .cam_recovery_check_stuck();
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // Restore `Initialized` and send repeated CA_INFO at 312 s: `ready_since` stays `ready_at`, and one
+        // stuck window at 322 s still does not alert because the inactive batch cleared the regression.
+        rig.worker.registry.get_mut(0).unwrap().state = CaState::Initialized;
+        assert!(rig.cam.lock().unwrap().send_to_resource(
+            EN50221_APP_CA_RESOURCEID,
+            TAG_CA_INFO,
+            &[0x7E, 0x01, 0x7E, 0x02],
+        ));
+        rig.advance_idle(2_000);
+        for _ in 0..5 {
+            rig.worker.service();
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().caids(),
+            &[0x7E01u16, 0x7E02][..]
+        );
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().ready_since,
+            ready_at,
+            "repeated CA_INFO must not move ready_since"
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "inactive batch disarmed the prior regression"
+        );
+
+        // 2 clean + 6 stuck alert at 402 s (< 5 min after the 312 s repeat CA_INFO).
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        let alert_at = rig.clock.tick_ms();
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            alert_at
+        );
+
+        // Empty CAPMT makes `ServiceWindows` inactive even while `Initialized`, so `cam_recovery_check_stuck` is skipped.
+        rig.worker.handle(Request::DelPmt {
+            adapter: 0,
+            pmt_id: 10,
+        });
+        rig.worker.handle(Request::DelPmt {
+            adapter: 0,
+            pmt_id: 11,
+        });
+        rig.advance_idle(900_000);
+        rig.worker.handle(Request::ServiceWindows {
+            adapter: 0,
+            seq: 99,
+            window_ms: 10_000,
+            services: Vec::new(),
+        });
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_episode_since,
+            alert_at,
+            "inactive ServiceWindows must not run cam_recovery_check_stuck"
+        );
+    }
+
+    // 6) 9-13% scrambled with < 1000 clear packets (11-03 16:32 case) is not clean.
+    #[test]
+    fn cam_stuck_9_to_13_percent_scrambled_under_1000_clear_is_not_clean() {
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+
+        // Warm-up seeds `joined`; then A sees 9.1% (33/363) and 12.0% (45/375) with 330 clear (< 1000) in-join.
+        rig.step_window(&[(1301, 33, 330), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 33, 330), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 45, 330), (1401, 0, 20_000)]);
+        // Both go 100% stuck: A was never clean, so no alert may fire.
+        for _ in 0..7 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // Once A gets a real >= 1000-clear window, regresses, and sees (33 scr, 330 clr) mid-confirmation, it is not reset as clean.
+        rig.step_window(&[(1301, 0, 2_000), (1401, 0, 2_000)]);
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        // 2nd confirmation window for A is (33 scr, 330 clr = 9.1% scr, < 1000 clr): counts as neutral, not clean!
+        rig.step_window(&[(1301, 33, 330), (1401, 25_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+        // 3rd confirmation window stuck: alerts immediately!
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            rig.clock.tick_ms()
+        );
+    }
+
+    // 7) ~11-13% scrambled with >= 1000 clear packets neither marks a service clean in its join nor ends a regression.
+    #[test]
+    fn cam_stuck_11_to_13_percent_scrambled_with_1000_plus_clear_is_not_clean() {
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+
+        // Service A sees 11.5% (2600/22600) and 13.0% (3000/23000) scrambled with 20_000 clear (>= 1000), while B is clean.
+        rig.step_window(&[(1301, 2_600, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 3_000, 20_000), (1401, 0, 20_000)]);
+        // Both go 100% stuck: A was never < 10% scrambled in its join, so no alert may fire.
+        for _ in 0..7 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // Once A gets a clean (< 10% scrambled, >= 1000 clear) window and regresses, (2600 scr, 20000 clr) does not end the regression.
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        rig.step_window(&[(1301, 2_600, 20_000), (1401, 25_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            rig.clock.tick_ms()
+        );
     }
 }
 
@@ -2870,7 +3808,6 @@ mod diag_capture {
 
     /// Lines for `event` emitted by the current test thread, so parallel tests
     /// cannot hide this test's event.
-    #[cfg(feature = "ci-plus")]
     pub(crate) fn events(event: &str) -> Vec<String> {
         let thread = std::thread::current().name().unwrap_or_default().to_owned();
         let event = format!("\"event\":\"{event}\"");

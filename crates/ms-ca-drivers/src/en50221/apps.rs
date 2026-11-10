@@ -142,6 +142,7 @@ impl CaDevice {
         if self.app_of(idx) == Some(App::CaSupport) {
             ms_log::log!("Closed the CA session for CA {}", self.id);
             self.state = CaState::Active;
+            self.ready_since = -1;
             self.push_event(HostEvent::CaSessionClosed);
         }
     }
@@ -316,6 +317,9 @@ impl CaDevice {
         if tag != TAG_CA_INFO {
             ms_log::log!("APP_CA_handler: unexpected tag (0x{:x})", tag);
             return;
+        }
+        if self.state != CaState::Initialized {
+            self.ready_since = self.now();
         }
         self.state = CaState::Initialized;
         self.report_state("ready");

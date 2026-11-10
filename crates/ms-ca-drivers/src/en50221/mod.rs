@@ -27,6 +27,7 @@ pub use capmt::{En50221Driver, TpduLink, apdu_tpdu, asn_1_encode};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use device::{
     ApduDir, ApduRecord, CaDevice, CaPmtSink, CaState, HostEvent, LinkMode, ReadOutcome, Session,
+    TransponderKey,
 };
 pub use link::{AdapterInfo, AdapterKind, CaLink, CaOpener, ResetResult, SlotInfo};
 pub use registry::{CaRegistry, InitResult, authdata_filename};
