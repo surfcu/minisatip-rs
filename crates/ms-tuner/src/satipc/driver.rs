@@ -10,9 +10,9 @@ use std::os::fd::AsRawFd;
 #[cfg(feature = "srt")]
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::client::{Client, Op, ReplyOutcome, Transport};
 use super::config::SatipServer;
@@ -34,6 +34,12 @@ const DEFAULT_LOG: u32 = ms_log::LOG_SATIPC;
 const OPEN_BACKOFF_MS: i64 = 5_000;
 /// Connect timeout per resolved address.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum time non-blocking RTSP writes may remain stalled before closing.
+const TX_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on [`SatipcTuner`] teardown wait before detaching the I/O thread.
+const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Cap on buffered outbound RTSP bytes while a peer stops reading.
+const TX_BUF_MAX: usize = 256 * 1024;
 /// I/O thread sleep when no socket had data.
 const IO_IDLE: Duration = Duration::from_millis(5);
 /// Interleaved TS kept for the data plane (`TCP_DATA_MAX`-like bound).
@@ -96,6 +102,19 @@ pub struct Driver {
     adapter_timeout_ms: i64,
     bind_dev_ip: Option<IpAddr>,
     receive_buffer: i32,
+    tx_buf: Vec<u8>,
+    tx_offset: usize,
+    tx_since: Option<Instant>,
+    connect_epoch: u64,
+    deferred_reconnect: bool,
+    defer_open_rtsp: bool,
+}
+
+struct ConnectTarget {
+    host: String,
+    port: u16,
+    source: Option<String>,
+    epoch: u64,
 }
 
 impl Driver {
@@ -143,46 +162,125 @@ impl Driver {
             adapter_timeout_ms: config.adapter_timeout_ms,
             bind_dev_ip: config.bind_dev_ip,
             receive_buffer: config.receive_buffer,
+            tx_buf: Vec::new(),
+            tx_offset: 0,
+            tx_since: None,
+            connect_epoch: 0,
+            deferred_reconnect: false,
+            defer_open_rtsp: false,
+        }
+    }
+
+    /// Snapshot of frontend status suitable for lock-free callers.
+    pub fn signal_status(&self) -> SignalStatus {
+        let client = &self.client;
+        SignalStatus {
+            locked: client.status,
+            strength: u16::try_from(client.strength.clamp(0, 255)).unwrap_or(0),
+            snr: u16::try_from(client.snr.clamp(0, 255)).unwrap_or(0),
+            // SAT>IP status carries no BER or dB SNR (ad->db stays MAX_DB).
+            ber: 0,
+            db: SignalStatus::DB_UNKNOWN,
+            // satipc.cpp:620: `ad->status` is set from every server signal report.
+            status_valid: true,
+        }
+    }
+
+    fn clear_tx(&mut self) {
+        self.tx_buf.clear();
+        self.tx_offset = 0;
+        self.tx_since = None;
+    }
+
+    fn flush_tx(&mut self) -> io::Result<bool> {
+        let Some(stream) = self.rtsp.as_mut() else {
+            self.clear_tx();
+            return Ok(false);
+        };
+        let mut made_progress = false;
+        while self.tx_offset < self.tx_buf.len() {
+            match stream.write(&self.tx_buf[self.tx_offset..]) {
+                Ok(0) => {
+                    self.clear_tx();
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+                Ok(written) => {
+                    self.tx_offset += written;
+                    made_progress = true;
+                    if self.tx_offset < self.tx_buf.len() {
+                        self.tx_since = Some(Instant::now());
+                    }
+                }
+                Err(error) if is_transient(&error) => {
+                    let since = self.tx_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= TX_STALL_TIMEOUT {
+                        self.clear_tx();
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "satipc RTSP write stalled",
+                        ));
+                    }
+                    return Ok(made_progress);
+                }
+                Err(error) => {
+                    self.clear_tx();
+                    return Err(error);
+                }
+            }
+        }
+        self.clear_tx();
+        Ok(made_progress)
+    }
+
+    fn prepare_connect_target(&self) -> ConnectTarget {
+        // satipc_open_rtsp_socket: the per-server source overrides bind_dev_ip().
+        let source = if self.client.source_ip.is_empty() {
+            self.bind_dev_ip.map(|ip| ip.to_string())
+        } else {
+            if let Some(bind) = self.bind_dev_ip {
+                // satipc.cpp:396-397
+                ms_log::log!(
+                    "per-server source {} overrides --bind-dev source {}",
+                    self.client.source_ip,
+                    bind
+                );
+            }
+            Some(self.client.source_ip.clone())
+        };
+        ConnectTarget {
+            host: self.client.host.clone(),
+            port: self.client.port,
+            source,
+            epoch: self.connect_epoch,
         }
     }
 
     /// `satipc_open_rtsp_socket`: connects and installs the RTSP socket.
     pub fn open_rtsp_socket(&mut self, is_init: bool) -> io::Result<()> {
         self.client.last_connect = self.client.tick();
-        // satipc_open_rtsp_socket: the per-server source overrides bind_dev_ip().
-        let bind_source = self.bind_dev_ip.map(|ip| ip.to_string());
-        let source = if self.client.source_ip.is_empty() {
-            bind_source.as_deref()
-        } else {
-            Some(self.client.source_ip.as_str())
-        };
-        // satipc.cpp:396-397
-        if !self.client.source_ip.is_empty()
-            && let Some(bind) = bind_source.as_deref()
-        {
-            ms_log::log!(
-                "per-server source {} overrides --bind-dev source {}",
-                self.client.source_ip,
-                bind
-            );
-        }
-        let stream = match connect(&self.client.host, self.client.port, source) {
+        let target = self.prepare_connect_target();
+        let stream = match connect(&target.host, target.port, target.source.as_deref()) {
             Ok(stream) => stream,
             // satipc.cpp:402-403
             Err(error) => ms_log::log_and_return!(
                 Err(error),
                 "could not connect to {}:{}, error {}",
-                self.client.host,
-                self.client.port,
+                target.host,
+                target.port,
                 ms_log::strerror(&error)
             ),
         };
+        self.finish_rtsp_connect(stream, is_init)
+    }
+
+    fn finish_rtsp_connect(&mut self, stream: TcpStream, is_init: bool) -> io::Result<()> {
         stream.set_nonblocking(true)?;
         let _ = stream.set_nodelay(true);
         if self.client.transport == Transport::Tcp {
             sys::set_receive_buffer(stream.as_raw_fd(), self.receive_buffer);
         }
         let fd = stream.as_raw_fd();
+        self.clear_tx();
         self.rtsp = Some(stream);
         self.rbuf.clear();
         self.demux.reset();
@@ -406,6 +504,7 @@ impl Driver {
 
     /// `satipc_drop_rtsp_socket`: releases an RTSP socket after a failed open.
     pub fn drop_rtsp_socket(&mut self) {
+        self.clear_tx();
         self.rtsp = None;
         self.rbuf.clear();
         self.demux.reset();
@@ -416,14 +515,21 @@ impl Driver {
         self.client.rtsp_socket_closed = true;
     }
 
-    /// `satipc_open_device`: 0 on success, else the C++ return code.
-    pub fn open_device(&mut self) -> i32 {
+    fn begin_open(&mut self) -> std::result::Result<ConnectTarget, i32> {
         let now = self.client.tick();
         if self.client.last_connect > 0 && now - self.client.last_connect < OPEN_BACKOFF_MS {
-            return 3;
+            return Err(3);
         }
         self.client.last_connect = now;
-        if self.open_rtsp_socket(true).is_err() {
+        self.connect_epoch = self.connect_epoch.wrapping_add(1);
+        self.deferred_reconnect = false;
+        self.sync_srt();
+        Ok(self.prepare_connect_target())
+    }
+
+    fn finish_open_with_rtsp(&mut self, stream: TcpStream) -> i32 {
+        if self.finish_rtsp_connect(stream, true).is_err() {
+            self.drop_rtsp_socket();
             return 2;
         }
         #[cfg(feature = "srt")]
@@ -445,10 +551,35 @@ impl Driver {
         0
     }
 
+    /// `satipc_open_device`: 0 on success, else the C++ return code.
+    pub fn open_device(&mut self) -> i32 {
+        let target = match self.begin_open() {
+            Ok(target) => target,
+            Err(rv) => return rv,
+        };
+        let stream = match connect(&target.host, target.port, target.source.as_deref()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                // satipc.cpp:402-403
+                ms_log::log!(
+                    "could not connect to {}:{}, error {}",
+                    target.host,
+                    target.port,
+                    ms_log::strerror(&error)
+                );
+                return 2;
+            }
+        };
+        self.finish_open_with_rtsp(stream)
+    }
+
     /// `satip_close_device` plus the socket deletions.
     pub fn close_device(&mut self) {
+        self.connect_epoch = self.connect_epoch.wrapping_add(1);
+        self.deferred_reconnect = false;
         self.client.close_device();
         self.run_ops();
+        self.clear_tx();
         self.rtsp = None;
         self.rtp = None;
         self.rtcp = None;
@@ -472,16 +603,20 @@ impl Driver {
         while let Some(op) = self.client.ops.pop_front() {
             match op {
                 Op::Send(data) => {
-                    let failed = match self.rtsp.as_mut() {
-                        Some(stream) => write_all_nonblocking(stream, &data).is_err(),
-                        None => false,
-                    };
-                    if failed {
-                        self.rtsp_eof();
+                    if self.rtsp.is_some() {
+                        if self.tx_buf.len().saturating_add(data.len()) > TX_BUF_MAX {
+                            self.rtsp_eof();
+                        } else {
+                            self.tx_buf.extend_from_slice(&data);
+                            if self.flush_tx().is_err() {
+                                self.rtsp_eof();
+                            }
+                        }
                     }
                 }
                 Op::CloseData => {
                     // UDP keeps its RTP sockets so the restart can reuse the ports.
+                    self.clear_tx();
                     self.rtsp = None;
                     self.rbuf.clear();
                     self.demux.reset();
@@ -494,7 +629,9 @@ impl Driver {
                     return;
                 }
                 Op::OpenRtsp => {
-                    if self.open_rtsp_socket(false).is_err() {
+                    if self.defer_open_rtsp {
+                        self.deferred_reconnect = true;
+                    } else if self.open_rtsp_socket(false).is_err() {
                         self.client.rtsp_socket_closed = true;
                         self.client.ops.retain(|op| !matches!(op, Op::Send(_)));
                     }
@@ -531,6 +668,7 @@ impl Driver {
             fd,
             self.client.fe_timeout_ms
         );
+        self.clear_tx();
         self.rtsp = None;
         self.client.rtsp_connected = false;
         match self.client.transport {
@@ -609,6 +747,13 @@ impl Driver {
         }
         self.sync_srt();
         let mut work = false;
+        if !self.tx_buf.is_empty() {
+            match self.flush_tx() {
+                Ok(true) => work = true,
+                Ok(false) => {}
+                Err(_) => self.rtsp_eof(),
+            }
+        }
         let mut buf = [0u8; 16 * 1024];
         let room =
             self.client.transport != Transport::Tcp || self.tcp_ts.len() + 65_536 <= TCP_TS_MAX;
@@ -792,6 +937,11 @@ impl Driver {
             self.client.post_init();
             self.run_ops();
         }
+        self.tune_open(params);
+        Ok(())
+    }
+
+    fn tune_open(&mut self, params: &TuneParams) {
         let mut tp = params.clone();
         tp.pids.clear();
         self.client.tp = tp;
@@ -799,7 +949,15 @@ impl Driver {
         self.standby_since = None;
         self.client.tune();
         self.run_ops();
-        Ok(())
+    }
+
+    fn take_pending_reconnect(&mut self) -> Option<ConnectTarget> {
+        if !self.deferred_reconnect {
+            return None;
+        }
+        self.deferred_reconnect = false;
+        self.client.last_connect = self.client.tick();
+        Some(self.prepare_connect_target())
     }
 
     /// Takes `ad->wait_new_stream` for the data plane.
@@ -820,7 +978,7 @@ impl Driver {
 
     /// `close_adapter_for_stream` for the last stream: standby, then clear `tp`.
     pub fn standby(&mut self) {
-        if !self.device_open {
+        if !self.device_open || self.standby_since.is_some() {
             return;
         }
         self.sync_srt();
@@ -872,45 +1030,61 @@ fn is_transient(error: &io::Error) -> bool {
     )
 }
 
-fn write_all_nonblocking(stream: &mut TcpStream, mut data: &[u8]) -> io::Result<()> {
-    let mut spins = 0;
-    while !data.is_empty() {
-        match stream.write(data) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(written) => data = &data[written..],
-            Err(error) if is_transient(&error) && spins < 1000 => {
-                spins += 1;
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => return Err(error),
-        }
+type ConnectFn = Arc<dyn Fn(&str, u16, Option<&str>) -> io::Result<TcpStream> + Send + Sync>;
+
+struct ExitSignal(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for ExitSignal {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.0;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        cvar.notify_all();
     }
-    Ok(())
 }
 
 /// SAT>IP client tuner: the [`Tuner`] face of a [`Driver`].
 pub struct SatipcTuner {
+    adapter_id: usize,
     driver: Arc<Mutex<Driver>>,
+    shared_status: Arc<Mutex<SignalStatus>>,
     stop: Arc<AtomicBool>,
+    exited: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<JoinHandle<()>>,
+    connect_fn: ConnectFn,
 }
 
 impl SatipcTuner {
     /// Starts the I/O thread; the server is contacted on the first tune.
     pub fn new(config: &SatipcConfig) -> io::Result<Self> {
-        let driver = Arc::new(Mutex::new(Driver::new(config)));
+        Self::new_with_connector(config, Arc::new(connect))
+    }
+
+    fn new_with_connector(config: &SatipcConfig, connect_fn: ConnectFn) -> io::Result<Self> {
+        let mut inner = Driver::new(config);
+        inner.defer_open_rtsp = true;
+        let initial_status = inner.signal_status();
+        let driver = Arc::new(Mutex::new(inner));
+        let shared_status = Arc::new(Mutex::new(initial_status));
         let stop = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new((Mutex::new(false), Condvar::new()));
         let thread = {
             let driver = Arc::clone(&driver);
+            let shared_status = Arc::clone(&shared_status);
             let stop = Arc::clone(&stop);
+            let exited = Arc::clone(&exited);
+            let connect_fn = Arc::clone(&connect_fn);
             thread::Builder::new()
                 .name(format!("satipc{}", config.adapter_id))
-                .spawn(move || io_loop(&driver, &stop))?
+                .spawn(move || io_loop(&driver, &shared_status, &stop, &exited, &connect_fn))?
         };
         Ok(Self {
+            adapter_id: config.adapter_id,
             driver,
+            shared_status,
             stop,
+            exited,
             thread: Some(thread),
+            connect_fn,
         })
     }
 
@@ -920,16 +1094,62 @@ impl SatipcTuner {
     }
 }
 
-fn lock(driver: &Mutex<Driver>) -> MutexGuard<'_, Driver> {
-    driver
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
+    value.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn io_loop(driver: &Mutex<Driver>, stop: &AtomicBool) {
+fn io_loop(
+    driver: &Mutex<Driver>,
+    shared_status: &Mutex<SignalStatus>,
+    stop: &AtomicBool,
+    exited: &Arc<(Mutex<bool>, Condvar)>,
+    connect_fn: &ConnectFn,
+) {
+    let _exit_signal = ExitSignal(Arc::clone(exited));
     while !stop.load(Ordering::SeqCst) {
-        let work = lock(driver).poll();
-        if !work {
+        let (work, status, reconnect) = {
+            let mut guard = lock(driver);
+            let work = guard.poll();
+            let status = guard.signal_status();
+            let reconnect = guard.take_pending_reconnect();
+            (work, status, reconnect)
+        };
+        *lock(shared_status) = status;
+        if let Some(target) = reconnect {
+            let connected = connect_fn(&target.host, target.port, target.source.as_deref());
+            if !stop.load(Ordering::SeqCst) {
+                let mut guard = lock(driver);
+                if guard.connect_epoch == target.epoch && !stop.load(Ordering::SeqCst) {
+                    match connected {
+                        Ok(stream) => {
+                            if let Err(error) = guard.finish_rtsp_connect(stream, false) {
+                                ms_log::log!(
+                                    "could not configure {}:{}, error {}",
+                                    target.host,
+                                    target.port,
+                                    ms_log::strerror(&error)
+                                );
+                                guard.client.rtsp_socket_closed = true;
+                                guard.client.ops.retain(|op| !matches!(op, Op::Send(_)));
+                            } else {
+                                guard.run_ops();
+                            }
+                        }
+                        Err(error) => {
+                            ms_log::log!(
+                                "could not connect to {}:{}, error {}",
+                                target.host,
+                                target.port,
+                                ms_log::strerror(&error)
+                            );
+                            guard.client.rtsp_socket_closed = true;
+                            guard.client.ops.retain(|op| !matches!(op, Op::Send(_)));
+                        }
+                    }
+                    *lock(shared_status) = guard.signal_status();
+                }
+            }
+        } else if !work {
             thread::sleep(IO_IDLE);
         }
     }
@@ -937,27 +1157,64 @@ fn io_loop(driver: &Mutex<Driver>, stop: &AtomicBool) {
 
 impl Tuner for SatipcTuner {
     fn tune(&mut self, params: &TuneParams) -> Result<()> {
-        lock(&self.driver).tune(params).map_err(TunerError::Io)
+        let target = {
+            let mut driver = lock(&self.driver);
+            driver.sync_srt();
+            if driver.device_open {
+                driver.tune_open(params);
+                *lock(&self.shared_status) = driver.signal_status();
+                return Ok(());
+            }
+            driver.begin_open().map_err(|rv| {
+                TunerError::Io(io::Error::other(format!(
+                    "satipc: cannot open {}:{} (rc {rv})",
+                    driver.client.host, driver.client.port
+                )))
+            })?
+        };
+        let stream = (self.connect_fn)(&target.host, target.port, target.source.as_deref())
+            .map_err(|error| {
+                ms_log::log!(
+                    "could not connect to {}:{}, error {}",
+                    target.host,
+                    target.port,
+                    ms_log::strerror(&error)
+                );
+                TunerError::Io(io::Error::other(format!(
+                    "satipc: cannot open {}:{} (rc 2)",
+                    target.host, target.port
+                )))
+            })?;
+        let mut driver = lock(&self.driver);
+        if self.stop.load(Ordering::SeqCst) || driver.connect_epoch != target.epoch {
+            return Err(TunerError::Io(io::Error::other("satipc open cancelled")));
+        }
+        if !driver.device_open {
+            let rv = driver.finish_open_with_rtsp(stream);
+            if rv != 0 {
+                *lock(&self.shared_status) = driver.signal_status();
+                return Err(TunerError::Io(io::Error::other(format!(
+                    "satipc: cannot open {}:{} (rc {rv})",
+                    driver.client.host, driver.client.port
+                ))));
+            }
+            driver.client.post_init();
+            driver.run_ops();
+        }
+        driver.tune_open(params);
+        *lock(&self.shared_status) = driver.signal_status();
+        Ok(())
     }
 
     fn set_pids(&mut self, pids: &PidSet) -> Result<()> {
-        lock(&self.driver).set_pids(pids);
+        let mut driver = lock(&self.driver);
+        driver.set_pids(pids);
+        *lock(&self.shared_status) = driver.signal_status();
         Ok(())
     }
 
     fn status(&self) -> SignalStatus {
-        let driver = lock(&self.driver);
-        let client = &driver.client;
-        SignalStatus {
-            locked: client.status,
-            strength: u16::try_from(client.strength.clamp(0, 255)).unwrap_or(0),
-            snr: u16::try_from(client.snr.clamp(0, 255)).unwrap_or(0),
-            // SAT>IP status carries no BER or dB SNR (ad->db stays MAX_DB).
-            ber: 0,
-            db: SignalStatus::DB_UNKNOWN,
-            // satipc.cpp:620: `ad->status` is set from every server signal report.
-            status_valid: true,
-        }
+        *lock(&self.shared_status)
     }
 
     fn read(&mut self, buf: &mut TsBuf) -> Result<usize> {
@@ -965,7 +1222,9 @@ impl Tuner for SatipcTuner {
     }
 
     fn standby(&mut self) {
-        lock(&self.driver).standby();
+        let mut driver = lock(&self.driver);
+        driver.standby();
+        *lock(&self.shared_status) = driver.signal_status();
     }
 
     fn take_wait_new_stream(&mut self) -> bool {
@@ -976,12 +1235,154 @@ impl Tuner for SatipcTuner {
 impl Drop for SatipcTuner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let (lock_ex, cvar) = &*self.exited;
+        let mut exited = lock_ex.lock().unwrap_or_else(PoisonError::into_inner);
+        let deadline = Instant::now() + DROP_JOIN_TIMEOUT;
+        while !*exited {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (guard, wait) = cvar
+                .wait_timeout(exited, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            exited = guard;
+            if wait.timed_out() {
+                break;
+            }
+        }
+        if *exited {
+            drop(exited);
             let _ = thread.join();
+            let mut driver = lock(&self.driver);
+            if driver.device_open {
+                driver.close_device();
+            }
+        } else {
+            ms_log::log!(
+                "satipc adapter {} I/O thread did not exit within {} ms, detaching",
+                self.adapter_id,
+                DROP_JOIN_TIMEOUT.as_millis()
+            );
+            if let Ok(mut driver) = self.driver.try_lock()
+                && driver.device_open
+            {
+                driver.close_device();
+            }
         }
-        let mut driver = lock(&self.driver);
-        if driver.device_open {
-            driver.close_device();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DeliverySystem;
+    use std::net::TcpListener;
+
+    fn test_config(port: u16) -> SatipcConfig {
+        SatipcConfig {
+            adapter_id: 99,
+            server: SatipServer {
+                host: "127.0.0.1".to_owned(),
+                port,
+                fe: -1,
+                delsys: DeliverySystem::DvbS2,
+                source_ip: String::new(),
+                transport: Transport::Tcp,
+                no_pids_all: false,
+            },
+            start_rtp: 6500,
+            user_agent: "minisatip test".to_owned(),
+            adapter_timeout_ms: 0,
+            ignore_signal: false,
+            bind_dev_ip: None,
+            receive_buffer: 0,
         }
+    }
+
+    #[test]
+    fn tune_releases_driver_lock_while_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let driver_slot: Arc<Mutex<Option<Arc<Mutex<Driver>>>>> = Arc::new(Mutex::new(None));
+        let slot_ref = Arc::clone(&driver_slot);
+        let lock_was_free = Arc::new(AtomicBool::new(false));
+        let lock_free_ref = Arc::clone(&lock_was_free);
+
+        let connector: ConnectFn = Arc::new(move |host, p, _src| {
+            let free = slot_ref
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|drv| drv.try_lock().is_ok());
+            lock_free_ref.store(free, Ordering::SeqCst);
+            TcpStream::connect((host, p))
+        });
+
+        let mut tuner = SatipcTuner::new_with_connector(&test_config(port), connector).unwrap();
+        *driver_slot.lock().unwrap() = Some(Arc::clone(&tuner.driver));
+        assert!(tuner.tune(&TuneParams::default()).is_ok());
+        assert!(
+            lock_was_free.load(Ordering::SeqCst),
+            "Mutex<Driver> was held across connect()"
+        );
+        let _ = tuner.status();
+    }
+
+    #[test]
+    fn drop_returns_within_bounded_timeout_when_reconnect_stalled() {
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_c = Arc::clone(&entered);
+        let release_c = Arc::clone(&release);
+
+        let connector: ConnectFn = Arc::new(move |_, _, _| {
+            {
+                let (lock, cvar) = &*entered_c;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            }
+            let (lock, cvar) = &*release_c;
+            let mut go = lock.lock().unwrap();
+            while !*go {
+                let (guard, wait) = cvar.wait_timeout(go, Duration::from_secs(6)).unwrap();
+                go = guard;
+                if wait.timed_out() {
+                    break;
+                }
+            }
+            Err(io::Error::new(io::ErrorKind::TimedOut, "stalled"))
+        });
+
+        let tuner = SatipcTuner::new_with_connector(&test_config(554), connector).unwrap();
+        {
+            let mut drv = tuner.driver();
+            drv.device_open = true;
+            drv.deferred_reconnect = true;
+        }
+        {
+            let (lock, cvar) = &*entered;
+            let mut inside = lock.lock().unwrap();
+            while !*inside {
+                let (guard, wait) = cvar.wait_timeout(inside, Duration::from_secs(2)).unwrap();
+                inside = guard;
+                assert!(!wait.timed_out(), "io_loop did not enter connector");
+            }
+        }
+
+        let start = Instant::now();
+        drop(tuner);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= DROP_JOIN_TIMEOUT - Duration::from_millis(200)
+                && elapsed < Duration::from_millis(3000),
+            "drop elapsed outside bounded window: {elapsed:?}"
+        );
+
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
     }
 }

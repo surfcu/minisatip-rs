@@ -1031,3 +1031,48 @@ fn test_satipc_open_device_full_table_closes_untracked() {
     assert_nothing_tracked(&d);
     drop(block4);
 }
+
+#[test]
+fn satipc_status_does_not_contend_with_driver_lock_and_send_is_nonblocking() {
+    use ms_tuner::{Tuner, satipc::SatipcTuner};
+    use std::time::Instant;
+
+    let _serial = serial();
+    let cfg = config(5, "127.0.0.1", 554, 5500);
+    let tuner = SatipcTuner::new(&cfg).expect("satipc tuner");
+    let _held = tuner.driver();
+
+    let start = Instant::now();
+    let _status = tuner.status();
+    assert!(
+        start.elapsed() < Duration::from_millis(50),
+        "status contended on Mutex<Driver>: {:?}",
+        start.elapsed()
+    );
+    drop(_held);
+
+    // Driver standby is idempotent once standing by, and non-blocking TX does not sleep 1 s.
+    let (srv, port) = listen_on_loopback();
+    let mut cfg2 = config(6, "127.0.0.1", port, 5500);
+    cfg2.server.transport = Transport::Tcp;
+    let mut d = Driver::new(&cfg2);
+    assert_eq!(d.open_device(), 0);
+    let _peer = srv.accept().expect("accept");
+    d.client.enabled = true;
+    d.client.rtsp_connected = true;
+    d.standby();
+    let ops_after_first = d.client.ops.len();
+    d.standby();
+    assert_eq!(d.client.ops.len(), ops_after_first, "idempotent standby");
+
+    // Fill socket buffer to verify Op::Send queues instead of sleeping 1000 x 1 ms.
+    let big = vec![b'X'; 8 * 1024 * 1024];
+    let send_start = Instant::now();
+    d.client.ops.push_back(ms_tuner::satipc::Op::Send(big));
+    d.run_ops();
+    assert!(
+        send_start.elapsed() < Duration::from_millis(250),
+        "Op::Send blocked on nonblocking TCP write: {:?}",
+        send_start.elapsed()
+    );
+}

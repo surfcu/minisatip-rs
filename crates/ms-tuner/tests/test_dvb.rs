@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ms_tuner::linux_dvb::*;
 use ms_tuner::{
@@ -1963,4 +1964,290 @@ fn wait_readable_polls_stream_and_pes_section_fds_and_checks_buffered_packets() 
     );
     tuner.set_pids(&PidSet::new()).unwrap();
     assert_eq!(tuner.open_demux_fds(), Some(vec![]));
+}
+
+struct FakeSec(Arc<Mutex<Vec<Call>>>);
+
+impl SecDevice for FakeSec {
+    fn set_tone(&mut self, tone: Tone) -> io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Call::SetTone(tone));
+        Ok(())
+    }
+
+    fn set_voltage(&mut self, voltage: Voltage) -> io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Call::SetVoltage(voltage));
+        Ok(())
+    }
+
+    fn send_master_cmd(&mut self, cmd: &DiseqcMessage) -> io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Call::SendMasterCmd(*cmd));
+        Ok(())
+    }
+
+    fn send_burst(&mut self, burst: MiniCmd) -> io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Call::SendBurst(burst));
+        Ok(())
+    }
+
+    fn sleep_ms(&mut self, ms: i32) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Call::Sleep(ms));
+    }
+
+    fn wakeup(&mut self, voltage: Voltage) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Call::Wakeup(voltage));
+    }
+}
+
+fn is_sec_call(call: &Call) -> bool {
+    matches!(
+        call,
+        Call::SetTone(_)
+            | Call::SetVoltage(_)
+            | Call::SendMasterCmd(_)
+            | Call::SendBurst(_)
+            | Call::Sleep(_)
+            | Call::Wakeup(_)
+    )
+}
+
+fn sat_tune_params(freq: i32, pol: Polarization, src: i32) -> TuneParams {
+    TuneParams {
+        freq,
+        sr: 22_000_000,
+        pol,
+        pol_specified: true,
+        src,
+        src_specified: true,
+        msys: DeliverySystem::DvbS2,
+        ..TuneParams::default()
+    }
+}
+
+#[test]
+fn master_registry_blocks_conflicting_slave_while_active_and_allows_compatible() {
+    let registry = MasterRegistry::new();
+    let sec_calls = Arc::new(Mutex::new(Vec::new()));
+    registry.register_master(0, Box::new(FakeSec(Arc::clone(&sec_calls))));
+
+    let mut master = LinuxDvbTuner::with_device(
+        FakeDevice::new(),
+        AdapterState {
+            id: 0,
+            ..backend_state()
+        },
+    )
+    .with_master_registry(registry.clone());
+
+    let mut slave = LinuxDvbTuner::with_device(
+        FakeDevice::new(),
+        AdapterState {
+            id: 1,
+            ..backend_state()
+        },
+    )
+    .with_master_registry(registry);
+    slave.post_open(false, 0, -1);
+
+    master
+        .tune(&sat_tune_params(10_744_000, Polarization::Vertical, 1))
+        .expect("master V/low tune succeeds");
+    sec_calls.lock().unwrap().clear();
+    slave.device_mut().calls.clear();
+
+    let err = slave
+        .tune(&sat_tune_params(12_544_000, Polarization::Horizontal, 1))
+        .expect_err("active master blocks conflicting H/high slave tune");
+    assert!(matches!(err, TunerError::Backend(-403)));
+    assert!(sec_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        slave
+            .device()
+            .calls
+            .iter()
+            .filter(|c| is_sec_call(c))
+            .count(),
+        0
+    );
+
+    slave
+        .tune(&sat_tune_params(10_891_000, Polarization::Vertical, 1))
+        .expect("compatible V/low slave tune succeeds");
+    assert!(
+        sec_calls.lock().unwrap().is_empty(),
+        "compatible slave does not resend SEC"
+    );
+    assert_eq!(
+        slave
+            .device()
+            .calls
+            .iter()
+            .filter(|c| is_sec_call(c))
+            .count(),
+        0
+    );
+    assert!(
+        slave
+            .device()
+            .last_properties()
+            .contains(&prop(DTV_TUNE, 0))
+    );
+}
+
+#[test]
+fn master_registry_lets_slave_drive_master_sec_on_standby_and_syncs_master() {
+    let registry = MasterRegistry::new();
+    let sec_calls = Arc::new(Mutex::new(Vec::new()));
+    registry.register_master(0, Box::new(FakeSec(Arc::clone(&sec_calls))));
+
+    let mut master = LinuxDvbTuner::with_device(
+        FakeDevice::new(),
+        AdapterState {
+            id: 0,
+            ..backend_state()
+        },
+    )
+    .with_master_registry(registry.clone());
+
+    let mut slave = LinuxDvbTuner::with_device(
+        FakeDevice::new(),
+        AdapterState {
+            id: 1,
+            ..backend_state()
+        },
+    )
+    .with_master_registry(registry);
+    slave.post_open(false, 0, -1);
+
+    master
+        .tune(&sat_tune_params(10_744_000, Polarization::Vertical, 1))
+        .expect("initial master V/low tune");
+    slave
+        .tune(&sat_tune_params(10_891_000, Polarization::Vertical, 1))
+        .expect("initial slave V/low tune");
+
+    master.standby();
+    slave.standby();
+    sec_calls.lock().unwrap().clear();
+    slave.device_mut().calls.clear();
+
+    slave
+        .tune(&sat_tune_params(12_544_000, Polarization::Horizontal, 1))
+        .expect("idle master allows H/high slave tune");
+    let master_sec = sec_calls.lock().unwrap();
+    assert!(master_sec.contains(&Call::SetVoltage(Voltage::V18)));
+    assert!(master_sec.contains(&Call::SetTone(Tone::On)));
+    drop(master_sec);
+    assert_eq!(
+        slave
+            .device()
+            .calls
+            .iter()
+            .filter(|c| is_sec_call(c))
+            .count(),
+        0,
+        "slave must drive SEC via master handle only"
+    );
+    let props = slave.device().last_properties();
+    assert!(props.contains(&prop(DTV_FREQUENCY, 1_944_000)));
+    assert!(props.contains(&prop(DTV_TUNE, 0)));
+
+    // Master waking up to V/low sees slave's H/high switch state and resends SEC.
+    slave.standby();
+    master.device_mut().calls.clear();
+    master
+        .tune(&sat_tune_params(10_744_000, Polarization::Vertical, 1))
+        .expect("master retune back to V/low succeeds");
+    assert!(
+        master
+            .device()
+            .calls
+            .contains(&Call::SetVoltage(Voltage::V13))
+    );
+    assert!(master.device().calls.contains(&Call::SetTone(Tone::Off)));
+}
+
+#[test]
+fn master_registry_slave_unicable_sends_diseqc_on_master_sec_while_master_active() {
+    let registry = MasterRegistry::new();
+    let sec_calls = Arc::new(Mutex::new(Vec::new()));
+    registry.register_master(0, Box::new(FakeSec(Arc::clone(&sec_calls))));
+
+    let unicable = DiseqcParams {
+        switch_type: SWITCH_UNICABLE,
+        ufreq: 1400,
+        uslot: 0,
+        ..DiseqcParams::default()
+    };
+
+    let mut master = LinuxDvbTuner::with_device(
+        FakeDevice::new(),
+        AdapterState {
+            id: 0,
+            ..backend_state()
+        },
+    )
+    .with_master_registry(registry.clone());
+    master.set_diseqc_params(DiseqcParams {
+        uslot: 1,
+        ufreq: 1210,
+        ..unicable
+    });
+
+    let mut slave = LinuxDvbTuner::with_device(
+        FakeDevice::new(),
+        AdapterState {
+            id: 1,
+            ..backend_state()
+        },
+    )
+    .with_master_registry(registry);
+    slave.post_open(false, 0, -1);
+    slave.set_diseqc_params(unicable);
+
+    master
+        .tune(&sat_tune_params(10_744_000, Polarization::Vertical, 1))
+        .expect("master Unicable tune succeeds");
+    sec_calls.lock().unwrap().clear();
+    slave.device_mut().calls.clear();
+
+    slave
+        .tune(&sat_tune_params(11_500_000, Polarization::Horizontal, 1))
+        .expect("slave Unicable tune succeeds while master is active");
+    assert!(
+        sec_calls
+            .lock()
+            .unwrap()
+            .contains(&Call::SendMasterCmd(DiseqcMessage {
+                msg: [0xe0, 0x10, 0x5a, 0x09, 0xb6, 0],
+                len: 5,
+            })),
+        "Unicable command must go to master SEC"
+    );
+    assert_eq!(
+        slave
+            .device()
+            .calls
+            .iter()
+            .filter(|c| is_sec_call(c))
+            .count(),
+        0
+    );
 }

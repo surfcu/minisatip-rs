@@ -12,9 +12,9 @@ use ms_tuner::{PID_ALL, PidSet, SignalStatus, TsBuf, TuneParams, Tuner, TunerErr
 use std::collections::BTreeMap;
 use std::io;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -52,10 +52,43 @@ const PID_NULL: u16 = 8191;
 /// before the frontend ioctls finish. The bound only guards against a wedged
 /// adapter thread: expiry is reported as a hardware failure (`-500`).
 pub const TUNE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound `AdapterHandle::query` waits before falling back to cached stats.
+pub const QUERY_REPLY_TIMEOUT: Duration = Duration::from_millis(50);
+/// Upper bound `AdapterHandle::shutdown` waits before detaching a wedged thread.
+pub const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Cap on queued control commands per adapter so a wedged thread cannot OOM.
+const MAX_PENDING_COMMANDS: usize = 4096;
+/// Cap on unread `Event::TablePackets` batches per adapter.
+const MAX_PENDING_TABLE_BATCHES: usize = 64;
 
 /// Locks a shared counter; a `Mutex` because 32-bit MIPS lacks `AtomicU64`.
 fn lock_counter(counter: &Mutex<u64>) -> MutexGuard<'_, u64> {
     counter.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Atomically increments `a` if strictly below `cap`.
+fn atomic_inc_below(a: &AtomicUsize, cap: usize) -> bool {
+    let mut cur = a.load(Ordering::Relaxed);
+    loop {
+        if cur >= cap {
+            return false;
+        }
+        match a.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Atomically decrements `a` saturating at zero.
+fn atomic_dec_sat(a: &AtomicUsize) {
+    let mut cur = a.load(Ordering::Relaxed);
+    while cur > 0 {
+        match a.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 /// Clamps a threshold to `1..200` ms, with 200 for out-of-range values.
@@ -239,17 +272,26 @@ impl ContinuityCounter {
 
     /// [`Self::check_packet`] with the packet position for the C++ log.
     fn check_packet_at(&mut self, packet: &[u8], position: i64) -> bool {
+        if let Some(pid) = self.check_packet_inner(packet, position) {
+            ms_log::diag::count_cc(i64::from(self.adapter_id), pid);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn check_packet_inner(&mut self, packet: &[u8], position: i64) -> Option<u16> {
         if packet.len() < DVB_FRAME || packet[1] & 0x80 != 0 {
-            return false;
+            return None;
         }
         let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
         if pid == PID_NULL {
-            return false;
+            return None;
         }
         self.packets += 1;
         *self.pid_packets.entry(pid).or_insert(0) += 1;
         if packet[3] & 0x10 == 0 {
-            return false;
+            return None;
         }
         let cc = i16::from(packet[3] & 0x0f);
         let cc_before = self.last.get(&pid).copied().unwrap_or(-1);
@@ -262,7 +304,6 @@ impl ContinuityCounter {
         if error {
             self.errors += 1;
             *self.pid_errors.entry(pid).or_insert(0) += 1;
-            ms_log::diag::count_cc(i64::from(self.adapter_id), pid);
             // stream.cpp:937 (`LOG`, general module).
             ms_log::log!(
                 "PID Continuity error (adapter {}, pos {}): pid: {:03}, Expected CC: {:X}, Actual CC: {:X}, CC Before {:X} {}",
@@ -280,7 +321,7 @@ impl ContinuityCounter {
             );
         }
         self.last.insert(pid, cc);
-        error
+        error.then_some(pid)
     }
 
     /// Checks every complete packet in `data` whose PID is in `pids`.
@@ -296,6 +337,7 @@ impl ContinuityCounter {
         if pids.contains(PID_ALL) {
             return;
         }
+        let mut cc_errors: BTreeMap<u16, u64> = BTreeMap::new();
         for (index, packet) in data.as_chunks::<DVB_FRAME>().0.iter().enumerate() {
             // stream.cpp:912: `_dump_packets("check_cc -> ", b, 188, i)`.
             if packet[1] & 0x80 != 0 {
@@ -308,9 +350,16 @@ impl ContinuityCounter {
             if ms_log::debug_enabled(ms_log::LOG_DMX) {
                 ms_log::dump_packets("check_cc -> ", packet, (offset + index * DVB_FRAME) as i64);
             }
-            if pids.contains(pid) {
-                self.check_packet_at(packet, ((offset + index * DVB_FRAME) / DVB_FRAME) as i64);
+            if pids.contains(pid)
+                && let Some(err_pid) = self
+                    .check_packet_inner(packet, ((offset + index * DVB_FRAME) / DVB_FRAME) as i64)
+            {
+                *cc_errors.entry(err_pid).or_default() += 1;
             }
+        }
+        if !cc_errors.is_empty() {
+            let batch: Vec<(u16, u64)> = cc_errors.into_iter().collect();
+            ms_log::diag::count_cc_batch(i64::from(self.adapter_id), &batch);
         }
     }
 
@@ -340,7 +389,13 @@ pub enum Command {
         params: Box<TuneParams>,
         /// When set, the thread reports the backend result before continuing.
         reply: Option<Sender<Result<(), TunerError>>>,
+        /// Monotonic issue sequence checked against `issued_tune_seq` before execution.
+        seq: Option<usize>,
+        /// Set when a synchronous waiter timed out so stale tunes are skipped.
+        cancelled: Arc<AtomicBool>,
     },
+    /// Notifies the tuner backend when the scheduler releases the last stream.
+    Standby,
     /// Starts sending `pids` to a new output.
     StartOutput {
         /// Stream that owns the output.
@@ -436,13 +491,30 @@ pub enum Event {
     },
 }
 
+struct ExitGuard(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.0;
+        let mut exited = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        *exited = true;
+        cvar.notify_all();
+    }
+}
+
 /// Control-plane handle to one adapter's data-plane thread.
 pub struct AdapterHandle {
+    adapter_id: i32,
     commands: Sender<Command>,
     events: Receiver<Event>,
     // A mutex rather than `AtomicU64`, which 32-bit MIPS does not provide.
     epoch: Mutex<u64>,
     tune_generation: Arc<Mutex<u64>>,
+    issued_tune_seq: Arc<AtomicUsize>,
+    pending_commands: Arc<AtomicUsize>,
+    pending_table_batches: Arc<AtomicUsize>,
+    latest_stats: Arc<Mutex<BTreeMap<StreamId, OutputStats>>>,
+    exited: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -472,12 +544,25 @@ impl AdapterHandle {
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
         let tune_generation = Arc::new(Mutex::new(0));
+        let issued_tune_seq = Arc::new(AtomicUsize::new(0));
+        let pending_commands = Arc::new(AtomicUsize::new(0));
+        let pending_table_batches = Arc::new(AtomicUsize::new(0));
+        let latest_stats = Arc::new(Mutex::new(BTreeMap::new()));
+        let exited = Arc::new((Mutex::new(false), Condvar::new()));
+
         let generation = Arc::clone(&tune_generation);
+        let plane_seq = Arc::clone(&issued_tune_seq);
+        let plane_pending = Arc::clone(&pending_commands);
+        let plane_tables = Arc::clone(&pending_table_batches);
+        let plane_stats = Arc::clone(&latest_stats);
+        let plane_exited = Arc::clone(&exited);
+        let adapter_id = config.adapter_id;
         let thread = thread::Builder::new()
             // adapter.cpp:341: the data-plane thread is `AD%d`.
-            .name(format!("AD{}", config.adapter_id))
+            .name(format!("AD{adapter_id}"))
             .spawn(move || {
-                let thread_name = format!("AD{}", config.adapter_id);
+                let _exit_guard = ExitGuard(plane_exited);
+                let thread_name = format!("AD{adapter_id}");
                 ms_log::set_thread_name(&thread_name);
                 let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
                 // socketworks.cpp:769-770.
@@ -488,20 +573,40 @@ impl AdapterHandle {
                 let mut plane = DataPlane::new(tuner, config, command_rx, event_tx, bandwidth);
                 plane.stages = stages;
                 plane.tune_generation = generation;
+                plane.issued_tune_seq = plane_seq;
+                plane.pending_commands = plane_pending;
+                plane.pending_table_batches = plane_tables;
+                plane.latest_stats = plane_stats;
                 plane.run()
             })?;
         Ok(Self {
+            adapter_id,
             commands,
             events,
             epoch: Mutex::new(0),
             tune_generation,
+            issued_tune_seq,
+            pending_commands,
+            pending_table_batches,
+            latest_stats,
+            exited,
             thread: Some(thread),
         })
     }
 
-    /// Sends a raw command; `false` when the thread has exited.
+    /// Sends a raw command; `false` when the queue is full or the thread has exited.
     pub fn send(&self, command: Command) -> bool {
-        self.commands.send(command).is_ok()
+        if matches!(command, Command::Stop) {
+            self.pending_commands.fetch_add(1, Ordering::Relaxed);
+        } else if !atomic_inc_below(&self.pending_commands, MAX_PENDING_COMMANDS) {
+            return false;
+        }
+        if self.commands.send(command).is_ok() {
+            true
+        } else {
+            atomic_dec_sat(&self.pending_commands);
+            false
+        }
     }
 
     /// Clone of the command sender, e.g. for an [`ms_sched::AdapterTuner`] bridge.
@@ -511,9 +616,12 @@ impl AdapterHandle {
 
     /// Tunes the adapter without waiting for the backend result.
     pub fn tune(&self, params: TuneParams) -> bool {
+        let seq = self.issued_tune_seq.fetch_add(1, Ordering::SeqCst) + 1;
         self.send(Command::Tune {
             params: Box::new(params),
             reply: None,
+            seq: Some(seq),
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -521,17 +629,27 @@ impl AdapterHandle {
     ///
     /// The C++ request path tunes synchronously; the control plane uses this to
     /// turn a failing `FE_SET_PROPERTY` into the matching RTSP error. A
-    /// stopped thread or timeout is reported as a hardware failure.
+    /// stopped thread or timeout is reported as a hardware failure and cancels
+    /// execution if not yet dequeued.
     pub fn tune_wait(&self, params: TuneParams, timeout: Duration) -> Result<(), TunerError> {
         let (reply, rx) = mpsc::channel();
+        let seq = self.issued_tune_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancelled = Arc::new(AtomicBool::new(false));
         if !self.send(Command::Tune {
             params: Box::new(params),
             reply: Some(reply),
+            seq: Some(seq),
+            cancelled: Arc::clone(&cancelled),
         }) {
             return Err(TunerError::Backend(-500));
         }
-        rx.recv_timeout(timeout)
-            .unwrap_or(Err(TunerError::Backend(-500)))
+        match rx.recv_timeout(timeout) {
+            Ok(res) => res,
+            Err(_) => {
+                cancelled.store(true, Ordering::SeqCst);
+                Err(TunerError::Backend(-500))
+            }
+        }
     }
 
     /// Starts an output for `stream_id`, returning its generation.
@@ -582,13 +700,27 @@ impl AdapterHandle {
         self.send(Command::StopOutput(stream_id))
     }
 
-    /// Queries counters; blocks until the thread replies.
+    /// Returns the most recently published stats for `stream_id` without blocking on the thread.
+    pub fn cached_stats(&self, stream_id: StreamId) -> Option<OutputStats> {
+        self.latest_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream_id)
+            .copied()
+    }
+
+    /// Queries counters; waits up to [`QUERY_REPLY_TIMEOUT`] and falls back to cached stats.
     pub fn query(&self, stream_id: StreamId) -> Option<OutputStats> {
         let (reply, rx) = mpsc::channel();
         if !self.send(Command::Query { stream_id, reply }) {
-            return None;
+            return self.cached_stats(stream_id);
         }
-        rx.recv().ok().flatten()
+        match rx.recv_timeout(QUERY_REPLY_TIMEOUT) {
+            Ok(stats) => stats,
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                self.cached_stats(stream_id)
+            }
+        }
     }
 
     /// Tunes the thread has handled; it is raised before the tune is answered.
@@ -601,15 +733,49 @@ impl AdapterHandle {
         &self.events
     }
 
-    /// Stops the thread and waits for it.
+    /// Receives one event non-blockingly and releases table-batch backpressure.
+    pub fn try_recv_event(&self) -> Result<Event, TryRecvError> {
+        let event = self.events.try_recv()?;
+        if matches!(event, Event::TablePackets { .. }) {
+            atomic_dec_sat(&self.pending_table_batches);
+        }
+        Ok(event)
+    }
+
+    /// Stops the thread and waits up to [`SHUTDOWN_JOIN_TIMEOUT`] for it.
     pub fn stop(mut self) {
         self.shutdown();
     }
 
     fn shutdown(&mut self) {
         let _ = self.commands.send(Command::Stop);
-        if let Some(thread) = self.thread.take() {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let (lock, cvar) = &*self.exited;
+        let mut exited = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let deadline = Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
+        while !*exited {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (guard, wait) = cvar
+                .wait_timeout(exited, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            exited = guard;
+            if wait.timed_out() {
+                break;
+            }
+        }
+        if *exited {
+            drop(exited);
             let _ = thread.join();
+        } else {
+            ms_log::log!(
+                "adapter {} data-plane thread did not exit within {} ms, detaching",
+                self.adapter_id,
+                SHUTDOWN_JOIN_TIMEOUT.as_millis()
+            );
         }
     }
 }
@@ -626,6 +792,8 @@ impl Drop for AdapterHandle {
 /// synchronous C++ request path; the other commands stay asynchronous.
 pub struct DataPlaneTuner {
     commands: Sender<Command>,
+    pending_commands: Option<Arc<AtomicUsize>>,
+    issued_tune_seq: Option<Arc<AtomicUsize>>,
     timeout: Duration,
 }
 
@@ -634,45 +802,93 @@ impl DataPlaneTuner {
     pub fn new(commands: Sender<Command>) -> Self {
         Self {
             commands,
+            pending_commands: None,
+            issued_tune_seq: None,
+            timeout: TUNE_REPLY_TIMEOUT,
+        }
+    }
+
+    /// Creates a bridge wired to `handle`'s command budget and tune sequence.
+    pub fn from_handle(handle: &AdapterHandle) -> Self {
+        Self {
+            commands: handle.commands.clone(),
+            pending_commands: Some(Arc::clone(&handle.pending_commands)),
+            issued_tune_seq: Some(Arc::clone(&handle.issued_tune_seq)),
             timeout: TUNE_REPLY_TIMEOUT,
         }
     }
 
     /// Creates a bridge with an explicit reply timeout.
     pub fn with_timeout(commands: Sender<Command>, timeout: Duration) -> Self {
-        Self { commands, timeout }
+        Self {
+            commands,
+            pending_commands: None,
+            issued_tune_seq: None,
+            timeout,
+        }
+    }
+
+    fn send_command(&self, command: Command) -> bool {
+        if let Some(pending) = &self.pending_commands {
+            if !atomic_inc_below(pending, MAX_PENDING_COMMANDS) {
+                return false;
+            }
+            if self.commands.send(command).is_ok() {
+                return true;
+            }
+            atomic_dec_sat(pending);
+            false
+        } else {
+            self.commands.send(command).is_ok()
+        }
     }
 }
 
 impl AdapterTuner for DataPlaneTuner {
     fn tune(&mut self, params: &TuneParams) -> Result<(), TuneError> {
         let (reply, rx) = mpsc::channel();
-        if self
-            .commands
-            .send(Command::Tune {
-                params: Box::new(params.clone()),
-                reply: Some(reply),
-            })
-            .is_err()
-        {
+        let seq = self
+            .issued_tune_seq
+            .as_ref()
+            .map(|issued| issued.fetch_add(1, Ordering::SeqCst) + 1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if !self.send_command(Command::Tune {
+            params: Box::new(params.clone()),
+            reply: Some(reply),
+            seq,
+            cancelled: Arc::clone(&cancelled),
+        }) {
             return Err(TuneError::Hardware);
         }
         match rx.recv_timeout(self.timeout) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(TunerError::Backend(-403))) => Err(TuneError::OutOfRange),
             Ok(Err(TunerError::Backend(-503))) => Err(TuneError::Pids),
-            Ok(Err(_)) | Err(_) => Err(TuneError::Hardware),
+            Ok(Err(_)) => Err(TuneError::Hardware),
+            Err(_) => {
+                cancelled.store(true, Ordering::SeqCst);
+                Err(TuneError::Hardware)
+            }
         }
     }
 
     fn set_pids(&mut self, pids: &PidSet) -> Result<(), TuneError> {
-        self.commands
-            .send(Command::SetBasePids(pids.clone()))
-            .map_err(|_| TuneError::Pids)
+        if self.send_command(Command::SetBasePids(pids.clone())) {
+            Ok(())
+        } else {
+            Err(TuneError::Pids)
+        }
     }
 
     fn set_section_pids(&mut self, pids: &PidSet) {
-        let _ = self.commands.send(Command::SetPsiPids(pids.clone()));
+        let _ = self.send_command(Command::SetPsiPids(pids.clone()));
+    }
+
+    fn standby(&mut self) {
+        if let Some(issued) = &self.issued_tune_seq {
+            issued.fetch_add(1, Ordering::SeqCst);
+        }
+        let _ = self.send_command(Command::Standby);
     }
 }
 
@@ -715,6 +931,10 @@ struct DataPlane {
     stages: Vec<Box<dyn TsStage>>,
     section_pids: PidSet,
     tune_generation: Arc<Mutex<u64>>,
+    issued_tune_seq: Arc<AtomicUsize>,
+    pending_commands: Arc<AtomicUsize>,
+    pending_table_batches: Arc<AtomicUsize>,
+    latest_stats: Arc<Mutex<BTreeMap<StreamId, OutputStats>>>,
     keep_reading: bool,
     poll_backoff: bool,
     /// Whether a tune was applied; lock events start after it.
@@ -770,6 +990,10 @@ impl DataPlane {
             stages: Vec::new(),
             section_pids: PidSet::new(),
             tune_generation: Arc::new(Mutex::new(0)),
+            issued_tune_seq: Arc::new(AtomicUsize::new(0)),
+            pending_commands: Arc::new(AtomicUsize::new(0)),
+            pending_table_batches: Arc::new(AtomicUsize::new(0)),
+            latest_stats: Arc::new(Mutex::new(BTreeMap::new())),
             keep_reading: false,
             poll_backoff: false,
             diag_tuned: false,
@@ -873,9 +1097,27 @@ impl DataPlane {
         }
     }
 
+    fn dec_pending_commands(&self) {
+        atomic_dec_sat(&self.pending_commands);
+    }
+
+    fn sync_latest_stats(&self) {
+        let mut latest = self
+            .latest_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        latest.clear();
+        for (&stream_id, subscriber) in &self.outputs {
+            latest.insert(stream_id, subscriber.output.stats());
+        }
+    }
+
     fn wait_commands(&mut self, wait: Duration) {
         match self.commands.recv_timeout(wait) {
-            Ok(command) => self.handle(command),
+            Ok(command) => {
+                self.dec_pending_commands();
+                self.handle(command);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => self.running = false,
         }
@@ -897,6 +1139,7 @@ impl DataPlane {
         let mut pace_wait = false;
         while self.running {
             while let Ok(command) = self.commands.try_recv() {
+                self.dec_pending_commands();
                 self.handle(command);
             }
             if !self.running {
@@ -912,7 +1155,24 @@ impl DataPlane {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Tune { params, reply } => {
+            Command::Tune {
+                params,
+                reply,
+                seq,
+                cancelled,
+            } => {
+                let stale = cancelled.load(Ordering::SeqCst)
+                    || seq.is_some_and(|s| s != self.issued_tune_seq.load(Ordering::SeqCst));
+                if stale {
+                    ms_log::log!(
+                        "adapter {} skipping stale/cancelled tune",
+                        self.config.adapter_id
+                    );
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(TunerError::Backend(-500)));
+                    }
+                    return;
+                }
                 {
                     let mut generation = lock_counter(&self.tune_generation);
                     *generation = generation.wrapping_add(1);
@@ -945,6 +1205,7 @@ impl DataPlane {
                 let _ = self.events.send(Event::Signal(None));
                 self.update_tuner_pids();
             }
+            Command::Standby => self.standby_if_idle(),
             Command::StartOutput {
                 stream_id,
                 epoch,
@@ -958,6 +1219,7 @@ impl DataPlane {
                 output.set_clocks(now.saturating_sub(setup_age_ms));
                 // Log lines use `sid->sid` (stream.cpp:785,838,845,...).
                 output.set_stream_id(stream_id);
+                let stats = output.stats();
                 self.outputs.insert(
                     stream_id,
                     Subscriber {
@@ -967,11 +1229,19 @@ impl DataPlane {
                         last_timer_ms: now,
                     },
                 );
+                self.latest_stats
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(stream_id, stats);
                 self.update_tuner_pids();
             }
             Command::SetSsrc { stream_id, ssrc } => {
                 if let Some(subscriber) = self.outputs.get_mut(&stream_id) {
                     subscriber.output.set_ssrc(ssrc);
+                    self.latest_stats
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(stream_id, subscriber.output.stats());
                 }
             }
             Command::SetPids { stream_id, pids } => {
@@ -986,6 +1256,10 @@ impl DataPlane {
             }
             Command::StopOutput(stream_id) => {
                 if let Some(subscriber) = self.outputs.remove(&stream_id) {
+                    self.latest_stats
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&stream_id);
                     let mut output = subscriber.output;
                     // stream.cpp:376,385: the UDP sockets close_stream forces
                     // shut. (StopOutput also runs for a transport change.)
@@ -1022,17 +1296,23 @@ impl DataPlane {
                 rtcp,
                 send_buffer,
             } => {
-                if let Some(subscriber) = self.outputs.get_mut(&stream_id)
-                    && let Err(error) =
+                if let Some(subscriber) = self.outputs.get_mut(&stream_id) {
+                    if let Err(error) =
                         subscriber
                             .output
                             .replace_udp_sockets(rtp, rtcp, send_buffer)
-                {
-                    ms_log::log!(
-                        "cannot change the transport of sid {}: {}",
-                        stream_id,
-                        error
-                    );
+                    {
+                        ms_log::log!(
+                            "cannot change the transport of sid {}: {}",
+                            stream_id,
+                            error
+                        );
+                    } else {
+                        self.latest_stats
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(stream_id, subscriber.output.stats());
+                    }
                 }
             }
             Command::SetThreshold(threshold) => self.threshold_ms = threshold,
@@ -1044,6 +1324,12 @@ impl DataPlane {
                     .outputs
                     .get(&stream_id)
                     .map(|subscriber| subscriber.output.stats());
+                if let Some(stats) = stats {
+                    self.latest_stats
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(stream_id, stats);
+                }
                 let _ = reply.send(stats);
             }
             Command::Stop => self.running = false,
@@ -1254,6 +1540,9 @@ impl DataPlane {
         for stream_id in closed {
             self.close(stream_id);
         }
+        if !self.outputs.is_empty() {
+            self.sync_latest_stats();
+        }
     }
 
     /// Copies packets on filtered PIDs for the control plane's section filters.
@@ -1268,16 +1557,27 @@ impl DataPlane {
                 tapped.extend_from_slice(packet);
             }
         }
-        if !tapped.is_empty() {
+        if !tapped.is_empty()
+            && atomic_inc_below(&self.pending_table_batches, MAX_PENDING_TABLE_BATCHES)
+        {
             let generation = *lock_counter(&self.tune_generation);
-            let _ = self.events.send(Event::TablePackets {
-                generation,
-                packets: tapped,
-            });
+            if self
+                .events
+                .send(Event::TablePackets {
+                    generation,
+                    packets: tapped,
+                })
+                .is_err()
+            {
+                atomic_dec_sat(&self.pending_table_batches);
+            }
         }
     }
 
     fn timers(&mut self) {
+        for stage in &mut self.stages {
+            stage.tick();
+        }
         let mono = self.mono_us();
         let now = mono / 1000;
         let wall = SystemTime::now();
@@ -1350,6 +1650,9 @@ impl DataPlane {
             self.close(stream_id);
         }
         self.report_continuity(now);
+        if !self.outputs.is_empty() {
+            self.sync_latest_stats();
+        }
     }
 
     /// Publishes the continuity error count at most once per second.
@@ -1368,18 +1671,29 @@ impl DataPlane {
 
     fn flush_queues(&mut self) {
         let mut closed = Vec::new();
+        let mut flushed_any = false;
         for (stream_id, subscriber) in &mut self.outputs {
-            if subscriber.output.has_pending() && subscriber.output.flush_queue().is_err() {
-                closed.push(*stream_id);
+            if subscriber.output.has_pending() {
+                flushed_any = true;
+                if subscriber.output.flush_queue().is_err() {
+                    closed.push(*stream_id);
+                }
             }
         }
         for stream_id in closed {
             self.close(stream_id);
         }
+        if flushed_any && !self.outputs.is_empty() {
+            self.sync_latest_stats();
+        }
     }
 
     fn close(&mut self, stream_id: StreamId) {
         if let Some(subscriber) = self.outputs.remove(&stream_id) {
+            self.latest_stats
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&stream_id);
             // The output-initiated closures below all lead to `close_stream`
             // (stream.cpp:376,385).
             subscriber.output.log_closing_sockets();
@@ -1460,6 +1774,8 @@ mod tests {
         plane.handle(Command::Tune {
             params: Box::new(TuneParams::default()),
             reply: None,
+            seq: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
         });
         plane.diag_status(&unlocked, 20);
         assert_eq!(plane.diag_lock, Some(false));
@@ -1514,6 +1830,8 @@ mod tests {
         plane.handle(Command::Tune {
             params: Box::new(TuneParams::default()),
             reply: None,
+            seq: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
         });
         assert_eq!(events.try_recv(), Ok(Event::Signal(None)), "a tune clears");
 
@@ -1699,6 +2017,8 @@ mod tests {
         idle_handle.send(Command::Tune {
             params: Box::new(TuneParams::default()),
             reply: Some(reply_tx),
+            seq: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
         });
         assert!(
             reply_rx
@@ -1739,6 +2059,8 @@ mod tests {
         plane.handle(Command::Tune {
             params: Box::new(TuneParams::default()),
             reply: None,
+            seq: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
         });
         assert!(matches!(events_rx.try_recv(), Ok(Event::Signal(None))));
 
@@ -2006,6 +2328,8 @@ mod tests {
             .send(Command::Tune {
                 params: Box::new(TuneParams::default()),
                 reply: Some(reply_tx),
+                seq: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
             })
             .unwrap();
         plane.wait_after_read(false, &mut pace_wait);

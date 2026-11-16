@@ -954,3 +954,182 @@ fn psi_pids_are_forwarded_to_the_tuner() {
     );
     adapter.stop();
 }
+
+type GateSignal = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+/// Tuner whose `read` blocks until released via a condvar, recording tune calls.
+struct GateTuner {
+    block_read: Arc<AtomicBool>,
+    in_read: GateSignal,
+    gate: GateSignal,
+    tuned_freqs: Arc<Mutex<Vec<i32>>>,
+}
+
+impl Tuner for GateTuner {
+    fn tune(&mut self, params: &TuneParams) -> Result<()> {
+        self.tuned_freqs.lock().unwrap().push(params.freq);
+        Ok(())
+    }
+
+    fn set_pids(&mut self, _pids: &PidSet) -> Result<()> {
+        Ok(())
+    }
+
+    fn status(&self) -> SignalStatus {
+        SignalStatus::default()
+    }
+
+    fn read(&mut self, _buf: &mut TsBuf) -> Result<usize> {
+        if self.block_read.load(Ordering::SeqCst) {
+            {
+                let (lock, cvar) = &*self.in_read;
+                let mut inside = lock.lock().unwrap();
+                *inside = true;
+                cvar.notify_all();
+            }
+            let (lock, cvar) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                let (guard, wait) = cvar.wait_timeout(released, Duration::from_secs(5)).unwrap();
+                released = guard;
+                if wait.timed_out() {
+                    break;
+                }
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(0)
+    }
+}
+
+struct GateState {
+    block_read: Arc<AtomicBool>,
+    in_read: GateSignal,
+    gate: GateSignal,
+    tuned_freqs: Arc<Mutex<Vec<i32>>>,
+}
+
+fn gate_tuner() -> (GateTuner, GateState) {
+    let block_read = Arc::new(AtomicBool::new(false));
+    let in_read = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let tuned_freqs = Arc::new(Mutex::new(Vec::new()));
+    let tuner = GateTuner {
+        block_read: Arc::clone(&block_read),
+        in_read: Arc::clone(&in_read),
+        gate: Arc::clone(&gate),
+        tuned_freqs: Arc::clone(&tuned_freqs),
+    };
+    let state = GateState {
+        block_read,
+        in_read,
+        gate,
+        tuned_freqs,
+    };
+    (tuner, state)
+}
+
+fn wait_entered(in_read: &GateSignal) {
+    let (lock, cvar) = &**in_read;
+    let mut inside = lock.lock().unwrap();
+    while !*inside {
+        let (guard, wait) = cvar.wait_timeout(inside, Duration::from_secs(2)).unwrap();
+        inside = guard;
+        assert!(!wait.timed_out(), "tuner read did not enter gate");
+    }
+}
+
+fn release_gate(gate: &GateSignal) {
+    let (lock, cvar) = &**gate;
+    *lock.lock().unwrap() = true;
+    cvar.notify_all();
+}
+
+#[test]
+fn query_returns_cached_stats_while_dataplane_blocked() {
+    let (tuner, state) = gate_tuner();
+    let handle = AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).unwrap();
+    let (rx, _) = udp_pair();
+    handle.start_output(1, output_to(rx.local_addr().unwrap(), 9), PidSet::new());
+    assert!(handle.query(1).is_some());
+
+    state.block_read.store(true, Ordering::SeqCst);
+    wait_entered(&state.in_read);
+
+    let start = Instant::now();
+    let cached = handle.query(1);
+    assert!(
+        start.elapsed() < Duration::from_millis(250),
+        "query blocked: {:?}",
+        start.elapsed()
+    );
+    assert!(cached.is_some());
+
+    release_gate(&state.gate);
+    handle.stop();
+}
+
+#[test]
+fn stop_returns_within_bounded_timeout_when_dataplane_wedged() {
+    let (tuner, state) = gate_tuner();
+    state.block_read.store(true, Ordering::SeqCst);
+    let handle = AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).unwrap();
+    handle.send(ms_net::dataplane::Command::KeepReading(true));
+    wait_entered(&state.in_read);
+
+    let start = Instant::now();
+    handle.stop();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= ms_net::dataplane::SHUTDOWN_JOIN_TIMEOUT - Duration::from_millis(200)
+            && elapsed < Duration::from_millis(3000),
+        "stop elapsed outside expected bounded window: {elapsed:?}"
+    );
+    release_gate(&state.gate);
+}
+
+#[test]
+fn timed_out_tune_is_cancelled_before_executing() {
+    use ms_sched::{AdapterTuner, TuneError};
+
+    let (tuner, state) = gate_tuner();
+    state.block_read.store(true, Ordering::SeqCst);
+    let handle = AdapterHandle::spawn(Box::new(tuner), DataPlaneConfig::default()).unwrap();
+    handle.send(ms_net::dataplane::Command::KeepReading(true));
+    wait_entered(&state.in_read);
+
+    let stale = TuneParams {
+        freq: 11_700,
+        ..TuneParams::default()
+    };
+    assert!(handle.tune_wait(stale, Duration::from_millis(30)).is_err());
+
+    let mut bridge = ms_net::dataplane::DataPlaneTuner::with_timeout(
+        handle.command_sender(),
+        Duration::from_millis(30),
+    );
+    assert_eq!(
+        bridge.tune(&TuneParams {
+            freq: 11_800,
+            ..TuneParams::default()
+        }),
+        Err(TuneError::Hardware)
+    );
+
+    let fresh = TuneParams {
+        freq: 12_100,
+        ..TuneParams::default()
+    };
+    assert!(handle.tune(fresh));
+
+    state.block_read.store(false, Ordering::SeqCst);
+    release_gate(&state.gate);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state.tuned_freqs.lock().unwrap().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(&*state.tuned_freqs.lock().unwrap(), &[12_100]);
+    handle.stop();
+}

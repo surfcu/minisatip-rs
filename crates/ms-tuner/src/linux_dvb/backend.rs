@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::PoisonError;
 
 use super::consts::{DVR_BUFFER, FE_HAS_LOCK};
-use super::device::{DemuxFd, DvbDevice, PesOutput, error_parts};
-use super::state::AdapterState;
+use super::device::{DemuxFd, DvbDevice, PesOutput, SecDevice, error_parts};
+use super::diseqc::{MasterView, SwitchState};
+use super::state::{AdapterState, MasterRegistry, MasterSlot};
 use super::sys::LinuxDvbDevice;
 use super::transponder::DvbTransponder;
 use crate::tuner::{
@@ -85,6 +87,7 @@ pub struct LinuxDvbTuner<D: DvbDevice = LinuxDvbDevice> {
     /// Whole TS packets built from sections, delivered before the stream.
     psi: Vec<u8>,
     read_buf: Vec<u8>,
+    master_registry: Option<MasterRegistry>,
 }
 
 impl LinuxDvbTuner<LinuxDvbDevice> {
@@ -174,6 +177,7 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
             partial: Vec::with_capacity(TS_PACKET_SIZE),
             psi: Vec::new(),
             read_buf: vec![0u8; 64 * 1024],
+            master_registry: None,
         }
     }
 
@@ -181,6 +185,7 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
     /// `DMX_SET_SOURCE` when `dmx_source` is set; `master_source` is -1 or
     /// the master adapter of a slave.
     pub fn post_open(&mut self, fbc: bool, master_source: i32, dmx_source: i32) {
+        self.state.master_source = master_source;
         let fn_num = self.state.fn_num;
         if fbc {
             if master_source >= 0 {
@@ -236,6 +241,12 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
         self
     }
 
+    /// Attaches the shared master-slave LNB registry used by `tune` and `standby`.
+    pub fn with_master_registry(mut self, registry: MasterRegistry) -> Self {
+        self.master_registry = Some(registry);
+        self
+    }
+
     /// Per-adapter state (switch cache, multipliers, transponder).
     pub fn state(&self) -> &AdapterState {
         &self.state
@@ -276,7 +287,7 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
             return;
         }
         self.status_cnt = self.status_cnt.saturating_add(1);
-        let _ = self.state.get_signal(&mut self.dev);
+        self.refresh_signal();
         self.status = SignalStatus {
             locked: self.state.status & FE_HAS_LOCK != 0,
             strength: self.state.strength,
@@ -286,6 +297,111 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
             status_valid: self.state.status_valid,
         };
         self.status_refreshed = true;
+    }
+
+    fn tune_with_registry(&mut self, tp: &DvbTransponder) -> i32 {
+        if self.state.master_source >= 0 {
+            let mid = self.state.master_source as usize;
+            let Some(slot_arc) = self.master_registry.as_ref().and_then(|r| r.slot(mid)) else {
+                ms_log::log!(
+                    "Adapter {} master source {} for specified but adapter not enabled",
+                    self.state.id,
+                    self.state.master_source
+                );
+                return self.state.tune(&mut self.dev, tp);
+            };
+            let mut slot = slot_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            let idle =
+                !slot.master_active && slot.slaves_used.iter().all(|&id| id == self.state.id);
+            let was_used = !slot.slaves_used.insert(self.state.id);
+            let MasterSlot {
+                ref mut state,
+                ref mut sec,
+                ..
+            } = *slot;
+            let master = MasterView {
+                id: self.state.master_source,
+                state,
+                idle,
+            };
+            let ret = self.state.tune_with_master_sec(
+                &mut self.dev,
+                sec.as_mut().map(|s| &mut **s as &mut dyn SecDevice),
+                tp,
+                Some(master),
+            );
+            if ret < 0 && !was_used {
+                slot.slaves_used.remove(&self.state.id);
+            }
+            return ret;
+        }
+        let Some(slot_arc) = usize::try_from(self.state.id)
+            .ok()
+            .and_then(|aid| self.master_registry.as_ref()?.slot(aid))
+        else {
+            return self.state.tune(&mut self.dev, tp);
+        };
+        let mut slot = slot_arc.lock().unwrap_or_else(PoisonError::into_inner);
+        // Sync master's cached switch state in case a slave updated it while idle.
+        self.state.old_pol = slot.state.pol;
+        self.state.old_hiband = slot.state.hiband;
+        self.state.old_diseqc = slot.state.diseqc;
+        let ret = self.state.tune(&mut self.dev, tp);
+        if ret >= 0 {
+            slot.state = SwitchState {
+                pol: self.state.old_pol,
+                hiband: self.state.old_hiband,
+                diseqc: self.state.old_diseqc,
+            };
+            slot.master_active = true;
+        }
+        ret
+    }
+
+    fn refresh_signal(&mut self) {
+        if self.state.master_source >= 0
+            && let Some(slot_arc) = self
+                .master_registry
+                .as_ref()
+                .and_then(|r| r.slot(self.state.master_source as usize))
+        {
+            let mut slot = slot_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            let idle =
+                !slot.master_active && slot.slaves_used.iter().all(|&id| id == self.state.id);
+            let MasterSlot {
+                ref mut state,
+                ref mut sec,
+                ..
+            } = *slot;
+            let master = MasterView {
+                id: self.state.master_source,
+                state,
+                idle,
+            };
+            let _ = self.state.get_signal_with_master_sec(
+                &mut self.dev,
+                sec.as_mut().map(|s| &mut **s as &mut dyn SecDevice),
+                Some(master),
+            );
+            return;
+        }
+        if let Some(slot_arc) = usize::try_from(self.state.id)
+            .ok()
+            .and_then(|aid| self.master_registry.as_ref()?.slot(aid))
+        {
+            let mut slot = slot_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            self.state.old_pol = slot.state.pol;
+            self.state.old_hiband = slot.state.hiband;
+            self.state.old_diseqc = slot.state.diseqc;
+            let _ = self.state.get_signal(&mut self.dev);
+            slot.state = SwitchState {
+                pol: self.state.old_pol,
+                hiband: self.state.old_hiband,
+                diseqc: self.state.old_diseqc,
+            };
+            return;
+        }
+        let _ = self.state.get_signal(&mut self.dev);
     }
 }
 
@@ -566,8 +682,11 @@ impl<D: DvbDevice> Drop for LinuxDvbTuner<D> {
 impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
     fn tune(&mut self, params: &TuneParams) -> Result<()> {
         let tp = DvbTransponder::from_params(params, self.state.tp.diseqc_param);
-        let ret = self.state.tune(&mut self.dev, &tp);
+        let prev_sid_cnt = self.state.sid_cnt;
+        self.state.sid_cnt = 1;
+        let ret = self.tune_with_registry(&tp);
         if ret < 0 {
+            self.state.sid_cnt = prev_sid_cnt;
             return Err(TunerError::Backend(ret));
         }
         self.status = SignalStatus {
@@ -592,6 +711,30 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
         // Sections of the previous transponder are not delivered after a retune.
         self.psi.clear();
         Ok(())
+    }
+
+    fn standby(&mut self) {
+        self.state.sid_cnt = 0;
+        let Some(registry) = &self.master_registry else {
+            return;
+        };
+        if self.state.master_source >= 0 {
+            if let Some(slot_arc) = registry.slot(self.state.master_source as usize) {
+                slot_arc
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .slaves_used
+                    .remove(&self.state.id);
+            }
+        } else if let Some(slot_arc) = usize::try_from(self.state.id)
+            .ok()
+            .and_then(|aid| registry.slot(aid))
+        {
+            slot_arc
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .master_active = false;
+        }
     }
 
     fn set_pids(&mut self, pids: &PidSet) -> Result<()> {

@@ -2,25 +2,81 @@
 //! back; one [`DdciHub`] mutex is shared by the threads involved (DEV-215).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use ms_ca::{CaService, ProgramTable, TablesResult};
 use ms_ca_drivers::ddci::{CiWriter, DDCI_SID, Ddci, TsBuffer};
+use ms_sched::MAX_ADAPTERS;
 use ms_sched::pmt::CaSink;
 use ms_ts::TsStage;
+
+const DEFAULT_LOG: u32 = ms_log::LOG_DDCI;
 
 /// Shared DDCI state.
 pub struct DdciState {
     pub ddci: Ddci,
     pub programs: ProgramTable,
-    writers: BTreeMap<usize, Box<dyn CiWriter + Send>>,
+    writers: BTreeMap<usize, Arc<Mutex<Box<dyn CiWriter + Send>>>>,
     origin: Instant,
+}
+
+struct DdciFlags {
+    enabled_devices: AtomicUsize,
+    ci_adapter: [AtomicBool; MAX_ADAPTERS],
+    mapped_adapter: [AtomicBool; MAX_ADAPTERS],
+}
+
+impl Default for DdciFlags {
+    fn default() -> Self {
+        Self {
+            enabled_devices: AtomicUsize::new(0),
+            ci_adapter: std::array::from_fn(|_| AtomicBool::new(false)),
+            mapped_adapter: std::array::from_fn(|_| AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Lock guard that refreshes atomic fast-path flags when dropped after mutable access.
+pub struct DdciGuard<'a> {
+    guard: Option<MutexGuard<'a, DdciState>>,
+    flags: &'a DdciFlags,
+    mutated: bool,
+}
+
+impl Deref for DdciGuard<'_> {
+    type Target = DdciState;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().expect("guard present until drop")
+    }
+}
+
+impl DerefMut for DdciGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.mutated = true;
+        self.guard.as_mut().expect("guard present until drop")
+    }
+}
+
+impl Drop for DdciGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take()
+            && self.mutated
+        {
+            DdciHub::sync_flags(&guard, self.flags);
+        }
+    }
 }
 
 /// Handle to the shared DDCI state.
 #[derive(Clone)]
-pub struct DdciHub(Arc<Mutex<DdciState>>);
+pub struct DdciHub {
+    state: Arc<Mutex<DdciState>>,
+    flags: Arc<DdciFlags>,
+}
 
 impl Default for DdciHub {
     fn default() -> Self {
@@ -30,17 +86,63 @@ impl Default for DdciHub {
 
 impl DdciHub {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(DdciState {
-            ddci: Ddci::new(),
-            programs: ProgramTable::new(),
-            writers: BTreeMap::new(),
-            origin: Instant::now(),
-        })))
+        Self {
+            state: Arc::new(Mutex::new(DdciState {
+                ddci: Ddci::new(),
+                programs: ProgramTable::new(),
+                writers: BTreeMap::new(),
+                origin: Instant::now(),
+            })),
+            flags: Arc::new(DdciFlags::default()),
+        }
+    }
+
+    fn sync_flags(state: &DdciState, flags: &DdciFlags) {
+        let enabled = state.ddci.devices.values().filter(|d| d.enabled).count();
+        flags.enabled_devices.store(enabled, Ordering::Relaxed);
+        for aid in 0..MAX_ADAPTERS {
+            let is_ci = state.ddci.devices.contains_key(&aid);
+            let is_mapped = state.ddci.devices.values().any(|d| {
+                d.enabled
+                    && d.mapping
+                        .values()
+                        .any(|m| usize::from(m.ad) == aid && m.rewrite)
+            });
+            flags.ci_adapter[aid].store(is_ci, Ordering::Relaxed);
+            flags.mapped_adapter[aid].store(is_mapped, Ordering::Relaxed);
+        }
+    }
+
+    /// Raw state lock for hot data-plane stages that do not change device/mapping topology.
+    fn lock_stage(&self) -> MutexGuard<'_, DdciState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The state; a poisoned lock still holds consistent tables.
-    pub fn lock(&self) -> MutexGuard<'_, DdciState> {
-        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    pub fn lock(&self) -> DdciGuard<'_> {
+        DdciGuard {
+            guard: Some(self.state.lock().unwrap_or_else(PoisonError::into_inner)),
+            flags: &self.flags,
+            mutated: false,
+        }
+    }
+
+    pub fn enabled_devices(&self) -> usize {
+        self.flags.enabled_devices.load(Ordering::Relaxed)
+    }
+
+    pub fn is_ci_adapter(&self, aid: u16) -> bool {
+        self.flags
+            .ci_adapter
+            .get(usize::from(aid))
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    pub fn is_mapped_adapter(&self, aid: u16) -> bool {
+        self.flags
+            .mapped_adapter
+            .get(usize::from(aid))
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     /// `ddci_open_device`: CI adapter `aid` writes to its CAM through `writer`.
@@ -53,7 +155,7 @@ impl DdciHub {
         state.ddci.devices.insert(aid, device);
         state.ddci.bump_sync_version();
         state.ddci.post_tune_ci(aid as u16);
-        state.writers.insert(aid, writer);
+        state.writers.insert(aid, Arc::new(Mutex::new(writer)));
     }
 
     /// `(adapter, pid)` pairs DDCI subscribed with `DDCI_SID`.
@@ -97,43 +199,92 @@ impl TsStage for DdciStage {
     }
 
     fn process_buf(&mut self, buf: &mut Vec<u8>, capacity: usize) {
-        let mut guard = self.hub.lock();
-        let state = &mut *guard;
-        if state.ddci.devices.contains_key(&usize::from(self.aid)) {
+        if usize::from(self.aid) >= MAX_ADAPTERS
+            || self.hub.is_ci_adapter(self.aid)
+            || self.hub.enabled_devices() == 0
+            || !self.hub.is_mapped_adapter(self.aid)
+        {
             return;
         }
-        let mut devices = Vec::new();
-        let mut has_rewrite = false;
-        for (&id, d) in &state.ddci.devices {
-            if !d.enabled {
-                continue;
+        let (devices, has_rewrite) = {
+            let guard = self.hub.lock_stage();
+            if guard.ddci.devices.contains_key(&usize::from(self.aid)) {
+                return;
             }
-            devices.push(id);
-            if !has_rewrite && d.mapping.values().any(|m| m.ad == self.aid && m.rewrite) {
-                has_rewrite = true;
+            let mut devices = Vec::new();
+            let mut has_rewrite = false;
+            for (&id, d) in &guard.ddci.devices {
+                if !d.enabled {
+                    continue;
+                }
+                devices.push(id);
+                if !has_rewrite && d.mapping.values().any(|m| m.ad == self.aid && m.rewrite) {
+                    has_rewrite = true;
+                }
             }
-        }
-        if devices.is_empty() {
+            (devices, has_rewrite)
+        };
+        if devices.is_empty() || !has_rewrite {
             return;
         }
-        state.ddci.now_ms = state.origin.elapsed().as_millis() as u64;
         // Grow `buf` up to `ad->lbuf` (`ddci.cpp:1105`) only when an enabled device maps `self.aid`.
         let rlen = buf.len();
         let mut data = std::mem::take(buf);
-        if has_rewrite {
-            data.resize(capacity.max(rlen), 0);
-        }
+        data.resize(capacity.max(rlen), 0);
         let mut ts = TsBuffer {
             id: self.aid,
             buf: data,
             rlen,
         };
         for dev in devices {
-            if let Some(writer) = state.writers.get_mut(&dev) {
-                state
+            let (prepared, writer) = {
+                let mut guard = self.hub.lock_stage();
+                let state = &mut *guard;
+                state.ddci.now_ms = state.origin.elapsed().as_millis() as u64;
+                let Some(prepared) = state
                     .ddci
-                    .process_ts(&mut ts, dev, &mut state.programs, writer.as_mut());
+                    .prepare_ts_write(&mut ts, dev, &mut state.programs)
+                else {
+                    continue;
+                };
+                let writer = state.writers.get(&dev).cloned();
+                if prepared.is_empty() || writer.is_none() {
+                    state.ddci.finish_ts_write(dev, &mut ts, prepared);
+                    continue;
+                }
+                (prepared, writer.expect("writer present"))
+            };
+            let dev_id = prepared.dev_id;
+            let bytes = prepared.total_bytes();
+            {
+                let mut ci = writer.lock().unwrap_or_else(PoisonError::into_inner);
+                let iov = prepared.iovecs();
+                ms_log::debugm_hot!(
+                    "writing {} bytes to DDCI device {}, fd {}, sock {}",
+                    bytes,
+                    dev_id,
+                    ci.fd(),
+                    ci.socket()
+                );
+                let rb = ci.writev(&iov);
+                if rb != bytes as isize {
+                    ms_log::log!(
+                        "ddci_process_ts: write incomplete to DDCI {},fd {}, wrote {} out of {} (iop {}{}), errno {}: {}",
+                        dev_id,
+                        ci.fd(),
+                        rb,
+                        bytes,
+                        iov.len(),
+                        if iov.len() > 1024 { " > IOV_MAX" } else { "" },
+                        ci.last_errno(),
+                        ci.last_error()
+                    );
+                }
             }
+            self.hub
+                .lock_stage()
+                .ddci
+                .finish_ts_write(dev, &mut ts, prepared);
         }
         if ts.rlen > rlen {
             ms_log::diag::count_batch_growth(i64::from(self.aid), ts.rlen as u64);
@@ -159,7 +310,7 @@ impl DdciCapture {
 
 impl TsStage for DdciCapture {
     fn process(&mut self, buf: &mut [u8]) {
-        self.hub.lock().ddci.push_from_cam(self.aid, buf);
+        self.hub.lock_stage().ddci.push_from_cam(self.aid, buf);
     }
 }
 
@@ -799,7 +950,7 @@ mod tests {
         sched.add_adapter(
             0,
             AdapterConfig::new(DeliverySystem::DvbS2),
-            Box::new(DataPlaneTuner::new(source.command_sender())),
+            Box::new(DataPlaneTuner::from_handle(&source)),
         );
         ca.adapter_added(&mut sched, 0);
         ca.dvbca_init_dev(AdapterInfo::dvb(0, 0, 0));
@@ -815,7 +966,7 @@ mod tests {
         let mut pump = |sched: &mut Scheduler, until: &dyn Fn(&[u16]) -> bool| {
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
-                while let Ok(event) = handles[0].as_ref().unwrap().events().try_recv() {
+                while let Ok(event) = handles[0].as_ref().unwrap().try_recv_event() {
                     if let Event::TablePackets {
                         generation,
                         packets,
@@ -906,7 +1057,7 @@ mod tests {
         sched.add_adapter(
             0,
             AdapterConfig::new(DeliverySystem::DvbS2),
-            Box::new(DataPlaneTuner::new(source.command_sender())),
+            Box::new(DataPlaneTuner::from_handle(&source)),
         );
         ca.adapter_added(&mut sched, 0);
 
@@ -926,7 +1077,7 @@ mod tests {
                 adapter_type: AdapterType::Ci,
                 ..AdapterConfig::default()
             },
-            Box::new(DataPlaneTuner::new(ci.command_sender())),
+            Box::new(DataPlaneTuner::from_handle(&ci)),
         );
         sched.post_tune_adapter(1);
         ca.adapter_added(&mut sched, 1);
@@ -960,7 +1111,7 @@ mod tests {
         while clear < 100 && Instant::now() < deadline {
             for (aid, handle) in handles.iter().enumerate() {
                 let handle = handle.as_ref().unwrap();
-                while let Ok(event) = handle.events().try_recv() {
+                while let Ok(event) = handle.try_recv_event() {
                     if let Event::TablePackets {
                         generation,
                         packets,
@@ -1386,5 +1537,95 @@ mod growth_tests {
             poll_cnt <= 25,
             "DdciReader backed off on persistent POLLHUP ({poll_cnt} polls in 55 ms)"
         );
+    }
+
+    #[test]
+    fn unmapped_stage_skips_stalled_ci_writer_and_hub_is_free_during_writev() {
+        use std::sync::Condvar;
+        use std::time::Duration;
+
+        struct BlockingWriter {
+            entered: Arc<(Mutex<bool>, Condvar)>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+            writes: usize,
+        }
+        impl CiWriter for BlockingWriter {
+            fn writev(&mut self, iov: &[&[u8]]) -> isize {
+                {
+                    let (lock, cvar) = &*self.entered;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_all();
+                }
+                let (lock, cvar) = &*self.release;
+                let mut go = lock.lock().unwrap();
+                while !*go {
+                    let (guard, wait) = cvar.wait_timeout(go, Duration::from_secs(3)).unwrap();
+                    go = guard;
+                    if wait.timed_out() {
+                        break;
+                    }
+                }
+                self.writes += 1;
+                iov.iter().map(|s| s.len() as isize).sum()
+            }
+        }
+
+        let hub = DdciHub::new();
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        hub.open_device(
+            1,
+            Box::new(BlockingWriter {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                writes: 0,
+            }),
+            false,
+        );
+        // Map adapter 0 PID 0x100 onto CI 1, leaving adapter 2 completely unmapped.
+        let _ddci_pid = hub.lock().ddci.add_pid_mapping_table(0, 0x100, 1, 1, false);
+        assert!(hub.is_mapped_adapter(0));
+        assert!(!hub.is_mapped_adapter(2));
+
+        let mut mapped = DdciStage::new(hub.clone(), 0);
+        let mut unmapped = DdciStage::new(hub.clone(), 2);
+
+        let worker = std::thread::spawn(move || {
+            let mut pkt = vec![0xFFu8; 188];
+            pkt[0] = 0x47;
+            pkt[1] = 0x01;
+            pkt[2] = 0x00;
+            pkt[3] = 0x10;
+            mapped.process_buf(&mut pkt, 188 * 4);
+        });
+
+        // Wait until mapped adapter enters CiWriter::writev on CI 1.
+        {
+            let (lock, cvar) = &*entered;
+            let mut inside = lock.lock().unwrap();
+            while !*inside {
+                let (guard, wait) = cvar.wait_timeout(inside, Duration::from_secs(2)).unwrap();
+                inside = guard;
+                assert!(!wait.timed_out(), "writev did not start");
+            }
+        }
+
+        // Hub lock is free while CI 1 writev blocks, and unmapped adapter 2 does not stall.
+        let t0 = Instant::now();
+        {
+            let _hub = hub.lock();
+        }
+        let mut unmapped_pkt = vec![0x47u8; 188];
+        unmapped.process_buf(&mut unmapped_pkt, 188 * 4);
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "hub or unmapped stage blocked on stalled CI writer: {:?}",
+            t0.elapsed()
+        );
+
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+        worker.join().unwrap();
     }
 }

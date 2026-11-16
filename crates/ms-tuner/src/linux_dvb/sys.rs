@@ -237,6 +237,91 @@ pub struct LinuxDvbDevice {
     base: Instant,
 }
 
+fn sec_set_tone(fd: i32, tone: Tone) -> io::Result<()> {
+    ioctl_arg(fd, NATIVE_IOCTLS.fe_set_tone, tone as i32 as libc::c_ulong)
+}
+
+fn sec_set_voltage(fd: i32, voltage: Voltage) -> io::Result<()> {
+    ioctl_arg(
+        fd,
+        NATIVE_IOCTLS.fe_set_voltage,
+        voltage as i32 as libc::c_ulong,
+    )
+}
+
+fn sec_send_master_cmd(fd: i32, cmd: &DiseqcMessage) -> io::Result<()> {
+    let bytes = cmd.bytes();
+    let mut raw = DiseqcMasterCmdRaw {
+        msg: [0; 6],
+        msg_len: bytes.len() as u8,
+    };
+    raw.msg[..bytes.len()].copy_from_slice(bytes);
+    ioctl_ptr(fd, NATIVE_IOCTLS.fe_diseqc_send_master_cmd, &mut raw)
+}
+
+fn sec_send_burst(fd: i32, burst: MiniCmd) -> io::Result<()> {
+    ioctl_arg(
+        fd,
+        NATIVE_IOCTLS.fe_diseqc_send_burst,
+        burst as i32 as libc::c_ulong,
+    )
+}
+
+fn sec_sleep_ms(ms: i32) {
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
+}
+
+/// Duplicated or standalone frontend descriptor used solely for master SEC ioctls.
+pub struct LinuxSecDevice {
+    fe: i32,
+}
+
+impl LinuxSecDevice {
+    /// Opens `/dev/dvb/adapterN/frontendM` read-write for slave switch ioctls (`init_hw`).
+    pub fn open_frontend(adapter: u32, frontend: u32) -> io::Result<Self> {
+        let fe = open_path(
+            &path(DEV_FRONTEND, adapter, frontend),
+            libc::O_RDWR | libc::O_NONBLOCK,
+        )?;
+        Ok(Self { fe })
+    }
+}
+
+impl Drop for LinuxSecDevice {
+    fn drop(&mut self) {
+        close_fd(self.fe);
+        self.fe = -1;
+    }
+}
+
+impl SecDevice for LinuxSecDevice {
+    fn set_tone(&mut self, tone: Tone) -> io::Result<()> {
+        sec_set_tone(self.fe, tone)
+    }
+
+    fn set_voltage(&mut self, voltage: Voltage) -> io::Result<()> {
+        sec_set_voltage(self.fe, voltage)
+    }
+
+    fn send_master_cmd(&mut self, cmd: &DiseqcMessage) -> io::Result<()> {
+        sec_send_master_cmd(self.fe, cmd)
+    }
+
+    fn send_burst(&mut self, burst: MiniCmd) -> io::Result<()> {
+        sec_send_burst(self.fe, burst)
+    }
+
+    fn sleep_ms(&mut self, ms: i32) {
+        sec_sleep_ms(ms);
+    }
+
+    fn log_fd(&self) -> i32 {
+        self.fe
+    }
+}
+
 impl LinuxDvbDevice {
     /// Opens `frontendN` and `dvrN` for one adapter (`dvb_open_device`, dvb.cpp:894).
     pub fn open(adapter: u32, frontend: u32) -> io::Result<Self> {
@@ -318,8 +403,21 @@ impl LinuxDvbDevice {
         self.frontend
     }
 
-    fn set_enum(&self, fd: i32, request: u32, value: i32) -> io::Result<()> {
-        ioctl_arg(fd, request, value as libc::c_ulong)
+    /// Duplicates the frontend descriptor so slave adapters can drive master SEC ioctls.
+    pub fn dup_sec(&self) -> io::Result<LinuxSecDevice> {
+        if self.fe < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "closed frontend",
+            ));
+        }
+        // SAFETY: `self.fe` is an open file descriptor owned by this device.
+        let dup = unsafe { libc::fcntl(self.fe, libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(LinuxSecDevice { fe: dup })
+        }
     }
 }
 
@@ -334,31 +432,23 @@ impl Drop for LinuxDvbDevice {
 
 impl SecDevice for LinuxDvbDevice {
     fn set_tone(&mut self, tone: Tone) -> io::Result<()> {
-        self.set_enum(self.fe, NATIVE_IOCTLS.fe_set_tone, tone as i32)
+        sec_set_tone(self.fe, tone)
     }
 
     fn set_voltage(&mut self, voltage: Voltage) -> io::Result<()> {
-        self.set_enum(self.fe, NATIVE_IOCTLS.fe_set_voltage, voltage as i32)
+        sec_set_voltage(self.fe, voltage)
     }
 
     fn send_master_cmd(&mut self, cmd: &DiseqcMessage) -> io::Result<()> {
-        let bytes = cmd.bytes();
-        let mut raw = DiseqcMasterCmdRaw {
-            msg: [0; 6],
-            msg_len: bytes.len() as u8,
-        };
-        raw.msg[..bytes.len()].copy_from_slice(bytes);
-        ioctl_ptr(self.fe, NATIVE_IOCTLS.fe_diseqc_send_master_cmd, &mut raw)
+        sec_send_master_cmd(self.fe, cmd)
     }
 
     fn send_burst(&mut self, burst: MiniCmd) -> io::Result<()> {
-        self.set_enum(self.fe, NATIVE_IOCTLS.fe_diseqc_send_burst, burst as i32)
+        sec_send_burst(self.fe, burst)
     }
 
     fn sleep_ms(&mut self, ms: i32) {
-        if ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-        }
+        sec_sleep_ms(ms);
     }
 
     fn log_fd(&self) -> i32 {

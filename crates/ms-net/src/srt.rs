@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 /// Invalid SRT socket value (`SRT_INVALID_SOCK`).
@@ -18,6 +18,8 @@ pub const SRT_PENDING_MAX: usize = 64;
 pub const MAX_UDP_PACKET_SIZE: usize = 1316;
 /// Listen backlog used by C++.
 pub const SRT_LISTEN_BACKLOG: i32 = 10;
+/// Send timeout matching `SO_SNDTIMEO` so stalled SRT peers fail instead of wedging data planes.
+pub const SRT_SEND_TIMEOUT_MS: i32 = 1100;
 
 /// Failure while setting up or using the SRT listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,8 +66,16 @@ pub trait SrtOps: Send + Sync {
     fn close(&self, sock: i32);
     /// Whether `sock` is in `SRTS_CONNECTED`.
     fn is_connected(&self, sock: i32) -> bool;
+    /// Sets `SRTO_SNDTIMEO` in ms; default returns `true` for fakes.
+    fn set_send_timeout(&self, _sock: i32, _timeout_ms: i32) -> bool {
+        true
+    }
     /// Sends bytes and returns the byte count, or a negative value on failure.
     fn send(&self, sock: i32, data: &[u8]) -> i32;
+}
+
+fn lock_pool(pool: &Mutex<PendingPool>) -> MutexGuard<'_, PendingPool> {
+    pool.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Result of a pre-accept callback.
@@ -243,7 +253,7 @@ impl<O: SrtOps + 'static> SrtListener<O> {
                 ms_srt::last_error()
             );
         }
-        self.pending.lock().expect("pending pool").drain();
+        lock_pool(&self.pending).drain();
         if let Some(handle) = self.drain.take() {
             drop(handle);
         }
@@ -277,7 +287,7 @@ impl<O: SrtOps + 'static> SrtListener<O> {
         if let Some(handle) = self.drain.take() {
             let _ = handle.join();
         }
-        let dropped = self.pending.lock().expect("pending pool").drain();
+        let dropped = lock_pool(&self.pending).drain();
         for socket in dropped {
             self.ops.close(socket);
         }
@@ -285,7 +295,7 @@ impl<O: SrtOps + 'static> SrtListener<O> {
 
     /// Takes the socket accepted with `streamid` (`srt_pending_take`).
     pub fn take(&self, streamid: &str) -> i32 {
-        self.pending.lock().expect("pending pool").take(streamid)
+        lock_pool(&self.pending).take(streamid)
     }
 
     /// Returns a socket for reuse, or closes it when disconnected
@@ -304,11 +314,7 @@ impl<O: SrtOps + 'static> SrtListener<O> {
             );
             return;
         }
-        let old = self
-            .pending
-            .lock()
-            .expect("pending pool")
-            .put(streamid, sock);
+        let old = lock_pool(&self.pending).put(streamid, sock);
         if old != SRT_INVALID_SOCK {
             self.ops.close(old);
         }

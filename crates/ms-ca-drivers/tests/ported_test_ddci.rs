@@ -1547,3 +1547,86 @@ fn test_emm_pids_stay_while_their_adapter_has_a_pmt() {
     x.del_pmt(1, &prog(&t, b));
     assert!(x.devices[&0].mapping.is_empty(), "nothing left mapped");
 }
+
+#[test]
+fn create_pmt_emits_valid_section_syntax_header_and_crc() {
+    use ms_psi::{CrcCheck, Pmt};
+
+    let mut x = Ddci::new();
+    let mut t = ProgramTable::new();
+    x.devices.insert(0, DdciDevice::new(0, 0));
+    let id = create_pmt(&mut t, 0, 0x66, 1023, 0x55, 0x100, 0x500);
+    x.add_pid_mapping_table(0, 0x0573, id, 0, false);
+    x.add_pid_mapping_table(0, 0x0100, id, 0, false);
+    let mut dp = DdciPmt {
+        ver: 0,
+        pcr_pid: 0x0100,
+        ..DdciPmt::default()
+    };
+    let psi = x.create_pmt(0, &prog(&t, id), 512, &mut dp);
+    let section = &psi[1..];
+    assert_eq!(section[1] & 0xF0, 0xB0, "section_syntax_indicator missing");
+    assert_eq!(section[5] & 0xC1, 0xC1, "version reserved bits missing");
+    assert!(
+        Pmt::parse(section, CrcCheck::Verify).is_ok(),
+        "PMT section must pass strict CRC verification"
+    );
+}
+
+#[test]
+fn mapping_exhaustion_returns_minus_one_without_poisoning_table() {
+    let mut x = Ddci::new();
+    x.devices.insert(0, DdciDevice::new(0, 0));
+    assert_eq!(x.add_pid_mapping_table(0, 8191, 1, 0, false), -1);
+    assert!(
+        !x.devices[&0].mapping.contains_key(&(0, 8191)),
+        "-1 pid mapping must not be inserted"
+    );
+}
+
+#[test]
+fn process_cat_rejects_bad_crc_and_skips_reserved_table_pids() {
+    let mut bad = CAT;
+    let last = bad.len() - 1;
+    bad[last] ^= 0xFF;
+    let mut x = Ddci::new();
+    x.devices.insert(0, DdciDevice::new(0, 0));
+    x.process_cat(0, &bad, 0);
+    assert!(
+        x.devices[&0].mapping.is_empty(),
+        "bad CAT CRC must not map any EMM PID"
+    );
+
+    // Reserved/null PIDs (< 32 or 0x1FFF) inside a valid-CRC CAT are skipped.
+    let mut body = vec![0x01, 0xB0, 0x00, 0x00, 0x01, 0xC1, 0x00, 0x00];
+    body.extend_from_slice(&[0x09, 0x04, 0x0B, 0x00, 0xE0, 0x00]); // pid 0 (<32)
+    body.extend_from_slice(&[0x09, 0x04, 0x0B, 0x00, 0xFF, 0xFF]); // pid 0x1FFF
+    body.extend_from_slice(&[0x09, 0x04, 0x0B, 0x00, 0xE0, 0x40]); // pid 64 (valid)
+    let len = (body.len() - 3 + 4) as u16;
+    let len_word = 0xB000 | len;
+    body[1..3].copy_from_slice(&len_word.to_be_bytes());
+    let crc = ms_ts::crc::crc32_mpeg2(&body);
+    body.extend_from_slice(&crc.to_be_bytes());
+
+    x.process_cat(0, &body, 0);
+    assert!(!mapped(&x, 0, 0), "PID 0 must be skipped");
+    assert!(!mapped(&x, 0, 0x1FFF), "PID 0x1FFF must be skipped");
+    assert!(mapped(&x, 0, 64), "valid EMM PID 64 must be mapped");
+}
+
+#[test]
+fn out_of_range_adapter_and_device_ids_do_not_panic() {
+    let mut x = Ddci::new();
+    x.devices.insert(0, DdciDevice::new(0, 0));
+    let mut ts = TsBuffer {
+        id: 250,
+        buf: vec![0x47; DVB_FRAME * 2],
+        rlen: DVB_FRAME,
+    };
+    let mut programs = ProgramTable::new();
+    let empty_map = [0u16; 8192];
+    x.push_ts_to_adapter(99, &mut ts, &empty_map);
+    x.push_ts_to_adapter(0, &mut ts, &empty_map);
+    assert!(x.prepare_ts_write(&mut ts, 99, &mut programs).is_none());
+    assert!(x.create_pat(99, &programs).is_empty());
+}

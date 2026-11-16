@@ -5,13 +5,13 @@
 //! them here. Adapters run on their own data-plane threads.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read};
+use std::io::{self, IoSlice, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -24,7 +24,7 @@ use ms_net::output::{OutputConfig, StreamOutput, UdpTarget};
 use ms_net::response::format_http_date;
 use ms_net::rtsp::{ParseOutcome, Protocol, Request, parse_request_logged};
 use ms_net::session::{DescribeOptions, SessionManager, UdpBinder};
-use ms_net::socket::DEFAULT_FIFO_SIZE;
+use ms_net::socket::{DEFAULT_FIFO_SIZE, MAX_SOCKS};
 use ms_net::ssdp::{
     ANNOUNCE_INTERVAL_MS, SharedIdentity, SsdpConfig, SsdpServer, UdpSsdpIo, read_boot_id, uuid4,
 };
@@ -43,9 +43,10 @@ use ms_tuner::{
 
 #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
 use ms_tuner::linux_dvb::{
-    self, DemuxMode, DiseqcParams, LinuxDeviceTree, LinuxDvbTuner, LinuxFrontendProbe, SWITCH_JESS,
-    SWITCH_SLAVE, SWITCH_UNICABLE, TUNER_FORCE_NO, TUNER_FORCE_SNR_DECIBEL,
-    TUNER_FORCE_SNR_PERCENT, TUNER_FORCE_STRENGTH_DECIBEL, TUNER_FORCE_STRENGTH_PERCENT,
+    self, DemuxMode, DiseqcParams, LinuxDeviceTree, LinuxDvbTuner, LinuxFrontendProbe,
+    LinuxSecDevice, MasterRegistry, SWITCH_JESS, SWITCH_SLAVE, SWITCH_UNICABLE, TUNER_FORCE_NO,
+    TUNER_FORCE_SNR_DECIBEL, TUNER_FORCE_SNR_PERCENT, TUNER_FORCE_STRENGTH_DECIBEL,
+    TUNER_FORCE_STRENGTH_PERCENT,
 };
 
 use crate::ca::CaRuntime;
@@ -62,6 +63,9 @@ const ACCEPT_POLL: Duration = Duration::from_millis(200);
 const SSDP_READ_TIMEOUT: Duration = Duration::from_millis(1100);
 const OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_millis(1100);
 const PENDING_STALL: Duration = Duration::from_secs(30);
+const SATIP_XML_DEADLINE: Duration = Duration::from_secs(15);
+const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(60);
+const THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Fixed runtime values shared by every request.
 struct ServerConfig {
@@ -163,10 +167,12 @@ struct SatipXmlPoll {
     interval: Duration,
     /// Results of the fetch thread, present while a fetch is in flight.
     fetched: Option<Receiver<SatipXmlFetch>>,
+    started_at: Option<Instant>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl SatipXmlPoll {
-    /// Collects completed fetches; a disconnected worker clears the slot.
+    /// Collects completed fetches; a disconnected or timed-out worker clears the slot.
     fn drain(&mut self) -> Vec<SatipXmlFetch> {
         let mut results = Vec::new();
         let mut disconnected = false;
@@ -184,6 +190,21 @@ impl SatipXmlPoll {
         }
         if disconnected {
             self.fetched = None;
+            self.started_at = None;
+            self.cancel = None;
+        } else if self
+            .started_at
+            .is_some_and(|started| started.elapsed() >= SATIP_XML_DEADLINE)
+        {
+            if let Some(cancel) = self.cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.fetched = None;
+            self.started_at = None;
+            ms_log::log!(
+                "satip_getxml: timed out after {} ms",
+                SATIP_XML_DEADLINE.as_millis()
+            );
         }
         results
     }
@@ -197,11 +218,19 @@ impl SatipXmlPoll {
         let urls = self.urls.clone();
         let over_tcp = self.over_tcp;
         let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
         self.fetched = Some(receiver);
+        self.started_at = Some(now);
+        self.cancel = Some(cancel);
         thread::spawn(move || {
             for url in urls {
+                if cancel_worker.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Ok((host, xml)) = fetch_satip_xml(&url)
-                    && sender.send((url, over_tcp, host, xml)).is_err()
+                    && (cancel_worker.load(Ordering::Relaxed)
+                        || sender.send((url, over_tcp, host, xml)).is_err())
                 {
                     break;
                 }
@@ -230,6 +259,7 @@ struct ConnectionRequest {
 }
 
 enum Inbound {
+    Opened(u64, Arc<AtomicUsize>),
     Request(Box<ConnectionRequest>),
     /// An interleaved RTP/RTCP frame was received (minisatip.cpp:1187-1189).
     Interleaved(u64),
@@ -255,6 +285,8 @@ struct ActiveOutput {
     dest: Option<SocketAddr>,
     /// SSRC last pushed to the data plane (`sid->ssrc`).
     ssrc: u32,
+    /// SRT socket last started on the data plane (`sid->srt_sock`).
+    srt_sock: i32,
 }
 
 /// Placeholder for adapters that exist in the device table but were not opened.
@@ -282,6 +314,7 @@ struct Runtime {
     handles: Vec<Option<AdapterHandle>>,
     outputs: HashMap<i32, ActiveOutput>,
     conn_streams: HashMap<u64, i32>,
+    conn_states: HashMap<u64, Arc<AtomicUsize>>,
     started: Instant,
     start_unix: i64,
     /// Process-wide counters fed by every data plane, including satipc
@@ -358,7 +391,7 @@ impl Runtime {
                     Some(Arc::clone(&bandwidth)),
                     ca.stages(aid),
                 )?;
-                let bridge = DataPlaneTuner::new(handle.command_sender());
+                let bridge = DataPlaneTuner::from_handle(&handle);
                 scheduler.add_adapter(aid, adapter_config(), Box::new(bridge));
                 // 1-based `fe=` -> adapter number, as for DVB adapters below.
                 scheduler.set_fe_map_entry(aid, aid as i16);
@@ -442,7 +475,7 @@ impl Runtime {
                 Some(Arc::clone(&bandwidth)),
                 ca.stages(aid),
             )?;
-            let bridge = DataPlaneTuner::new(handle.command_sender());
+            let bridge = DataPlaneTuner::from_handle(&handle);
             scheduler.add_adapter(aid, satipc_adapter_config(&server), Box::new(bridge));
             handles[aid] = Some(handle);
             satip_adapters.push(SatipAdapter {
@@ -468,6 +501,8 @@ impl Runtime {
                 next: Instant::now() + interval,
                 interval,
                 fetched: None,
+                started_at: None,
+                cancel: None,
             })
         });
 
@@ -541,6 +576,7 @@ impl Runtime {
             handles,
             outputs: HashMap::new(),
             conn_streams: HashMap::new(),
+            conn_states: HashMap::new(),
             started: Instant::now(),
             start_unix: sys::now_seconds(),
             bandwidth: Arc::clone(&bandwidth),
@@ -562,6 +598,9 @@ impl Runtime {
                 PENDING_POLL
             };
             match receiver.recv_timeout(tick) {
+                Ok(Inbound::Opened(conn_id, state)) => {
+                    self.conn_states.insert(conn_id, state);
+                }
                 Ok(Inbound::Request(message)) => self.handle_request(*message),
                 Ok(Inbound::Interleaved(conn_id)) => {
                     if let Some(id) = self.conn_streams.get(&conn_id).copied() {
@@ -570,6 +609,7 @@ impl Runtime {
                 }
                 Ok(Inbound::Closed(conn_id, fd)) => {
                     self.close_connection(conn_id, fd);
+                    self.conn_states.remove(&conn_id);
                     match self.pending_replies.get_mut(&conn_id) {
                         Some(pending) if pending.offset < pending.data.len() => {
                             pending.close_when_flushed = true;
@@ -616,7 +656,7 @@ impl Runtime {
             Some(Arc::clone(&self.bandwidth)),
             stages,
         )?;
-        let bridge = DataPlaneTuner::new(handle.command_sender());
+        let bridge = DataPlaneTuner::from_handle(&handle);
         self.session.scheduler_mut().add_adapter(
             aid,
             satipc_adapter_config(&server),
@@ -725,6 +765,35 @@ impl Runtime {
         }
     }
 
+    fn attach_conn_stream(&mut self, conn_id: u64, id: i32) {
+        self.conn_streams.insert(conn_id, id);
+        if let Some(state) = self.conn_states.get(&conn_id) {
+            state.store(1, Ordering::Relaxed);
+        }
+    }
+
+    fn detach_conn(&mut self, conn_id: u64) -> Option<i32> {
+        let removed = self.conn_streams.remove(&conn_id);
+        if let Some(state) = self.conn_states.get(&conn_id) {
+            state.store(0, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    fn detach_stream_conns(&mut self, id: i32) {
+        let conn_states = &self.conn_states;
+        self.conn_streams.retain(|conn_id, sid| {
+            if *sid == id {
+                if let Some(state) = conn_states.get(conn_id) {
+                    state.store(0, Ordering::Relaxed);
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// Closes streams whose idle timeout expired (`stream_timeout`).
     fn expire_streams(&mut self) {
         let expired = self.session.expired_streams();
@@ -734,7 +803,7 @@ impl Runtime {
         for id in expired {
             self.stop_output(id);
             self.session.close_stream(id);
-            self.conn_streams.retain(|_, sid| *sid != id);
+            self.detach_stream_conns(id);
         }
         self.update_thresholds();
     }
@@ -803,7 +872,7 @@ impl Runtime {
                 .collect();
             for (id, adapter) in outputs {
                 if let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref)
-                    && let Some(stats) = handle.query(id)
+                    && let Some(stats) = handle.cached_stats(id)
                 {
                     self.session
                         .set_stream_output_stats(id, stats.overflow, stats.buffered);
@@ -912,10 +981,10 @@ impl Runtime {
         }
         match sid {
             Some(id) => {
-                self.conn_streams.insert(conn_id, id);
+                self.attach_conn_stream(conn_id, id);
             }
             None => {
-                self.conn_streams.remove(&conn_id);
+                self.detach_conn(conn_id);
             }
         }
         self.prune_outputs();
@@ -941,7 +1010,7 @@ impl Runtime {
         if self.session.stream(id).is_none() {
             self.stop_output(id);
             if self.conn_streams.get(&conn_id) == Some(&id) {
-                self.conn_streams.remove(&conn_id);
+                self.detach_conn(conn_id);
             }
             return;
         }
@@ -1162,25 +1231,33 @@ impl Runtime {
         let Some(stream) = self.session.stream(id) else {
             return;
         };
-        let (stream_type, adapter, do_play, ssrc) = (
+        let (stream_type, adapter, do_play, ssrc, srt_sock) = (
             stream.stream_type,
             stream.adapter,
             stream.do_play,
             stream.session_id as u32,
+            stream.srt_sock,
         );
         let dest = udp_destination(stream);
-        let Some(active) = self
-            .outputs
-            .get(&id)
-            .map(|active| (active.adapter, active.stream_type, active.dest, active.ssrc))
-        else {
+        let Some(active) = self.outputs.get(&id).map(|active| {
+            (
+                active.adapter,
+                active.stream_type,
+                active.dest,
+                active.ssrc,
+                active.srt_sock,
+            )
+        }) else {
             if do_play {
                 self.start_output(id, conn_id, peer, writer);
             }
             return;
         };
-        let (active_adapter, active_type, active_dest, active_ssrc) = active;
-        if active_adapter != adapter || active_type != stream_type {
+        let (active_adapter, active_type, active_dest, active_ssrc, active_srt_sock) = active;
+        if active_adapter != adapter
+            || active_type != stream_type
+            || (stream_type == StreamType::RtspSrt && active_srt_sock != srt_sock)
+        {
             self.stop_output(id);
             if adapter >= 0 {
                 self.start_output(id, conn_id, peer, writer);
@@ -1280,14 +1357,23 @@ impl Runtime {
                 };
                 StreamOutput::udp_from_bound(rtp, rtcp, config, now_ms, self.config.output_buffer)
             }
-            StreamType::RtspTcp => Ok(StreamOutput::rtsp_tcp(
-                Box::new(writer),
-                Some(peer),
-                config,
-                now_ms,
-            )),
+            StreamType::RtspTcp => {
+                #[cfg(target_os = "linux")]
+                if self.config.output_buffer > 0 {
+                    ms_net::sys::set_socket_send_buffer(
+                        writer.as_raw_fd(),
+                        self.config.output_buffer,
+                    );
+                }
+                Ok(StreamOutput::rtsp_tcp(
+                    Box::new(NonblockingTcpWriter(writer)),
+                    Some(peer),
+                    config,
+                    now_ms,
+                ))
+            }
             StreamType::Http => Ok(StreamOutput::http(
-                Box::new(writer),
+                Box::new(NonblockingTcpWriter(writer)),
                 Some(peer),
                 config,
                 now_ms,
@@ -1326,6 +1412,7 @@ impl Runtime {
                             stream_type,
                             dest,
                             ssrc,
+                            srt_sock,
                         },
                     );
                 }
@@ -1371,7 +1458,7 @@ impl Runtime {
             .collect();
         for id in dead {
             self.stop_output(id);
-            self.conn_streams.retain(|_, sid| *sid != id);
+            self.detach_stream_conns(id);
         }
     }
 
@@ -1422,7 +1509,7 @@ impl Runtime {
         for id in streams {
             self.close_control_stream(id);
         }
-        if let Some(id) = self.conn_streams.remove(&conn_id) {
+        if let Some(id) = self.detach_conn(conn_id) {
             self.close_control_stream(id);
         }
         self.update_thresholds();
@@ -1440,11 +1527,12 @@ impl Runtime {
 
     fn drain_events(&mut self) {
         let mut tables = Vec::new();
+        let mut closed_ids = Vec::new();
         for (aid, handle) in self.handles.iter().enumerate() {
             let Some(handle) = handle else {
                 continue;
             };
-            while let Ok(event) = handle.events().try_recv() {
+            while let Ok(event) = handle.try_recv_event() {
                 match event {
                     // Only the tracked generation may close the stream; a
                     // stale event belongs to a restarted output.
@@ -1452,6 +1540,7 @@ impl Runtime {
                         if self.outputs.get(&id).map(|active| active.epoch) == Some(epoch) {
                             self.outputs.remove(&id);
                             self.session.close_stream(id);
+                            closed_ids.push(id);
                         }
                     }
                     // StopOutput is always requested here, and the caller
@@ -1476,6 +1565,9 @@ impl Runtime {
                     } => tables.push((aid, generation, packets)),
                 }
             }
+        }
+        for id in closed_ids {
+            self.detach_stream_conns(id);
         }
         for (aid, generation, packets) in tables {
             self.ca.on_table_packets(
@@ -1684,6 +1776,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
     let shutdown = Arc::new(AtomicBool::new(false));
     // A mutex rather than `AtomicU64`, which 32-bit MIPS does not provide.
     let next_id = Arc::new(Mutex::new(1_u64));
+    let active_conns = Arc::new(AtomicUsize::new(0));
     let listeners = vec![
         spawn_listener(
             rtsp_listener,
@@ -1692,6 +1785,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
             requests.clone(),
             Arc::clone(&shutdown),
             Arc::clone(&next_id),
+            Arc::clone(&active_conns),
         )?,
         spawn_listener(
             http_listener,
@@ -1700,6 +1794,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
             requests.clone(),
             Arc::clone(&shutdown),
             Arc::clone(&next_id),
+            Arc::clone(&active_conns),
         )?,
     ];
 
@@ -1752,10 +1847,10 @@ pub fn run(opts: &Options) -> Result<(), String> {
     shutdown.store(true, Ordering::SeqCst);
     drop(requests);
     for listener in listeners {
-        let _ = listener.join();
+        listener.join_bounded(THREAD_JOIN_TIMEOUT);
     }
     if let Some(ssdp) = ssdp {
-        let _ = ssdp.join();
+        ssdp.join_bounded(THREAD_JOIN_TIMEOUT);
     }
     runtime.shutdown();
     Ok(())
@@ -1867,6 +1962,132 @@ fn send_now(fd: RawFd, data: &[u8]) -> io::Result<usize> {
             return Err(error);
         }
         return Ok(result as usize);
+    }
+}
+
+#[allow(unsafe_code)]
+fn send_vectored_now(fd: RawFd, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+    let mut iov: [libc::iovec; 1024] = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; 1024];
+    let mut count = 0usize;
+    for slice in bufs {
+        if slice.is_empty() {
+            continue;
+        }
+        iov[count] = libc::iovec {
+            iov_base: slice.as_ptr().cast_mut().cast(),
+            iov_len: slice.len(),
+        };
+        count += 1;
+        if count == iov.len() {
+            break;
+        }
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    // SAFETY: zeroed `msghdr` clears musl padding; `iov[..count]` outlives `sendmsg`.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iov.as_mut_ptr();
+    msg.msg_iovlen = count as _;
+    loop {
+        // SAFETY: `fd` is an open socket and `msg` points to valid `iovec` entries.
+        let result = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        return Ok(result as usize);
+    }
+}
+
+/// Non-blocking TCP writer so stalled RTSP-TCP/HTTP clients yield `WouldBlock` to `WriteQueue`.
+struct NonblockingTcpWriter(TcpStream);
+
+impl Write for NonblockingTcpWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        send_now(self.0.as_raw_fd(), buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        send_vectored_now(self.0.as_raw_fd(), bufs)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct ExitSignal(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for ExitSignal {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.0;
+        let mut exited = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        *exited = true;
+        cvar.notify_all();
+    }
+}
+
+struct BoundedThread {
+    name: String,
+    handle: Option<JoinHandle<()>>,
+    exited: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl BoundedThread {
+    fn spawn<F>(name: impl Into<String>, f: F) -> io::Result<Self>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let name = name.into();
+        let exited = Arc::new((Mutex::new(false), Condvar::new()));
+        let signal = Arc::clone(&exited);
+        let handle = thread::Builder::new().name(name.clone()).spawn(move || {
+            let _guard = ExitSignal(signal);
+            f();
+        })?;
+        Ok(Self {
+            name,
+            handle: Some(handle),
+            exited,
+        })
+    }
+
+    fn join_bounded(mut self, timeout: Duration) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let (lock, cvar) = &*self.exited;
+        let mut exited = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let deadline = Instant::now() + timeout;
+        while !*exited {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (guard, wait) = cvar
+                .wait_timeout(exited, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            exited = guard;
+            if wait.timed_out() {
+                break;
+            }
+        }
+        if *exited {
+            drop(exited);
+            let _ = handle.join();
+        } else {
+            ms_log::log!(
+                "{} thread did not exit within {} ms, detaching",
+                self.name,
+                timeout.as_millis()
+            );
+        }
     }
 }
 
@@ -2124,11 +2345,16 @@ fn spawn_dvb_adapters(
         .ok()
         .filter(|size| *size > 0)
         .unwrap_or(ms_net::dataplane::ADAPTER_BUFFER);
+    let masters = slave_masters(opts);
+    let master_ids: HashSet<usize> = masters.iter().flatten().copied().collect();
+    let master_registry = MasterRegistry::new();
+    let mut physical: [Option<(u32, u32)>; MAX_ADAPTERS] = [None; MAX_ADAPTERS];
     for frontend in frontends {
         let aid = frontend.adapter as usize;
         if aid >= MAX_ADAPTERS {
             continue;
         }
+        physical[aid] = Some((frontend.path_adapter, frontend.path_frontend));
         let selected = opts
             .enabled_adapters
             .as_ref()
@@ -2152,9 +2378,17 @@ fn spawn_dvb_adapters(
                     } else {
                         -1
                     };
-                    let master = slave_masters(opts)[aid].map_or(-1, |master| master as i32);
+                    let master = masters[aid].map_or(-1, |master| master as i32);
                     tuner.post_open(frontend.fbc, master, dmx_source);
                     apply_tuner_options(opts, aid, &diseqc, &mut tuner);
+                    if master_ids.contains(&aid)
+                        && let Ok(sec) = tuner.device().dup_sec()
+                    {
+                        master_registry.register_master(aid, Box::new(sec));
+                    }
+                    if !master_ids.is_empty() {
+                        tuner = tuner.with_master_registry(master_registry.clone());
+                    }
                     ca.set_hw_node(
                         aid,
                         frontend.path_adapter as i32,
@@ -2169,7 +2403,7 @@ fn spawn_dvb_adapters(
                         bandwidth.clone(),
                         ca.stages(aid),
                     )?;
-                    let bridge = DataPlaneTuner::new(handle.command_sender());
+                    let bridge = DataPlaneTuner::from_handle(&handle);
                     handles[aid] = Some(handle);
                     // init_hw -> pmt_init_device -> dvbca_init_dev (ca.cpp:3891).
                     ca.dvbca_init_dev(ms_ca_drivers::en50221::AdapterInfo::dvb(
@@ -2202,6 +2436,14 @@ fn spawn_dvb_adapters(
         // `get_adapter_nw` reads `fe_map[fe - 1]`, so `?fe=N` selects
         // adapter N-1 unless `-s` installs another map.
         scheduler.set_fe_map_entry(aid, aid as i16);
+    }
+    for &mid in &master_ids {
+        if !master_registry.has_master(mid)
+            && let Some((pa, fe)) = physical[mid]
+            && let Ok(sec) = LinuxSecDevice::open_frontend(pa, fe)
+        {
+            master_registry.register_master(mid, Box::new(sec));
+        }
     }
     Ok(())
 }
@@ -2266,7 +2508,7 @@ fn spawn_ddci_adapters(
         )?;
         // The CAM output is read without client streams (ddci_read_sec_data).
         handle.send(Command::KeepReading(true));
-        let bridge = DataPlaneTuner::new(handle.command_sender());
+        let bridge = DataPlaneTuner::from_handle(&handle);
         let mut config = AdapterConfig {
             enabled: true,
             adapter_type: ms_sched::AdapterType::Ci,
@@ -2532,6 +2774,27 @@ fn apply_tuner_options(
     state.force_tuner_signal = force;
 }
 
+fn try_acquire_conn_slot(counter: &AtomicUsize, cap: usize) -> bool {
+    let mut cur = counter.load(Ordering::Relaxed);
+    loop {
+        if cur >= cap {
+            return false;
+        }
+        match counter.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+struct ActiveConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn spawn_listener(
     listener: TcpListener,
     protocol: Protocol,
@@ -2539,14 +2802,22 @@ fn spawn_listener(
     requests: Sender<Inbound>,
     shutdown: Arc<AtomicBool>,
     next_id: Arc<Mutex<u64>>,
-) -> Result<JoinHandle<()>, String> {
+    active_conns: Arc<AtomicUsize>,
+) -> Result<BoundedThread, String> {
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("cannot configure {name} listener: {error}"))?;
-    thread::Builder::new()
-        .name(format!("{name}-accept"))
-        .spawn(move || accept_loop(listener, protocol, requests, shutdown, next_id))
-        .map_err(|error| format!("cannot start {name} listener: {error}"))
+    BoundedThread::spawn(format!("{name}-accept"), move || {
+        accept_loop(
+            listener,
+            protocol,
+            requests,
+            shutdown,
+            next_id,
+            active_conns,
+        );
+    })
+    .map_err(|error| format!("cannot start {name} listener: {error}"))
 }
 
 /// Gives the logger the standard thread name (`thread_info[].thread_name`).
@@ -2562,11 +2833,22 @@ fn accept_loop(
     requests: Sender<Inbound>,
     shutdown: Arc<AtomicBool>,
     next_id: Arc<Mutex<u64>>,
+    active_conns: Arc<AtomicUsize>,
 ) {
     adopt_thread_name();
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                let fd = stream.as_raw_fd();
+                if !try_acquire_conn_slot(&active_conns, MAX_SOCKS) {
+                    ms_log::log!(
+                        "ERROR on accept: connection limit ({}) reached, dropping socket {}",
+                        MAX_SOCKS,
+                        fd
+                    );
+                    continue;
+                }
+                let guard = ActiveConnGuard(Arc::clone(&active_conns));
                 let conn_id = {
                     let mut next = next_id.lock().unwrap_or_else(PoisonError::into_inner);
                     let conn_id = *next;
@@ -2575,10 +2857,12 @@ fn accept_loop(
                 };
                 let requests = requests.clone();
                 let shutdown = Arc::clone(&shutdown);
-                let fd = stream.as_raw_fd();
-                let spawn = thread::Builder::new()
-                    .name(format!("conn{conn_id}"))
-                    .spawn(move || serve_connection(stream, protocol, conn_id, requests, shutdown));
+                let spawn =
+                    thread::Builder::new()
+                        .name(format!("conn{conn_id}"))
+                        .spawn(move || {
+                            serve_connection(stream, protocol, conn_id, requests, shutdown, guard)
+                        });
                 if spawn.is_err() {
                     // socketworks.cpp:556-558.
                     ms_log::log!(
@@ -2617,6 +2901,7 @@ fn serve_connection(
     conn_id: u64,
     requests: Sender<Inbound>,
     shutdown: Arc<AtomicBool>,
+    _conn_guard: ActiveConnGuard,
 ) {
     adopt_thread_name();
     // The logged `s->sock`; the number stays meaningful after the close.
@@ -2631,14 +2916,23 @@ fn serve_connection(
         Ok(peer) => peer,
         Err(_) => return,
     };
+    let conn_state = Arc::new(AtomicUsize::new(0));
+    if requests
+        .send(Inbound::Opened(conn_id, Arc::clone(&conn_state)))
+        .is_err()
+    {
+        return;
+    }
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let mut reads = 0u64;
+    let mut last_io = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
                 reads += 1;
+                last_io = Instant::now();
                 buffer.extend_from_slice(&chunk[..read]);
                 loop {
                     match parse_request_logged(
@@ -2700,6 +2994,10 @@ fn serve_connection(
                         | io::ErrorKind::Interrupted
                 ) =>
             {
+                if conn_state.load(Ordering::Relaxed) == 0 && last_io.elapsed() >= IDLE_CONN_TIMEOUT
+                {
+                    break;
+                }
                 continue;
             }
             Err(_) => break,
@@ -2713,10 +3011,8 @@ fn spawn_ssdp(
     identity: SharedIdentity,
     io: UdpSsdpIo,
     shutdown: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name("ssdp".to_owned())
-        .spawn(move || ssdp_loop(config, identity, io, shutdown))
+) -> BoundedThread {
+    BoundedThread::spawn("ssdp", move || ssdp_loop(config, identity, io, shutdown))
         .expect("spawn SSDP thread")
 }
 
@@ -2763,6 +3059,15 @@ fn ssdp_loop(
 }
 
 #[cfg(feature = "srt")]
+#[allow(unsafe_code)]
+fn close_unacquired_fd(fd: RawFd) {
+    // SAFETY: caller ensures `fd` is still owned and not yet acquired by libsrt.
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+#[cfg(feature = "srt")]
 fn start_srt_listener(
     config: &ServerConfig,
 ) -> Option<ms_net::srt::SrtListener<ms_net::srt::LibSrtOps>> {
@@ -2793,8 +3098,15 @@ fn start_srt_listener(
             );
         }
     };
+    let udp_fd = socket.into_raw_fd();
     let mut listener = ms_net::srt::SrtListener::new(Arc::new(ms_net::srt::LibSrtOps));
-    if let Err(error) = listener.init(socket.into_raw_fd()) {
+    if let Err(error) = listener.init(udp_fd) {
+        if matches!(
+            error,
+            ms_net::srt::SrtError::CreateSocket | ms_net::srt::SrtError::Bind
+        ) {
+            close_unacquired_fd(udp_fd);
+        }
         crate::sys::log_error(format_args!("minisatip: SRT disabled: {error}"));
         ms_net::srt::LibSrtOps::cleanup();
         return None;
@@ -3029,6 +3341,8 @@ mod tests {
             next: Instant::now(),
             interval: Duration::from_secs(120),
             fetched: None,
+            started_at: None,
+            cancel: None,
         };
 
         let started = Instant::now();
@@ -3054,5 +3368,25 @@ mod tests {
         assert_eq!(host, "127.0.0.1");
         let parsed = parse_satip_xml(&xml, &host).expect("caps");
         assert_eq!(parsed.tuners_for(ms_tuner::DeliverySystem::DvbS2), 1);
+    }
+
+    #[test]
+    fn satip_xml_poll_resets_stuck_fetch_after_deadline() {
+        let (_tx, rx) = mpsc::channel::<SatipXmlFetch>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut poll = SatipXmlPoll {
+            urls: Vec::new(),
+            over_tcp: false,
+            next: Instant::now(),
+            interval: Duration::from_secs(120),
+            fetched: Some(rx),
+            started_at: Some(Instant::now() - SATIP_XML_DEADLINE - Duration::from_secs(1)),
+            cancel: Some(Arc::clone(&cancel)),
+        };
+
+        assert!(poll.drain().is_empty());
+        assert!(poll.fetched.is_none());
+        assert!(poll.started_at.is_none());
+        assert!(cancel.load(Ordering::Relaxed));
     }
 }

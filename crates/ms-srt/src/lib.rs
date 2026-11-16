@@ -30,8 +30,12 @@ const SRTO_STREAMID: c_int = 46;
 /// Integer socket options (`SRT_SOCKOPT`) used by minisatip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SockOpt {
+    /// `SRTO_SNDSYN`: blocking send.
+    SndSyn,
     /// `SRTO_RCVSYN`: blocking receive.
     RcvSyn,
+    /// `SRTO_SNDTIMEO`: send timeout in ms.
+    SndTimeo,
     /// `SRTO_RCVTIMEO`: receive timeout in ms.
     RcvTimeo,
     /// `SRTO_LATENCY`: receiver and peer latency in ms.
@@ -43,7 +47,9 @@ pub enum SockOpt {
 impl SockOpt {
     fn code(self) -> c_int {
         match self {
+            Self::SndSyn => 1,
             Self::RcvSyn => 2,
+            Self::SndTimeo => 13,
             Self::RcvTimeo => 14,
             Self::Latency => 23,
             Self::ConnTimeo => 36,
@@ -286,17 +292,20 @@ unsafe extern "C" fn listen_trampoline(
     _peeraddr: *const c_void,
     streamid: *const c_char,
 ) -> c_int {
-    let listener = opaque.addr() as SrtSocket;
-    let Some(handler) = listen_callbacks().get(&listener).cloned() else {
-        return -1;
-    };
-    let streamid = if streamid.is_null() {
-        None
-    } else {
-        // SAFETY: libsrt passes a NUL-terminated stream id for the handshake.
-        unsafe { CStr::from_ptr(streamid) }.to_str().ok()
-    };
-    if handler(streamid, ns) { 0 } else { -1 }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let listener = opaque.addr() as SrtSocket;
+        let Some(handler) = listen_callbacks().get(&listener).cloned() else {
+            return -1;
+        };
+        let streamid = if streamid.is_null() {
+            None
+        } else {
+            // SAFETY: libsrt passes a NUL-terminated stream id for the handshake.
+            unsafe { CStr::from_ptr(streamid) }.to_str().ok()
+        };
+        if handler(streamid, ns) { 0 } else { -1 }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]

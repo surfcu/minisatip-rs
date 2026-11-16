@@ -135,11 +135,13 @@ fn decode_service_descriptor(
             .data
             .split_first()
             .ok_or(PsiError::BadDescriptor)?;
-        decoded.service_type = Some(*kind);
         let (provider, rest) = split_dvb_string(rest)?;
         let (name, _) = split_dvb_string(rest)?;
-        decoded.provider_name = dvb_get_string(provider, NAME_LENGTH, charset);
-        decoded.service_name = dvb_get_string(name, NAME_LENGTH, charset);
+        if decoded.service_type.is_none() {
+            decoded.service_type = Some(*kind);
+            decoded.provider_name = dvb_get_string(provider, NAME_LENGTH, charset);
+            decoded.service_name = dvb_get_string(name, NAME_LENGTH, charset);
+        }
     }
     Ok(decoded)
 }
@@ -240,5 +242,33 @@ mod tests {
             Err(PsiError::CrcMismatch)
         );
         assert!(Sdt::parse(&section, CrcCheck::Skip).is_ok());
+    }
+
+    #[test]
+    fn duplicate_service_descriptor_keeps_first() {
+        let mut entry = vec![
+            0x00, 0x01, // service_id
+            0xFF, // EIT flags
+            0x80, // running + free CA + high nibble
+            20,   // descriptors loop len (updated below)
+        ];
+        entry.extend_from_slice(&[0x48, 9, 0x01, 3, b'O', b'N', b'E', 3, b'F', b'S', b'T']);
+        entry.extend_from_slice(&[0x48, 9, 0x02, 3, b'T', b'W', b'O', 3, b'S', b'N', b'D']);
+        let dlen = (entry.len() - 5) as u16;
+        entry[3] = 0x80 | ((dlen >> 8) as u8 & 0x0F);
+        entry[4] = dlen as u8;
+        let mut payload = vec![0x00, 0x02, 0xFF];
+        payload.extend_from_slice(&entry);
+        let section = build_section(SDT_ACTUAL_TABLE_ID, 0x0001, 0, &payload);
+        let sdt = Sdt::parse(&section, CrcCheck::Verify).unwrap();
+        assert_eq!(sdt.services[0].service_type, Some(0x01));
+        assert_eq!(
+            sdt.services[0].provider_name.as_deref(),
+            Some(b"ONE".as_slice())
+        );
+        assert_eq!(
+            sdt.services[0].service_name.as_deref(),
+            Some(b"FST".as_slice())
+        );
     }
 }

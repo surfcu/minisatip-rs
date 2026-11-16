@@ -883,7 +883,8 @@ impl CaDevice {
         if let Ok(n) = link.read(&mut buf)
             && n > 0
         {
-            return ReadOutcome::Data(buf[..n].to_vec());
+            let len = n.min(buf.len());
+            return ReadOutcome::Data(buf[..len].to_vec());
         }
         if pri && self.state != CaState::Inactive {
             self.request_close();

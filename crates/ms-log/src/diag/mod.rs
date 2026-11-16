@@ -217,6 +217,17 @@ pub fn count_cc(adapter: i64, pid: u16) {
     *counters.cc.entry((adapter, pid)).or_default() += 1;
 }
 
+/// Counts continuity errors for a whole buffer under a single lock acquisition.
+pub fn count_cc_batch(adapter: i64, errors: &[(u16, u64)]) {
+    if !cfg!(feature = "diag-log") || errors.is_empty() {
+        return;
+    }
+    let mut counters = counters().lock().unwrap_or_else(PoisonError::into_inner);
+    for &(pid, count) in errors {
+        *counters.cc.entry((adapter, pid)).or_default() += count;
+    }
+}
+
 /// Counts output drops; the client is built only when the feature is on.
 pub fn count_send_drop(
     client: impl FnOnce() -> String,

@@ -24,6 +24,7 @@ openssl-sys = { version = "0.9", optional = true }
 ms-log = { path = "../ms-log" }
 ms-ca = { path = "../ms-ca" }
 ms-config = { path = "../ms-config" }
+ms-psi = { path = "../ms-psi" }
 ms-tuner = { path = "../ms-tuner" }
 ms-ts = { path = "../ms-ts" }
 
@@ -32,7 +33,6 @@ libc = "0.2"
 
 [dev-dependencies]
 ms-fakecam = { path = "../ms-fakecam" }
-ms-psi = { path = "../ms-psi" }
 ms-ts = { path = "../ms-ts" }
 
 [lints]

@@ -12,4 +12,7 @@ pub trait TsStage: Send {
         let _ = capacity;
         self.process(buf);
     }
+
+    /// Periodic maintenance hook called from the data-plane timer pass even when idle.
+    fn tick(&mut self) {}
 }

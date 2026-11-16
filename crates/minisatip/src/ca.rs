@@ -27,7 +27,7 @@ use ms_sched::pmt::{
     CaSink, FILTER_ADD_REMOVE, FILTER_CRC, FILTER_EMM, FILTER_REVERSE, FilterTarget, PmtState,
 };
 use ms_sched::{AdapterType, MAX_ADAPTERS, PidState, Scheduler};
-use ms_ts::{SectionAssembler, TsStage, crc32_mpeg2};
+use ms_ts::{EmmAssembler, SectionAssembler, TsStage, crc32_mpeg2};
 use ms_tuner::PidSet;
 use std::collections::BTreeSet;
 
@@ -43,6 +43,7 @@ const STATS_MS: i64 = 1000;
 /// Period of the decrypt windows: the `ci_decrypt` diagnostics and the `--cam-recovery` counts.
 const DECRYPT_WINDOW_MS: i64 = 10_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DVBAPI_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 /// PID that requests the whole transport stream.
 const PID_ALL: i32 = 8192;
@@ -1582,48 +1583,6 @@ impl RouterFilter {
     }
 }
 
-/// `assemble_emm`: whole 183-byte payloads; one buffer may hold several EMMs.
-#[derive(Default)]
-struct EmmAssembler {
-    data: Vec<u8>,
-}
-
-impl EmmAssembler {
-    /// `FILTER_PACKET_SIZE`.
-    const MAX: usize = 4000;
-
-    fn push(&mut self, b: &[u8]) -> Option<&[u8]> {
-        if b[4] == 0 && (0x82..=0x8F).contains(&b[5]) {
-            self.data.clear();
-        } else if self.data.len() + 183 > Self::MAX {
-            ms_log::log!("assemble_emm: data too large {}", self.data.len() + 184);
-            self.data.clear();
-            return None;
-        }
-        self.data.extend_from_slice(&b[5..188]);
-        let len = emm_len(&self.data);
-        (len > 0 && self.data.len() >= len).then(|| &self.data[..len])
-    }
-}
-
-/// `getEMMlen`: bytes covered by consecutive 0x80-0x8F sections.
-fn emm_len(b: &[u8]) -> usize {
-    let mut i = 0;
-    let mut emms = 0;
-    while i + 3 <= b.len() && (0x80..=0x8F).contains(&b[i]) {
-        i += ((usize::from(b[i + 1] & 0xF) << 8) | usize::from(b[i + 2])) + 3;
-        emms += 1;
-    }
-    ms_log::debugm_hot!(
-        "returning EMM len {} ({:X}) from {}, found {} emms",
-        i,
-        i,
-        b.len(),
-        emms
-    );
-    i
-}
-
 impl SectionRouter {
     /// Feeds one packet to every filter on its PID; returns completed sections.
     fn feed(&mut self, sched: &Scheduler, aid: i32, b: &[u8]) -> Vec<(i32, Vec<u8>)> {
@@ -1906,7 +1865,7 @@ struct Dvbapi {
     shared: Rc<RefCell<DvbapiShared>>,
     cfg: DvbapiConfig,
     conn: Option<Stream>,
-    connecting: Option<Receiver<io::Result<Stream>>>,
+    connecting: Option<(Receiver<io::Result<Stream>>, Instant)>,
     ca_id: Option<i32>,
     /// Scheduler filter id → DVBAPI filter id, and back.
     filters: BTreeMap<i32, FilterId>,
@@ -1944,14 +1903,14 @@ impl Dvbapi {
                     let _ = tx.send(transport::connect(&cfg, CONNECT_TIMEOUT));
                 });
             if spawned.is_ok() {
-                self.connecting = Some(rx);
+                self.connecting = Some((rx, Instant::now()));
             }
         }
     }
 
     /// Completes a pending connect, reads everything available and writes queued messages.
     fn service_socket(&mut self, now: i64) {
-        if let Some(rx) = self.connecting.as_ref() {
+        if let Some((rx, started)) = self.connecting.as_ref() {
             match rx.try_recv() {
                 Ok(Ok(stream)) => {
                     self.connecting = None;
@@ -1967,7 +1926,12 @@ impl Dvbapi {
                     self.connecting = None;
                     ms_log::log!("connect_dvbapi: connect to {} failed", self.cfg.host);
                 }
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) => {
+                    if started.elapsed() >= DVBAPI_CONNECT_DEADLINE {
+                        self.connecting = None;
+                        ms_log::log!("connect_dvbapi: connect to {} timed out", self.cfg.host);
+                    }
+                }
                 Err(TryRecvError::Disconnected) => self.connecting = None,
             }
         }
@@ -3854,5 +3818,23 @@ mod window_tests {
         let windows = recorder.windows();
         assert_eq!(windows.len(), 1, "decrypt_windows still ran on idle tick");
         assert_eq!(windows[0].1, 1_500);
+    }
+
+    #[test]
+    fn dvbapi_resets_connecting_after_deadline() {
+        let mut dvbapi = Dvbapi::new(DvbapiConfig {
+            host: "127.0.0.1".to_owned(),
+            ..DvbapiConfig::default()
+        });
+        let (_tx, rx) = mpsc::channel();
+        dvbapi.connecting = Some((
+            rx,
+            Instant::now() - DVBAPI_CONNECT_DEADLINE - Duration::from_secs(1),
+        ));
+        dvbapi.service_socket(100);
+        assert!(
+            dvbapi.connecting.is_none(),
+            "stale dvbapi connect attempt must clear after deadline"
+        );
     }
 }

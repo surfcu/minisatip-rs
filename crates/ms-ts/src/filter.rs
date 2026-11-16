@@ -3,6 +3,9 @@
 use crate::packet::TsPacket;
 use crate::section::SectionAssembler;
 
+/// `DEFAULT_LOG` of the `pmt.cpp` sites ported here (`#define DEFAULT_LOG LOG_PMT`).
+const DEFAULT_LOG: u32 = ms_log::LOG_PMT;
+
 /// Maximum number of filters held by one table, matching the C++ limit.
 pub const MAX_FILTERS: usize = 200;
 /// Invert the mask match result.
@@ -147,7 +150,7 @@ impl Filter {
     }
 }
 
-/// Owned table of PID filters; wrap it in a `Mutex` for concurrent use.
+/// Owned standalone PID filter table (runtime scheduling uses `ms-sched` and `SectionRouter`).
 pub struct FilterTable {
     filters: Vec<Option<Filter>>,
 }
@@ -243,6 +246,52 @@ impl Default for FilterTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `assemble_emm`: whole 183-byte payloads; one buffer may hold several EMMs.
+#[derive(Default)]
+pub struct EmmAssembler {
+    data: Vec<u8>,
+}
+
+impl EmmAssembler {
+    /// `FILTER_PACKET_SIZE`.
+    const MAX: usize = 4000;
+
+    /// Appends one TS packet's payload and returns completed contiguous EMM sections.
+    pub fn push(&mut self, b: &[u8]) -> Option<&[u8]> {
+        if b.len() < 188 {
+            return None;
+        }
+        if b[4] == 0 && (0x82..=0x8F).contains(&b[5]) {
+            self.data.clear();
+        } else if self.data.len() + 183 > Self::MAX {
+            ms_log::log!("assemble_emm: data too large {}", self.data.len() + 184);
+            self.data.clear();
+            return None;
+        }
+        self.data.extend_from_slice(&b[5..188]);
+        let len = emm_len(&self.data);
+        (len > 0 && self.data.len() >= len).then(|| &self.data[..len])
+    }
+}
+
+/// `getEMMlen`: bytes covered by consecutive 0x80-0x8F sections.
+pub fn emm_len(b: &[u8]) -> usize {
+    let mut i = 0;
+    let mut emms = 0;
+    while i + 3 <= b.len() && (0x80..=0x8F).contains(&b[i]) {
+        i += ((usize::from(b[i + 1] & 0xF) << 8) | usize::from(b[i + 2])) + 3;
+        emms += 1;
+    }
+    ms_log::debugm_hot!(
+        "returning EMM len {} ({:X}) from {}, found {} emms",
+        i,
+        i,
+        b.len(),
+        emms
+    );
+    i
 }
 
 #[cfg(test)]

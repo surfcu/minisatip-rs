@@ -3181,3 +3181,25 @@ fn test_find_new_id() {
     }
     assert_eq!(sched.pmt_add(0, 300, 200), -1, "full table returns -1");
 }
+
+#[test]
+fn oversize_pat_section_is_rejected() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let fid = sched.add_filter(0, 0, FilterTarget::Pat, FILTER_CRC);
+    assert!(fid >= 0);
+
+    let mut pat = vec![0x00, 0xB0, 0x00, 0x00, 0x01, 0xC1, 0x00, 0x00];
+    // 377 PMT entries * 4 bytes = 1508 bytes payload -> pat_len > 1500.
+    for i in 1..=377u16 {
+        pat.extend_from_slice(&i.to_be_bytes());
+        pat.extend_from_slice(&(0xE000 | (0x100 + i)).to_be_bytes());
+    }
+    let section_len = (pat.len() - 3 + 4) as u16;
+    let len_word = 0xB000 | (section_len & 0x0FFF);
+    pat[1..3].copy_from_slice(&len_word.to_be_bytes());
+    pat.extend_from_slice(&[0u8; 4]);
+
+    assert_eq!(sched.process_pat(fid, &pat), 0);
+    assert_eq!(sched.adapter(0).unwrap().active_pmts, 0);
+    assert!(sched.pmt(0).is_none());
+}

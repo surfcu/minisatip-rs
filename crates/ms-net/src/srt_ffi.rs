@@ -3,9 +3,9 @@
 //!
 //! Enabled by the `srt` feature, which links libsrt through `ms-srt`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::srt::{AcceptDecision, PendingPool, SRT_INVALID_SOCK, SrtOps};
+use crate::srt::{AcceptDecision, PendingPool, SRT_INVALID_SOCK, SRT_SEND_TIMEOUT_MS, SrtOps};
 
 const SRT_BACKLOG: i32 = 10;
 
@@ -64,6 +64,10 @@ impl SrtOps for LibSrtOps {
         ms_srt::is_connected(sock)
     }
 
+    fn set_send_timeout(&self, sock: i32, timeout_ms: i32) -> bool {
+        ms_srt::set_flag(sock, ms_srt::SockOpt::SndTimeo, timeout_ms)
+    }
+
     fn send(&self, sock: i32, data: &[u8]) -> i32 {
         ms_srt::send(sock, data)
     }
@@ -72,12 +76,13 @@ impl SrtOps for LibSrtOps {
 /// The pre-accept callback (`srt_accept_poll`, srt.cpp:100): queues `ns` under
 /// its stream id and closes the socket it replaces.
 fn pre_accept(pending: &Mutex<PendingPool>, streamid: Option<&str>, ns: i32) -> bool {
-    let mut pool = pending.lock().expect("pending pool");
+    let mut pool = pending.lock().unwrap_or_else(PoisonError::into_inner);
     match pool.accept(streamid, ns) {
         AcceptDecision::Accepted { replaced } => {
             if replaced != SRT_INVALID_SOCK {
                 ms_srt::close(replaced);
             }
+            let _ = ms_srt::set_flag(ns, ms_srt::SockOpt::SndTimeo, SRT_SEND_TIMEOUT_MS);
             true
         }
         AcceptDecision::Rejected => false,
@@ -231,6 +236,85 @@ mod tests {
         ms_srt::close(server);
         drop(output);
         listener.close();
+        assert!(LibSrtOps::cleanup());
+    }
+
+    #[test]
+    fn srt_session_lifecycle_reuses_and_returns_sockets() {
+        let _serial = SRT_TEST_LOCK.lock().expect("srt test lock");
+        assert!(LibSrtOps::startup());
+        let (udp_fd, port) = free_udp_fd();
+        let mut listener = SrtListener::new(Arc::new(LibSrtOps));
+        listener.init(udp_fd).expect("listener must init");
+
+        let c1 = client_connect(port, "stream-a");
+        let c2 = client_connect(port, "stream-b");
+        let mut s1 = SRT_INVALID_SOCK;
+        let mut s2 = SRT_INVALID_SOCK;
+        for _ in 0..100 {
+            if s1 == SRT_INVALID_SOCK {
+                s1 = listener.take("stream-a");
+            }
+            if s2 == SRT_INVALID_SOCK {
+                s2 = listener.take("stream-b");
+            }
+            if s1 != SRT_INVALID_SOCK && s2 != SRT_INVALID_SOCK {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(s1, SRT_INVALID_SOCK);
+        assert_ne!(s2, SRT_INVALID_SOCK);
+        // Re-queue s1 and s2 so SessionManager::decode_transport_from takes them.
+        listener.return_socket(s1, "stream-a");
+        listener.return_socket(s2, "stream-b");
+
+        let mut manager = crate::session::SessionManager::new();
+        manager.set_srt_listener(listener);
+        let sid = manager.add_stream().expect("stream slot");
+
+        // Initial SETUP takes s1.
+        assert_eq!(
+            manager.decode_transport(sid, "RTP/AVP/SRT;srt_streamid=stream-a"),
+            Ok(())
+        );
+        assert_eq!(manager.stream(sid).unwrap().srt_sock, s1);
+
+        // Re-SETUP with same streamid reuses connected s1 instead of failing.
+        assert_eq!(
+            manager.decode_transport(sid, "RTP/AVP/SRT;srt_streamid=stream-a"),
+            Ok(())
+        );
+        assert_eq!(manager.stream(sid).unwrap().srt_sock, s1);
+
+        // Switching to stream-b takes s2 and returns s1 to the pending pool.
+        assert_eq!(
+            manager.decode_transport(sid, "RTP/AVP/SRT;srt_streamid=stream-b"),
+            Ok(())
+        );
+        assert_eq!(manager.stream(sid).unwrap().srt_sock, s2);
+        assert_eq!(manager.srt_listener().unwrap().take("stream-a"), s1);
+
+        // Switching to TCP returns s2 to the pending pool.
+        assert_eq!(
+            manager.decode_transport(sid, "RTP/AVP/TCP;interleaved=0-1"),
+            Ok(())
+        );
+        assert_eq!(
+            manager.stream(sid).unwrap().stream_type,
+            crate::StreamType::RtspTcp
+        );
+        assert_eq!(manager.stream(sid).unwrap().srt_sock, SRT_INVALID_SOCK);
+        assert_eq!(manager.srt_listener().unwrap().take("stream-b"), s2);
+
+        ms_srt::close(s1);
+        ms_srt::close(s2);
+        ms_srt::close(c1);
+        ms_srt::close(c2);
+        manager.close_stream(sid);
+        if let Some(mut listener) = manager.take_srt_listener() {
+            listener.close();
+        }
         assert!(LibSrtOps::cleanup());
     }
 }

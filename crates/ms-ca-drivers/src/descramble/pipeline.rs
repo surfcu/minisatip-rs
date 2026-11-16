@@ -137,7 +137,13 @@ fn payloads<'a>(buf: &'a mut [u8], offsets: &[usize]) -> Vec<&'a mut [u8]> {
     let mut rest = buf;
     let mut base = 0;
     for &off in offsets {
+        if off < base || off - base > rest.len() {
+            continue;
+        }
         let tail = std::mem::take(&mut rest).split_at_mut(off - base).1;
+        if tail.len() < DVB_FRAME {
+            break;
+        }
         let (packet, tail) = tail.split_at_mut(DVB_FRAME);
         let start = adaptation_len(packet);
         out.push(&mut packet[start..]);
@@ -929,5 +935,22 @@ impl Descrambler {
                 entry.dec_err += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payloads_ignores_unsorted_overlapping_or_oob_offsets() {
+        let mut buf = vec![0u8; DVB_FRAME * 2];
+        buf[0] = 0x47;
+        buf[DVB_FRAME] = 0x47;
+        // Second offset is overlapping (< DVB_FRAME), last is out-of-bounds.
+        let slices = payloads(&mut buf, &[0, 94, 0, DVB_FRAME, DVB_FRAME * 3]);
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].len(), DVB_FRAME - 4);
+        assert_eq!(slices[1].len(), DVB_FRAME - 4);
     }
 }

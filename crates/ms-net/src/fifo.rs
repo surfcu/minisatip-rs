@@ -6,6 +6,7 @@ pub type FifoPeek<'a> = (&'a [u8], &'a [u8]);
 /// Circular byte buffer with 64-bit read/write indices, like `SFIFO`.
 #[derive(Debug, Clone)]
 pub struct Fifo {
+    capacity: usize,
     data: Vec<u8>,
     read_index: u64,
     write_index: u64,
@@ -15,7 +16,7 @@ pub struct Fifo {
 }
 
 impl Fifo {
-    /// Allocates a zeroed buffer of `size` bytes.
+    /// Creates an empty ring buffer that allocates its `size`-byte backing lazily on first use.
     ///
     /// `#[track_caller]` supplies the nearest Rust equivalent of the
     /// `__FILE__`/`__LINE__` pair `create_fifo` stores in `SFIFO`.
@@ -23,7 +24,8 @@ impl Fifo {
     pub fn new(size: usize) -> Self {
         let origin = std::panic::Location::caller();
         Self {
-            data: vec![0; size],
+            capacity: size,
+            data: Vec::new(),
             read_index: 0,
             write_index: 0,
             origin_file: origin.file(),
@@ -31,9 +33,15 @@ impl Fifo {
         }
     }
 
+    fn ensure_allocated(&mut self) {
+        if self.data.is_empty() && self.capacity > 0 {
+            self.data.resize(self.capacity, 0);
+        }
+    }
+
     /// Capacity in bytes.
     pub fn size(&self) -> usize {
-        self.data.len()
+        self.capacity
     }
 
     /// Logical read position.
@@ -48,6 +56,9 @@ impl Fifo {
 
     /// Replaces both indices; used by the ported C++ tests.
     pub fn set_indices(&mut self, read_index: u64, write_index: u64) {
+        if write_index > read_index {
+            self.ensure_allocated();
+        }
         self.read_index = read_index;
         self.write_index = write_index;
     }
@@ -63,13 +74,14 @@ impl Fifo {
             .saturating_sub(self.used().min(self.size() as u64) as usize)
     }
 
-    /// Raw backing storage.
+    /// Raw backing storage (empty until the first write or mutable access).
     pub fn data(&self) -> &[u8] {
         &self.data
     }
 
     /// Raw backing storage, for tests that seed bytes at an index directly.
     pub fn data_mut(&mut self) -> &mut [u8] {
+        self.ensure_allocated();
         &mut self.data
     }
 
@@ -103,6 +115,7 @@ impl Fifo {
                 self.origin_line
             );
         }
+        self.ensure_allocated();
         let offset = (self.write_index % self.size() as u64) as usize;
         let first = src.len().min(self.size() - offset);
         self.data[offset..offset + first].copy_from_slice(&src[..first]);
@@ -116,7 +129,7 @@ impl Fifo {
     /// Returns one or two slices covering up to `len` bytes at a relative offset.
     pub fn peek(&self, len: usize, relative_offset: u64) -> FifoPeek<'_> {
         let size = self.size();
-        if size == 0 {
+        if size == 0 || self.data.is_empty() {
             return (&[], &[]);
         }
         let start = self.read_index.saturating_add(relative_offset);
@@ -135,7 +148,7 @@ impl Fifo {
     /// Reads four bytes at an absolute logical position, zero when short.
     pub fn peek_32(&self, offset: u64) -> u32 {
         let size = self.size();
-        if size == 0 || self.write_index.saturating_sub(offset) < 4 {
+        if size == 0 || self.data.is_empty() || self.write_index.saturating_sub(offset) < 4 {
             return 0;
         }
         let mut value = 0u32;
@@ -193,4 +206,22 @@ pub fn copy_iovec_to_fifo(fifo: &mut Fifo, offset: usize, chunks: &[&[u8]]) -> u
         };
     }
     before - fifo.available()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fifo_allocates_backing_lazily() {
+        let mut fifo = Fifo::new(10 * 1024 * 1024);
+        assert!(fifo.data().is_empty());
+        assert_eq!(fifo.size(), 10 * 1024 * 1024);
+        assert_eq!(fifo.available(), 10 * 1024 * 1024);
+        assert_eq!(fifo.peek(16, 0), (&[][..], &[][..]));
+        assert_eq!(fifo.peek_32(0), 0);
+        assert_eq!(fifo.push(b"hello"), 5);
+        assert_eq!(fifo.data().len(), 10 * 1024 * 1024);
+        assert_eq!(fifo.peek(5, 0), (&b"hello"[..], &[][..]));
+    }
 }

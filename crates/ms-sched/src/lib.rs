@@ -189,6 +189,9 @@ pub trait AdapterTuner {
     fn del_filters(&mut self, _fd: i32, _pid: i32) -> Result<(), TuneError> {
         Ok(())
     }
+
+    /// Notifies the backend when the last stream detaches from the adapter.
+    fn standby(&mut self) {}
 }
 
 /// Monotonic source for [`PidEntry`] subscription order (`adapter::pid_order_seq`).
@@ -1029,6 +1032,11 @@ impl Scheduler {
             self.mark_pid_deleted(index, sid, None);
         }
         self.update_pids(index);
+        if count == 0
+            && let Some(adapter) = self.adapters[index].as_mut()
+        {
+            adapter.tuner.standby();
+        }
     }
 
     fn fix_master_sid(&mut self, index: usize) {

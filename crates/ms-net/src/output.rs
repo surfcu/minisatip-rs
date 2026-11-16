@@ -265,6 +265,7 @@ impl StreamOutput {
         config: OutputConfig,
         now_ms: i64,
     ) -> Self {
+        let _ = ops.set_send_timeout(sock, crate::srt::SRT_SEND_TIMEOUT_MS);
         Self::new(
             Transport::Srt { sock, ops, remote },
             StreamType::RtspSrt,

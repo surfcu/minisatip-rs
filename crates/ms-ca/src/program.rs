@@ -18,18 +18,69 @@ pub struct RawDescriptor {
 }
 
 impl RawDescriptor {
-    /// Builds from `tag, len, body...` bytes (`create_descriptor`).
+    /// Builds from `tag, len, body...` bytes, returning `None` if truncated.
+    pub fn from_bytes_checked(b: &[u8]) -> Option<Self> {
+        let len = usize::from(*b.get(1)?);
+        let body = b.get(2..2 + len)?;
+        Some(Self {
+            tag: b[0],
+            data: body.to_vec(),
+        })
+    }
+
+    /// Builds from `tag, len, body...` bytes (`create_descriptor`), clamping truncated input.
     pub fn from_bytes(b: &[u8]) -> Self {
-        let len = usize::from(b[1]);
+        if b.len() < 2 {
+            return Self {
+                tag: b.first().copied().unwrap_or(0),
+                data: Vec::new(),
+            };
+        }
+        let end = b.len().min(2 + usize::from(b[1]));
         Self {
             tag: b[0],
-            data: b[2..2 + len].to_vec(),
+            data: b[2..end].to_vec(),
         }
     }
 
     pub fn is_ca(&self) -> bool {
         self.tag == 0x09
     }
+}
+
+/// Inserts `(caid, pid)` into `caids` unless duplicate or at `MAX_CAID`.
+pub(crate) fn push_ca_descriptor(
+    caids: &mut Vec<CaDescriptor>,
+    caid: u16,
+    pid: u16,
+    private_data: &[u8],
+) {
+    if caids.iter().any(|c| c.caid == caid && c.pid == pid) || caids.len() >= MAX_CAID {
+        return;
+    }
+    caids.push(CaDescriptor {
+        caid,
+        pid,
+        private_data: private_data.to_vec(),
+    });
+}
+
+/// Collects program- and A/V ES-level CA descriptors from `pmt`, deduplicated by `(caid, pid)`.
+pub fn collect_pmt_ca_descriptors(pmt: &ms_psi::Pmt) -> Vec<CaDescriptor> {
+    let mut caids = Vec::new();
+    let es = pmt
+        .streams
+        .iter()
+        .filter(|s| s.is_audio || s.is_video)
+        .flat_map(|s| s.descriptors.iter());
+    for d in pmt.program_info.iter().chain(es) {
+        if d.is_ca()
+            && let (Some(caid), Some(pid)) = (d.ca_system_id(), d.ca_pid())
+        {
+            push_ca_descriptor(&mut caids, caid, pid, d.private_data());
+        }
+    }
+    caids
 }
 
 /// One elementary stream (`SStreamPid`).
@@ -86,15 +137,7 @@ impl Program {
 
     /// `pmt_add_caid`: duplicates and entries past `MAX_CAID` are ignored.
     pub fn add_caid(&mut self, caid: u16, pid: u16, private_data: &[u8]) {
-        if self.caids.iter().any(|c| c.caid == caid && c.pid == pid) || self.caids.len() >= MAX_CAID
-        {
-            return;
-        }
-        self.caids.push(CaDescriptor {
-            caid,
-            pid,
-            private_data: private_data.to_vec(),
-        });
+        push_ca_descriptor(&mut self.caids, caid, pid, private_data);
     }
 
     /// Removes the first stream with this pid; true when one was removed.
@@ -114,12 +157,7 @@ impl Program {
         self.version = i32::from(pmt.header.version_number);
         // C++ stores the section's PCR pid; ms-psi zeroes it for the ES loop.
         self.pcr_pid = pmt.pcr_pid_header;
-        self.caids.clear();
-        for d in pmt.program_info.iter().filter(|d| d.is_ca()) {
-            if let (Some(caid), Some(pid)) = (d.ca_system_id(), d.ca_pid()) {
-                self.add_caid(caid, pid, d.private_data());
-            }
-        }
+        self.caids = collect_pmt_ca_descriptors(pmt);
         self.streams = pmt
             .streams
             .iter()

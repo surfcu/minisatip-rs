@@ -380,3 +380,22 @@ fn srt_setup_requires_a_listener_and_pending_socket() {
         Err(TransportError)
     );
 }
+
+#[test]
+fn poisoned_pending_pool_recovers_without_panicking() {
+    let ops = Arc::new(FakeOps::default());
+    let mut listener = SrtListener::new(ops.clone());
+    let pending = Arc::clone(listener.pending());
+    let _ = thread::spawn(move || {
+        let _guard = pending.lock().unwrap();
+        panic!("poison pending pool");
+    })
+    .join();
+
+    ops.set_connected(11, true);
+    listener.return_socket(11, "poison-sid");
+    assert_eq!(listener.take("poison-sid"), 11);
+    listener.return_socket(11, "poison-sid");
+    listener.close();
+    assert!(ops.closed_sockets().contains(&11));
+}

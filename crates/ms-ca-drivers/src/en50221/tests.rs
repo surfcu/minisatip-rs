@@ -659,6 +659,41 @@ fn ca_read_enigma_removal() {
     assert!(!d.take_close_request(), "no close when inactive");
 }
 
+#[test]
+fn ca_read_enigma_clamps_overlong_read_count() {
+    struct OverlongLink;
+    impl CaLink for OverlongLink {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf[..4].copy_from_slice(&[1, 2, 3, 4]);
+            Ok(buf.len() + 128)
+        }
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn reset(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn slot_info(&mut self) -> io::Result<SlotInfo> {
+            Ok(SlotInfo::default())
+        }
+        fn sleep_ms(&mut self, _: u32) {}
+    }
+
+    let (_, mut d) = dev(64);
+    d.mode = LinkMode::Enigma;
+    d.enabled = true;
+    d.state = CaState::Active;
+    d.set_link(Some(Box::new(OverlongLink)));
+
+    match d.read_enigma(false) {
+        ReadOutcome::Data(bytes) => {
+            assert_eq!(bytes.len(), MAX_TPDU);
+            assert_eq!(&bytes[..4], &[1, 2, 3, 4]);
+        }
+        other => panic!("expected Data, got {other:?}"),
+    }
+}
+
 // C++ ca_read_enigma polls POLLPRI instead of passing a fixed false (ca.cpp:3695-3717).
 #[test]
 fn service_enigma_priority_requests_close() {

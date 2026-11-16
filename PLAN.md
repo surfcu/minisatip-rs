@@ -295,8 +295,9 @@ Unvalidated rows must be called out in release notes.
 - **Last session (2026-11-04):** merged:
   - #95 PLAN and README update; #96 `scripts/decerr.py` bitrate-weighted decrypt-error
     comparison tool.
-  - #97–#99 the remaining 13 findings from the first port review against C++ (all 18 findings
-    now closed): `DDCI_SID` excluded from `entry.order`, `order == 0` normalised to
+  - #97–#99 the remaining 13 findings from the first port review against C++ (all 18 code-review
+    findings from the first review closed; M9 exit remains gated on the 7-day soak and hardware
+    matrix below): `DDCI_SID` excluded from `entry.order`, `order == 0` normalised to
     `u32::MAX`, upstream #1533 (`11fcf4a`) PMT completeness tie-break (#97); ES descriptor
     forwarding into DDCI CAPMTs, `WouldBlock`/`Interrupted` `POLLOUT` retry on EN50221 CA link
     writes, `SendOutcome::result` aligned with C++ `send_capmt`, descrambler `ServiceStats`
@@ -304,6 +305,18 @@ Unvalidated rows must be called out in release notes.
     `ad_ccerr`, `st_overflow` and `st_buffered` wired into `WebSnapshot`, `ad_allsys` using
     `DeliverySystem::name()`, `TuneParams::src` widened to `i32`, `DEV-291` documenting the
     bounded 5 s `satipc` RTSP connect timeout, and full 16-byte CI+ CC key check (#99).
+  - Post-soak independent third review fixes (topic branch `rs/post-soak-review-fixes`,
+    `DEV-294`–`DEV-296`, `DEV-077` withdrawn): bounded `AdapterHandle::query` (50 ms) and cached
+    status queries, non-blocking RTSP-TCP/HTTP stream writes (`MSG_DONTWAIT|MSG_NOSIGNAL`),
+    `SRTO_SNDTIMEO` (1.1 s), 2 s bounded shutdown/`satipc` joins, cancelled stale timed-out
+    tunes, complete SRT re-SETUP/swap/pool-return lifecycle & poisoned-mutex tolerance,
+    non-blocking `satipc` RTSP connect & TX queue + lock-free `status()`, split per-device DDCI
+    CI writers with unlocked `writev` & lock-free unmapped skip, DDCI PMT `0xB000`/`0xC1` header
+    + `-1` mapping rejection + CRC-verified `process_cat` & bounds checks, deduplicated
+    `EmmAssembler` and `collect_pmt_ca_descriptors`, SDT first-wins & 1500-byte PAT guard,
+    `MasterRegistry` cross-thread DVB slave-LNB switch sharing (`setup_switch`/`standby`),
+    `MAX_SOCKS` + 60 s idle close, lazy `Fifo`, bounded queues, idle `DescramblerStage::tick`,
+    and 15 s `--satip-xml` / 5 s `dvbapi-connect` helper deadlines.
   - #100–#103 nine additional parity and robustness fixes from a second codebase review:
     `SendOutcome::WriteFailed` and `SendOutcome::NoSession` mapped to `TablesResult::Retry`
     like upstream `3d42bee` (#100); `--sdt-charset` wired into SDT parsing and `-C`/

@@ -30,4 +30,4 @@ pub use transponder::*;
 #[cfg(target_os = "linux")]
 pub use backend::{DemuxMode, LinuxDvbTuner};
 #[cfg(target_os = "linux")]
-pub use sys::{LinuxDeviceTree, LinuxFrontendProbe};
+pub use sys::{LinuxDeviceTree, LinuxFrontendProbe, LinuxSecDevice};

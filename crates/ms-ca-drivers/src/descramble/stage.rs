@@ -302,4 +302,8 @@ impl TsStage for DescramblerStage {
         self.descrambler
             .mark_pids_null(buf, self.config.drop_encrypted, pids_all);
     }
+
+    fn tick(&mut self) {
+        self.drain_commands();
+    }
 }

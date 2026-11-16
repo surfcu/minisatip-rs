@@ -1,12 +1,15 @@
 //! Per-adapter DVB state and the ports of `dvb_tune` / `dvb_get_signal`.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
+
 use super::consts::*;
-use super::device::{DtvProperty, DvbDevice, error_parts};
+use super::device::{DtvProperty, DvbDevice, SecDevice, error_parts};
 use crate::names;
 
 /// `#define DEFAULT_LOG LOG_DVB` (dvb.cpp:53).
 const DEFAULT_LOG: u32 = ms_log::LOG_DVB;
-use super::diseqc::{MasterView, SwitchOptions, setup_switch};
+use super::diseqc::{MasterView, SwitchOptions, SwitchState, setup_switch};
 use super::signal::{
     LOCK_RETRY_INITIAL_MS, LOCK_RETRY_INTERVAL_MS, LOCK_RETRY_MAX, NEW_SIGNAL, OLD_SIGNAL,
     RawSignal, SIGNAL_UNPROBED, SnrCalib, adapt_signal, apply_multiplier, read_status, signal_v3,
@@ -110,7 +113,7 @@ impl AdapterState {
         state
     }
 
-    /// `setup_switch` (dvb.cpp:1135) against `dev` (the master frontend for a slave).
+    /// Shared LNB state and frontend SEC handle for one master adapter.
     pub fn setup_switch<D: super::device::SecDevice + ?Sized>(
         &mut self,
         dev: &mut D,
@@ -135,15 +138,39 @@ impl AdapterState {
         freq
     }
 
+    fn setup_switch_target<D: DvbDevice + ?Sized>(
+        &mut self,
+        dev: &mut D,
+        sec_override: Option<&mut dyn SecDevice>,
+        force: bool,
+        master: Option<MasterView<'_>>,
+    ) -> i32 {
+        match sec_override {
+            Some(sec) => self.setup_switch(sec, force, master),
+            None => self.setup_switch(dev, force, master),
+        }
+    }
+
     /// `dvb_tune` (dvb.cpp:1262) for an independent adapter.
     pub fn tune<D: DvbDevice + ?Sized>(&mut self, dev: &mut D, tp: &DvbTransponder) -> i32 {
-        self.tune_with_master(dev, tp, None)
+        self.tune_with_master_sec(dev, None, tp, None)
     }
 
     /// `dvb_tune` with the switch state of a master adapter for a slave.
     pub fn tune_with_master<D: DvbDevice + ?Sized>(
         &mut self,
         dev: &mut D,
+        tp: &DvbTransponder,
+        master: Option<MasterView<'_>>,
+    ) -> i32 {
+        self.tune_with_master_sec(dev, None, tp, master)
+    }
+
+    /// `dvb_tune` running `setup_switch` against `sec_override` (the master frontend) when set.
+    pub fn tune_with_master_sec<D: DvbDevice + ?Sized>(
+        &mut self,
+        dev: &mut D,
+        sec_override: Option<&mut dyn SecDevice>,
         tp: &DvbTransponder,
         master: Option<MasterView<'_>>,
     ) -> i32 {
@@ -170,7 +197,7 @@ impl AdapterState {
         match tp.sys.unwrap_or(SYS_UNDEFINED) {
             SYS_DVBS | SYS_DVBS2 => {
                 let bpol = dev.now_ms();
-                freq = self.setup_switch(dev, false, master);
+                freq = self.setup_switch_target(dev, sec_override, false, master);
                 if !(MIN_FRQ_DVBS..=MAX_FRQ_DVBS).contains(&freq) {
                     ms_log::log!("Frequency {} is not within range ", freq);
                     return -403;
@@ -370,13 +397,23 @@ impl AdapterState {
 
     /// `dvb_get_signal` (dvb.cpp:2306) for an independent adapter.
     pub fn get_signal<D: DvbDevice + ?Sized>(&mut self, dev: &mut D) -> i32 {
-        self.get_signal_with_master(dev, None)
+        self.get_signal_with_master_sec(dev, None, None)
     }
 
     /// `dvb_get_signal`; the master view is only used by a failed-lock resend.
     pub fn get_signal_with_master<D: DvbDevice + ?Sized>(
         &mut self,
         dev: &mut D,
+        master: Option<MasterView<'_>>,
+    ) -> i32 {
+        self.get_signal_with_master_sec(dev, None, master)
+    }
+
+    /// `dvb_get_signal` sending any failed-lock switch resend through `sec_override` when set.
+    pub fn get_signal_with_master_sec<D: DvbDevice + ?Sized>(
+        &mut self,
+        dev: &mut D,
+        sec_override: Option<&mut dyn SecDevice>,
         master: Option<MasterView<'_>>,
     ) -> i32 {
         let mut raw = RawSignal::default();
@@ -446,7 +483,7 @@ impl AdapterState {
         }
         self.ber = raw.ber;
 
-        self.retry_lock(dev, master, status_valid);
+        self.retry_lock_sec(dev, sec_override, master, status_valid);
         0
     }
 
@@ -504,6 +541,16 @@ impl AdapterState {
         master: Option<MasterView<'_>>,
         status_valid: bool,
     ) {
+        self.retry_lock_sec(dev, None, master, status_valid);
+    }
+
+    fn retry_lock_sec<D: DvbDevice + ?Sized>(
+        &mut self,
+        dev: &mut D,
+        sec_override: Option<&mut dyn SecDevice>,
+        master: Option<MasterView<'_>>,
+        status_valid: bool,
+    ) {
         let now = dev.now_ms();
         if !self.lock_retry_update(now, status_valid) {
             return;
@@ -513,6 +560,56 @@ impl AdapterState {
             self.id,
             self.lock_retries
         );
-        self.setup_switch(dev, true, master);
+        self.setup_switch_target(dev, sec_override, true, master);
+    }
+}
+
+/// Shared LNB switch state and frontend SEC handle for one master adapter.
+pub struct MasterSlot {
+    pub state: SwitchState,
+    pub sec: Option<Box<dyn SecDevice + Send>>,
+    pub master_active: bool,
+    pub slaves_used: BTreeSet<i32>,
+}
+
+/// Cross-thread registry connecting slave adapters to their master's SEC and switch state.
+#[derive(Clone, Default)]
+pub struct MasterRegistry(Arc<Mutex<BTreeMap<usize, Arc<Mutex<MasterSlot>>>>>);
+
+impl MasterRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers master `aid` with its frontend SEC device.
+    pub fn register_master(&self, aid: usize, sec: Box<dyn SecDevice + Send>) {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        map.insert(
+            aid,
+            Arc::new(Mutex::new(MasterSlot {
+                state: SwitchState::default(),
+                sec: Some(sec),
+                master_active: false,
+                slaves_used: BTreeSet::new(),
+            })),
+        );
+    }
+
+    /// Returns whether `aid` is already registered as a master.
+    pub fn has_master(&self, aid: usize) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&aid)
+    }
+
+    /// Returns the shared mutex for master `aid`, if registered.
+    pub fn slot(&self, aid: usize) -> Option<Arc<Mutex<MasterSlot>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&aid)
+            .cloned()
     }
 }

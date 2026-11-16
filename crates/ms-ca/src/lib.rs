@@ -7,7 +7,11 @@ pub mod program;
 
 pub use capmt::{BuiltCapmt, Capmt, CapmtError, capmt_content_hash, create_capmt};
 pub use device::{CaDevice, CaState, SendCmd, SendOutcome};
-pub use program::{CaDescriptor, EsStream, Program, ProgramTable, RawDescriptor, SdtInfo};
+use program::push_ca_descriptor;
+pub use program::{
+    CaDescriptor, EsStream, Program, ProgramTable, RawDescriptor, SdtInfo,
+    collect_pmt_ca_descriptors,
+};
 
 /// Most CA descriptors kept per service, like the C++ `MAX_CAID`.
 pub const MAX_CAID: usize = 20;
@@ -69,12 +73,7 @@ impl CaService {
             pcr_pid: pmt.pcr_pid_header,
             ..Self::default()
         };
-        let es = pmt.streams.iter().flat_map(|s| s.descriptors.iter());
-        for descriptor in pmt.program_info.iter().chain(es) {
-            if descriptor.is_ca() {
-                service.add_ca_descriptor(&descriptor.data);
-            }
-        }
+        service.ca = collect_pmt_ca_descriptors(pmt);
         service.streams = pmt
             .streams
             .iter()
@@ -107,19 +106,12 @@ impl CaService {
 
     /// Adds a CA descriptor payload unless its (CAID, PID) already exists.
     pub fn add_ca_descriptor(&mut self, data: &[u8]) {
-        if data.len() < 4 || self.ca.len() >= MAX_CAID {
+        if data.len() < 4 {
             return;
         }
         let caid = u16::from_be_bytes([data[0], data[1]]);
         let pid = (((data[2] & 0x1F) as u16) << 8) | data[3] as u16;
-        if self.ca.iter().any(|c| c.caid == caid && c.pid == pid) {
-            return;
-        }
-        self.ca.push(CaDescriptor {
-            caid,
-            pid,
-            private_data: data[4..].to_vec(),
-        });
+        push_ca_descriptor(&mut self.ca, caid, pid, &data[4..]);
     }
 }
 
@@ -385,5 +377,50 @@ mod tests {
             service.add_ca_descriptor(&[0x01, 0x00, 0xE0, pid]);
         }
         assert_eq!(service.ca.len(), MAX_CAID);
+    }
+
+    #[test]
+    fn raw_descriptor_and_apply_pmt_handle_truncated_and_es_ca() {
+        assert_eq!(
+            RawDescriptor::from_bytes(&[]),
+            RawDescriptor {
+                tag: 0,
+                data: vec![]
+            }
+        );
+        assert_eq!(
+            RawDescriptor::from_bytes(&[0x09, 10, 1, 2]),
+            RawDescriptor {
+                tag: 0x09,
+                data: vec![1, 2]
+            }
+        );
+        assert!(RawDescriptor::from_bytes_checked(&[0x09, 10, 1, 2]).is_none());
+
+        let payload = [
+            0xE1, 0x00, 0xF0, 0x00, // PCR 0x100, no program_info
+            0x02, 0xE1, 0x01, 0xF0, 0x06, // video 0x101
+            0x09, 0x04, 0x09, 0x8C, 0xE6, 0x00, // ES CA
+            0x05, 0xE1, 0x05, 0xF0, 0x06, // private non-A/V stream
+            0x09, 0x04, 0x01, 0x00, 0xE7, 0x00,
+        ];
+        let mut pmt = Pmt::parse(&section(&payload), CrcCheck::Verify).unwrap();
+        // Force a non-A/V descriptor directly to verify `collect_pmt_ca_descriptors` filters it too.
+        pmt.streams[1].descriptors.push(ms_psi::Descriptor {
+            tag: 0x09,
+            data: vec![0x01, 0x00, 0xE7, 0x00],
+        });
+        let mut prog = Program::default();
+        prog.apply_pmt(&pmt);
+        let service = CaService::from_pmt(1, 0, 0x30, &pmt);
+        assert_eq!(prog.caids, service.ca);
+        assert_eq!(
+            prog.caids,
+            vec![CaDescriptor {
+                caid: 0x098C,
+                pid: 0x0600,
+                private_data: vec![],
+            }]
+        );
     }
 }

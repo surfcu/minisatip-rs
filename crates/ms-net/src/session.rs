@@ -23,7 +23,7 @@ use crate::rtsp::{
 };
 use crate::satip::{merge_satip_url, parse_satip_url_new};
 #[cfg(feature = "srt")]
-use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener};
+use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener, SrtOps};
 use crate::web::{
     ADAPTER_CI, ADAPTER_DVB, ADAPTER_NETCV, ADAPTER_SATIP, AdapterState, CaDeviceState,
     GUARD_INTERVAL_AUTO, KeyState, PmtState, QAM_AUTO, RuntimeState, StreamState, WebService,
@@ -865,6 +865,27 @@ impl SessionManager {
         });
     }
 
+    #[cfg(feature = "srt")]
+    fn release_stream_srt(&mut self, index: usize) {
+        let srt_socket = self
+            .streams
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .and_then(|stream| {
+                if stream.srt_sock != SRT_INVALID_SOCK {
+                    let sock = std::mem::replace(&mut stream.srt_sock, SRT_INVALID_SOCK);
+                    let streamid = std::mem::take(&mut stream.srt_streamid);
+                    Some((sock, streamid))
+                } else {
+                    None
+                }
+            });
+        // C++ returns connected SRT sockets to the pending pool (stream.cpp:379, 652-659).
+        if let (Some((sock, streamid)), Some(listener)) = (srt_socket, self.srt.as_ref()) {
+            listener.return_socket(sock, &streamid);
+        }
+    }
+
     /// Disables a stream whose adapter was already released by the scheduler.
     fn disable_stream(&mut self, id: StreamId) {
         let Some(index) = self.slot_index(id) else {
@@ -872,23 +893,15 @@ impl SessionManager {
         };
         self.diag_close(index);
         #[cfg(feature = "srt")]
-        let srt_socket = self.streams[index].as_ref().and_then(|stream| {
-            (stream.stream_type == StreamType::RtspSrt && stream.srt_sock != SRT_INVALID_SOCK)
-                .then(|| (stream.srt_sock, stream.srt_streamid.clone()))
-        });
+        self.release_stream_srt(index);
         if let Some(stream) = self.streams[index].as_mut() {
             stream.enabled = false;
             stream.adapter = -1;
             stream.do_play = false;
             stream.srt_sock = -1;
+            stream.srt_streamid.clear();
         }
         self.udp_sockets.remove(&id);
-        // C++ frees the sockets and returns a connected SRT socket
-        // (adapter.cpp:1113-1115 -> stream.cpp:652-659).
-        #[cfg(feature = "srt")]
-        if let (Some((sock, streamid)), Some(listener)) = (srt_socket, self.srt.as_ref()) {
-            listener.return_socket(sock, &streamid);
-        }
     }
 
     /// Closes a stream and releases its adapter.
@@ -901,25 +914,18 @@ impl SessionManager {
         self.diag_close(index);
         let adapter = self.streams[index].as_ref().expect("checked slot").adapter;
         #[cfg(feature = "srt")]
-        let srt_socket = self.streams[index].as_ref().and_then(|stream| {
-            (stream.stream_type == StreamType::RtspSrt && stream.srt_sock != SRT_INVALID_SOCK)
-                .then(|| (stream.srt_sock, stream.srt_streamid.clone()))
-        });
+        self.release_stream_srt(index);
         if let Some(stream) = self.streams[index].as_mut() {
             stream.enabled = false;
             stream.adapter = -1;
             stream.do_play = false;
             stream.srt_sock = -1;
+            stream.srt_streamid.clear();
         }
         if adapter >= 0 {
             self.sched.close_adapter_for_stream(id, adapter);
         }
         self.udp_sockets.remove(&id);
-        // C++ returns a connected SRT socket to the pending pool (stream.cpp:379).
-        #[cfg(feature = "srt")]
-        if let (Some((sock, streamid)), Some(listener)) = (srt_socket, self.srt.as_ref()) {
-            listener.return_socket(sock, &streamid);
-        }
         // stream.cpp:408.
         ms_log::log!("closed stream {}", id);
     }
@@ -954,7 +960,6 @@ impl SessionManager {
             return Err(TransportError);
         };
         let spec = parse_transport(value);
-        let stream = self.streams[index].as_mut().expect("checked slot");
         match spec.kind {
             // stream.cpp:470-481: TCP takes the RTSP peer and ignores port tokens.
             TransportKind::Tcp => {
@@ -964,6 +969,9 @@ impl SessionManager {
                     id,
                     value
                 );
+                #[cfg(feature = "srt")]
+                self.release_stream_srt(index);
+                let stream = self.streams[index].as_mut().expect("checked slot");
                 stream.stream_type = StreamType::RtspTcp;
                 stream.remote_host = peer_host.to_owned();
                 stream.remote_port = peer_port;
@@ -975,63 +983,78 @@ impl SessionManager {
             }
             TransportKind::Srt => {}
         }
-        match spec.kind {
-            TransportKind::Srt => {
-                // stream.cpp:466: logged before `decode_transport_srt`.
-                ms_log::log!(
-                    "Assuming SRT transport for stream sid {}, arg {}",
-                    id,
-                    value
-                );
-                #[cfg(not(feature = "srt"))]
-                {
-                    // C++ DISABLE_SRT builds reject the transport (stream.cpp:412).
-                    let _ = &spec.srt_streamid;
-                    // stream.cpp:446.
-                    ms_log::log0!("SRT not supported, install libsrt-openssl-dev");
-                    return Err(TransportError);
-                }
-                #[cfg(feature = "srt")]
-                {
-                    // stream.cpp:416.
-                    let Some(listener) = self.srt.as_ref() else {
-                        ms_log::log_and_return!(
-                            Err(TransportError),
-                            "SRT listener not initialized"
-                        );
-                    };
-                    // stream.cpp:429.
-                    let Some(streamid) = spec.srt_streamid.as_deref() else {
-                        ms_log::log_and_return!(
-                            Err(TransportError),
-                            "SRT transport missing srt_streamid= parameter"
-                        );
-                    };
-                    let sock = listener.take(streamid);
-                    if sock == SRT_INVALID_SOCK {
-                        // stream.cpp:436.
-                        ms_log::log_and_return!(
-                            Err(TransportError),
-                            "Failed finding pending SRT socket for sid {}, srt_streamid {}",
-                            id,
-                            streamid
-                        );
-                    }
-                    stream.srt_sock = sock;
-                    stream.srt_streamid = streamid.to_owned();
-                    stream.stream_type = StreamType::RtspSrt;
-                    // stream.cpp:441.
-                    ms_log::log!(
-                        "SRT stream setup for sid {}, srt_streamid='{}', srt_sock={} (from pending)",
-                        id,
-                        streamid,
-                        sock
-                    );
-                }
-            }
-            TransportKind::Tcp | TransportKind::Udp => {}
+        // stream.cpp:466: logged before `decode_transport_srt`.
+        ms_log::log!(
+            "Assuming SRT transport for stream sid {}, arg {}",
+            id,
+            value
+        );
+        #[cfg(not(feature = "srt"))]
+        {
+            // C++ DISABLE_SRT builds reject the transport (stream.cpp:412).
+            let _ = &spec.srt_streamid;
+            // stream.cpp:446.
+            ms_log::log0!("SRT not supported, install libsrt-openssl-dev");
+            Err(TransportError)
         }
-        Ok(())
+        #[cfg(feature = "srt")]
+        {
+            // stream.cpp:416.
+            let Some(listener) = self.srt.as_ref() else {
+                ms_log::log_and_return!(Err(TransportError), "SRT listener not initialized");
+            };
+            // stream.cpp:429.
+            let Some(streamid) = spec.srt_streamid.as_deref() else {
+                ms_log::log_and_return!(
+                    Err(TransportError),
+                    "SRT transport missing srt_streamid= parameter"
+                );
+            };
+            let old_srt = self.streams[index]
+                .as_ref()
+                .filter(|stream| stream.srt_sock != SRT_INVALID_SOCK)
+                .map(|stream| (stream.srt_sock, stream.srt_streamid.clone()));
+            let pending_sock = listener.take(streamid);
+            let (sock, source) = if pending_sock != SRT_INVALID_SOCK {
+                if let Some((old_sock, old_streamid)) = old_srt
+                    && old_sock != pending_sock
+                {
+                    if old_streamid == streamid {
+                        listener.ops().close(old_sock);
+                    } else {
+                        listener.return_socket(old_sock, &old_streamid);
+                    }
+                }
+                (pending_sock, "from pending")
+            } else if let Some((old_sock, old_streamid)) = old_srt
+                && old_streamid == streamid
+                && listener.ops().is_connected(old_sock)
+            {
+                (old_sock, "reusing existing")
+            } else {
+                // stream.cpp:436.
+                ms_log::log_and_return!(
+                    Err(TransportError),
+                    "Failed finding pending SRT socket for sid {}, srt_streamid {}",
+                    id,
+                    streamid
+                );
+            };
+            let stream = self.streams[index].as_mut().expect("checked slot");
+            stream.srt_sock = sock;
+            stream.srt_streamid = streamid.to_owned();
+            stream.stream_type = StreamType::RtspSrt;
+            self.udp_sockets.remove(&id);
+            // stream.cpp:441.
+            ms_log::log!(
+                "SRT stream setup for sid {}, srt_streamid='{}', srt_sock={} ({})",
+                id,
+                streamid,
+                sock,
+                source
+            );
+            Ok(())
+        }
     }
 
     /// UDP branch of `decode_transport` (stream.cpp:484-606).

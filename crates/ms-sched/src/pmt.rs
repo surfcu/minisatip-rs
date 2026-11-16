@@ -2065,6 +2065,9 @@ impl Scheduler {
             ver,
             pat_len
         );
+        if pat_len > 1500 {
+            return 0;
+        }
 
         if let Some(adapter) = self.adapters[index].as_mut() {
             adapter.active_pmts = 0;
