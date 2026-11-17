@@ -226,11 +226,26 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 - [ ] New CA policies (bandwidth balancing, pre-packing) as documented deviations
 - [ ] Opt-in Step 3 `--cam-recovery` escalation (`ioctl(CA_RESET)` on the affected CI slot
   only, after Step 1 CAPMT re-send `#88` and Step 2 per-service silent leave/rejoin `#94`
-  both fail to clear scrambled output): strictly rate-limited with cooldown/exponential
-  backoff (and gated on prior clear descrambling or verified post-MMI lockup) so a
-  genuinely unsubscribed channel cannot reset-loop the CAM, while letting
-  `HostEvent::ReleasePmts` re-offer active PMTs without restarting `minisatip-rs` or
-  disturbing FTA/other-CA streams (recorded as a `DEV-xxx` row in `docs/deviations.md`)
+  both fail to clear scrambled output): gated on input-healthy `cam_stuck` confirmation
+  (`DEV-284`, or sustained `cam_single_stuck` after prior clear descrambling) and strictly
+  rate-limited with cooldown/exponential backoff so a genuinely unsubscribed channel
+  cannot reset-loop the CAM, while restarting a wedged CAM-internal EMM/entitlement
+  service and letting `HostEvent::ReleasePmts` re-offer active PMTs without restarting
+  `minisatip-rs` or disturbing FTA/other-CA streams (recorded as a `DEV-xxx` row in
+  `docs/deviations.md`)
+- [ ] Fix DDCI mandatory `PID 1` (CAT) & `PID 20` (TDT/TOT) multi-PMT reference tracking
+  and cross-adapter ownership/handover (`crates/ms-ca-drivers/src/ddci/mod.rs`
+  `Ddci::process_pmt` / `del_pmt_mapping_table`, inherited from C++ `ddci.cpp:561-573`):
+  (1) always attach every active same-adapter `pmt.id` to `(ad, 1)` and `(ad, 20)` so
+  closing the first service on `ad` does not unmap `PID 1`/`20` while sibling PMTs on `ad`
+  remain active; and (2) reserve `ddpid 1` and `ddpid 20` exclusively for the single
+  active CAT/EMM-owning adapter instead of spilling secondary adapters onto `ddpid 2` /
+  `ddpid 21` (which injects raw CAT/TDT onto reserved/network-sync PIDs, leaves `ddpid 1`/
+  `20` unmapped when the first adapter exits, and can pair one transponder's `CAT` on
+  `ddpid 1` with another transponder's EMM PIDs), atomically promoting a surviving active
+  adapter onto `ddpid 1` + `ddpid 20` + `process_cat` when the owner's last DDCI PMT
+  leaves (recorded as a `DEV-xxx` row in `docs/deviations.md`; evaluate upstream PR
+  alongside `#1565`)
 - [ ] Revisit the DDCI 128-byte FPGA/DMA read-granularity fix
   (`catalinii/minisatip#1437`, `catalinii/minisatip#1447` — currently ported verbatim
   in `Ddci::prepare_ts_write` / `Ddci::process_ts` at
@@ -302,7 +317,11 @@ Unvalidated rows must be called out in release notes.
 - CA bandwidth balancing and pre-packing from request history
 - Opt-in Step 3 `--cam-recovery` single-slot `ioctl(CA_RESET)` escalation with strict
   cooldown/backoff after `#88` CAPMT re-send + `#94` silent rejoin fail (anti-reset-loop
-  guard for unsubscribed services; isolated to the wedged slot via `ReleasePmts`)
+  guard for unsubscribed services; recovers wedged CAM EMM/entitlement state via
+  `ReleasePmts`)
+- DDCI mandatory `PID 1` (CAT) / `PID 20` (TDT/TOT) multi-PMT reference counting,
+  single-owner `ddpid 1`/`20` reservation (no `ddpid 2`/`21` spill), and atomic
+  cross-adapter CAT/EMM handover
 - DDCI CI-write tail flushing and MTD shaping (`catalinii/minisatip#1437` / `#1447`
   revisit at M10: "Biased Idle-Edge Writer Task", "Underflow Stuffing in an MTD
   Token-Bucket Shaper", decoupled per-CI writer queue)
