@@ -418,6 +418,13 @@ Unvalidated rows must be called out in release notes.
   - CA scenarios in the harness (#36).
   - Second CI (adapter 9) once a CAM is in; test the enigma2 CI routing once a CAM
     is in that box.
+  - Post-soak license switch to GPL 2.0: replace `LICENSE` with the GNU GPL v2 text (matching
+    upstream `COPYING`), update `[workspace.package].license` in `Cargo.toml` (all workspace
+    crates inherit `license.workspace = true`) from `"GPL-3.0-only"` to `"GPL-2.0-or-later"`
+    (matching upstream `src/minisatip.cpp:6-7` "version 2 ... or any later version" and keeping
+    optional `ci-plus` OpenSSL 3.x / Apache-2.0 builds license-compatible) or `"GPL-2.0-only"`
+    (with an OpenSSL linking exception if `ci-plus` binaries are distributed), and align
+    `README.md` and GitHub repo metadata.
 - **Blockers:** no SAT>IP server (M8 exit).
 - **CI+ (2026-10-24):** content control runs behind the `ci-plus` feature: a slot
   keeps CI+ when `{cert_dir}/root.pem` exists and `-C` was not given, and CI+ keys
