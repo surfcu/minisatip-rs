@@ -84,6 +84,9 @@ pub struct CaRuntime {
     offered: Rc<RefCell<Vec<(usize, usize)>>>,
     /// EN 50221 device fields for the status page, by adapter id.
     ca_views: BTreeMap<usize, DeviceView>,
+    adapter_timeout_ms: i64,
+    adapter_timeouts: BTreeMap<usize, i64>,
+    dvbapi_active_until: Option<i64>,
     next_poll: i64,
     next_watchdog: i64,
     next_stats: i64,
@@ -100,6 +103,12 @@ pub struct CaRuntime {
     window_base: BTreeMap<usize, WindowBase>,
     /// Per-DDCI-pid totals at the last service window (`--cam-recovery`).
     service_window_base: BTreeMap<(usize, u16), (u64, u64)>,
+    /// Per-`(ci_aid, host_aid)` RF/CC snapshot at the last service window.
+    host_input_base: BTreeMap<(usize, usize), ms_net::dataplane::InputHealthSnapshot>,
+    /// Per-`(ci_aid, host_ad)` DDCI mapped ECM total at the last service window.
+    ecm_window_base: BTreeMap<(usize, u16), u64>,
+    #[cfg(test)]
+    test_input_health: BTreeMap<usize, ms_net::dataplane::InputHealthSnapshot>,
     /// Per-adapter window sequence number shared by `ScrambledWindow` and `ServiceWindows`.
     window_seq: BTreeMap<usize, u64>,
     sync_dirty: bool,
@@ -136,6 +145,11 @@ impl CaRuntime {
         if let Some(tap) = capture.as_ref() {
             dvbca_settings.set_apdu_sink(tap.apdu_sink());
         }
+        let adapter_timeouts = opts
+            .adapter_timeouts
+            .iter()
+            .map(|entry| (usize::from(entry.adapter), i64::from(entry.timeout_ms)))
+            .collect();
         Self {
             #[cfg(feature = "diag-log")]
             capture,
@@ -157,6 +171,9 @@ impl CaRuntime {
             hw_nodes: BTreeMap::new(),
             offered,
             ca_views: BTreeMap::new(),
+            adapter_timeout_ms: i64::from(opts.adapter_timeout),
+            adapter_timeouts,
+            dvbapi_active_until: None,
             next_poll: 0,
             next_watchdog: 0,
             next_stats: 0,
@@ -165,6 +182,10 @@ impl CaRuntime {
             diag_clear_pkts: BTreeMap::new(),
             window_base: BTreeMap::new(),
             service_window_base: BTreeMap::new(),
+            host_input_base: BTreeMap::new(),
+            ecm_window_base: BTreeMap::new(),
+            #[cfg(test)]
+            test_input_health: BTreeMap::new(),
             window_seq: BTreeMap::new(),
             sync_dirty: true,
             synced_sched_version: 0,
@@ -529,6 +550,7 @@ impl CaRuntime {
         state.dvbca.sweep_pending(&state.pending, |id, program| {
             sched.pmt(id as i32).is_some_and(|pmt| {
                 matches!(pmt.state, PmtState::Running | PmtState::Starting)
+                    && pmt.generation == program.generation
                     && pmt.adapter == i32::from(program.adapter)
                     && pmt.sid == i32::from(program.sid)
                     && pmt.pid == i32::from(program.pid)
@@ -747,6 +769,10 @@ impl CaRuntime {
         self.ca_views.remove(&aid);
         self.window_base.remove(&aid);
         self.service_window_base.retain(|&(a, _), _| a != aid);
+        self.host_input_base
+            .retain(|&(ci, h), _| ci != aid && h != aid);
+        self.ecm_window_base
+            .retain(|&(ci, h), _| ci != aid && usize::from(h) != aid);
         self.router.forget_adapter(aid as i32);
         self.sync_dirty = true;
     }
@@ -861,6 +887,33 @@ impl CaRuntime {
         (ca, keys)
     }
 
+    /// Mirrors `is_adapter_active()` (`dvbapi.cpp:608`): true while a stream runs or
+    /// within the adapter's `-Z` idle grace window (`0` keeps an opened adapter active).
+    fn dvbapi_adapters_active(&mut self, sched: &Scheduler, now: i64) -> bool {
+        let mut any_active = false;
+        for aid in 0..MAX_ADAPTERS {
+            if sched.adapter(aid).is_some_and(|a| a.sid_cnt > 0) {
+                any_active = true;
+                let timeout_ms = self
+                    .adapter_timeouts
+                    .get(&aid)
+                    .copied()
+                    .unwrap_or(self.adapter_timeout_ms);
+                let until = if timeout_ms <= 0 {
+                    i64::MAX
+                } else {
+                    now.saturating_add(timeout_ms)
+                };
+                self.dvbapi_active_until =
+                    Some(self.dvbapi_active_until.map_or(until, |cur| cur.max(until)));
+            }
+        }
+        if self.dvbapi_active_until.is_some_and(|until| now >= until) {
+            self.dvbapi_active_until = None;
+        }
+        any_active || self.dvbapi_active_until.is_some()
+    }
+
     /// One control-loop pass: DVBAPI socket, timers, events and data-plane sync.
     pub fn tick(&mut self, sched: &mut Scheduler, handles: &[Option<AdapterHandle>]) {
         let now = self.now();
@@ -872,16 +925,17 @@ impl CaRuntime {
         self.collect_stats();
         if now >= self.next_decrypt_window {
             self.next_decrypt_window = now + DECRYPT_WINDOW_MS;
-            self.decrypt_windows(sched, now);
+            self.decrypt_windows(sched, handles, now);
         }
         self.dvbca_notices(sched);
-        if let Some(dvbapi) = self.dvbapi.as_mut() {
-            dvbapi.service_socket(now);
-            if now >= self.next_poll {
-                self.next_poll = now + DVBAPI_POLL_MS;
-                let active =
-                    (0..MAX_ADAPTERS).any(|aid| sched.adapter(aid).is_some_and(|a| a.sid_cnt > 0));
-                dvbapi.poll(now, active);
+        if self.dvbapi.is_some() {
+            let active = self.dvbapi_adapters_active(sched, now);
+            if let Some(dvbapi) = self.dvbapi.as_mut() {
+                dvbapi.service_socket(now);
+                if now >= self.next_poll {
+                    self.next_poll = now + DVBAPI_POLL_MS;
+                    dvbapi.poll(now, active);
+                }
             }
         }
         if now >= self.next_watchdog {
@@ -949,8 +1003,12 @@ impl CaRuntime {
                     .send(DescramblerCommand::DisableCw { pmt_id });
             }
         }
-        if let Some(dvbapi) = self.dvbapi.as_mut() {
-            dvbapi.flush(self.origin.elapsed().as_millis() as i64);
+        if self.dvbapi.is_some() {
+            let now = self.now();
+            let _ = self.dvbapi_adapters_active(sched, now);
+            if let Some(dvbapi) = self.dvbapi.as_mut() {
+                dvbapi.flush(now);
+            }
         }
     }
 
@@ -1143,9 +1201,24 @@ impl CaRuntime {
         }
     }
 
+    fn host_input_snapshot(
+        &self,
+        handles: &[Option<AdapterHandle>],
+        host_aid: usize,
+    ) -> Option<ms_net::dataplane::InputHealthSnapshot> {
+        #[cfg(test)]
+        if let Some(snapshot) = self.test_input_health.get(&host_aid).copied() {
+            return Some(snapshot);
+        }
+        handles
+            .get(host_aid)
+            .and_then(Option::as_ref)
+            .map(AdapterHandle::input_health)
+    }
+
     /// Per decrypt window of every CI adapter: `ci_decrypt` diagnostics, and the
     /// counts to its CAM when `--cam-recovery` is set.
-    fn decrypt_windows(&mut self, sched: &Scheduler, now: i64) {
+    fn decrypt_windows(&mut self, sched: &Scheduler, handles: &[Option<AdapterHandle>], now: i64) {
         let aids: Vec<usize> = self.adapters.keys().copied().collect();
         let mut windows = Vec::new();
         let mut service_windows = Vec::new();
@@ -1192,12 +1265,45 @@ impl CaRuntime {
                     && is_ddci
                     && let Some(link) = self.ddci.as_ref()
                 {
-                    let services = ddci_services(link, sched, aid);
+                    let (services, ecm_totals) = ddci_services(link, sched, aid);
+                    let active_hosts: BTreeSet<usize> =
+                        services.iter().filter_map(|s| s.host_aid).collect();
+                    self.host_input_base
+                        .retain(|&(ci, h), _| ci != aid || active_hosts.contains(&h));
+                    self.ecm_window_base
+                        .retain(|&(ci, h), _| ci != aid || active_hosts.contains(&usize::from(h)));
+                    let mut host_healthy = BTreeMap::new();
+                    for &host_aid in &active_hosts {
+                        let rf_ok = if let Some(curr) = self.host_input_snapshot(handles, host_aid)
+                        {
+                            let prev = self.host_input_base.insert((aid, host_aid), curr);
+                            prev.is_some_and(|p| {
+                                p.current_locked == Some(true)
+                                    && curr.current_locked == Some(true)
+                                    && curr.unlock_seq == p.unlock_seq
+                                    && curr.cc_errors >= p.cc_errors
+                                    && curr.cc_errors - p.cc_errors
+                                        <= ms_ca_drivers::en50221::CAM_STUCK_MAX_CC_DELTA
+                            })
+                        } else {
+                            self.host_input_base.remove(&(aid, host_aid));
+                            false
+                        };
+                        let ecm_ok = if let Ok(ad_u16) = u16::try_from(host_aid) {
+                            let curr_ecm = ecm_totals.get(&ad_u16).copied().unwrap_or(0);
+                            let prev_ecm = self.ecm_window_base.insert((aid, ad_u16), curr_ecm);
+                            prev_ecm.is_some_and(|prev| curr_ecm > prev)
+                        } else {
+                            false
+                        };
+                        host_healthy.insert(host_aid, rf_ok && ecm_ok);
+                    }
                     let deltas = Self::service_window_deltas(
                         &mut self.service_window_base,
                         aid,
                         pid_totals,
                         &services,
+                        &host_healthy,
                     );
                     service_windows.push((aid, seq, sample.2, deltas));
                 }
@@ -1267,8 +1373,32 @@ impl CaRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_host_input_health_for_test(
+        &mut self,
+        host_aid: usize,
+        snapshot: ms_net::dataplane::InputHealthSnapshot,
+    ) {
+        self.test_input_health.insert(host_aid, snapshot);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_host_input_for_test(
+        &mut self,
+        ci_aid: usize,
+        host_aid: usize,
+        snapshot: ms_net::dataplane::InputHealthSnapshot,
+        ecm_total: u64,
+    ) {
+        self.test_input_health.insert(host_aid, snapshot);
+        self.host_input_base.insert((ci_aid, host_aid), snapshot);
+        if let Ok(ad) = u16::try_from(host_aid) {
+            self.ecm_window_base.insert((ci_aid, ad), ecm_total);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn run_decrypt_windows_for_test(&mut self, sched: &Scheduler, now: i64) {
-        self.decrypt_windows(sched, now);
+        self.decrypt_windows(sched, &[], now);
     }
 
     /// Window deltas per service from cumulative per-pid totals; a pid is
@@ -1277,17 +1407,9 @@ impl CaRuntime {
         base: &mut BTreeMap<(usize, u16), (u64, u64)>,
         aid: usize,
         totals: &[(u16, u64, u64)],
-        services: &[(
-            u16,
-            Option<ms_ca_drivers::en50221::TransponderKey>,
-            Vec<u16>,
-        )],
-    ) -> Vec<(
-        u16,
-        Option<ms_ca_drivers::en50221::TransponderKey>,
-        u64,
-        u64,
-    )> {
+        services: &[DdciServiceSpec],
+        host_healthy: &BTreeMap<usize, bool>,
+    ) -> Vec<ms_ca_drivers::en50221::ServiceWindow> {
         let mut deltas: BTreeMap<u16, (u64, u64)> = BTreeMap::new();
         let mut reported = BTreeSet::new();
         for &(pid, scrambled, clear) in totals {
@@ -1306,16 +1428,25 @@ impl CaRuntime {
         base.retain(|&(a, pid), _| a != aid || reported.contains(&pid));
         services
             .iter()
-            .map(|(sid, tp_key, pids)| {
+            .map(|spec| {
                 let mut scrambled = 0;
                 let mut clear = 0;
-                for pid in pids {
+                for pid in &spec.pids {
                     if let Some(&(s, c)) = deltas.get(pid) {
                         scrambled += s;
                         clear += c;
                     }
                 }
-                (*sid, *tp_key, scrambled, clear)
+                ms_ca_drivers::en50221::ServiceWindow {
+                    sid: spec.sid,
+                    tp_key: spec.tp_key,
+                    scrambled,
+                    clear,
+                    input_healthy: spec
+                        .host_aid
+                        .and_then(|h| host_healthy.get(&h).copied())
+                        .unwrap_or(false),
+                }
             })
             .collect()
     }
@@ -1788,23 +1919,37 @@ fn host_transponder_key(
     })
 }
 
-/// The `(sid, tp_key, DDCI pids)` of each service on a DDCI device; the hub
-/// lock is released before the scheduler is read.
+/// One DDCI slot's service metadata and mapped ES PIDs for `ServiceWindows`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DdciServiceSpec {
+    pub sid: u16,
+    pub host_aid: Option<usize>,
+    pub tp_key: Option<ms_ca_drivers::en50221::TransponderKey>,
+    pub pids: Vec<u16>,
+}
+
+/// Services and per-host-adapter ECM totals on a DDCI device; releases hub lock before `sched`.
 fn ddci_services(
     link: &DdciLink,
     sched: &Scheduler,
     aid: usize,
-) -> Vec<(
-    u16,
-    Option<ms_ca_drivers::en50221::TransponderKey>,
-    Vec<u16>,
-)> {
-    let slots = link.hub.lock().ddci.slot_pmts(aid);
+) -> (Vec<DdciServiceSpec>, BTreeMap<u16, u64>) {
+    let (slots, ecm_totals) = {
+        let state = link.hub.lock();
+        let slots = state.ddci.slot_pmts(aid);
+        let ecm_totals = state
+            .ddci
+            .devices
+            .get(&aid)
+            .map_or_else(BTreeMap::new, |d| d.adapter_ecm_pkts.clone());
+        (slots, ecm_totals)
+    };
     let mut services = Vec::new();
     for id in slots {
         let Some(pmt) = sched.pmt(id) else {
             continue;
         };
+        let host_aid = usize::try_from(pmt.adapter).ok();
         let tp_key = host_transponder_key(sched, pmt.adapter);
         let es: Vec<u16> = pmt
             .stream_pids
@@ -1820,9 +1965,14 @@ fn ddci_services(
                 .ddci
                 .es_ddci_pids(aid, pmt.adapter as u16, id, &es)
         };
-        services.push((pmt.sid as u16, tp_key, pids));
+        services.push(DdciServiceSpec {
+            sid: pmt.sid as u16,
+            host_aid,
+            tp_key,
+            pids,
+        });
     }
-    services
+    (services, ecm_totals)
 }
 
 /// [`ddci_services`] over a bare hub, for the worker tests.
@@ -1831,18 +1981,14 @@ pub(crate) fn ddci_services_for_test(
     hub: &DdciHub,
     sched: &Scheduler,
     aid: usize,
-) -> Vec<(
-    u16,
-    Option<ms_ca_drivers::en50221::TransponderKey>,
-    Vec<u16>,
-)> {
+) -> Vec<DdciServiceSpec> {
     let link = DdciLink {
         hub: hub.clone(),
         ca_id: 0,
         mirrored: BTreeSet::new(),
         cat_filters: BTreeMap::new(),
     };
-    ddci_services(&link, sched, aid)
+    ddci_services(&link, sched, aid).0
 }
 
 /// The registered EN 50221 CA.
@@ -3187,9 +3333,9 @@ mod window_tests {
         for (cam_recovery_ms, expected) in [(0, 0), (-5_000, 0), (10_000, 1)] {
             let (mut ca, recorder) = recording_runtime(cam_recovery_ms);
             set_counters(&mut ca, 1, 0, 0);
-            ca.decrypt_windows(&sched, 1_000);
+            ca.decrypt_windows(&sched, &[], 1_000);
             set_counters(&mut ca, 1, 50_000, 0);
-            ca.decrypt_windows(&sched, 11_000);
+            ca.decrypt_windows(&sched, &[], 11_000);
             assert_eq!(
                 recorder.windows().len(),
                 expected,
@@ -3221,10 +3367,10 @@ mod window_tests {
         let (mut ca, recorder) = recording_runtime(10_000);
         set_counters(&mut ca, 1, 0, 0);
         set_counters(&mut ca, 2, 0, 0);
-        ca.decrypt_windows(&sched, 1_000);
+        ca.decrypt_windows(&sched, &[], 1_000);
         set_counters(&mut ca, 1, 3_000, 40);
         set_counters(&mut ca, 2, 7_000, 90);
-        ca.decrypt_windows(&sched, 11_000);
+        ca.decrypt_windows(&sched, &[], 11_000);
         assert_eq!(
             recorder.windows(),
             vec![(1, 3_000, 40, 10_000), (2, 7_000, 90, 10_000)]
@@ -3298,12 +3444,13 @@ mod window_tests {
     // The silent path reports a service window per DDCI device sharing an incrementing seq with ScrambledWindow.
     #[test]
     fn decrypt_windows_report_ddci_service_windows() {
+        use ms_ca_drivers::en50221::ServiceWindow;
         let (hub, sched) = ddci_window_sched();
         let (mut ca, recorder) = ddci_runtime(10_000, hub);
         set_pid_totals(&mut ca, 0, vec![(1301, 2_000, 0), (1302, 50, 0)]);
-        ca.decrypt_windows(&sched, 1_000);
+        ca.decrypt_windows(&sched, &[], 1_000);
         set_pid_totals(&mut ca, 0, vec![(1301, 4_000, 0), (1302, 100, 0)]);
-        ca.decrypt_windows(&sched, 2_000);
+        ca.decrypt_windows(&sched, &[], 2_000);
         let scr1 = recorder.windows_with_seq();
         let svc1 = recorder.service_windows_with_seq();
         assert_eq!(scr1.len(), 1);
@@ -3315,11 +3462,21 @@ mod window_tests {
         );
         assert_eq!(
             (svc1[0].0, svc1[0].2, svc1[0].3.as_slice()),
-            (0, 1_000, &[(0x1234, None, 0, 0)][..]),
-            "the first window seeds the per-pid totals"
+            (
+                0,
+                1_000,
+                &[ServiceWindow {
+                    sid: 0x1234,
+                    tp_key: None,
+                    scrambled: 0,
+                    clear: 0,
+                    input_healthy: false,
+                }][..]
+            ),
+            "the first window seeds the per-pid totals and fails input_healthy closed without handles"
         );
         set_pid_totals(&mut ca, 0, vec![(1301, 5_000, 0), (1302, 150, 0)]);
-        ca.decrypt_windows(&sched, 15_500);
+        ca.decrypt_windows(&sched, &[], 15_500);
         let scr2 = recorder.windows_with_seq();
         let svc2 = recorder.service_windows_with_seq();
         assert_eq!(scr2.len(), 1);
@@ -3331,7 +3488,17 @@ mod window_tests {
         );
         assert_eq!(
             (svc2[0].0, svc2[0].2, svc2[0].3.as_slice()),
-            (0, 13_500, &[(0x1234, None, 1_050, 0)][..])
+            (
+                0,
+                13_500,
+                &[ServiceWindow {
+                    sid: 0x1234,
+                    tp_key: None,
+                    scrambled: 1_050,
+                    clear: 0,
+                    input_healthy: false,
+                }][..]
+            )
         );
     }
 
@@ -3342,9 +3509,9 @@ mod window_tests {
         for cam_recovery_ms in [0, -5_000] {
             let (mut ca, recorder) = ddci_runtime(cam_recovery_ms, hub.clone());
             set_pid_totals(&mut ca, 0, vec![(1301, 2_000, 0)]);
-            ca.decrypt_windows(&sched, 1_000);
+            ca.decrypt_windows(&sched, &[], 1_000);
             set_pid_totals(&mut ca, 0, vec![(1301, 4_000, 0)]);
-            ca.decrypt_windows(&sched, 11_000);
+            ca.decrypt_windows(&sched, &[], 11_000);
             assert!(
                 recorder.service_windows().is_empty(),
                 "--cam-recovery {cam_recovery_ms} ms"
@@ -3361,9 +3528,9 @@ mod window_tests {
         let (mut ca, recorder) = ddci_runtime(10_000, hub);
         let sched = ci_sched(&[1]);
         set_pid_totals(&mut ca, 1, vec![(1301, 2_000, 0)]);
-        ca.decrypt_windows(&sched, 1_000);
+        ca.decrypt_windows(&sched, &[], 1_000);
         set_pid_totals(&mut ca, 1, vec![(1301, 4_000, 0)]);
-        ca.decrypt_windows(&sched, 11_000);
+        ca.decrypt_windows(&sched, &[], 11_000);
         assert!(recorder.service_windows().is_empty());
     }
 
@@ -3373,21 +3540,21 @@ mod window_tests {
         let sched = ci_sched(&[3]);
         let (mut ca, recorder) = recording_runtime(10_000);
         set_counters(&mut ca, 3, 100, 10);
-        ca.decrypt_windows(&sched, 1_000);
+        ca.decrypt_windows(&sched, &[], 1_000);
         assert!(recorder.windows_with_seq().is_empty());
         set_counters(&mut ca, 3, 200, 20);
-        ca.decrypt_windows(&sched, 11_000);
+        ca.decrypt_windows(&sched, &[], 11_000);
         assert_eq!(recorder.windows_with_seq(), vec![(3, 1, 100, 10, 10_000)]);
 
         ca.adapter_removed(3);
         set_counters(&mut ca, 3, 150, 40);
-        ca.decrypt_windows(&sched, 21_000);
+        ca.decrypt_windows(&sched, &[], 21_000);
         assert!(
             recorder.windows_with_seq().is_empty(),
             "a removed adapter reseeds"
         );
         set_counters(&mut ca, 3, 250, 60);
-        ca.decrypt_windows(&sched, 31_000);
+        ca.decrypt_windows(&sched, &[], 31_000);
         assert_eq!(
             recorder.windows_with_seq(),
             vec![(3, 2, 100, 20, 10_000)],
@@ -3402,11 +3569,17 @@ mod window_tests {
     ) -> Vec<(u16, u64, u64)> {
         let with_keys: Vec<_> = services
             .iter()
-            .map(|(sid, pids)| (*sid, None, pids.clone()))
+            .map(|(sid, pids)| DdciServiceSpec {
+                sid: *sid,
+                host_aid: None,
+                tp_key: None,
+                pids: pids.clone(),
+            })
             .collect();
-        CaRuntime::service_window_deltas(base, 1, totals, &with_keys)
+        let healthy = BTreeMap::new();
+        CaRuntime::service_window_deltas(base, 1, totals, &with_keys, &healthy)
             .into_iter()
-            .map(|(sid, _, scr, clr)| (sid, scr, clr))
+            .map(|w| (w.sid, w.scrambled, w.clear))
             .collect()
     }
 
@@ -3809,7 +3982,7 @@ mod window_tests {
 
         // Advance descrambler stats while scheduler and DDCI stay completely idle.
         set_counters(&mut ca, 1, 0, 0);
-        ca.decrypt_windows(&sched, 0);
+        ca.decrypt_windows(&sched, &[], 0);
         set_counters(&mut ca, 1, 1_500, 100);
         ca.next_decrypt_window = 0;
         ca.tick(&mut sched, &handles);
@@ -3836,5 +4009,105 @@ mod window_tests {
             dvbapi.connecting.is_none(),
             "stale dvbapi connect attempt must clear after deadline"
         );
+    }
+
+    #[test]
+    fn dvbapi_adapters_active_honors_adapter_timeout_and_zero_sticky() {
+        let mut sched = Scheduler::new();
+        for aid in [0, 1] {
+            sched.add_adapter(
+                aid,
+                ms_sched::AdapterConfig::new(ms_tuner::DeliverySystem::DvbS2),
+                Box::new(NullSchedTuner),
+            );
+        }
+        let opts = Options {
+            adapter_timeout: 30_000,
+            adapter_timeouts: vec![ms_config::AdapterTimeout {
+                adapter: 1,
+                timeout_ms: 5_000,
+            }],
+            ..Options::default()
+        };
+        let mut ca = CaRuntime::new(&opts);
+        assert!(!ca.dvbapi_adapters_active(&sched, 1_000));
+
+        // Adapter 1 has a 5 s per-adapter `-Z` override: stays active across zaps for 5 s.
+        assert!(sched.set_adapter_for_stream(1, 1));
+        assert!(ca.dvbapi_adapters_active(&sched, 2_000));
+        sched.close_adapter_for_stream(1, 1);
+        assert!(ca.dvbapi_adapters_active(&sched, 6_999));
+        assert!(!ca.dvbapi_adapters_active(&sched, 7_000));
+
+        // Adapter 0 uses the 30 s default `-Z` window.
+        assert!(sched.set_adapter_for_stream(2, 0));
+        assert!(ca.dvbapi_adapters_active(&sched, 10_000));
+        sched.close_adapter_for_stream(2, 0);
+        assert!(ca.dvbapi_adapters_active(&sched, 39_999));
+        assert!(!ca.dvbapi_adapters_active(&sched, 40_000));
+
+        // `-Z *:0` keeps an opened adapter active indefinitely (`adapter.cpp:190`).
+        let mut sticky = CaRuntime::new(&Options {
+            adapter_timeout: 0,
+            ..Options::default()
+        });
+        assert!(!sticky.dvbapi_adapters_active(&sched, 0));
+        assert!(sched.set_adapter_for_stream(3, 0));
+        assert!(sticky.dvbapi_adapters_active(&sched, 1_000));
+        sched.close_adapter_for_stream(3, 0);
+        assert!(sticky.dvbapi_adapters_active(&sched, 86_400_000));
+    }
+
+    #[test]
+    fn dvbca_notices_sweeps_pending_offer_when_reused_slot_bumps_generation() {
+        let mut sched = Scheduler::new();
+        sched.add_adapter(
+            0,
+            ms_sched::AdapterConfig::new(ms_tuner::DeliverySystem::DvbS2),
+            Box::new(NullSchedTuner),
+        );
+        let pmt_id = sched.pmt_add(0, 0x64, 0x100);
+        sched.pmt_slot_mut(pmt_id).unwrap().state = PmtState::Running;
+        let gen1 = sched.pmt(pmt_id).unwrap().generation;
+
+        let (dvbca, recorder) = Dvbca::recording();
+        let dvbca = Rc::new(dvbca);
+        let pending = PendingOffers::default();
+        let mut sink = DvbcaSink::new(Rc::clone(&dvbca), Rc::default(), Rc::clone(&pending));
+        let svc = CaService {
+            pmt_id: pmt_id as usize,
+            generation: gen1,
+            adapter: 0,
+            sid: 0x64,
+            pmt_pid: 0x100,
+            ..CaService::default()
+        };
+        assert_eq!(sink.add_pmt(&svc, false), TablesResult::Retry);
+        assert_eq!(pending.borrow().len(), 1);
+
+        let mut ca = CaRuntime::new(&Options::default());
+        ca.dvbca = Some(DvbcaState {
+            dvbca: Rc::clone(&dvbca),
+            caids: Rc::default(),
+            pending: Rc::clone(&pending),
+            ca_id: 0,
+            requested: None,
+        });
+        ca.dvbca_notices(&mut sched);
+        assert_eq!(pending.borrow().len(), 1, "same generation stays pending");
+
+        // Free and immediately re-add the exact same (adapter, sid, pid) -> bumps generation.
+        sched.pmt_del(pmt_id);
+        let reused = sched.pmt_add(0, 0x64, 0x100);
+        assert_eq!(reused, pmt_id);
+        sched.pmt_slot_mut(reused).unwrap().state = PmtState::Running;
+        assert_ne!(sched.pmt(reused).unwrap().generation, gen1);
+
+        ca.dvbca_notices(&mut sched);
+        assert!(
+            pending.borrow().is_empty(),
+            "stale generation offer must be swept"
+        );
+        drop(recorder);
     }
 }

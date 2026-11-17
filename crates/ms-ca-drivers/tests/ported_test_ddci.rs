@@ -1630,3 +1630,80 @@ fn out_of_range_adapter_and_device_ids_do_not_panic() {
     assert!(x.prepare_ts_write(&mut ts, 99, &mut programs).is_none());
     assert!(x.create_pat(99, &programs).is_empty());
 }
+
+// DEV-293: `create_eit` encodes `now_utc - 3600` as EN 300 468 40-bit UTC_time (MJD + BCD).
+#[test]
+fn test_create_eit_utc_bcd_and_day_rollover() {
+    use ms_ca_drivers::en50221::apps::date_time_body;
+
+    let mut x = Ddci::new();
+    // 2026-11-14T00:30:45Z -> 1 h ago = 2026-11-13T23:30:45Z (MJD 61357 = 0xEFAD, BCD 23:30:45).
+    x.now_unix = Some(1_794_616_245);
+    let eit = x.create_eit(0x409E, 5);
+    let mut pkt = [0u8; 188];
+    let mut cc = 0;
+    buffer_to_ts(&mut pkt, &eit, &mut cc, 18);
+    let sec = assemble(&pkt).expect("valid EIT section and CRC-32");
+    assert_eq!(sec[0], 0x4E);
+    assert_eq!(u16::from_be_bytes([sec[3], sec[4]]), 0x409E);
+    assert_eq!((sec[5] >> 1) & 0x1F, 5);
+    assert_eq!(sec[13], 0x4E);
+    assert_eq!(u16::from_be_bytes([sec[14], sec[15]]), 1);
+    assert_eq!(&sec[16..21], &[0xEF, 0xAD, 0x23, 0x30, 0x45]);
+    assert_eq!(&sec[16..21], &date_time_body(1_794_616_245 - 3600));
+    assert_eq!(&sec[21..24], &[0x24, 0x00, 0x00]);
+    assert_eq!(sec[24] >> 5, 4);
+    assert_eq!((sec[24] >> 4) & 1, 1);
+    assert_eq!(&sec[26..32], &[0x55, 0x04, b'9', b'0', b'2', 0]);
+
+    // Pre-1970+1h timestamps saturate cleanly to Unix epoch 0 (MJD 40587, 00:00:00).
+    x.now_unix = Some(100);
+    let epoch = x.create_eit(1, 0);
+    assert_eq!(&epoch[17..22], &[0x9E, 0x8B, 0x00, 0x00, 0x00]);
+    assert_eq!(utc_time_bcd(u64::MAX).len(), 5);
+}
+
+// DEV-293: default `Ddci::new()` (`now_unix = None`) emits live UTC BCD on PID 18 in `add_psi`.
+#[test]
+fn test_add_psi_emits_live_utc_bcd_eit_on_pid_18() {
+    let (mut x, mut t) = ci_fixture(&[2]);
+    x.now_ms = 10_000;
+    let pmt_id = create_pmt(&mut t, 2, 0x1234, 601, 602, 0x100, 0x100);
+    assert_eq!(x.process_pmt(2, &prog(&t, pmt_id), false), TablesResult::Ok);
+    x.devices.get_mut(&8).unwrap().pmt[0].last_pmt = x.now_ms - 1000;
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(3600);
+    let mut buf = [0u8; 4096];
+    let len = x.add_psi(8, &mut buf, 2, &mut t) as usize;
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(3600);
+
+    let eit_pkt = buf[..len]
+        .as_chunks::<188>()
+        .0
+        .iter()
+        .find(|p| p[0] == 0x47 && pid_from_ts(*p) == 18)
+        .expect("PID 18 EIT packet emitted");
+    let sec = assemble(eit_pkt).expect("PID 18 EIT section CRC-32 valid");
+    let mjd = u16::from_be_bytes([sec[16], sec[17]]);
+    assert!(mjd >= 60_000, "live UTC MJD expected, got {mjd}");
+    for &b in &sec[18..21] {
+        assert!(
+            (b >> 4) <= 9 && (b & 0x0F) <= 9,
+            "invalid BCD byte {b:#04x}"
+        );
+    }
+    let matches_window = (before..=after).any(|ts| sec[16..21] == utc_time_bcd(ts));
+    assert!(
+        matches_window,
+        "EIT start_time {:?} outside [{before}, {after}]",
+        &sec[16..21]
+    );
+}

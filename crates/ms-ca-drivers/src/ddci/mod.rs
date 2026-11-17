@@ -13,8 +13,8 @@ use ms_ca::{Program, ProgramTable, TablesResult};
 use ms_ts::crc::crc32_mpeg2;
 
 use fifo::Fifo;
-pub use psi::{LocalTime, buffer_to_ts, pid_from_ts, set_pid_ts};
-use psi::{dvb_put_string, ymd_to_mjd};
+use psi::dvb_put_string;
+pub use psi::{buffer_to_ts, pid_from_ts, set_pid_ts, utc_time_bcd};
 
 /// `#define DEFAULT_LOG LOG_DDCI` (ddci.cpp:54).
 const DEFAULT_LOG: u32 = ms_log::LOG_DDCI;
@@ -180,6 +180,12 @@ fn wall_now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+fn wall_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// One DDCI device (`ddci_device_t`).
 #[derive(Clone, Debug)]
 pub struct DdciDevice {
@@ -204,6 +210,8 @@ pub struct DdciDevice {
     pub mapping: BTreeMap<(u16, u16), Mapping>,
     /// CAT-listed EMM pids, never swept by updates.
     pub emm_pids: BTreeSet<(u16, u16)>,
+    /// Monotonic mapped ECM packet total per host adapter for `cam_stuck` input gating.
+    pub adapter_ecm_pkts: BTreeMap<u16, u64>,
     pub fifo: Fifo,
 }
 
@@ -231,6 +239,7 @@ impl DdciDevice {
             disable_cat: false,
             mapping: BTreeMap::new(),
             emm_pids: BTreeSet::new(),
+            adapter_ecm_pkts: BTreeMap::new(),
             fifo: Fifo::new(DDCI_BUFFER),
         }
     }
@@ -318,6 +327,7 @@ struct PreparedDeviceMaps {
     dev_id: i32,
     ad_dd: [u16; 8192],
     dd_ad: [u16; 8192],
+    ecm_pids: [u64; 128],
     classes: Option<Vec<u8>>,
 }
 
@@ -396,8 +406,8 @@ pub struct Ddci {
     next_filter: usize,
     /// `getTick()` in ms.
     pub now_ms: u64,
-    /// Local time one hour ago, for the EIT start time.
-    pub eit_start: LocalTime,
+    /// Fixed UTC Unix time (s) for `create_eit` in tests; `None` reads `SystemTime::now()`.
+    pub now_unix: Option<u64>,
     /// `--cam-ecm-trace` (diag-log); `None` adds one branch per mapped packet.
     pub table_trace: Option<TableTrace>,
     sync_version: u64,
@@ -420,7 +430,7 @@ impl Ddci {
             filters: BTreeMap::new(),
             next_filter: 0,
             now_ms: 0,
-            eit_start: LocalTime::default(),
+            now_unix: None,
             table_trace: None,
             sync_version: 1,
         }
@@ -757,6 +767,11 @@ impl Ddci {
             self.release_mapping_entry(dev_id, ad, pmt, &m);
         }
         self.drop_orphan_emm(dev, ad);
+        if let Some(d) = self.devices.get_mut(&dev)
+            && !d.mapping.values().any(|m| m.ad == ad)
+        {
+            d.adapter_ecm_pkts.remove(&ad);
+        }
     }
 
     /// Unmaps an adapter's EMM pids with its last PMT (DEV-290); C++ ties them to slot 0's
@@ -1351,16 +1366,16 @@ impl Ddci {
         b
     }
 
-    /// `ddci_create_eit`: a present event that started an hour ago.
+    /// `ddci_create_eit`: a present event starting one hour ago in UTC BCD (DEV-293).
     pub fn create_eit(&self, sid: u16, version: i32) -> Vec<u8> {
-        let tm = self.eit_start;
-        let mjd = ymd_to_mjd(tm.year, tm.month, tm.mday);
+        let now = self.now_unix.unwrap_or_else(wall_unix_secs);
+        let start = utc_time_bcd(now.saturating_sub(3600));
         let mut p = vec![0x00, 0x4E, 0xF0, 0x00];
         p.extend_from_slice(&sid.to_be_bytes());
         p.push(0xC1 | (((version & 0x0F) as u8) << 1));
         p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x4E, 0x00, 0x01]);
-        p.extend_from_slice(&mjd.to_be_bytes());
-        p.extend_from_slice(&[tm.hour, tm.min, tm.sec, 0x24, 0x00, 0x00]);
+        p.extend_from_slice(&start);
+        p.extend_from_slice(&[0x24, 0x00, 0x00]);
         p.push((4 << 5) ^ (1 << 4));
         p.push(0x00);
         let desc = p.len();
@@ -1737,7 +1752,14 @@ impl Ddci {
         programs: &mut ProgramTable,
     ) -> Option<PreparedDdciWrite> {
         let maps = self.prepare_device_maps(dev, ad.id, programs)?;
-        let runs = self.collect_ts_runs(ad, maps.dev_id, &maps.ad_dd, maps.classes.as_deref());
+        let runs = self.collect_ts_runs(
+            ad,
+            dev,
+            maps.dev_id,
+            &maps.ad_dd,
+            &maps.ecm_pids,
+            maps.classes.as_deref(),
+        );
         if runs.is_empty() {
             return Some(PreparedDdciWrite {
                 dev_id: maps.dev_id,
@@ -1848,10 +1870,18 @@ impl Ddci {
         {
             *ri = d.fifo.write_index;
         }
+        let mut ecm_pids = [0u64; 128];
+        for program in programs.iter().filter(|p| p.adapter == aid) {
+            for ca in &program.caids {
+                let p = usize::from(ca.pid & 0x1FFF);
+                ecm_pids[p >> 6] |= 1u64 << (p & 63);
+            }
+        }
         Some(PreparedDeviceMaps {
             dev_id,
             ad_dd,
             dd_ad,
+            ecm_pids,
             classes,
         })
     }
@@ -1859,10 +1889,13 @@ impl Ddci {
     fn collect_ts_runs(
         &mut self,
         ad: &mut TsBuffer,
+        dev: usize,
         dev_id: i32,
         ad_dd: &[u16; 8192],
+        ecm_pids: &[u64; 128],
         classes: Option<&[u8]>,
     ) -> Vec<(usize, usize)> {
+        let mut ecm_pkts = 0u64;
         let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
         let limit = ad.rlen.min(ad.buf.len());
@@ -1872,6 +1905,9 @@ impl Ddci {
                 let pid = pid_from_ts(b) & 0x1FFF;
                 let dpid = ad_dd[usize::from(pid)];
                 if dpid != 0 {
+                    if (ecm_pids[usize::from(pid) >> 6] >> (pid & 63)) & 1 != 0 {
+                        ecm_pkts += 1;
+                    }
                     let class = classes.map_or(0, |c| c[usize::from(pid)]);
                     if let Some(trace) = self.table_trace.as_mut().filter(|_| class != 0) {
                         // Counted before the write: a short write still counts.
@@ -1894,6 +1930,11 @@ impl Ddci {
                 }
             }
             i += DVB_FRAME;
+        }
+        if ecm_pkts > 0
+            && let Some(d) = self.devices.get_mut(&dev)
+        {
+            *d.adapter_ecm_pkts.entry(ad.id).or_insert(0) += ecm_pkts;
         }
         runs
     }
@@ -1918,7 +1959,14 @@ impl Ddci {
         let Some(maps) = self.prepare_device_maps(dev, ad.id, programs) else {
             return;
         };
-        let runs = self.collect_ts_runs(ad, maps.dev_id, &maps.ad_dd, maps.classes.as_deref());
+        let runs = self.collect_ts_runs(
+            ad,
+            dev,
+            maps.dev_id,
+            &maps.ad_dd,
+            &maps.ecm_pids,
+            maps.classes.as_deref(),
+        );
         if !runs.is_empty() {
             let psi = self.build_psi_tail(dev, ad.id, programs);
             // Every write ends with a null packet: the FPGA reads in 128 byte units (#1437).

@@ -224,6 +224,31 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 - [ ] CI+ validated on real CI+ CAMs (port done behind `ci-plus`; experimental,
   needs external testers)
 - [ ] New CA policies (bandwidth balancing, pre-packing) as documented deviations
+- [ ] Opt-in Step 3 `--cam-recovery` escalation (`ioctl(CA_RESET)` on the affected CI slot
+  only, after Step 1 CAPMT re-send `#88` and Step 2 per-service silent leave/rejoin `#94`
+  both fail to clear scrambled output): strictly rate-limited with cooldown/exponential
+  backoff (and gated on prior clear descrambling or verified post-MMI lockup) so a
+  genuinely unsubscribed channel cannot reset-loop the CAM, while letting
+  `HostEvent::ReleasePmts` re-offer active PMTs without restarting `minisatip-rs` or
+  disturbing FTA/other-CA streams (recorded as a `DEV-xxx` row in `docs/deviations.md`)
+- [ ] Revisit the DDCI 128-byte FPGA/DMA read-granularity fix
+  (`catalinii/minisatip#1437`, `catalinii/minisatip#1447` — currently ported verbatim
+  in `Ddci::prepare_ts_write` / `Ddci::process_ts` at
+  `crates/ms-ca-drivers/src/ddci/mod.rs`, appending a `0x1FFF` null packet to every
+  `writev`): evaluate lower-overhead Rust data-plane designs such as a **Biased
+  Idle-Edge Writer Task** (decouple `CiWriter` from tuner threads / `DdciHub` and emit a
+  flushing null packet only on the active-to-idle edge when the per-CI queue drains) or
+  **Underflow Stuffing in an MTD Token-Bucket Shaper** (shape multi-tuner CI writes to
+  the CAM bitrate ceiling and stuff null packets only on shaper underflow / alignment
+  edges rather than after every tuner batch), recorded as a `DEV-xxx` row in
+  `docs/deviations.md` if adopted
+- [ ] Upstream #1565 (`fix-1565-ddci-sdt17`): reserve DDCI PID 17 for generated SDT and
+  ignore transponder PID 0/17 mappings (avoiding the `dd_ad[0] = 17` reverse-table
+  overwrite and CI-side PID 0 teardown traps)
+- [ ] Upstream #1558 (`88bf2fe`): late-CW / scrambled-burst margin diagnostics (`DEV-163`)
+- [ ] Upstream #1527 (`b78943f`): `enigma-ddci` MTD DVR loopback over `/dev/ciN` on 4K
+  Enigma2 receivers (port or record as out-of-scope deviation; also sync #1548
+  `key_ecmpids` when bumping the C++ harness baseline)
 - [ ] Decide on upstream proposal vs separate project
 
 ## 8. Hardware matrix
@@ -275,6 +300,12 @@ Unvalidated rows must be called out in release notes.
 ## 12. Backlog (post-parity ideas)
 
 - CA bandwidth balancing and pre-packing from request history
+- Opt-in Step 3 `--cam-recovery` single-slot `ioctl(CA_RESET)` escalation with strict
+  cooldown/backoff after `#88` CAPMT re-send + `#94` silent rejoin fail (anti-reset-loop
+  guard for unsubscribed services; isolated to the wedged slot via `ReleasePmts`)
+- DDCI CI-write tail flushing and MTD shaping (`catalinii/minisatip#1437` / `#1447`
+  revisit at M10: "Biased Idle-Edge Writer Task", "Underflow Stuffing in an MTD
+  Token-Bucket Shaper", decoupled per-CI writer queue)
 - Prometheus metrics endpoint
 - Typed config file alongside CLI flags
 - JSON status API
@@ -285,14 +316,45 @@ Unvalidated rows must be called out in release notes.
 
 - **Current milestone:** M9 (parity hardening). M0–M8 items are in place; the open exit
   criteria are listed below.
-- **Deployed (2026-10-24, updated 2026-11-04):** minisatip-rs replaces the C++ build on both boxes.
-  - The main box (8 DVB-S2 tuners, DuoFlex CI) runs `main` `da3d104` (sha `f0e38bfc`) as a
-    systemd unit behind tvheadend since 2026-11-04 11:41:54 +03 (official 7-day M9 soak start).
-  - The enigma2 box (armv7) runs `main` `da3d104` (sha `ae46c836`) with `-E` and `diag-log`
-    since 2026-11-04 11:41:48 +03 (09:41:48 +01), after 10 days of continuous uptime on its
-    previous build.
+- **Deployed (2026-10-24, updated 2026-11-17):** minisatip-rs replaces the C++ build on both boxes.
+  - Both the main box (8 DVB-S2 tuners, DuoFlex CI) and the enigma2 box (armv7, `-E` and
+    `diag-log`, no CAM on that box) run `main` with all M9 parity/review fixes below.
   - Logs from both boxes and tvheadend go to a central Loki/Grafana host.
-- **Last session (2026-11-04):** merged:
+- **Last session (2026-11-17):** merged:
+  - DDCI synthetic `PID 18` EIT `start_time` encoded directly in EN 300 468 UTC 4-bit BCD
+    (`DEV-293`), eliminating local-timezone forward shift and invalid raw-binary BCD nibbles.
+  - Balanced `cam_stuck` + `cam_single_stuck` detection (`DEV-284`): host RF lock, continuity
+    (`<= 50` CC errors/window), and mapped ECM (`> 0`) input-health gate failing closed; 60-minute
+    anchor retention + single-tuner zap latch across `del_pmt`; 24h `known_good` (512-entry) and
+    cold post-Tier-1 transponder corroboration; separate 3-minute `cam_single_stuck` notice.
+  - Upstream `#1556` (`7e5e822`) safety/parity backports (`DEV-140`, `DEV-246`): RFC 8259
+    `CBuf::escape_json`, empty-PIN 0-digit enquiry guard, and `TAG_TEXT_MORE` joining.
+  - Review round-3 CA/scheduler fixes (`DEV-181`): DVBAPI `-Z` per-adapter idle-poll grace window,
+    in-place `CLM_UPDATE` preservation for slow-CAM `PendingOffer` updates, and `add_ca` capped at
+    `MAX_CA` (64).
+  - Post-soak independent review fixes (`DEV-294`–`DEV-296`, `DEV-077`/`DEV-141`/`DEV-217`
+    withdrawn): bounded `AdapterHandle::query` (50 ms) and cached status queries, non-blocking
+    RTSP-TCP/HTTP stream writes (`MSG_DONTWAIT|MSG_NOSIGNAL`), `SRTO_SNDTIMEO` (1.1 s), 2 s
+    bounded shutdown/`satipc` joins, cancelled stale timed-out tunes, complete SRT
+    re-SETUP/swap/pool-return lifecycle & poisoned-mutex tolerance, non-blocking `satipc` RTSP
+    connect & TX queue + lock-free `status()`, split per-device DDCI CI writers with unlocked
+    `writev` & lock-free unmapped skip, DDCI PMT `0xB000`/`0xC1` header + `-1` mapping rejection +
+    CRC-verified `process_cat` & bounds checks, deduplicated `EmmAssembler` and
+    `collect_pmt_ca_descriptors`, SDT first-wins & 1500-byte PAT guard, `MasterRegistry`
+    cross-thread DVB slave-LNB switch sharing (`setup_switch`/`standby`), `MAX_SOCKS` + 60 s idle
+    close, lazy `Fifo`, bounded queues, idle `DescramblerStage::tick`, and 15 s `--satip-xml` / 5 s
+    `dvbapi-connect` helper deadlines.
+- **Sessions (2026-11-09/11):** merged and deployed:
+  - #105 (`DEV-280`, `DEV-292`): 300 ms DVB frontend status polling (skipping the first tick
+    after `tune`), `poll(2)` waits on active `LinuxDvbTuner` and `DdciReader` data planes and TCP
+    accept loops, a reusable `DdciReader` scratch buffer, `DdciStage::process_buf` tail resize
+    gated on active DDCI mappings, `CaRuntime::after_scheduler` gated on scheduler/DDCI sync
+    versions, longer idle `CA_poll` waits when no slot has a CAM link, and `idle_pids` diag-log
+    reporting on stream stop and once per minute while idle.
+  - #106 (`DEV-292`): pace the first empty-read wait after partial tuner bursts via `IDLE_POLL`
+    so multi-burst DVB deliveries do not wake 1000 times/s.
+  - #107 (`DEV-284`): initial `cam_stuck` detect-and-alert on DDCI with `--cam-recovery`.
+- **Session (2026-11-04):** merged:
   - #95 PLAN and README update; #96 `scripts/decerr.py` bitrate-weighted decrypt-error
     comparison tool.
   - #97–#99 the remaining 13 findings from the first port review against C++ (all 18 code-review
@@ -305,18 +367,6 @@ Unvalidated rows must be called out in release notes.
     `ad_ccerr`, `st_overflow` and `st_buffered` wired into `WebSnapshot`, `ad_allsys` using
     `DeliverySystem::name()`, `TuneParams::src` widened to `i32`, `DEV-291` documenting the
     bounded 5 s `satipc` RTSP connect timeout, and full 16-byte CI+ CC key check (#99).
-  - Post-soak independent third review fixes (topic branch `rs/post-soak-review-fixes`,
-    `DEV-294`–`DEV-296`, `DEV-077` withdrawn): bounded `AdapterHandle::query` (50 ms) and cached
-    status queries, non-blocking RTSP-TCP/HTTP stream writes (`MSG_DONTWAIT|MSG_NOSIGNAL`),
-    `SRTO_SNDTIMEO` (1.1 s), 2 s bounded shutdown/`satipc` joins, cancelled stale timed-out
-    tunes, complete SRT re-SETUP/swap/pool-return lifecycle & poisoned-mutex tolerance,
-    non-blocking `satipc` RTSP connect & TX queue + lock-free `status()`, split per-device DDCI
-    CI writers with unlocked `writev` & lock-free unmapped skip, DDCI PMT `0xB000`/`0xC1` header
-    + `-1` mapping rejection + CRC-verified `process_cat` & bounds checks, deduplicated
-    `EmmAssembler` and `collect_pmt_ca_descriptors`, SDT first-wins & 1500-byte PAT guard,
-    `MasterRegistry` cross-thread DVB slave-LNB switch sharing (`setup_switch`/`standby`),
-    `MAX_SOCKS` + 60 s idle close, lazy `Fifo`, bounded queues, idle `DescramblerStage::tick`,
-    and 15 s `--satip-xml` / 5 s `dvbapi-connect` helper deadlines.
   - #100–#103 nine additional parity and robustness fixes from a second codebase review:
     `SendOutcome::WriteFailed` and `SendOutcome::NoSession` mapped to `TablesResult::Retry`
     like upstream `3d42bee` (#100); `--sdt-charset` wired into SDT parsing and `-C`/
@@ -402,17 +452,17 @@ Unvalidated rows must be called out in release notes.
     timer, as `sockets_timeout`, ca.cpp:3829). The real CAM works through the CI path.
   - M8: satipc against a real SAT>IP server. SAT>IP client adapters report `ad_type` 2
     (`ADAPTER_SATIP`, DEV-053), so the status page scales their SNR as C++ does.
-  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); 7-day standard-mix soak started
-    2026-11-04 11:42:00 +03 (target completion 2026-11-11 11:42:00 +03, see "Soak"); resource
-    comparison and `scripts/decerr.py` bitrate-weighted decrypt-error comparison.
+  - M9: `test_utils.cpp` ported (9 of 12 tests, DEV-282); fresh 7-day standard-mix soak restarted
+    2026-11-17 on consolidated `main` (see "Soak"); resource comparison and `scripts/decerr.py`
+    bitrate-weighted decrypt-error comparison.
 - **Binary features (rs/binary-features):** `dvbcsa-icam` exposes iCAM CSA (the CW
   path already matched C++); CI checks it without linking. Netceiver is parked
   (§3): the binary is built without it, so `-n` is unknown as in C++.
 - **Next:**
-  - Finish the 7-day standard-mix soak started 2026-11-04 11:42:00 +03 (both boxes running
-    `main` `da3d104`).
-  - #63 / #94: watch `--cam-recovery` (CAPMT re-send on MMI lock + silent per-service re-join),
-    `--cam-ecm-trace`, `--ddci-capture` and `--cam-menu-snapshot` during the 7-day soak.
+  - Finish the fresh 7-day standard-mix soak started 2026-11-17 on consolidated `main`.
+  - #63 / #94 / #107: watch `--cam-recovery` (CAPMT re-send on MMI lock, silent per-service
+    re-join, `cam_single_stuck` and balanced `cam_stuck` input-gated alerts), `--cam-ecm-trace`,
+    `--ddci-capture` and `--cam-menu-snapshot` during the 7-day soak.
   - C++ vs Rust decrypt-error comparison weighted by bitrate (`scripts/decerr.py`) and resource
     comparison.
   - CA scenarios in the harness (#36).
@@ -452,17 +502,20 @@ Unvalidated rows must be called out in release notes.
     watchdog resetting the two empty CI slots as in C++ (ca.cpp:3679-3693), plus 60
     heartbeats and the stream events. The -F file reached 2.2 MB, so it did not
     rotate.
-- **Soak (M9), started 2026-11-04 11:42:00 +03 (08:42:00 UTC): official 7-day standard-mix soak.**
-  Both boxes run `main` `da3d104` (#88–#103 included): the enigma2 box (armv7 musl with
-  `diag-log`, sha `ae46c836`, compile time Nov 4 2026 08:16:32 UTC) started at 11:41:48 +03
+- **Soak (M9), 2026-11-11 02:20:36 +03 to 2026-11-17 (superseded by consolidated 2026-11-17 release):**
+  The main box ran `main` `3c5ad09` (#105–#107; x86_64 musl with `diag-log`, sha256 `42397d49`)
+  from 2026-11-11 01:39:15 +03 (patched on 2026-11-14 with `DEV-293` UTC BCD EIT `start_time`), and
+  the enigma2 box ran `main` `4887d58` (#105–#106; armv7 musl with `diag-log`, sha256 `59b1d353`),
+  with 0 panics across 6.5 days before restarting on the consolidated 2026-11-17 release (`DEV-284`,
+  `DEV-293`–`DEV-296`, `#1556`).
+- **Soak (M9), 2026-11-04 11:42:00 +03 to 2026-11-07/10 (superseded by #105–#107):**
+  Both boxes ran `main` `da3d104` (#88–#103 included): the enigma2 box (armv7 musl with
+  `diag-log`, sha `ae46c836`, compile time Nov 4 2026 08:16:32 UTC) from 11:41:48 +03
   (09:41:48 +01), and the main box (x86_64 musl with `diag-log`, sha `f0e38bfc`, plain CI with
   `--ddci-capture`, `--cam-recovery 10`, `--cam-recovery-no-zap-guard`, `--cam-ecm-trace`,
-  `--cam-menu` and `--cam-menu-snapshot`) restarted at 11:41:54 +03. The load generator on the
-  logging host restored the standard M9 soak mix (`steady` `[2, 3]` with `scrambled_share = 0.5`,
-  `zap` `scrambled_share = 0.5`, `rejoin`, `parallel`, `spread` `weight = 2` across both boxes,
-  `quiet` hours `00:00–07:00` with 1 idle hour and at most 1 stream, `main_max_adapters = 2`
-  for tuner thermal protection) and started at 11:42:00 +03. Target 7-day completion:
-  **2026-11-11 11:42:00 +03**.
+  `--cam-menu` and `--cam-menu-snapshot`) from 11:41:54 +03 under the standard M9 soak mix from
+  11:42:00 +03. It passed a 71.8 h check with 0 panics and 0 restarts before a CAM entitlement/lock
+  episode on 2026-11-07 and the #105–#107 CPU/wake-pacing and `cam_stuck` alert deploys ended it.
 - **Soak (M9), status 2026-11-03 23:40 +03: a #63 soak, not the standard one.** The load
   generator restarted on 2026-11-03 09:51:38 +03 under the same scrambled-only zapping load,
   with quiet hours off, so it does not count for the 7-day criterion. Deploys restarted
@@ -579,4 +632,5 @@ Unvalidated rows must be called out in release notes.
   CAM blocked after a CAM MMI error message until restart (#63), in CI+ and in plain CI,
   with C++ as well as minisatip-rs; `--cam-recovery` (#80, a CAPMT re-send since #88, plus
   the per-service re-join of #94) is the plain-CI recovery under test. Upstream: the DDCI
-  EMM fix catalinii/minisatip#1555 is open.
+  EMM fix catalinii/minisatip#1555 merged (`3b40870` / `v2.0.188`); #1565, #1558 and #1527
+  are queued for M10.

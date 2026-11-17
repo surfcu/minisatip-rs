@@ -61,9 +61,20 @@ const MAX_PENDING_COMMANDS: usize = 4096;
 /// Cap on unread `Event::TablePackets` batches per adapter.
 const MAX_PENDING_TABLE_BATCHES: usize = 64;
 
-/// Locks a shared counter; a `Mutex` because 32-bit MIPS lacks `AtomicU64`.
-fn lock_counter(counter: &Mutex<u64>) -> MutexGuard<'_, u64> {
+/// Locks shared state; a `Mutex` because 32-bit MIPS lacks `AtomicU64`.
+fn lock_counter<T>(counter: &Mutex<T>) -> MutexGuard<'_, T> {
     counter.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Host-adapter RF lock and continuity counters sampled non-destructively by `CaRuntime`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputHealthSnapshot {
+    /// Latest post-tune frontend lock state; `None` before the first poll after tune/standby.
+    pub current_locked: Option<bool>,
+    /// Increments on every tune, idle standby, or transition to an unlocked frontend reading.
+    pub unlock_seq: u64,
+    /// Monotonic continuity-error total (`ContinuityCounter::errors`).
+    pub cc_errors: u64,
 }
 
 /// Atomically increments `a` if strictly below `cap`.
@@ -510,6 +521,7 @@ pub struct AdapterHandle {
     // A mutex rather than `AtomicU64`, which 32-bit MIPS does not provide.
     epoch: Mutex<u64>,
     tune_generation: Arc<Mutex<u64>>,
+    input_health: Arc<Mutex<InputHealthSnapshot>>,
     issued_tune_seq: Arc<AtomicUsize>,
     pending_commands: Arc<AtomicUsize>,
     pending_table_batches: Arc<AtomicUsize>,
@@ -544,6 +556,7 @@ impl AdapterHandle {
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
         let tune_generation = Arc::new(Mutex::new(0));
+        let input_health = Arc::new(Mutex::new(InputHealthSnapshot::default()));
         let issued_tune_seq = Arc::new(AtomicUsize::new(0));
         let pending_commands = Arc::new(AtomicUsize::new(0));
         let pending_table_batches = Arc::new(AtomicUsize::new(0));
@@ -551,6 +564,7 @@ impl AdapterHandle {
         let exited = Arc::new((Mutex::new(false), Condvar::new()));
 
         let generation = Arc::clone(&tune_generation);
+        let health = Arc::clone(&input_health);
         let plane_seq = Arc::clone(&issued_tune_seq);
         let plane_pending = Arc::clone(&pending_commands);
         let plane_tables = Arc::clone(&pending_table_batches);
@@ -573,6 +587,7 @@ impl AdapterHandle {
                 let mut plane = DataPlane::new(tuner, config, command_rx, event_tx, bandwidth);
                 plane.stages = stages;
                 plane.tune_generation = generation;
+                plane.input_health = health;
                 plane.issued_tune_seq = plane_seq;
                 plane.pending_commands = plane_pending;
                 plane.pending_table_batches = plane_tables;
@@ -585,6 +600,7 @@ impl AdapterHandle {
             events,
             epoch: Mutex::new(0),
             tune_generation,
+            input_health,
             issued_tune_seq,
             pending_commands,
             pending_table_batches,
@@ -726,6 +742,11 @@ impl AdapterHandle {
     /// Tunes the thread has handled; it is raised before the tune is answered.
     pub fn tune_generation(&self) -> u64 {
         *lock_counter(&self.tune_generation)
+    }
+
+    /// Non-destructive RF lock and continuity snapshot of this adapter.
+    pub fn input_health(&self) -> InputHealthSnapshot {
+        *lock_counter(&self.input_health)
     }
 
     /// Event receiver.
@@ -931,6 +952,8 @@ struct DataPlane {
     stages: Vec<Box<dyn TsStage>>,
     section_pids: PidSet,
     tune_generation: Arc<Mutex<u64>>,
+    input_health: Arc<Mutex<InputHealthSnapshot>>,
+    last_health_cc: u64,
     issued_tune_seq: Arc<AtomicUsize>,
     pending_commands: Arc<AtomicUsize>,
     pending_table_batches: Arc<AtomicUsize>,
@@ -990,6 +1013,8 @@ impl DataPlane {
             stages: Vec::new(),
             section_pids: PidSet::new(),
             tune_generation: Arc::new(Mutex::new(0)),
+            input_health: Arc::new(Mutex::new(InputHealthSnapshot::default())),
+            last_health_cc: 0,
             issued_tune_seq: Arc::new(AtomicUsize::new(0)),
             pending_commands: Arc::new(AtomicUsize::new(0)),
             pending_table_batches: Arc::new(AtomicUsize::new(0)),
@@ -1202,6 +1227,14 @@ impl DataPlane {
                 self.signal_read = false;
                 self.reported_signal = None;
                 self.last_signal_ms = None;
+                {
+                    let cc = self.continuity.errors();
+                    self.last_health_cc = cc;
+                    let mut health = lock_counter(&self.input_health);
+                    health.current_locked = None;
+                    health.unlock_seq = health.unlock_seq.wrapping_add(1);
+                    health.cc_errors = cc;
+                }
                 let _ = self.events.send(Event::Signal(None));
                 self.update_tuner_pids();
             }
@@ -1503,6 +1536,11 @@ impl DataPlane {
         self.continuity
             .check_buffer(&self.buf.as_bytes()[checked..], &self.active_pids);
         self.cc_checked = self.buf.len();
+        let cc = self.continuity.errors();
+        if cc != self.last_health_cc {
+            self.last_health_cc = cc;
+            lock_counter(&self.input_health).cc_errors = cc;
+        }
         true
     }
 
@@ -1584,6 +1622,16 @@ impl DataPlane {
         let signal = self.tuner.status();
         if self.signal_read {
             self.diag_status(&signal, now);
+            if self.diag_tuned {
+                let cc = self.continuity.errors();
+                self.last_health_cc = cc;
+                let mut health = lock_counter(&self.input_health);
+                if !signal.locked && health.current_locked != Some(false) {
+                    health.unlock_seq = health.unlock_seq.wrapping_add(1);
+                }
+                health.current_locked = Some(signal.locked);
+                health.cc_errors = cc;
+            }
         }
         self.report_signal(signal, now);
         #[cfg(feature = "diag-log")]
@@ -1713,6 +1761,14 @@ impl DataPlane {
     fn standby_if_idle(&mut self) {
         if self.outputs.is_empty() {
             self.tuner.standby();
+            if !self.keep_reading {
+                let cc = self.continuity.errors();
+                self.last_health_cc = cc;
+                let mut health = lock_counter(&self.input_health);
+                health.current_locked = None;
+                health.unlock_seq = health.unlock_seq.wrapping_add(1);
+                health.cc_errors = cc;
+            }
         }
     }
 }
@@ -2585,6 +2641,140 @@ mod tests {
         assert!(
             logged.contains("open_demux_fds=Some([(0, 300), (17, 317)])"),
             "{logged}"
+        );
+    }
+
+    #[test]
+    fn input_health_tracks_tune_lock_unlock_standby_and_continuity() {
+        struct StatusTuner {
+            locked: Arc<Mutex<bool>>,
+        }
+        impl Tuner for StatusTuner {
+            fn tune(&mut self, _params: &TuneParams) -> TunerResult<()> {
+                Ok(())
+            }
+            fn set_pids(&mut self, _pids: &PidSet) -> TunerResult<()> {
+                Ok(())
+            }
+            fn status(&self) -> SignalStatus {
+                let locked = *lock_counter(&self.locked);
+                SignalStatus {
+                    locked,
+                    status_valid: true,
+                    ..SignalStatus::default()
+                }
+            }
+            fn read(&mut self, _buf: &mut TsBuf) -> TunerResult<usize> {
+                Ok(0)
+            }
+        }
+
+        let locked = Arc::new(Mutex::new(true));
+        let (_cmd_tx, commands) = mpsc::channel::<Command>();
+        let (events_tx, _events_rx) = mpsc::channel::<Event>();
+        let mut plane = DataPlane::new(
+            Box::new(StatusTuner {
+                locked: Arc::clone(&locked),
+            }),
+            DataPlaneConfig::default(),
+            commands,
+            events_tx,
+            None,
+        );
+        assert_eq!(
+            *lock_counter(&plane.input_health),
+            InputHealthSnapshot::default()
+        );
+
+        // Tune clears lock and advances unlock_seq once; first locked poll keeps unlock_seq.
+        plane.handle(Command::Tune {
+            params: Box::new(TuneParams::default()),
+            reply: None,
+            seq: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        assert_eq!(
+            *lock_counter(&plane.input_health),
+            InputHealthSnapshot {
+                current_locked: None,
+                unlock_seq: 1,
+                cc_errors: 0,
+            }
+        );
+        plane.read_once();
+        plane.timers();
+        assert_eq!(
+            *lock_counter(&plane.input_health),
+            InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 1,
+                cc_errors: 0,
+            }
+        );
+
+        // A cancelled/stale Tune must not clear current_locked or advance unlock_seq.
+        plane.handle(Command::Tune {
+            params: Box::new(TuneParams::default()),
+            reply: None,
+            seq: None,
+            cancelled: Arc::new(AtomicBool::new(true)),
+        });
+        assert_eq!(
+            *lock_counter(&plane.input_health),
+            InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 1,
+                cc_errors: 0,
+            }
+        );
+
+        // Continuity discontinuity updates cc_errors immediately on after_read.
+        plane.wait_new_stream = false;
+        plane.active_pids = PidSet::from_pids([0x100u16]);
+        let mut p1 = [0xFFu8; DVB_FRAME];
+        p1[0] = 0x47;
+        p1[1] = 0x01;
+        p1[2] = 0x00;
+        p1[3] = 0x10;
+        let mut p2 = p1;
+        p2[3] = 0x15;
+        plane.buf.push_data(&p1);
+        plane.buf.push_data(&p2);
+        assert!(plane.after_read(50));
+        assert_eq!(lock_counter(&plane.input_health).cc_errors, 1);
+
+        // Unlock poll bumps unlock_seq once while unlocked; re-lock preserves unlock_seq.
+        *lock_counter(&locked) = false;
+        plane.timers();
+        plane.timers();
+        assert_eq!(
+            *lock_counter(&plane.input_health),
+            InputHealthSnapshot {
+                current_locked: Some(false),
+                unlock_seq: 2,
+                cc_errors: 1,
+            }
+        );
+        *lock_counter(&locked) = true;
+        plane.timers();
+        assert_eq!(
+            *lock_counter(&plane.input_health),
+            InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 2,
+                cc_errors: 1,
+            }
+        );
+
+        // Idle standby (`Command::Standby`) clears current_locked and bumps unlock_seq.
+        plane.handle(Command::Standby);
+        assert_eq!(
+            *lock_counter(&plane.input_health),
+            InputHealthSnapshot {
+                current_locked: None,
+                unlock_seq: 3,
+                cc_errors: 1,
+            }
         );
     }
 }

@@ -41,13 +41,13 @@ fn escape_json_without_room_logs_the_cpp_line() {
 
     let mut buffer = CBuf::new(4);
     buffer.put(b"abc");
-    // variables.cpp:171-176: dl is the remaining space; 1 < 2 aborts the copy.
+    // variables.cpp:171-178: dl is the remaining space; 1 < 3 aborts the copy.
     buffer.escape_json(b"x");
     assert_eq!(buffer.len(), 3, "escape_json must not move the pointer");
 
     let prefix = "[05/03 14:07:09.042 main]: ";
     assert_eq!(
         *lines.lock().unwrap(),
-        vec![format!("{prefix}escape_json_string: dl 1 < 2 for x")]
+        vec![format!("{prefix}escape_json_string: dl 1 < 3 for x")]
     );
 }

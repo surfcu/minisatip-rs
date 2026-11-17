@@ -2004,3 +2004,39 @@ fn closing_a_held_page_keeps_a_waiting_snapshot() {
         "a refused answer does not cancel it"
     );
 }
+
+#[test]
+fn zero_length_enquiry_with_empty_pin_does_not_auto_answer() {
+    let (_clock, cam, mut dev) = setup(CamConfig::default(), true);
+    drain_events(&mut dev);
+
+    // Unsolicited 0-digit enquiry with empty PIN sends CLOSE_MMI without TAG_ANSWER (#1556).
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x00, 0, b'I', b'n', b'f', b'o'],
+    );
+    assert_eq!(
+        mmi_apdus(&cam),
+        [(TAG_CLOSE_MMI, vec![MMI_CLOSE_MMI_CMD_ID_IMMEDIATE])]
+    );
+
+    // Solicited 0-digit enquiry with empty PIN sends TAG_ANSWER(CANCEL), not ANSWER.
+    dev.enter_menu().expect("enter menu");
+    deliver(
+        &mut dev,
+        &cam,
+        EN50221_APP_MMI_RESOURCEID,
+        TAG_ENQUIRY,
+        &[0x00, 0, b'I', b'n', b'f', b'o'],
+    );
+    assert_eq!(
+        mmi_apdus(&cam)[1..],
+        [
+            (TAG_ENTER_MENU, vec![]),
+            (TAG_ANSWER, vec![MMI_ANSW_ID_CANCEL])
+        ]
+    );
+}

@@ -116,8 +116,36 @@ fn ecm_and_emm_packets_are_counted_and_parity_changes_reported() {
 #[test]
 fn nothing_is_counted_without_the_option() {
     let (mut x, mut t) = fixture();
-    feed(&mut x, &mut t, &[packet(1000, Some(0x80), false)]);
+    feed(
+        &mut x,
+        &mut t,
+        &[
+            packet(1000, Some(0x80), false),
+            packet(1001, Some(0x82), false),
+            packet(2000, None, false),
+        ],
+    );
     assert!(x.table_trace.is_none());
+    // Per-host-adapter mapped ECM total still advances for `cam_stuck` input gating and clears on unmap.
+    assert_eq!(x.devices[&0].adapter_ecm_pkts.get(&1), Some(&1));
+    let mut prepared_buf: Vec<u8> = [
+        packet(1000, Some(0x81), false),
+        packet(2000, None, false),
+        packet(1000, None, false),
+    ]
+    .concat();
+    let rlen = prepared_buf.len();
+    prepared_buf.extend_from_slice(&[0u8; 188]);
+    let mut ad = TsBuffer {
+        id: 1,
+        buf: prepared_buf,
+        rlen,
+    };
+    let prepared = x.prepare_ts_write(&mut ad, 0, &mut t).expect("mapped");
+    x.finish_ts_write(0, &mut ad, prepared);
+    assert_eq!(x.devices[&0].adapter_ecm_pkts.get(&1), Some(&3));
+    x.del_pmt_mapping_table(0, 1, 0);
+    assert!(!x.devices[&0].adapter_ecm_pkts.contains_key(&1));
 }
 
 #[test]

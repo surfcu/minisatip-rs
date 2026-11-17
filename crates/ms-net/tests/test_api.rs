@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
 use ms_net::api::{
-    Raw, Symbol, SymbolTable, VAR_AARRAY_STRING, VAR_ARRAY_INT8, VAR_FLOAT, VAR_FUNCTION_INT,
+    CBuf, Raw, Symbol, SymbolTable, VAR_AARRAY_STRING, VAR_ARRAY_INT8, VAR_FLOAT, VAR_FUNCTION_INT,
     VAR_FUNCTION_INT64, VAR_FUNCTION_STRING, VAR_HEX, VAR_INT, VAR_INT8, VAR_INT16, VAR_INT64,
     VAR_PSTRING, VAR_STRING, VAR_UINT8, VAR_UINT16, cstr, is_var, parse_int, snprintf_pointer,
 };
@@ -322,9 +322,54 @@ fn json_state_engine_emits_cpp_bytes() {
     );
 }
 
+// Ported from tests/test_minisatip.cpp:test_escape_json_string (#1556).
 #[test]
-fn escape_json_reproduces_cpp_control_character_quirk() {
-    // variables.cpp:171-187: strlcatf sizes the escape with the source length.
+fn escape_json_is_rfc8259_and_bounds_safe() {
+    let mut dest = CBuf::new(64);
+    dest.escape_json(b"a\"b\\c\n\r\t\x08\x0c\x01\x1f\x7fZ");
+    let exp1 = b"\"a\\\"b\\\\c\\n\\r\\t\\b\\f\\u0001\\u001F\\u007FZ\"";
+    assert_eq!(dest.as_cstr(), exp1);
+    assert_eq!(dest.len(), exp1.len());
+
+    // sl > dl: dl=8 allows at most 5 payload bytes, so 6-byte \u0001 is omitted cleanly.
+    let long_src = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c";
+    let mut small = CBuf::new(8);
+    small.escape_json(long_src);
+    assert_eq!(small.as_cstr(), b"\"\"");
+    assert_eq!(small.len(), 2);
+
+    // Exact fit for one \u00XX escape: '"' + 6 + '"' + '\0' = 9 bytes.
+    let mut fit9 = CBuf::new(9);
+    fit9.escape_json(long_src);
+    assert_eq!(fit9.as_cstr(), b"\"\\u0001\"");
+    assert_eq!(fit9.len(), 8);
+
+    // Boundary truncation on 2-byte escape: dl=5 holds at most 2 payload bytes.
+    let mut fit5 = CBuf::new(5);
+    fit5.escape_json(b"\"\"");
+    assert_eq!(fit5.as_cstr(), b"\"\\\"\"");
+    assert_eq!(fit5.len(), 4);
+
+    // Multibyte UTF-8 kept whole on truncation; invalid sequences become U+FFFD.
+    let mut utf8_trunc = CBuf::new(5);
+    utf8_trunc.escape_json(b"A\xC3\xBC");
+    assert_eq!(utf8_trunc.as_cstr(), b"\"A\"");
+
+    let mut bad_utf8 = CBuf::new(64);
+    bad_utf8.escape_json(b"A\xFFZ\xC0\xAF\xED\xA0\x80");
+    assert_eq!(
+        bad_utf8.as_cstr(),
+        b"\"A\xEF\xBF\xBDZ\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\""
+    );
+
+    // dl < 3 leaves ptr unchanged and NUL-terminates dest[0].
+    let mut tiny = CBuf::new(4);
+    tiny.put(b"ab");
+    tiny.set(2, b'X');
+    tiny.escape_json(b"abc");
+    assert_eq!(tiny.len(), 2);
+    assert_eq!(tiny.as_cstr(), b"ab");
+
     let mut table = SymbolTable::new();
     table.push(vec![Symbol::scalar(
         "c",
@@ -332,16 +377,7 @@ fn escape_json_reproduces_cpp_control_character_quirk() {
         0.0,
         Raw::Str(b"a\nb\tc".to_vec()),
     )]);
-    assert_eq!(table.json_state(), b"{\n\"c\":\"a%xc\"\n}\n");
-
-    let mut lone = SymbolTable::new();
-    lone.push(vec![Symbol::scalar(
-        "c",
-        VAR_STRING,
-        0.0,
-        Raw::Str(b"\n".to_vec()),
-    )]);
-    assert_eq!(lone.json_state(), b"{\n\"c\":\"\n}\n");
+    assert_eq!(table.json_state(), b"{\n\"c\":\"a\\nb\\tc\"\n}\n");
 }
 
 #[test]

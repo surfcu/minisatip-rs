@@ -20,10 +20,7 @@ fn c_str(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
 
 /// `ca_send_datetime` body: MJD then BCD hours, minutes, seconds (UTC).
 pub fn date_time_body(unix: u64) -> [u8; 5] {
-    let bcd = |v: u64| (((v / 10) << 4) | (v % 10)) as u8;
-    let [hi, lo] = ((unix / 86400 + 40587) as u16).to_be_bytes();
-    let t = unix % 86400;
-    [hi, lo, bcd(t / 3600), bcd(t % 3600 / 60), bcd(t % 60)]
+    crate::ddci::utc_time_bcd(unix)
 }
 
 /// Texts of an MMI menu/list body (title, subtitle, bottom, items), as `APP_MMI_handler` walks it.
@@ -37,18 +34,26 @@ pub fn mmi_menu_lines(id: usize, body: &[u8]) -> Vec<String> {
     } else {
         usize::from(first) + 1
     };
+    let max_lines = n + 3;
+    let mut pending: Vec<u8> = Vec::new();
     ms_log::log!("CA {} ======= MMI menu =======", id);
-    for i in 0..n + 3 {
-        if data.len() < 3 {
+    while lines.len() < max_lines {
+        if data.len() < 4 {
             break;
         }
+        let idx = lines.len();
+        let text_tag = (u32::from(data[0]) << 16) | (u32::from(data[1]) << 8) | u32::from(data[2]);
         ms_log::debugm!(
             "[{}] text tag: {:02x} {:02x} {:02x}",
-            i,
+            idx,
             data[0],
             data[1],
             data[2]
         );
+        if text_tag != TAG_TEXT_LAST && text_tag != TAG_TEXT_MORE {
+            ms_log::log!("CA {} unexpected MMI text tag: {:06X}", id, text_tag);
+            break;
+        }
         data = &data[3..];
         let Some((len, llen)) = decode_len(data) else {
             if data.len() >= 3 {
@@ -59,16 +64,28 @@ pub fn mmi_menu_lines(id: usize, body: &[u8]) -> Vec<String> {
                     data[1],
                     data[2]
                 );
+            } else {
+                ms_log::log!("CA {} asn_1_decode failed (truncated)", id);
             }
             break;
         };
         data = &data[llen..];
-        ms_log::debugm!("[{}] {} bytes text", i, len);
+        ms_log::debugm!("[{}] {} bytes text", idx, len);
         let Some(text) = data.get(..len) else {
             break;
         };
-        ms_log::log!("[UI {}] {}", i, c_str(text));
-        lines.push(String::from_utf8_lossy(text).into_owned());
+        ms_log::log!("[UI {}] {}", idx, c_str(text));
+        if text_tag == TAG_TEXT_MORE {
+            let room = (MAX_MMI_TEXT_LEN * 4).saturating_sub(pending.len());
+            pending.extend_from_slice(&text[..text.len().min(room)]);
+        } else if pending.is_empty() {
+            lines.push(String::from_utf8_lossy(text).into_owned());
+        } else {
+            let room = (MAX_MMI_TEXT_LEN * 4).saturating_sub(pending.len());
+            pending.extend_from_slice(&text[..text.len().min(room)]);
+            lines.push(String::from_utf8_lossy(&pending).into_owned());
+            pending.clear();
+        }
         data = &data[len..];
     }
     ms_log::log!("======================");
@@ -409,7 +426,8 @@ impl CaDevice {
                     self.report_menu("enquiry", 0, 1, hash, "snapshot", solicited);
                     return;
                 }
-                let answer = if self.pin.len() == usize::from(answer_len) {
+                let pin_matches = !self.pin.is_empty() && self.pin.len() == usize::from(answer_len);
+                let answer = if pin_matches {
                     ms_log::log!("answering to PIN enquiry");
                     let mut answer = vec![MMI_ANSW_ID_ANSWER];
                     answer.extend_from_slice(&self.pin);
@@ -430,8 +448,7 @@ impl CaDevice {
                     self.end_menu();
                 }
                 // A prompt the configured PIN answers is not a stuck CAM.
-                if !solicited && (self.pin.is_empty() || self.pin.len() != usize::from(answer_len))
-                {
+                if !solicited && !pin_matches {
                     self.note_cam_recovery_mmi();
                     self.snapshot_trigger();
                 }
@@ -653,5 +670,42 @@ mod tests {
         assert_eq!(mmi_menu_lines(0, &b), ["Title", "Sub", "Bottom"]);
         assert!(mmi_menu_lines(0, &b[..6]).is_empty());
         assert!(mmi_menu_lines(0, &[]).is_empty());
+    }
+
+    #[test]
+    fn menu_lines_join_text_more_and_reject_unexpected_text_tag() {
+        let append = |buf: &mut Vec<u8>, tag: u32, bytes: &[u8]| {
+            buf.extend_from_slice(&tag.to_be_bytes()[1..]);
+            if bytes.len() < 0x80 {
+                buf.push(bytes.len() as u8);
+            } else {
+                buf.extend_from_slice(&[0x82, (bytes.len() >> 8) as u8, bytes.len() as u8]);
+            }
+            buf.extend_from_slice(bytes);
+        };
+        let mut menu = vec![0x01];
+        append(&mut menu, TAG_TEXT_MORE, b"Split ");
+        append(&mut menu, TAG_TEXT_LAST, b"Title");
+        append(&mut menu, TAG_TEXT_LAST, b"Sub");
+        append(&mut menu, TAG_TEXT_LAST, b"Bottom");
+        append(&mut menu, TAG_TEXT_MORE, &[b'X'; 600]);
+        append(&mut menu, TAG_TEXT_LAST, &[b'Y'; 600]);
+        append(&mut menu, TAG_TEXT_LAST, b"Item2");
+        menu.extend_from_slice(&[0x00, 0x00]);
+        let lines = mmi_menu_lines(0, &menu);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "Split Title");
+        assert_eq!(lines[1], "Sub");
+        assert_eq!(lines[2], "Bottom");
+        assert_eq!(lines[3].len(), MAX_MMI_TEXT_LEN * 4);
+        assert!(lines[3].starts_with(&"X".repeat(600)));
+        assert!(lines[3].ends_with(&"Y".repeat(420)));
+        assert_eq!(lines[4], "Item2");
+
+        let mut bad = vec![0x00];
+        append(&mut bad, TAG_TEXT_LAST, b"Title");
+        append(&mut bad, 0x9F8899, b"Bad");
+        append(&mut bad, TAG_TEXT_LAST, b"Bottom");
+        assert_eq!(mmi_menu_lines(0, &bad), ["Title"]);
     }
 }

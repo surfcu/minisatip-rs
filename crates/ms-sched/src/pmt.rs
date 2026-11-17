@@ -27,6 +27,8 @@ pub const MAX_PMT: usize = 25_600;
 pub const MAX_CAID: usize = 20;
 /// Section filters (`MAX_FILTERS`).
 pub const MAX_FILTERS: usize = 200;
+/// Registered CA sinks (`u64` mask width in `ca_mask` / `disabled_ca_mask`).
+pub const MAX_CA: usize = u64::BITS as usize;
 /// Filter flag: add/remove the PID with the filter (`FILTER_ADD_REMOVE`).
 pub const FILTER_ADD_REMOVE: i32 = 1;
 /// Filter flag: survive retuning (`FILTER_PERMANENT`).
@@ -1226,11 +1228,15 @@ impl Scheduler {
         }
     }
 
-    /// Registers a CA sink (`add_ca`) and returns its id.
+    /// Registers a CA sink (`add_ca`) and returns its id, or `-1` when all 64 slots are full.
     pub fn add_ca(&mut self, sink: Box<dyn CaSink>) -> i32 {
         if let Some(slot) = self.pmt.ca.iter().position(Option::is_none) {
             self.pmt.ca[slot] = Some(sink);
             return slot as i32;
+        }
+        if self.pmt.ca.len() >= MAX_CA {
+            ms_log::log!("CA slots full ({})", MAX_CA);
+            return -1;
         }
         let id = self.pmt.ca.len() as i32;
         self.pmt.ca.push(Some(sink));
@@ -1270,6 +1276,7 @@ impl Scheduler {
     pub fn init_ca_for_adapter(&mut self, aid: usize, ca: i32) {
         let registered = usize::try_from(ca)
             .ok()
+            .filter(|&slot| slot < MAX_CA)
             .and_then(|slot| self.pmt.ca.get(slot))
             .is_some_and(Option::is_some);
         if let Some(adapter) = self.adapter_mut_inner(aid)
@@ -1483,7 +1490,9 @@ impl Scheduler {
     }
 
     fn close_pmt_for_ca(&mut self, slot: i32, aid: i32, pmt_id: i32) {
-        let mask = 1u64 << slot;
+        let Some(mask) = u32::try_from(slot).ok().and_then(|b| 1u64.checked_shl(b)) else {
+            return;
+        };
         let Some(service) = self.ca_service(pmt_id) else {
             return;
         };

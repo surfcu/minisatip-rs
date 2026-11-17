@@ -83,6 +83,8 @@ pub const TAG_DATE_TIME: u32 = 0x9F8441;
 pub const TAG_CLOSE_MMI: u32 = 0x9F8800;
 pub const TAG_DISPLAY_CONTROL: u32 = 0x9F8801;
 pub const TAG_DISPLAY_REPLY: u32 = 0x9F8802;
+pub const TAG_TEXT_LAST: u32 = 0x9F8803;
+pub const TAG_TEXT_MORE: u32 = 0x9F8804;
 pub const TAG_ENQUIRY: u32 = 0x9F8807;
 pub const TAG_ANSWER: u32 = 0x9F8808;
 pub const TAG_MENU_LAST: u32 = 0x9F8809;
@@ -90,6 +92,9 @@ pub const TAG_MENU_MORE: u32 = 0x9F880A;
 pub const TAG_MENU_ANSWER: u32 = 0x9F880B;
 pub const TAG_LIST_LAST: u32 = 0x9F880C;
 pub const TAG_LIST_MORE: u32 = 0x9F880D;
+
+/// Per-line MMI text cap (`MAX_MMI_TEXT_LEN`); `TAG_TEXT_MORE` joins cap at `4 * MAX_MMI_TEXT_LEN`.
+pub const MAX_MMI_TEXT_LEN: usize = 255;
 
 pub const MMI_CLOSE_MMI_CMD_ID_IMMEDIATE: u8 = 0x00;
 pub const MMI_ANSW_ID_CANCEL: u8 = 0x00;

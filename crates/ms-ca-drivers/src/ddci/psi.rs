@@ -1,4 +1,4 @@
-//! PSI helpers shared by the DDCI tables: `buffer_to_ts`, DVB strings, MJD.
+//! PSI helpers shared by the DDCI tables: `buffer_to_ts`, DVB strings, `UTC_time`.
 
 pub use ms_ts::buffer_to_ts;
 
@@ -13,26 +13,12 @@ pub fn dvb_put_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// `YMDtoMJD`, called with `tm_year` (years since 1900) as in C++.
-pub fn ymd_to_mjd(y: i32, m: i32, d: i32) -> u16 {
-    let l = i32::from(m < 3);
-    (14956
-        + d
-        + ((f64::from(y - l) * 365.25) as i32)
-        + ((f64::from(m + 1 + l * 12) * 30.6001) as i32)) as u16
-}
-
-/// Broken-down local time (`struct tm` fields used by `ddci_create_eit`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LocalTime {
-    /// Years since 1900.
-    pub year: i32,
-    /// 1..=12.
-    pub month: i32,
-    pub mday: i32,
-    pub hour: u8,
-    pub min: u8,
-    pub sec: u8,
+/// EN 300 468 40-bit `UTC_time`: 16-bit MJD then 6-digit BCD `HHMMSS` (UTC).
+pub fn utc_time_bcd(unix: u64) -> [u8; 5] {
+    let bcd = |v: u64| (((v / 10) << 4) | (v % 10)) as u8;
+    let [hi, lo] = ((unix / 86400).wrapping_add(40587) as u16).to_be_bytes();
+    let t = unix % 86400;
+    [hi, lo, bcd(t / 3600), bcd(t % 3600 / 60), bcd(t % 60)]
 }
 
 /// `set_pid_ts`.

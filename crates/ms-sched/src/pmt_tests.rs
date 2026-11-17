@@ -3203,3 +3203,21 @@ fn oversize_pat_section_is_rejected() {
     assert_eq!(sched.adapter(0).unwrap().active_pmts, 0);
     assert!(sched.pmt(0).is_none());
 }
+
+#[test]
+fn add_ca_caps_at_u64_mask_width_and_reuses_freed_slots() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    let log = Rc::new(RefCell::new(CaLog::default()));
+    for expected in 0..MAX_CA as i32 {
+        assert_eq!(sched.add_ca(Box::new(FakeCa(log.clone()))), expected);
+    }
+    assert_eq!(sched.add_ca(Box::new(FakeCa(log.clone()))), -1);
+    sched.init_ca_for_adapter(0, -1);
+    sched.init_ca_for_adapter(0, MAX_CA as i32);
+    sched.restart_pmt_for_ca(-1, 0);
+    sched.restart_pmt_for_ca(MAX_CA as i32, 0);
+
+    sched.del_ca(63);
+    assert_eq!(sched.add_ca(Box::new(FakeCa(log.clone()))), 63);
+    assert_eq!(sched.add_ca(Box::new(FakeCa(log.clone()))), -1);
+}

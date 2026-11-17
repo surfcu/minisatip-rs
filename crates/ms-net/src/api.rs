@@ -571,55 +571,117 @@ impl CBuf {
         self.write_at(index, &[byte]);
     }
 
-    /// `ptr += escape_json_string(buf + ptr, len - ptr, src, sl)`
-    /// (variables.cpp:171-187), including its `strlcatf(dest, sl, ...)` bug.
-    // The C++ `LOG_AND_RETURN` sits in a void function, so it returns `()`.
-    #[allow(clippy::unused_unit)]
+    /// `ptr += escape_json_string(buf + ptr, len - ptr, src, sl)` (`variables.cpp:171-274`, #1556).
     pub fn escape_json(&mut self, src: &[u8]) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
         let base = self.ptr;
         let dl = self.buf.len() as i64 - base as i64;
-        if dl < 2 {
-            // variables.cpp:174 (`__FUNCTION__` and `%s` of `src`).
-            ms_log::log_and_return!(
-                (),
-                "{}: dl {} < 2 for {}",
+        if dl < 3 {
+            if dl > 0 {
+                self.write_at(base, &[0]);
+            }
+            ms_log::log!(
+                "{}: dl {} < 3 for {}",
                 "escape_json_string",
                 dl,
                 String::from_utf8_lossy(cstr(src))
             );
+            return;
         }
-        let sl = src.len() as i64;
+        // Reserve space for closing '"' and NUL.
+        let limit = (dl - 2) as usize;
         self.write_at(base, b"\"");
-        let mut j: i64 = 1;
-        for &c in src {
-            if j >= dl - 1 {
-                break;
-            }
-            if c >= 32 {
-                self.write_at(base + j as usize, &[c]);
+        let mut j = 1usize;
+        let mut i = 0usize;
+        while i < src.len() {
+            let c = src[i];
+            let esc = match c {
+                b'"' => Some(b'"'),
+                b'\\' => Some(b'\\'),
+                0x08 => Some(b'b'),
+                0x0C => Some(b'f'),
+                b'\n' => Some(b'n'),
+                b'\r' => Some(b'r'),
+                b'\t' => Some(b't'),
+                _ => None,
+            };
+            if let Some(esc) = esc {
+                if j + 2 > limit {
+                    break;
+                }
+                self.write_at(base + j, &[b'\\', esc]);
+                j += 2;
+                i += 1;
+            } else if c < 0x20 || c == 0x7F {
+                if j + 6 > limit {
+                    break;
+                }
+                self.write_at(
+                    base + j,
+                    &[
+                        b'\\',
+                        b'u',
+                        b'0',
+                        b'0',
+                        HEX[usize::from(c >> 4)],
+                        HEX[usize::from(c & 0x0F)],
+                    ],
+                );
+                j += 6;
+                i += 1;
+            } else if c < 0x80 {
+                if j + 1 > limit {
+                    break;
+                }
+                self.write_at(base + j, &[c]);
                 j += 1;
-                continue;
-            }
-            let text = format!("%x{c:02X}");
-            let room = sl - j;
-            if room < 0 {
-                // A negative size converts to a huge size_t: no truncation.
-                self.write_at(base + j as usize, text.as_bytes());
-                self.write_at(base + j as usize + text.len(), &[0]);
+                i += 1;
             } else {
-                self.snprintf(base + j as usize, room as usize, text.as_bytes());
-            }
-            j += text.len() as i64;
-            if j >= sl {
-                j = sl - 1;
+                let seq_len = if (c & 0xE0) == 0xC0 && c >= 0xC2 {
+                    2
+                } else if (c & 0xF0) == 0xE0 {
+                    3
+                } else if (c & 0xF8) == 0xF0 && c <= 0xF4 {
+                    4
+                } else {
+                    0
+                };
+                let mut valid = seq_len > 0 && i + seq_len <= src.len();
+                if valid {
+                    for &cont in &src[i + 1..i + seq_len] {
+                        if (cont & 0xC0) != 0x80 {
+                            valid = false;
+                        }
+                    }
+                    let b1 = src.get(i + 1).copied().unwrap_or(0);
+                    if seq_len == 3 && ((c == 0xE0 && b1 < 0xA0) || (c == 0xED && b1 >= 0xA0)) {
+                        valid = false;
+                    }
+                    if seq_len == 4 && ((c == 0xF0 && b1 < 0x90) || (c == 0xF4 && b1 >= 0x90)) {
+                        valid = false;
+                    }
+                }
+                if valid {
+                    if j + seq_len > limit {
+                        break;
+                    }
+                    self.write_at(base + j, &src[i..i + seq_len]);
+                    j += seq_len;
+                    i += seq_len;
+                } else {
+                    if j + 3 > limit {
+                        break;
+                    }
+                    self.write_at(base + j, &[0xEF, 0xBF, 0xBD]);
+                    j += 3;
+                    i += 1;
+                }
             }
         }
-        self.write_at(base + j as usize, b"\"");
+        self.write_at(base + j, b"\"");
         j += 1;
-        self.write_at(base + j as usize, &[0]);
-        // C++ can move `ptr` past the buffer here; never let a later write
-        // underflow (DEV-140).
-        self.ptr = (base + j as usize).min(self.buf.len());
+        self.write_at(base + j, &[0]);
+        self.ptr = (base + j).min(self.buf.len());
     }
 
     /// The C string at the start of the buffer.

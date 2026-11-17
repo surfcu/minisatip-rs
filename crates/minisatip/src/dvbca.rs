@@ -11,9 +11,7 @@ use ms_ca::{CaCaps, CaDriver, CaService, EsStream, Program, ProgramTable, Tables
 use ms_ca_drivers::en50221::device::{
     ApduSink, CaDevice as CiDevice, CaPmtSink, CaState, CcKeyBytes, HostEvent, UnsolicitedMmi,
 };
-use ms_ca_drivers::en50221::{
-    AdapterInfo, CaOpener, CaRegistry, Clock, InitResult, TransponderKey,
-};
+use ms_ca_drivers::en50221::{AdapterInfo, CaOpener, CaRegistry, Clock, InitResult, ServiceWindow};
 use ms_config::Options;
 use ms_net::web::CamMenuOp;
 
@@ -134,10 +132,7 @@ impl DvbcaSettings {
 pub(crate) type SequencedScrambledWindow = (usize, u64, u64, u64, i64);
 
 #[cfg(test)]
-pub(crate) type ServiceWindowItem = (u16, Option<TransponderKey>, u64, u64);
-
-#[cfg(test)]
-pub(crate) type SequencedServiceWindowReport = (usize, u64, i64, Vec<ServiceWindowItem>);
+pub(crate) type SequencedServiceWindowReport = (usize, u64, i64, Vec<ServiceWindow>);
 
 /// Reads back the scrambled and service windows a test `Dvbca` was sent without dropping either.
 #[cfg(test)]
@@ -208,7 +203,7 @@ impl WindowRecorder {
                     window_ms,
                     services
                         .into_iter()
-                        .map(|(sid, _, scr, clr)| (sid, scr, clr))
+                        .map(|w| (w.sid, w.scrambled, w.clear))
                         .collect(),
                 )
             })
@@ -249,12 +244,12 @@ enum Request {
         clear: u64,
         window_ms: i64,
     },
-    /// One window per service: its `(sid, tp_key, scrambled, clear)` counts.
+    /// One window per service on the DDCI adapter.
     ServiceWindows {
         adapter: usize,
         seq: u64,
         window_ms: i64,
-        services: Vec<(u16, Option<TransponderKey>, u64, u64)>,
+        services: Vec<ServiceWindow>,
     },
     Stop,
 }
@@ -434,7 +429,7 @@ impl Dvbca {
         adapter: usize,
         seq: u64,
         window_ms: i64,
-        services: Vec<(u16, Option<TransponderKey>, u64, u64)>,
+        services: Vec<ServiceWindow>,
     ) {
         let _ = self.requests.send(Request::ServiceWindows {
             adapter,
@@ -524,8 +519,8 @@ impl ms_sched::pmt::CaSink for DvbcaSink {
     fn add_pmt(&mut self, service: &CaService, update: bool) -> TablesResult {
         let program = program_from_service(service);
         let id = service.pmt_id;
-        // A late answer for the same program is the result of the CAPMT already
-        // sent; an offer for another program in the slot is released first.
+        // A late answer for the same offer is reused; a new program or reused slot
+        // releases the old offer first, while an in-place PMT update updates in place.
         let mut pending = self.pending.borrow_mut();
         if let Some(offer) = pending.get(&id) {
             if same_offer(&offer.program, &program) {
@@ -542,8 +537,14 @@ impl ms_sched::pmt::CaSink for DvbcaSink {
                 };
             }
             if let Some(old) = pending.remove(&id) {
-                self.dvbca
-                    .del_pmt(usize::from(old.program.adapter), id as i32);
+                let same_join = old.program.generation == program.generation
+                    && old.program.adapter == program.adapter
+                    && old.program.sid == program.sid
+                    && old.program.pid == program.pid;
+                if !same_join {
+                    self.dvbca
+                        .del_pmt(usize::from(old.program.adapter), id as i32);
+                }
             }
         }
         let Some(rx) = self.dvbca.add_pmt(program.clone(), update) else {
@@ -798,6 +799,9 @@ impl Worker {
                 ) {
                     let before = capmt_ids(capmt);
                     capmt.del_pmt(pmt_id, &self.programs, &mut SlotDriver(&mut *dev));
+                    if let Ok(id) = usize::try_from(pmt_id) {
+                        dev.note_capmt_removed(id);
+                    }
                     if capmt_ids(capmt) != before {
                         dev.cam_recovery_pmts_changed();
                     }
@@ -864,10 +868,8 @@ impl Worker {
                 };
                 dev.cam_recovery_sync_services(&pairs, active);
                 if active {
-                    for &(sid, tp_key, scrambled, clear) in &services {
-                        dev.cam_recovery_service_window_seq(
-                            seq, sid, tp_key, window_ms, scrambled, clear,
-                        );
+                    for &window in &services {
+                        dev.cam_recovery_service_window_seq(seq, window_ms, window);
                     }
                 }
                 // Re-joined here, where `active` was just checked: an initialised CAM with a CAPMT.
@@ -944,6 +946,7 @@ impl Worker {
         let generation = program.generation;
         self.programs.insert(program);
         let before = capmt_ids(capmt);
+        let update = update || capmt.slot_of(pmt_id).is_some();
         let result = capmt.process_pmt(pmt_id, update, &self.programs, &mut SlotDriver(&mut *dev));
         if capmt_ids(capmt) != before {
             dev.cam_recovery_pmts_changed();
@@ -952,6 +955,7 @@ impl Worker {
         if result == TablesResult::Ok
             && let Ok(id) = usize::try_from(pmt_id)
         {
+            dev.note_capmt_added(id, generation);
             for parity in 0..2u8 {
                 let slot = usize::from(parity);
                 if dev.key[slot] != [0; 16] {
@@ -1843,7 +1847,10 @@ mod tests {
                 adapter: 0,
                 seq: 1,
                 window_ms: 10_000,
-                services: vec![(0x64, None, a, 0), (0x65, None, 0, b)],
+                services: vec![
+                    ServiceWindow::unkeyed(0x64, a, 0),
+                    ServiceWindow::unkeyed(0x65, 0, b),
+                ],
             });
         };
         window(&mut worker, 0, 0);
@@ -1922,7 +1929,7 @@ mod tests {
                 adapter: 0,
                 seq: 1,
                 window_ms: 10_000,
-                services: vec![(0x64, None, 2_000, 0)],
+                services: vec![ServiceWindow::unkeyed(0x64, 2_000, 0)],
             });
         };
         window(&mut worker);
@@ -1971,7 +1978,7 @@ mod tests {
     /// program by SID, so the re-join uses the CAPMT's own pmt id.
     #[test]
     fn service_windows_rejoin_the_capmt_pmt_with_the_same_sid() {
-        use crate::ca::{CaRuntime, ddci_services_for_test};
+        use crate::ca::{CaRuntime, DdciServiceSpec, ddci_services_for_test};
         use ms_ca_drivers::ddci::{DdciDevice, Mapping};
         use ms_ca_drivers::en50221::consts::TAG_CA_PMT;
         use ms_sched::{AdapterConfig, AdapterTuner, Scheduler, TuneError};
@@ -2015,16 +2022,26 @@ mod tests {
         sched.pmt_add_stream_pid(id, 602, 6, true, false);
 
         let services = ddci_services_for_test(&hub, &sched, 0);
-        assert_eq!(services, [(0x1234, None, vec![1301, 1302])]);
+        assert_eq!(
+            services,
+            [DdciServiceSpec {
+                sid: 0x1234,
+                host_aid: Some(4),
+                tp_key: None,
+                pids: vec![1301, 1302],
+            }]
+        );
+        let healthy = BTreeMap::from([(4usize, true)]);
         let mut base = BTreeMap::new();
         assert_eq!(
             CaRuntime::service_window_deltas(
                 &mut base,
                 0,
                 &[(1301, 2_000, 0), (1302, 50, 0)],
-                &services
+                &services,
+                &healthy,
             ),
-            [(0x1234, None, 0, 0)],
+            [ServiceWindow::unkeyed(0x1234, 0, 0)],
             "the first report seeds"
         );
         let deltas = CaRuntime::service_window_deltas(
@@ -2032,8 +2049,9 @@ mod tests {
             0,
             &[(1301, 4_000, 0), (1302, 100, 0)],
             &services,
+            &healthy,
         );
-        assert_eq!(deltas, [(0x1234, None, 2_050, 0)]);
+        assert_eq!(deltas, [ServiceWindow::unkeyed(0x1234, 2_050, 0)]);
 
         let (mut worker, clock, cam) = resend_worker();
         worker.add_pmt(zap_program(3, 0x1234), false);
@@ -2501,6 +2519,8 @@ mod tests {
         recorder: WindowRecorder,
         cam_cum: (u64, u64),
         cum: BTreeMap<u16, (u64, u64)>,
+        host_ecm: BTreeMap<usize, u64>,
+        host_ecm_step: BTreeMap<usize, u64>,
         expected_seq: u64,
     }
 
@@ -2574,6 +2594,8 @@ mod tests {
                 recorder,
                 cam_cum: (0, 0),
                 cum: BTreeMap::new(),
+                host_ecm: BTreeMap::new(),
+                host_ecm_step: BTreeMap::new(),
                 expected_seq: 0,
             };
             // Advance past the 5-minute readiness floor unless a test checks under-5-min behavior.
@@ -2624,6 +2646,26 @@ mod tests {
                 self.sched.process_pat(fid, &pat);
                 assert_eq!(self.sched.adapter_transponder_id(aid), tsid);
             }
+            let snap = ms_net::dataplane::InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 1,
+                cc_errors: 0,
+            };
+            self.host_ecm.insert(aid, 0);
+            self.host_ecm_step.insert(aid, 20);
+            self.ca.seed_host_input_for_test(0, aid, snap, 0);
+        }
+
+        fn set_host_health(
+            &mut self,
+            aid: usize,
+            snapshot: ms_net::dataplane::InputHealthSnapshot,
+        ) {
+            self.ca.set_host_input_health_for_test(aid, snapshot);
+        }
+
+        fn set_host_ecm_step(&mut self, aid: usize, step: u64) {
+            self.host_ecm_step.insert(aid, step);
         }
 
         /// Maps a host PMT into DDCI device 0 and adds the corresponding CI CAPMT program.
@@ -2667,8 +2709,89 @@ mod tests {
             self.ca.seed_service_pid_for_test(0, ddci_pid, cur);
         }
 
+        /// Maps a host PMT and adds the CI CAPMT without pre-seeding window baselines (real mid-window join).
+        fn add_service_unseeded(
+            &mut self,
+            slot: usize,
+            host_aid: usize,
+            capmt_pmt_id: i32,
+            sid: u16,
+            es_pid: u16,
+            ddci_pid: u16,
+        ) {
+            use ms_ca_drivers::ddci::Mapping;
+
+            let src_pmt = self
+                .sched
+                .pmt_add(host_aid as i32, i32::from(sid), 0x100 + slot as i32);
+            self.sched
+                .pmt_add_stream_pid(src_pmt, i32::from(es_pid), 2, false, true);
+            {
+                let mut state = self.hub.lock();
+                let dev = state.ddci.devices.get_mut(&0).unwrap();
+                dev.pmt[slot].id = src_pmt;
+                dev.mapping.insert(
+                    (host_aid as u16, es_pid),
+                    Mapping {
+                        ad: host_aid as u16,
+                        pid: es_pid,
+                        ddci_pid: i32::from(ddci_pid),
+                        ddci: 0,
+                        rewrite: false,
+                        pmt: BTreeSet::from([src_pmt]),
+                        filter_id: None,
+                        pid_added: false,
+                    },
+                );
+            }
+            self.worker
+                .add_pmt(zap_program(capmt_pmt_id as usize, sid), false);
+        }
+
+        /// Removes a service from DDCI slot `slot`, scheduler, and the CI CAPMT.
+        fn remove_service(&mut self, slot: usize, host_aid: usize, capmt_pmt_id: i32) {
+            let src_pmt = {
+                let mut state = self.hub.lock();
+                let dev = state.ddci.devices.get_mut(&0).unwrap();
+                let id = dev.pmt[slot].id;
+                dev.pmt[slot].id = -1;
+                dev.mapping
+                    .retain(|&(ad, _), m| !(ad == host_aid as u16 && m.pmt.contains(&id)));
+                if !dev.mapping.values().any(|m| m.ad == host_aid as u16) {
+                    dev.adapter_ecm_pkts.remove(&(host_aid as u16));
+                }
+                id
+            };
+            if src_pmt >= 0 {
+                self.sched.pmt_del(src_pmt);
+            }
+            self.cum.retain(|&pid, _| {
+                let state = self.hub.lock();
+                state
+                    .ddci
+                    .devices
+                    .get(&0)
+                    .is_some_and(|d| d.mapping.values().any(|m| m.ddci_pid == i32::from(pid)))
+            });
+            self.worker.handle(Request::DelPmt {
+                adapter: 0,
+                pmt_id: capmt_pmt_id,
+            });
+        }
+
         /// Runs `CaRuntime::decrypt_windows` at the current clock tick and forwards the recorded pair.
         fn step_window_at_current_time(&mut self, pid_deltas: &[(u16, u64, u64)]) {
+            for (&aid, &step) in &self.host_ecm_step {
+                if step > 0 {
+                    let next = self.host_ecm.entry(aid).or_insert(0);
+                    *next += step;
+                    let total = *next;
+                    let mut state = self.hub.lock();
+                    if let Some(dev) = state.ddci.devices.get_mut(&0) {
+                        dev.adapter_ecm_pkts.insert(aid as u16, total);
+                    }
+                }
+            }
             for &(ddci_pid, scr, clr) in pid_deltas {
                 self.cam_cum.0 += scr;
                 self.cam_cum.1 += clr;
@@ -3344,6 +3467,573 @@ mod tests {
             rig.clock.tick_ms()
         );
     }
+
+    // 8) Cached `known_good` second mux corroborates an active 40-min wedged anchor on its first post-lag window (~16 s).
+    #[test]
+    fn cam_stuck_known_good_fast_probe_alerts_on_first_post_lag_window_after_long_dwell() {
+        #[cfg(feature = "diag-log")]
+        let lines = super::diag_capture::lines();
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        // Initially PAT tsid is unknown (0) when 0x0202 caches `known_good`.
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            0,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.remove_service(1, 5, 11);
+
+        // Anchor 0x0101 wedges and stays stuck alone for 40 minutes (240 windows > 15 min).
+        for _ in 0..240 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        assert!(
+            rig.worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_single_stuck_last_alert_ms
+                > 0,
+            "single-mux notice fired at 3 minutes"
+        );
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "2-mux cam_stuck must not fire on one mux alone"
+        );
+
+        // Re-configure adapter 5 with PAT tsid=202 (same freq/pol/src -> `same_transponder` matches `known_good`).
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        // Joining only 1 s before Tick 1 (`start < capmt_joined + 2 s` on Tick 2) must wait for Tick 3.
+        rig.clock.advance(9_000);
+        rig.add_service_unseeded(1, 5, 11, 0x0202, 701, 1401);
+        rig.clock.advance(1_000);
+        rig.step_window_at_current_time(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "window starting only 1 s after CAPMT join (< 2 s lag) must not alert"
+        );
+        rig.remove_service(1, 5, 11);
+
+        // Real mid-window 20 s probe: join at +4 s, Tick 1 at +10 s (`start < joined` seeds bases), Tick 2 at +20 s (`start = capmt_joined + 6 s`).
+        rig.clock.advance(4_000);
+        rig.add_service_unseeded(1, 5, 11, 0x0202, 701, 1401);
+        rig.clock.advance(6_000);
+        rig.step_window_at_current_time(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "seed window (`start < joined`) must not alert"
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        let alert_ms = rig.clock.tick_ms();
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            alert_ms,
+            "known_good probe alerts at 16 s post-join despite prior cam_single_stuck and 40 min anchor age"
+        );
+        #[cfg(feature = "diag-log")]
+        {
+            let thread = std::thread::current().name().unwrap_or_default().to_owned();
+            let captured = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let alerts: Vec<&String> = captured
+                .iter()
+                .filter(|l| l.contains(&thread) && l.contains("manual CAM reset may be needed"))
+                .collect();
+            assert_eq!(alerts.len(), 1, "{alerts:?}");
+            assert!(alerts[0].contains("probe=known_good"), "{}", alerts[0]);
+        }
+
+        // After > 24 hours without seeing 0x0202 clean, its `known_good` cache entry expires (no 16 s fast alert).
+        rig.remove_service(1, 5, 11);
+        rig.step_window(&[(1301, 0, 20_000)]);
+        rig.advance_idle(86_500_000);
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        rig.clock.advance(4_000);
+        rig.add_service_unseeded(1, 5, 11, 0x0202, 701, 1401);
+        rig.clock.advance(6_000);
+        rig.step_window_at_current_time(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            alert_ms,
+            "known_good entry older than 24 h must expire and fall back to cold Tier-1"
+        );
+    }
+
+    // 9) Single-tuner sequential zap retains latched anchor across empty CAPMT, alerts on 2nd mux, and clears on clean or 60-min TTL.
+    #[test]
+    fn cam_stuck_sequential_single_tuner_zap_uses_latched_anchor_and_clears_on_clean_or_ttl() {
+        #[cfg(feature = "diag-log")]
+        let lines = super::diag_capture::lines();
+        let mut rig = CamStuckRig::new(2);
+        // Cache 0x0202 on 11500V as `known_good`, then retune single adapter 4 to 11000H for 0x0101.
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0202, 701, 1401);
+        rig.step_window(&[(1401, 0, 20_000)]);
+        rig.step_window(&[(1401, 0, 20_000)]);
+        rig.remove_service(0, 4, 10);
+
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.step_window(&[(1301, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000)]);
+        // 6 stuck windows: silent rejoin at #3 + 3 post-windows -> 0x0101 qualifies and latches!
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        // While 0x0101 stays open, a neutral window on 0x0101 must NOT fall back to its latched snapshot.
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.clock.advance(4_000);
+        rig.add_service_unseeded(1, 5, 11, 0x0202, 701, 1401);
+        rig.clock.advance(6_000);
+        rig.step_window_at_current_time(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        rig.step_window(&[(1301, 0, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "latched snapshot must not stand in while the anchor service is still open"
+        );
+        rig.remove_service(1, 5, 11);
+        rig.step_window(&[(1301, 25_000, 0)]);
+
+        // User closes stream on 11000H; 2 idle empty-CAPMT windows pass before opening 11500V.
+        rig.remove_service(0, 4, 10);
+        rig.step_window(&[]);
+        rig.step_window(&[]);
+
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        // Reuse the same CAPMT pmt_id (10, as `find_new_id` does after `del_pmt`).
+        rig.clock.advance(4_000);
+        rig.add_service_unseeded(0, 4, 10, 0x0202, 701, 1401);
+        rig.clock.advance(6_000);
+        rig.step_window_at_current_time(&[(1401, 15_000, 0)]);
+        rig.step_window(&[(1401, 15_000, 0)]);
+        let first_alert = rig.clock.tick_ms();
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            first_alert,
+            "latched anchor + sequential known_good zap alerts even when pmt_id is reused"
+        );
+        #[cfg(feature = "diag-log")]
+        {
+            let thread = std::thread::current().name().unwrap_or_default().to_owned();
+            let captured = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let last = captured
+                .iter()
+                .rev()
+                .find(|l| l.contains(&thread) && l.contains("manual CAM reset may be needed"))
+                .expect("latched alert log");
+            assert!(last.contains("latched regressed="), "{last}");
+        }
+
+        // A clean window clears `latched_regression` and ends the episode; advance >30 min hold.
+        rig.step_window(&[(1401, 0, 20_000)]);
+        rig.advance_idle(1_900_000);
+        // Without a fresh anchor, 0x0202 going stuck alone does not alert (latch was cleared).
+        for _ in 0..4 {
+            rig.step_window(&[(1401, 15_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            first_alert,
+            "cleared latch must not corroborate a single regressed mux"
+        );
+
+        // Now 0x0202 is latched (it cleared above, then ran 4+2=6 stuck windows); close it and expire the 60-min TTL.
+        rig.step_window(&[(1401, 15_000, 0)]);
+        rig.step_window(&[(1401, 15_000, 0)]);
+        rig.remove_service(0, 4, 10);
+        rig.advance_idle(3_660_000);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.clock.advance(4_000);
+        rig.add_service_unseeded(0, 4, 10, 0x0101, 601, 1301);
+        rig.clock.advance(6_000);
+        rig.step_window_at_current_time(&[(1301, 25_000, 0)]);
+        rig.step_window(&[(1301, 25_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            first_alert,
+            "latched anchor older than 60 min must expire"
+        );
+    }
+
+    // 10) Cold uncached 2nd mux does not alert at 20 s, alerts 1 window after Tier-1 (~46 s), and two cold muxes never alert.
+    #[test]
+    fn cam_stuck_cold_uncached_second_mux_requires_tier1_plus_one_window_and_two_cold_never_alert()
+    {
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        // Two cold never-clean muxes without any `ever_clean` anchor never alert even after Tier-1 + 10 windows.
+        rig.add_service(0, 4, 10, 0x0888, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0999, 701, 1401);
+        for _ in 0..14 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+        assert_eq!(
+            rig.worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_single_stuck_last_alert_ms,
+            -1
+        );
+
+        // Fresh rig: Anchor 0x0101 clears and wedges; cold uncached 0x0999 opens mid-window after wedge.
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.step_window(&[(1301, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000)]);
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+
+        rig.clock.advance(4_000);
+        rig.add_service_unseeded(1, 5, 11, 0x0999, 701, 1401);
+        rig.clock.advance(6_000);
+        // +6 s (seed), +16 s (in-join #1), +26 s (#2), +36 s (#3), +46 s (#4: silent rejoin fires): no alert yet.
+        rig.step_window_at_current_time(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        for _ in 0..4 {
+            rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+            assert_eq!(
+                rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+                -1,
+                "cold uncached mux must wait for Tier-1 + 1 post-window"
+            );
+        }
+        // +56 s (1st stuck window after 0x0999's +46 s silent rejoin): alerts!
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            rig.clock.tick_ms()
+        );
+    }
+
+    // 11) Input-health gate blocks unlocked RF, transient unlock_seq bumps, cc_delta > 50, and ecm_delta == 0.
+    #[test]
+    fn cam_stuck_and_single_stuck_require_healthy_rf_lock_continuity_and_ecm_flow() {
+        use ms_net::dataplane::InputHealthSnapshot;
+
+        // Rain-fade continuity errors (`cc_delta = 60 > 50`) prevent regression and `cam_single_stuck`.
+        let mut fade_rig = CamStuckRig::new(1);
+        fade_rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        fade_rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        fade_rig.step_window(&[(1301, 0, 20_000)]);
+        fade_rig.step_window(&[(1301, 0, 20_000)]);
+        for i in 1..=25u64 {
+            fade_rig.set_host_health(
+                4,
+                InputHealthSnapshot {
+                    current_locked: Some(true),
+                    unlock_seq: 1,
+                    cc_errors: i * 60,
+                },
+            );
+            fade_rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        assert_eq!(
+            fade_rig
+                .worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_single_stuck_last_alert_ms,
+            -1,
+            "rain-fade CC errors must block cam_single_stuck"
+        );
+
+        // Anchor 0x0101 healthy & wedged; test each unhealthy input mode on 2nd mux 0x0202 (`known_good`).
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.remove_service(1, 5, 11);
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+
+        rig.clock.advance(4_000);
+        rig.add_service_unseeded(1, 5, 11, 0x0202, 701, 1401);
+        rig.clock.advance(6_000);
+        rig.step_window_at_current_time(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+
+        // (a) Unlocked frontend on adapter 5.
+        rig.set_host_health(
+            5,
+            InputHealthSnapshot {
+                current_locked: Some(false),
+                unlock_seq: 2,
+                cc_errors: 0,
+            },
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1
+        );
+
+        // (b) Re-locked, but `prev.current_locked` was `Some(false)` at window start -> still unhealthy for this window!
+        rig.set_host_health(
+            5,
+            InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 2,
+                cc_errors: 0,
+            },
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "window that started unlocked must not count as healthy"
+        );
+
+        // (c) Mid-window transient unlock-and-relock (`unlock_seq` 2 -> 3 while ending locked).
+        rig.set_host_health(
+            5,
+            InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 3,
+                cc_errors: 0,
+            },
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "mid-window unlock_seq bump must block alert"
+        );
+
+        // (d) Continuity-error spike (`cc_delta = 51 > 50`).
+        rig.set_host_health(
+            5,
+            InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 3,
+                cc_errors: 51,
+            },
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "cc_delta = 51 must block alert"
+        );
+
+        // (e) Zero ECM packets forwarded (`ecm_delta == 0`).
+        rig.set_host_ecm_step(5, 0);
+        rig.set_host_health(
+            5,
+            InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 3,
+                cc_errors: 51,
+            },
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            -1,
+            "missing ECM flow must block alert"
+        );
+
+        // (f) Healthy window at exact CC boundary (`cc_delta = 50 <= 50`, locked, `unlock_seq` steady, `ecm_delta > 0`): alerts!
+        rig.set_host_ecm_step(5, 20);
+        rig.set_host_health(
+            5,
+            InputHealthSnapshot {
+                current_locked: Some(true),
+                unlock_seq: 3,
+                cc_errors: 101,
+            },
+        );
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            rig.clock.tick_ms()
+        );
+    }
+
+    // 12) `cam_single_stuck` requires 18 stuck post-Tier-1 windows, holds 30 min, and never downgrades after `cam_stuck`.
+    #[test]
+    fn cam_single_stuck_fires_at_18_windows_holds_30_min_and_escalates_to_cam_stuck() {
+        let mut rig = CamStuckRig::new(2);
+        rig.add_host_adapter(
+            4,
+            Some(sat_tp(1, 11_000_000, ms_tuner::Polarization::Horizontal)),
+            101,
+        );
+        rig.add_host_adapter(
+            5,
+            Some(sat_tp(1, 11_500_000, ms_tuner::Polarization::Vertical)),
+            202,
+        );
+        rig.add_service(0, 4, 10, 0x0101, 601, 1301);
+        rig.add_service(1, 5, 11, 0x0202, 701, 1401);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.step_window(&[(1301, 0, 20_000), (1401, 0, 20_000)]);
+        rig.remove_service(1, 5, 11);
+
+        // 3 stuck windows trigger silent rejoin on 0x0101; then 17 stuck + 2 neutral post-Tier-1 windows do NOT fire yet.
+        for _ in 0..3 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        for _ in 0..17 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        rig.step_window(&[(1301, 0, 0)]);
+        rig.step_window(&[(1301, 0, 0)]);
+        assert_eq!(
+            rig.worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_single_stuck_last_alert_ms,
+            -1,
+            "neutral windows must not advance cam_single_stuck's 18 stuck-window requirement"
+        );
+
+        // 18th stuck post-Tier-1 window fires `cam_single_stuck` once.
+        rig.step_window(&[(1301, 25_000, 0)]);
+        let single_at = rig.clock.tick_ms();
+        assert_eq!(
+            rig.worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_single_stuck_last_alert_ms,
+            single_at
+        );
+
+        // Clean recovery + second single-mux wedge within 30 minutes is held.
+        rig.step_window(&[(1301, 0, 20_000)]);
+        for _ in 0..20 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        assert!(
+            rig.worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_single_stuck_episode_alerted
+        );
+        assert_eq!(
+            rig.worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_single_stuck_last_alert_ms,
+            single_at,
+            "second single-mux episode within 30 minutes is held"
+        );
+
+        // Clean recovery, advance past 30 min, escalate to 2-mux `cam_stuck`, then drop 2nd mux for >15 min: no downgrade.
+        rig.step_window(&[(1301, 0, 20_000)]);
+        rig.advance_idle(1_900_000);
+        for _ in 0..6 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        rig.clock.advance(4_000);
+        rig.add_service_unseeded(1, 5, 11, 0x0202, 701, 1401);
+        rig.clock.advance(6_000);
+        rig.step_window_at_current_time(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        rig.step_window(&[(1301, 25_000, 0), (1401, 15_000, 0)]);
+        assert_eq!(
+            rig.worker.registry.get(0).unwrap().cam_stuck_last_alert_ms,
+            rig.clock.tick_ms()
+        );
+        rig.remove_service(1, 5, 11);
+        for _ in 0..100 {
+            rig.step_window(&[(1301, 25_000, 0)]);
+        }
+        assert_eq!(
+            rig.worker
+                .registry
+                .get(0)
+                .unwrap()
+                .cam_single_stuck_last_alert_ms,
+            single_at,
+            "must not downgrade-emit cam_single_stuck after cam_stuck already fired in this wedge"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3457,6 +4147,60 @@ mod pending_tests {
                 pmt_id: 4
             })
         ));
+    }
+
+    #[test]
+    fn in_place_pmt_update_while_pending_skips_del_pmt_but_reused_slot_releases() {
+        let (dvbca, worker) = manual();
+        let pending = PendingOffers::default();
+        let mut sink = DvbcaSink::new(Rc::clone(&dvbca), Rc::default(), Rc::clone(&pending));
+
+        let mut initial = service(0x64);
+        initial.generation = 7;
+        initial.streams.push(ms_ca::StreamPid {
+            pid: 0x101,
+            stream_type: 2,
+        });
+        assert_eq!(sink.add_pmt(&initial, false), TablesResult::Retry);
+        let Ok(Request::AddPmt { reply: r1, .. }) = worker.try_recv() else {
+            panic!("initial AddPmt");
+        };
+
+        // Same (adapter, sid, pid, generation) with an added ES PID: update in place, no DelPmt.
+        let mut updated = initial.clone();
+        updated.streams.push(ms_ca::StreamPid {
+            pid: 0x102,
+            stream_type: 3,
+        });
+        assert_eq!(sink.add_pmt(&updated, false), TablesResult::Retry);
+        let Ok(Request::AddPmt {
+            program: p2,
+            reply: r2,
+            ..
+        }) = worker.try_recv()
+        else {
+            panic!("expected in-place AddPmt without DelPmt");
+        };
+        assert_eq!(p2.streams.len(), 2);
+        let _ = r1.send(TablesResult::Ok);
+        r2.send(TablesResult::Ok).unwrap();
+        assert_eq!(sink.add_pmt(&updated, false), TablesResult::Ok);
+        assert!(pending.borrow().is_empty());
+
+        // Same (adapter, sid, pid) on a new join bumps `generation`: must emit DelPmt first.
+        assert_eq!(sink.add_pmt(&updated, false), TablesResult::Retry);
+        let _ = worker.try_recv();
+        let mut rejoined = updated;
+        rejoined.generation = 8;
+        assert_eq!(sink.add_pmt(&rejoined, false), TablesResult::Retry);
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(Request::DelPmt {
+                adapter: 0,
+                pmt_id: 4
+            })
+        ));
+        assert!(matches!(worker.try_recv(), Ok(Request::AddPmt { .. })));
     }
 }
 
