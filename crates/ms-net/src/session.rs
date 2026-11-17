@@ -1463,8 +1463,13 @@ impl SessionManager {
     pub fn web_snapshot(&self) -> WebSnapshot {
         let mut snapshot = WebSnapshot::new();
         snapshot.adapters = vec![AdapterState::default(); ms_sched::MAX_ADAPTERS];
-        for aid in 0..ms_sched::MAX_ADAPTERS {
-            snapshot.adapters[aid].disabled = self.sched.is_disabled(aid);
+        for (aid, dst) in snapshot
+            .adapters
+            .iter_mut()
+            .enumerate()
+            .take(ms_sched::MAX_ADAPTERS)
+        {
+            dst.disabled = self.sched.is_disabled(aid);
             let Some(adapter) = self.sched.adapter(aid) else {
                 continue;
             };
@@ -1482,7 +1487,7 @@ impl SessionManager {
                 None => (0, 0, SignalStatus::DB_UNKNOWN),
             };
             let ber = self.adapter_ber.get(aid).copied().unwrap_or(0);
-            snapshot.adapters[aid] = AdapterState {
+            *dst = AdapterState {
                 present: true,
                 enabled: adapter.config.enabled,
                 disabled: self.sched.is_disabled(aid),

@@ -382,13 +382,13 @@ impl CaptureTap {
             apdu_seq_at_start,
         };
         // The pre-window goes out as one batch per direction (Arc handles, no copy).
-        for dir in 0..2 {
+        for (dir, drop_cnt) in cap.drops.iter_mut().enumerate() {
             let Some(ring) = st.rings.get(&(dev, dir)) else {
                 continue;
             };
             if ring.chunks.is_empty() {
                 continue;
-            }
+            };
             let bytes = ring.bytes;
             let chunks: Vec<Chunk> = ring.chunks.iter().cloned().collect();
             let msg = Msg::Chunks {
@@ -398,7 +398,7 @@ impl CaptureTap {
                 chunks,
             };
             if !self.queue(msg, bytes) {
-                cap.drops[dir] += bytes as u64;
+                *drop_cnt += bytes as u64;
             }
         }
         st.last_accepted.insert(dev, now);

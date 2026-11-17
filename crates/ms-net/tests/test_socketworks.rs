@@ -172,12 +172,11 @@ fn test_socket_buffering() {
         queue.flush(&mut sink);
     }
 
-    for index in 0..90 {
+    for (index, &byte) in sink.data.iter().enumerate().take(90) {
         if !(50..=58).contains(&index) {
             assert_eq!(
-                sink.data[index], index as u8,
-                "Invalid value found in the buffer at position {index}: {:02X}",
-                sink.data[index]
+                byte, index as u8,
+                "Invalid value found in the buffer at position {index}: {byte:02X}",
             );
         }
     }

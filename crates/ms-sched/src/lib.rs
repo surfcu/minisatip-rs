@@ -2002,15 +2002,15 @@ mod tests {
         let mut scheduler = scheduler();
         {
             let adapter = scheduler.adapter_mut(0).unwrap();
-            for i in 0..8 {
-                adapter.pids[i].state = match i % 4 {
+            for (i, entry) in adapter.pids.iter_mut().enumerate().take(8) {
+                entry.state = match i % 4 {
                     0 => PidState::Inactive,
                     1 => PidState::Active,
                     2 => PidState::New,
                     _ => PidState::Deleted,
                 };
-                adapter.pids[i].pid = i as i32;
-                adapter.pids[i].packets = i as u32;
+                entry.pid = i as i32;
+                entry.packets = i as u32;
             }
         }
         scheduler.update_pids(0);

@@ -846,8 +846,8 @@ fn ca_app_info_name_bounds() {
 #[test]
 fn ca_open_session_table_full() {
     let (_, mut d) = dev(72);
-    for i in 0..MAX_SESSIONS {
-        d.sessions[i] = session(i as u16 + 1, EN50221_APP_AI_RESOURCEID);
+    for (i, slot) in d.sessions.iter_mut().enumerate().take(MAX_SESSIONS) {
+        *slot = session(i as u16 + 1, EN50221_APP_AI_RESOURCEID);
     }
     let link = Mock::default();
     d.set_link(link.boxed());

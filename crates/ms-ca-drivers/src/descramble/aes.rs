@@ -105,7 +105,7 @@ impl Aes128 {
     /// Encrypts one block in place.
     pub fn encrypt_block(&self, block: &mut [u8; BLOCK]) {
         Self::add_round_key(block, &self.round_keys[0]);
-        for round in 1..11 {
+        for (round, rk) in self.round_keys.iter().enumerate().skip(1) {
             for b in block.iter_mut() {
                 *b = SBOX[*b as usize];
             }
@@ -124,7 +124,7 @@ impl Aes128 {
                     }
                 }
             }
-            Self::add_round_key(block, &self.round_keys[round]);
+            Self::add_round_key(block, rk);
         }
     }
 
