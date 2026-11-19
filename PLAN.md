@@ -264,6 +264,121 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
 - [ ] Upstream #1527 (`b78943f`): `enigma-ddci` MTD DVR loopback over `/dev/ciN` on 4K
   Enigma2 receivers (port or record as out-of-scope deviation; also sync #1548
   `key_ecmpids` when bumping the C++ harness baseline)
+- [ ] Multi-model code review fixes — Rust port bugs (`V-01`–`V-14`, verified 2026-11-19):
+  - [ ] `V-01` (`crates/ms-ca-drivers/src/en50221/sys.rs:9-12, 121-137`): derive `CA_RESET` and
+    `CA_GET_SLOT_INFO` from `ms_tuner::linux_dvb::NATIVE` instead of hardcoded `asm-generic`
+    `0x6F80`/`0x800C_6F82` so `mipsel` gets `0x2000_6F80`/`0x400C_6F82` instead of `ENOTTY`
+  - [ ] `V-02` (`crates/ms-net/src/srt_ffi.rs:78-90` `pre_accept`): drop `pending.lock()` before
+    calling `ms_srt::close(replaced)` and `ms_srt::set_flag(ns, SockOpt::SndTimeo, ...)` to
+    preserve `srt.cpp:38` `libsrt` lock-order safety
+  - [ ] `V-03` (`crates/ms-sched/src/pmt.rs:2222-2253` `Scheduler::process_pmt`): run
+    `ParsedPmt::parse(section, CrcCheck::Skip)` before `release_pmt_claims` and `pmt.caids = 0`
+    so a single malformed section with `version != pmt.version` cannot wipe `caids` without
+    advancing `pmt.version`
+  - [ ] `V-04` (`crates/minisatip/src/runtime.rs:2464-2475, 644-650` `spawn_ddci_adapters`,
+    `add_satip_adapter`): allocate only where `scheduler.adapter(aid).is_none() &&
+    handles[aid].is_none()` so DDCI and SAT>IP client adapters never overwrite `-e`-disabled or
+    failed-to-open DVB slots (`DEV-258`)
+  - [ ] `V-05` (`crates/ms-tuner/src/satipc/driver.rs:702-707, 757-771`,
+    `crates/ms-tuner/src/satipc/media.rs:111-124, 185-209`): bound `Driver::rbuf` and
+    `TcpDemux::data` RTSP headers/bodies and include `demux.buffered()` in `Driver::poll`
+    backpressure so an unfinished/oversized SAT>IP server response resets via `rtsp_eof()` instead
+    of growing to OOM (`panic = "abort"`)
+  - [ ] `V-06` (`crates/minisatip/src/runtime.rs:1279-1301, 1405-1438, 1465-1474, 1583-1608`,
+    `crates/ms-net/src/dataplane.rs:613-626`): cache per-adapter `SetThreshold` values so
+    `update_thresholds()` only sends on change instead of flooding `MAX_PENDING_COMMANDS` (4096)
+    on every request, and exempt/retry rejected `StopOutput`, `StartOutput`,
+    `ReplaceUdpSockets`, `SetSsrc` and `SetPids` transitions
+  - [ ] `V-07` (`crates/ms-net/src/bandwidth.rs:154-173`,
+    `crates/ms-net/src/dataplane.rs:1242-1316, 1374-1408`): keep cumulative `tbw` outside
+    `Window::default()` 1 s resets (`DEV-174`), compute `stats.octets`/`packets` deltas modulo
+    `u32` across 4 GiB wraps, and fold/clear `bandwidth_marks[&sid]` on `StopOutput`/`StartOutput`
+  - [ ] `V-08` (`crates/ms-tuner/src/linux_dvb/backend.rs:683-714, 842-861`
+    `LinuxDvbTuner::tune`): clear `self.partial` alongside `self.psi` on every tune and reset the
+    `SignalStatus` placeholder on failed tunes so old-transponder partial packets and stale lock
+    levels never cross retunes
+  - [ ] `V-09` (`crates/ms-tuner/src/satipc/driver.rs:505-516, 617-624, 881-887, 944-952,
+    980-993`): clear `self.tcp_ts` in `tune_open`, `drop_rtsp_socket`, `Op::CloseData` and
+    `standby`, and gate the `Transport::Tcp` arm of `read_media` on `!self.client.ignore_packets`
+  - [ ] `V-10` (`crates/ms-tuner/src/satipc/driver.rs:368-495, 535-542`): move `open_srt()` DNS
+    resolution (`to_socket_addrs`) and blocking `ms_srt::connect` outside the `Driver` mutex
+    under `connect_epoch`
+  - [ ] `V-11` (`crates/minisatip/src/ca.rs:438-448, 478-480` `CaRuntime::sync_ddci`): record
+    `(aid, pid)` in `link.mirrored` only when `sched.mark_pid_add(aid, DDCI_SID, pid) >= 0` (and
+    set `ok = false` on rejection) so DDCI PID claims retry when adapter PID slots free up
+  - [ ] `V-12` (`crates/ms-net/src/output.rs:733-744` `poll_rtcp`,
+    `crates/ms-tuner/src/linux_dvb/backend.rs:633-668, 827-841` `read_sections`): cap per-tick
+    RTCP datagram drains and per-`read` demux section reads / `self.psi` backlog so UDP/PSI
+    floods cannot starve `DataPlane::run`
+  - [ ] `V-13` (`crates/ms-net/src/session.rs:197, 1490-1579`,
+    `crates/minisatip/src/runtime.rs`): populate `AdapterState::name` (`ad_adapter_names`),
+    `WebSnapshot::satipc` (`ad_satip`, `ad_satip_transport_type`), and `-1` `st_overflow` for
+    enabled streams without an output socket
+  - [ ] `V-14` (`crates/ms-tuner/src/netceiver/backend.rs:109-134` `NetceiverTuner::del_pid`,
+    parked): iterate `0..self.lp` and zero vacated tail slots so slot `MAX_PIDS - 1` (127) can be
+    deleted and stale tail entries cannot decrement `self.lp`
+- [ ] Multi-model code review fixes — inherited upstream C++ `28dfd78` bugs (`U-01`–`U-09`,
+  verified 2026-11-19; record each adopted fix as a `DEV-xxx` row in `docs/deviations.md` and
+  evaluate upstream PRs):
+  - [ ] `U-01` (`crates/ms-ca-drivers/src/en50221/device.rs:462-466, 593`,
+    `crates/ms-ca-drivers/src/en50221/apps.rs:343-362`, C++ `ca.cpp:839`): preserve forced `-c`/
+    `--ca-channels` CAIDs across `teardown()` instead of clearing `self.caids` while keeping
+    `has_forced_caids = true` (which leaves reconnects with an empty CAID list)
+  - [ ] `U-02` (`crates/minisatip/src/dvbca.rs:1180` `HostEvent::CaSessionClosed`, C++
+    `ca.cpp:2845-2850`): call `capmt.release_pmts()` and emit `Notice::Released` when the CAM
+    closes its CA Support session so `Running` PMTs clear `ca_mask` and re-offer on reopen
+  - [ ] `U-03` (`crates/ms-config/src/parse.rs:1520-1616` `parse_signal_multiplier`, C++
+    `adapter.cpp:2111-2170`): locate the strength/SNR `-` separator after `:`, expand documented
+    `ad1-ad2` adapter ranges (`-M 4-6:1.2-1.3`), reset `SignalForce` per comma token, and apply
+    wildcard `*` `SignalForce` (`-M *:%1.0-#1.0`)
+  - [ ] `U-04` (`crates/ms-ca-drivers/src/en50221/device.rs:880-980, 1007-1098`, C++
+    `ca.cpp:3752-3837`): buffer `T_DATA_MORE` fragments across separate `read()` calls until
+    `T_DATA_LAST` and loop `handle_spdu` over multiple SPDUs in a single Enigma `/dev/ciN` read
+  - [ ] `U-05` (`crates/ms-ca-drivers/src/en50221/device.rs:1001-1004`
+    `find_session_for_resource`, C++ `ca.cpp:3403-3409`): search `0..MAX_SESSIONS` instead of
+    `1..MAX_SESSIONS` so slot 0 (wire session 1) is not skipped
+  - [ ] `U-06` (`crates/ms-ca-drivers/src/ddci/mod.rs:1861-1872` `prepare_device_maps`, C++
+    `ddci.cpp:1213-1214`): track per-adapter FIFO initialization explicitly instead of overloading
+    `read_index == 0` so the very first CAM output batch after startup (`write_index` `0 -> N`)
+    is not discarded
+  - [ ] `U-07` (`crates/ms-ts/src/section.rs:56-129` `SectionAssembler::assemble_packet`, C++
+    `pmt.cpp:1864-1866`): reset `pos`/`expected`/`synced` (keeping `last_len`) after returning a
+    section so trailing non-PUSI packets do not re-emit the completed section
+  - [ ] `U-08` (`crates/ms-ca-drivers/src/dvbapi/client.rs:603-634` `dmx_stop`, C++
+    `dvbapi.cpp:341-345`): decrement `k.ecms` only inside `if let Some(slot) = index`
+  - [ ] `U-09` (`crates/ms-ca-drivers/src/en50221/ciplus/crypto.rs:286-305`
+    `get_bin_from_nibble`, C++ `ca.cpp:659-670`): restrict hex ranges to `b'A'..=b'F'` and
+    `b'a'..=b'f'`
+- [ ] Multi-model code review fixes — `LOW` hardening & `ms-harness`/`ms-fakecam` hygiene
+  (verified 2026-11-19):
+  - [ ] Production `LOW`: `satipc/client.rs:624, 1051` (`u32::from_be_bytes` for RTCP SR packet
+    count; emit `pol=none` when `pol_specified && pol == Polarization::None`),
+    `ms-net/src/satip.rs:49-120` (preserve existing `TuneParams` fields on invalid re-SETUP
+    tokens), `runtime.rs:684-712, 2955-2957, 3015-3017, 226` (`detach_stream_conns` in
+    `remove_satip_server`; `break` instead of `return` on `try_clone` failure so `Inbound::Closed`
+    fires; fallible `spawn_ssdp` and `SatipXmlPoll` thread spawns under `panic = "abort"`),
+    `ddci.rs:335-342` & `ddci/mod.rs:816, 1013, 2013-2039` (`state.programs.del` in
+    `DdciSink::del_pmt`; prune unlocked `Ddci::channels`; drop latent `.expect`, dead
+    `push_from_cam` `left == 0` log, and legacy single-writer `Ddci::ddci_ts`),
+    `ca.rs:969-975, 1558-1586, 2110-2183` (100-bit `handles_mask` for `MAX_ADAPTERS = 100`;
+    check `FILTER_CRC` vs `FILTER_ADD_REMOVE` in `forget_stale_filters` for `(aid, 1)`;
+    non-sleeping `Dvbapi::flush`), `ciplus/{crypto.rs:71-79, cc.rs:356-423, 577-634,
+    asn1.rs:4-12, authdata.rs:68}` (check `OsRng::fill`; bound `data_req_loop`/`encode_len` at
+    `0xFFFF`; `index >= MAX_PAIRS`), `descramble/csa.rs:64` (fallible `dvbcsa_bs_key_alloc`),
+    `session.rs:1227` & `ssdp.rs:654-662` & `fifo.rs:130-146` & `writeq.rs:333` &
+    `ms-sched/src/lib.rs:1080` (checked `stream=` subtraction, `bootid.saturating_add(1)`,
+    clamped `Fifo::peek` and `prio_data.drain`, graceful lookup error),
+    `dataplane.rs:753-764, 1455, 1761-1773` (private `events()` receiver, skip `read == 0`/CI in
+    `record_read`, gate `standby_if_idle` on `!keep_reading`), `file.rs:194-233` (bound
+    `scanned` packets, guard truncated looping files and unfiltered PCR pacing), and
+    `ms-log/src/diag/mod.rs:314-322` (reset `HEARTBEAT_STARTED`/`FLUSH_STARTED` in `diag::stop`)
+  - [ ] Harness & FakeCAM (`ms-harness`, `ms-fakecam`): `fakeoscam.rs:32-48, 63, 138-145`
+    (guard `< 13`-byte `CA_PMT` frames and stop listener threads on drop across `--runs N`),
+    `runner.rs:59-67, 604-611` (write `capture_file` once before parallel `thread::scope` A/B
+    runs), `client.rs:259-264` (`end.checked_add(length)`), `fakecam.rs:77-85` (join serving
+    thread before `remove_dir_all`), `diff.rs:40` (emit `@@` when `start == 0`),
+    `ms-fakecam/src/host.rs:45` (`data.first().copied().unwrap_or(0)` in `tpdu`), and
+    `ms-fakecam/src/ciplus.rs:656-658` (fallible `rand_fill`)
 - [ ] Decide on upstream proposal vs separate project
 
 ## 8. Hardware matrix
@@ -325,6 +440,9 @@ Unvalidated rows must be called out in release notes.
 - DDCI CI-write tail flushing and MTD shaping (`catalinii/minisatip#1437` / `#1447`
   revisit at M10: "Biased Idle-Edge Writer Task", "Underflow Stuffing in an MTD
   Token-Bucket Shaper", decoupled per-CI writer queue)
+- Verified 2026-11-19 multi-model code review items (see M10 checklist: `V-01`–`V-14` Rust port
+  fixes, `U-01`–`U-09` upstream C++ `DEV-xxx` / PR candidates, `LOW` hardening and
+  `ms-harness`/`ms-fakecam` hygiene)
 - Prometheus metrics endpoint
 - Typed config file alongside CLI flags
 - JSON status API
