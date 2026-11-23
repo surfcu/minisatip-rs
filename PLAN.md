@@ -233,7 +233,7 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
   service and letting `HostEvent::ReleasePmts` re-offer active PMTs without restarting
   `minisatip-rs` or disturbing FTA/other-CA streams (recorded as a `DEV-xxx` row in
   `docs/deviations.md`)
-- [ ] Fix DDCI mandatory `PID 1` (CAT) & `PID 20` (TDT/TOT) multi-PMT reference tracking
+- [x] Fix DDCI mandatory `PID 1` (CAT) & `PID 20` (TDT/TOT) multi-PMT reference tracking
   and cross-adapter ownership/handover (`crates/ms-ca-drivers/src/ddci/mod.rs`
   `Ddci::process_pmt` / `del_pmt_mapping_table`, inherited from C++ `ddci.cpp:561-573`):
   (1) always attach every active same-adapter `pmt.id` to `(ad, 1)` and `(ad, 20)` so
@@ -257,101 +257,101 @@ Each milestone lists exit criteria. Tick only when all criteria hold.
   the CAM bitrate ceiling and stuff null packets only on shaper underflow / alignment
   edges rather than after every tuner batch), recorded as a `DEV-xxx` row in
   `docs/deviations.md` if adopted
-- [ ] Upstream #1565 (`fix-1565-ddci-sdt17`): reserve DDCI PID 17 for generated SDT and
+- [x] Upstream #1565 (`fix-1565-ddci-sdt17`): reserve DDCI PID 17 for generated SDT and
   ignore transponder PID 0/17 mappings (avoiding the `dd_ad[0] = 17` reverse-table
   overwrite and CI-side PID 0 teardown traps)
 - [ ] Upstream #1558 (`88bf2fe`): late-CW / scrambled-burst margin diagnostics (`DEV-163`)
 - [ ] Upstream #1527 (`b78943f`): `enigma-ddci` MTD DVR loopback over `/dev/ciN` on 4K
   Enigma2 receivers (port or record as out-of-scope deviation; also sync #1548
   `key_ecmpids` when bumping the C++ harness baseline)
-- [ ] Multi-model code review fixes — Rust port bugs (`V-01`–`V-14`, verified 2026-11-19):
-  - [ ] `V-01` (`crates/ms-ca-drivers/src/en50221/sys.rs:9-12, 121-137`): derive `CA_RESET` and
+- [x] Multi-model code review fixes — Rust port bugs (`V-01`–`V-14`, verified 2026-11-19):
+  - [x] `V-01` (`crates/ms-ca-drivers/src/en50221/sys.rs:9-12, 121-137`): derive `CA_RESET` and
     `CA_GET_SLOT_INFO` from `ms_tuner::linux_dvb::NATIVE` instead of hardcoded `asm-generic`
     `0x6F80`/`0x800C_6F82` so `mipsel` gets `0x2000_6F80`/`0x400C_6F82` instead of `ENOTTY`
-  - [ ] `V-02` (`crates/ms-net/src/srt_ffi.rs:78-90` `pre_accept`): drop `pending.lock()` before
+  - [x] `V-02` (`crates/ms-net/src/srt_ffi.rs:78-90` `pre_accept`): drop `pending.lock()` before
     calling `ms_srt::close(replaced)` and `ms_srt::set_flag(ns, SockOpt::SndTimeo, ...)` to
     preserve `srt.cpp:38` `libsrt` lock-order safety
-  - [ ] `V-03` (`crates/ms-sched/src/pmt.rs:2222-2253` `Scheduler::process_pmt`): run
+  - [x] `V-03` (`crates/ms-sched/src/pmt.rs:2222-2253` `Scheduler::process_pmt`): run
     `ParsedPmt::parse(section, CrcCheck::Skip)` before `release_pmt_claims` and `pmt.caids = 0`
     so a single malformed section with `version != pmt.version` cannot wipe `caids` without
     advancing `pmt.version`
-  - [ ] `V-04` (`crates/minisatip/src/runtime.rs:2464-2475, 644-650` `spawn_ddci_adapters`,
+  - [x] `V-04` (`crates/minisatip/src/runtime.rs:2464-2475, 644-650` `spawn_ddci_adapters`,
     `add_satip_adapter`): allocate only where `scheduler.adapter(aid).is_none() &&
     handles[aid].is_none()` so DDCI and SAT>IP client adapters never overwrite `-e`-disabled or
     failed-to-open DVB slots (`DEV-258`)
-  - [ ] `V-05` (`crates/ms-tuner/src/satipc/driver.rs:702-707, 757-771`,
+  - [x] `V-05` (`crates/ms-tuner/src/satipc/driver.rs:702-707, 757-771`,
     `crates/ms-tuner/src/satipc/media.rs:111-124, 185-209`): bound `Driver::rbuf` and
     `TcpDemux::data` RTSP headers/bodies and include `demux.buffered()` in `Driver::poll`
     backpressure so an unfinished/oversized SAT>IP server response resets via `rtsp_eof()` instead
     of growing to OOM (`panic = "abort"`)
-  - [ ] `V-06` (`crates/minisatip/src/runtime.rs:1279-1301, 1405-1438, 1465-1474, 1583-1608`,
+  - [x] `V-06` (`crates/minisatip/src/runtime.rs:1279-1301, 1405-1438, 1465-1474, 1583-1608`,
     `crates/ms-net/src/dataplane.rs:613-626`): cache per-adapter `SetThreshold` values so
     `update_thresholds()` only sends on change instead of flooding `MAX_PENDING_COMMANDS` (4096)
     on every request, and exempt/retry rejected `StopOutput`, `StartOutput`,
     `ReplaceUdpSockets`, `SetSsrc` and `SetPids` transitions
-  - [ ] `V-07` (`crates/ms-net/src/bandwidth.rs:154-173`,
+  - [x] `V-07` (`crates/ms-net/src/bandwidth.rs:154-173`,
     `crates/ms-net/src/dataplane.rs:1242-1316, 1374-1408`): keep cumulative `tbw` outside
     `Window::default()` 1 s resets (`DEV-174`), compute `stats.octets`/`packets` deltas modulo
     `u32` across 4 GiB wraps, and fold/clear `bandwidth_marks[&sid]` on `StopOutput`/`StartOutput`
-  - [ ] `V-08` (`crates/ms-tuner/src/linux_dvb/backend.rs:683-714, 842-861`
+  - [x] `V-08` (`crates/ms-tuner/src/linux_dvb/backend.rs:683-714, 842-861`
     `LinuxDvbTuner::tune`): clear `self.partial` alongside `self.psi` on every tune and reset the
     `SignalStatus` placeholder on failed tunes so old-transponder partial packets and stale lock
     levels never cross retunes
-  - [ ] `V-09` (`crates/ms-tuner/src/satipc/driver.rs:505-516, 617-624, 881-887, 944-952,
+  - [x] `V-09` (`crates/ms-tuner/src/satipc/driver.rs:505-516, 617-624, 881-887, 944-952,
     980-993`): clear `self.tcp_ts` in `tune_open`, `drop_rtsp_socket`, `Op::CloseData` and
     `standby`, and gate the `Transport::Tcp` arm of `read_media` on `!self.client.ignore_packets`
-  - [ ] `V-10` (`crates/ms-tuner/src/satipc/driver.rs:368-495, 535-542`): move `open_srt()` DNS
+  - [x] `V-10` (`crates/ms-tuner/src/satipc/driver.rs:368-495, 535-542`): move `open_srt()` DNS
     resolution (`to_socket_addrs`) and blocking `ms_srt::connect` outside the `Driver` mutex
     under `connect_epoch`
-  - [ ] `V-11` (`crates/minisatip/src/ca.rs:438-448, 478-480` `CaRuntime::sync_ddci`): record
+  - [x] `V-11` (`crates/minisatip/src/ca.rs:438-448, 478-480` `CaRuntime::sync_ddci`): record
     `(aid, pid)` in `link.mirrored` only when `sched.mark_pid_add(aid, DDCI_SID, pid) >= 0` (and
     set `ok = false` on rejection) so DDCI PID claims retry when adapter PID slots free up
-  - [ ] `V-12` (`crates/ms-net/src/output.rs:733-744` `poll_rtcp`,
+  - [x] `V-12` (`crates/ms-net/src/output.rs:733-744` `poll_rtcp`,
     `crates/ms-tuner/src/linux_dvb/backend.rs:633-668, 827-841` `read_sections`): cap per-tick
     RTCP datagram drains and per-`read` demux section reads / `self.psi` backlog so UDP/PSI
     floods cannot starve `DataPlane::run`
-  - [ ] `V-13` (`crates/ms-net/src/session.rs:197, 1490-1579`,
+  - [x] `V-13` (`crates/ms-net/src/session.rs:197, 1490-1579`,
     `crates/minisatip/src/runtime.rs`): populate `AdapterState::name` (`ad_adapter_names`),
     `WebSnapshot::satipc` (`ad_satip`, `ad_satip_transport_type`), and `-1` `st_overflow` for
     enabled streams without an output socket
-  - [ ] `V-14` (`crates/ms-tuner/src/netceiver/backend.rs:109-134` `NetceiverTuner::del_pid`,
+  - [x] `V-14` (`crates/ms-tuner/src/netceiver/backend.rs:109-134` `NetceiverTuner::del_pid`,
     parked): iterate `0..self.lp` and zero vacated tail slots so slot `MAX_PIDS - 1` (127) can be
     deleted and stale tail entries cannot decrement `self.lp`
-- [ ] Multi-model code review fixes — inherited upstream C++ `28dfd78` bugs (`U-01`–`U-09`,
+- [x] Multi-model code review fixes — inherited upstream C++ `28dfd78` bugs (`U-01`–`U-09`,
   verified 2026-11-19; record each adopted fix as a `DEV-xxx` row in `docs/deviations.md` and
   evaluate upstream PRs):
-  - [ ] `U-01` (`crates/ms-ca-drivers/src/en50221/device.rs:462-466, 593`,
+  - [x] `U-01` (`crates/ms-ca-drivers/src/en50221/device.rs:462-466, 593`,
     `crates/ms-ca-drivers/src/en50221/apps.rs:343-362`, C++ `ca.cpp:839`): preserve forced `-c`/
     `--ca-channels` CAIDs across `teardown()` instead of clearing `self.caids` while keeping
     `has_forced_caids = true` (which leaves reconnects with an empty CAID list)
-  - [ ] `U-02` (`crates/minisatip/src/dvbca.rs:1180` `HostEvent::CaSessionClosed`, C++
+  - [x] `U-02` (`crates/minisatip/src/dvbca.rs:1180` `HostEvent::CaSessionClosed`, C++
     `ca.cpp:2845-2850`): call `capmt.release_pmts()` and emit `Notice::Released` when the CAM
     closes its CA Support session so `Running` PMTs clear `ca_mask` and re-offer on reopen
-  - [ ] `U-03` (`crates/ms-config/src/parse.rs:1520-1616` `parse_signal_multiplier`, C++
+  - [x] `U-03` (`crates/ms-config/src/parse.rs:1520-1616` `parse_signal_multiplier`, C++
     `adapter.cpp:2111-2170`): locate the strength/SNR `-` separator after `:`, expand documented
     `ad1-ad2` adapter ranges (`-M 4-6:1.2-1.3`), reset `SignalForce` per comma token, and apply
     wildcard `*` `SignalForce` (`-M *:%1.0-#1.0`)
-  - [ ] `U-04` (`crates/ms-ca-drivers/src/en50221/device.rs:880-980, 1007-1098`, C++
+  - [x] `U-04` (`crates/ms-ca-drivers/src/en50221/device.rs:880-980, 1007-1098`, C++
     `ca.cpp:3752-3837`): buffer `T_DATA_MORE` fragments across separate `read()` calls until
     `T_DATA_LAST` and loop `handle_spdu` over multiple SPDUs in a single Enigma `/dev/ciN` read
-  - [ ] `U-05` (`crates/ms-ca-drivers/src/en50221/device.rs:1001-1004`
+  - [x] `U-05` (`crates/ms-ca-drivers/src/en50221/device.rs:1001-1004`
     `find_session_for_resource`, C++ `ca.cpp:3403-3409`): search `0..MAX_SESSIONS` instead of
     `1..MAX_SESSIONS` so slot 0 (wire session 1) is not skipped
-  - [ ] `U-06` (`crates/ms-ca-drivers/src/ddci/mod.rs:1861-1872` `prepare_device_maps`, C++
+  - [x] `U-06` (`crates/ms-ca-drivers/src/ddci/mod.rs:1861-1872` `prepare_device_maps`, C++
     `ddci.cpp:1213-1214`): track per-adapter FIFO initialization explicitly instead of overloading
     `read_index == 0` so the very first CAM output batch after startup (`write_index` `0 -> N`)
     is not discarded
-  - [ ] `U-07` (`crates/ms-ts/src/section.rs:56-129` `SectionAssembler::assemble_packet`, C++
+  - [x] `U-07` (`crates/ms-ts/src/section.rs:56-129` `SectionAssembler::assemble_packet`, C++
     `pmt.cpp:1864-1866`): reset `pos`/`expected`/`synced` (keeping `last_len`) after returning a
     section so trailing non-PUSI packets do not re-emit the completed section
-  - [ ] `U-08` (`crates/ms-ca-drivers/src/dvbapi/client.rs:603-634` `dmx_stop`, C++
+  - [x] `U-08` (`crates/ms-ca-drivers/src/dvbapi/client.rs:603-634` `dmx_stop`, C++
     `dvbapi.cpp:341-345`): decrement `k.ecms` only inside `if let Some(slot) = index`
-  - [ ] `U-09` (`crates/ms-ca-drivers/src/en50221/ciplus/crypto.rs:286-305`
+  - [x] `U-09` (`crates/ms-ca-drivers/src/en50221/ciplus/crypto.rs:286-305`
     `get_bin_from_nibble`, C++ `ca.cpp:659-670`): restrict hex ranges to `b'A'..=b'F'` and
     `b'a'..=b'f'`
 - [ ] Multi-model code review fixes — `LOW` hardening & `ms-harness`/`ms-fakecam` hygiene
   (verified 2026-11-19):
-  - [ ] Production `LOW`: `satipc/client.rs:624, 1051` (`u32::from_be_bytes` for RTCP SR packet
+  - [x] Production `LOW`: `satipc/client.rs:624, 1051` (`u32::from_be_bytes` for RTCP SR packet
     count; emit `pol=none` when `pol_specified && pol == Polarization::None`),
     `ms-net/src/satip.rs:49-120` (preserve existing `TuneParams` fields on invalid re-SETUP
     tokens), `runtime.rs:684-712, 2955-2957, 3015-3017, 226` (`detach_stream_conns` in
@@ -453,11 +453,27 @@ Unvalidated rows must be called out in release notes.
 
 - **Current milestone:** M9 (parity hardening). M0–M8 items are in place; the open exit
   criteria are listed below.
-- **Deployed (2026-10-24, updated 2026-11-17):** minisatip-rs replaces the C++ build on both boxes.
+- **Deployed (2026-10-24, updated 2026-11-23):** minisatip-rs replaces the C++ build on both boxes.
   - Both the main box (8 DVB-S2 tuners, DuoFlex CI) and the enigma2 box (armv7, `-E` and
     `diag-log`, no CAM on that box) run `main` with all M9 parity/review fixes below.
   - Logs from both boxes and tvheadend go to a central Loki/Grafana host.
-- **Last session (2026-11-17):** merged:
+- **Last session (2026-11-23, pre-soak M10 batch):** implemented on `rs/pre-soak-m10-fixes`:
+  - `V-01`–`V-14` Rust port fixes (mipsel `CA_RESET`/`CA_GET_SLOT_INFO` ioctls, SRT lock order,
+    non-destructive PMT parse order, `-e`-disabled slot preservation, bounded `satipc` RTSP/TCP
+    backpressure, cached `SetThreshold` + exempt commands, persistent `tbw` + `u32` wrap/fold,
+    tune `partial`/`SignalStatus` cleanup, `satipc` TCP reset/gate, non-blocking `open_srt`,
+    `sync_ddci` retry gating, RTCP/section polling caps, `AdapterState::name`/web `satipc`/
+    `-1` `st_overflow`, parked `netceiver` `del_pid` bounds).
+  - Production `LOW` hardening (`satipc` BE RTCP SR & `pol=none`, `satip.rs` merge validation,
+    fallible `satip-xml`/`ssdp` threads, `detach_stream_conns` & `Inbound::Closed`, DDCI
+    `programs.del` & unlocked `channels` pruning, `ca.rs` `u128` handle mask, flag-checked
+    `forget_stale_filters` & non-blocking `Dvbapi::flush`, CI+ RNG/`encode_len`/`MAX_PAIRS`,
+    fallible `Csa`, `AdapterHandle::recv_event_timeout` & `keep_reading` gates, bounded replay
+    scan, `diag::stop` resets).
+  - DDCI mandatory `PID 1`/`20` single-owner handover + `#1565` `PID 0`/`17` reservation (`DEV-297`),
+    explicit `read_index_init` tracking (`U-06`/`DEV-298`), and inherited C++ `28dfd78` fixes
+    `U-01`–`U-05` & `U-07`–`U-09` (`DEV-299`–`DEV-300`).
+- **Prior session (2026-11-17):** merged:
   - DDCI synthetic `PID 18` EIT `start_time` encoded directly in EN 300 468 UTC 4-bit BCD
     (`DEV-293`), eliminating local-timezone forward shift and invalid raw-binary BCD nibbles.
   - Balanced `cam_stuck` + `cam_single_stuck` detection (`DEV-284`): host RF lock, continuity

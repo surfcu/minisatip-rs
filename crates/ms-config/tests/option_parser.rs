@@ -773,3 +773,29 @@ fn fbc_hosts_bind_adapters_2_to_7_to_adapter_0() {
     );
     assert!(ms_config::parse_args(&argv(&[])).options.slaves.is_empty());
 }
+
+#[test]
+fn signal_multiplier_supports_ranges_per_token_force_reset_and_wildcard_force() {
+    let opts = parse(&["-M", "4-6:%1.2-#1.3,7:1.5-2.0"]);
+    assert_eq!(opts.signal_multipliers.len(), 4);
+    for (idx, aid) in [4u8, 5, 6].into_iter().enumerate() {
+        let entry = &opts.signal_multipliers[idx];
+        assert_eq!(entry.adapter, aid);
+        assert!(approx(entry.strength, 1.2));
+        assert!(approx(entry.snr, 1.3));
+        assert!(entry.force.strength_percent);
+        assert!(entry.force.snr_decibel);
+    }
+    let seventh = &opts.signal_multipliers[3];
+    assert_eq!(seventh.adapter, 7);
+    assert!(approx(seventh.strength, 1.5));
+    assert!(approx(seventh.snr, 2.0));
+    assert!(!seventh.force.strength_percent && !seventh.force.snr_decibel);
+
+    let wild = parse(&["-M", "0:1.0-1.0", "-M", "*:%1.0-#1.0"]);
+    assert!(wild.signal_force.strength_percent);
+    assert!(wild.signal_force.snr_decibel);
+    assert!(!wild.signal_force.strength_decibel && !wild.signal_force.snr_percent);
+    assert!(wild.signal_multipliers[0].force.strength_percent);
+    assert!(wild.signal_multipliers[0].force.snr_decibel);
+}

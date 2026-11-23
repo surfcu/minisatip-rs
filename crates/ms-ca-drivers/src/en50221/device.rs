@@ -259,6 +259,7 @@ pub struct CaDevice {
     pub(super) link: Option<Box<dyn CaLink>>,
     pub(super) sock: Option<u64>,
     generation: u64,
+    tpdu_buf: Vec<u8>,
     pub(super) caids: Vec<u16>,
     pub has_forced_caids: bool,
     pub(super) sessions: [Option<Session>; MAX_SESSIONS],
@@ -366,6 +367,7 @@ impl CaDevice {
             link: None,
             sock: None,
             generation: 0,
+            tpdu_buf: Vec::new(),
             caids: Vec::new(),
             has_forced_caids: false,
             sessions: [None; MAX_SESSIONS],
@@ -590,7 +592,10 @@ impl CaDevice {
         self.sessions = [None; MAX_SESSIONS];
         self.key = [[0; 16]; 2];
         self.iv = [[0; 16]; 2];
-        self.caids.clear();
+        if !self.has_forced_caids {
+            self.caids.clear();
+        }
+        self.tpdu_buf.clear();
         self.poll_fails = 0;
         self.datetime_next_send = 0;
         self.pending_tag = 0;
@@ -893,13 +898,14 @@ impl CaDevice {
                 ms_log::hexdump(Some("INVALID LENGTH: "), &data[..len]);
                 break;
             }
-            if out.len() + asn_len > MAX_TPDU {
+            if out.len() + self.tpdu_buf.len() + asn_len > MAX_TPDU {
                 // C++ prints the socket buffer bound (`*rb + buf_len`).
                 ms_log::log!(
                     "Received data for CA {} larger than socket buffer (len {})",
                     self.id,
                     MAX_TPDU
                 );
+                self.tpdu_buf.clear();
                 break;
             }
             let body = &d[2 + lfl..1 + lfl + asn_len];
@@ -923,7 +929,15 @@ impl CaDevice {
                         "Got \"Request Transport Connection\" from Module ->currently not handled!"
                     );
                 }
-                T_DATA_MORE | T_DATA_LAST => out.extend_from_slice(body),
+                T_DATA_MORE => self.tpdu_buf.extend_from_slice(body),
+                T_DATA_LAST => {
+                    if self.tpdu_buf.is_empty() {
+                        out.extend_from_slice(body);
+                    } else {
+                        self.tpdu_buf.extend_from_slice(body);
+                        out.append(&mut self.tpdu_buf);
+                    }
+                }
                 T_SB => {
                     if body.first().is_some_and(|b| b & 0x80 != 0) {
                         self.write_tpdu(T_RCV, &[]);
@@ -998,109 +1012,125 @@ impl CaDevice {
         Some(idx)
     }
 
-    /// `find_session_for_resource`; like C++ it never looks at session 1.
+    /// `find_session_for_resource`: scans every session slot starting from index 0.
     pub fn find_session_for_resource(&self, resource: u32) -> Option<usize> {
-        (1..MAX_SESSIONS).find(|&i| self.sessions[i].is_some_and(|s| s.resource == resource))
+        (0..MAX_SESSIONS).find(|&i| self.sessions[i].is_some_and(|s| s.resource == resource))
     }
 
-    /// `ca_read`: one SPDU from the CAM.
+    /// `ca_read`: all complete SPDUs carried by a CAM buffer.
     pub fn handle_spdu(&mut self, data: &[u8]) {
         ms_log::hexdump!("CAREAD", data);
-        let Some(&tag) = data.first() else {
+        if data.is_empty() {
             return;
-        };
+        }
         if self.state == CaState::Inactive {
             self.state = CaState::Active;
         }
         self.poll_fails = 0;
-        let Some((len, llen)) = decode_len(&data[1..]) else {
-            ms_log::log!(
-                "Invalid SPDU length {:02X} {:02X} {:02X}",
-                data.get(1).copied().unwrap_or(0),
-                data.get(2).copied().unwrap_or(0),
-                data.get(3).copied().unwrap_or(0)
-            );
-            return;
-        };
-        let start = 1 + llen + len;
-        match tag {
-            ST_OPEN_SESSION_REQUEST => {
-                let Some(r) = data.get(2..6) else {
-                    return;
-                };
-                let resource = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
-                let idx = self.new_session(resource);
-                let status = if idx.is_some() { 0 } else { SS_NOT_FOUND };
-                let number = idx.map_or(-1, |i| i as i32 + 1);
-                let name = idx
-                    .and_then(|i| self.sessions[i])
-                    .map_or("none", |s| s.handler.name);
+        let mut rest = data;
+        while let Some(&tag) = rest.first() {
+            let Some((len, llen)) = decode_len(&rest[1..]) else {
                 ms_log::log!(
-                    "Found session_number {} for resource {:06X}, name {}, status {:02X}",
-                    number,
-                    resource,
-                    name,
-                    status
+                    "Invalid SPDU length {:02X} {:02X} {:02X}",
+                    rest.get(1).copied().unwrap_or(0),
+                    rest.get(2).copied().unwrap_or(0),
+                    rest.get(3).copied().unwrap_or(0)
                 );
-                let mut pkt = vec![status];
-                pkt.extend_from_slice(&resource.to_be_bytes());
-                self.write_spdu(number, ST_OPEN_SESSION_RESPONSE, &pkt, &[]);
-                if let Some(idx) = idx {
-                    self.app_create(idx, resource);
-                }
+                return;
+            };
+            let start = 1 + llen + len;
+            if start > rest.len() {
+                return;
             }
-            ST_CLOSE_SESSION_REQUEST => {
-                let Some(b) = data.get(2..4) else {
-                    return;
-                };
-                let number = u16::from_be_bytes([b[0], b[1]]);
-                if number < 1 || usize::from(number) > MAX_SESSIONS {
-                    ms_log::log!("CA {}: bad session {}, dropping", self.id, number);
-                    return;
+            match tag {
+                ST_OPEN_SESSION_REQUEST => {
+                    let Some(r) = rest.get(1 + llen..1 + llen + 4) else {
+                        return;
+                    };
+                    let resource = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
+                    let idx = self.new_session(resource);
+                    let status = if idx.is_some() { 0 } else { SS_NOT_FOUND };
+                    let number = idx.map_or(-1, |i| i as i32 + 1);
+                    let name = idx
+                        .and_then(|i| self.sessions[i])
+                        .map_or("none", |s| s.handler.name);
+                    ms_log::log!(
+                        "Found session_number {} for resource {:06X}, name {}, status {:02X}",
+                        number,
+                        resource,
+                        name,
+                        status
+                    );
+                    let mut pkt = vec![status];
+                    pkt.extend_from_slice(&resource.to_be_bytes());
+                    self.write_spdu(number, ST_OPEN_SESSION_RESPONSE, &pkt, &[]);
+                    if let Some(idx) = idx {
+                        self.app_create(idx, resource);
+                    }
+                    rest = &rest[start..];
                 }
-                let idx = usize::from(number) - 1;
-                // C++ prints a zeroed `handler.name` as glibc's "(null)".
-                let name = self.sessions[idx].map_or("(null)", |s| s.handler.name);
-                ms_log::log!("Received close session {}", name);
-                if self.sessions[idx].is_some() {
-                    self.app_close(idx);
+                ST_CLOSE_SESSION_REQUEST => {
+                    let Some(b) = rest.get(1 + llen..1 + llen + 2) else {
+                        return;
+                    };
+                    let number = u16::from_be_bytes([b[0], b[1]]);
+                    if number < 1 || usize::from(number) > MAX_SESSIONS {
+                        ms_log::log!("CA {}: bad session {}, dropping", self.id, number);
+                        return;
+                    }
+                    let idx = usize::from(number) - 1;
+                    // C++ prints a zeroed `handler.name` as glibc's "(null)".
+                    let name = self.sessions[idx].map_or("(null)", |s| s.handler.name);
+                    ms_log::log!("Received close session {}", name);
+                    if self.sessions[idx].is_some() {
+                        self.app_close(idx);
+                    }
+                    if self.pending_session == number {
+                        self.clear_pending();
+                    }
+                    if self.pending_tag == 0 {
+                        self.pending_since = self.now();
+                    }
+                    self.sessions[idx] = None;
+                    let mut pkt = vec![0];
+                    pkt.extend_from_slice(&number.to_be_bytes());
+                    self.write_spdu(i32::from(number), ST_CLOSE_SESSION_RESPONSE, &pkt, &[]);
+                    rest = &rest[start..];
                 }
-                if self.pending_session == number {
-                    self.clear_pending();
+                ST_SESSION_NUMBER => {
+                    let Some(b) = rest.get(1 + llen..3 + llen) else {
+                        return;
+                    };
+                    let number = u16::from_be_bytes([b[0], b[1]]);
+                    ms_log::debugm!("got ST_SESSION_NUMBER for session_number {}", number);
+                    if number < 1 || usize::from(number) > MAX_SESSIONS {
+                        ms_log::log!("CA {}: bad session {}, dropping", self.id, number);
+                        return;
+                    }
+                    let idx = usize::from(number) - 1;
+                    let tail = &rest[start..];
+                    let consumed = if self.sessions[idx].is_some() {
+                        self.read_apdu(idx, tail)
+                    } else {
+                        ms_log::log!("CA {}: session {} is not registered", self.id, number);
+                        apdu_chain_len(tail)
+                    };
+                    rest = &rest[start + consumed..];
                 }
-                if self.pending_tag == 0 {
-                    self.pending_since = self.now();
-                }
-                self.sessions[idx] = None;
-                let mut pkt = vec![0];
-                pkt.extend_from_slice(&number.to_be_bytes());
-                self.write_spdu(i32::from(number), ST_CLOSE_SESSION_RESPONSE, &pkt, &[]);
+                ST_OPEN_SESSION_RESPONSE
+                | ST_CREATE_SESSION
+                | ST_CREATE_SESSION_RESPONSE
+                | ST_CLOSE_SESSION_RESPONSE => rest = &rest[start..],
+                _ => return,
             }
-            ST_SESSION_NUMBER => {
-                let Some(b) = data.get(1 + llen..3 + llen) else {
-                    return;
-                };
-                let number = u16::from_be_bytes([b[0], b[1]]);
-                ms_log::debugm!("got ST_SESSION_NUMBER for session_number {}", number);
-                if number < 1 || usize::from(number) > MAX_SESSIONS {
-                    ms_log::log!("CA {}: bad session {}, dropping", self.id, number);
-                    return;
-                }
-                let idx = usize::from(number) - 1;
-                if self.sessions[idx].is_some() {
-                    self.read_apdu(idx, data.get(start..).unwrap_or(&[]));
-                } else {
-                    ms_log::log!("CA {}: session {} is not registered", self.id, number);
-                }
-            }
-            _ => {}
         }
     }
 
-    /// `ca_read_apdu`: every APDU of the SPDU goes to the session's handler.
-    pub fn read_apdu(&mut self, idx: usize, mut data: &[u8]) {
+    /// `ca_read_apdu`: every APDU of the SPDU goes to the session's handler; returns bytes consumed.
+    pub fn read_apdu(&mut self, idx: usize, mut data: &[u8]) -> usize {
         ms_log::hexdump!("APDU", data);
-        while data.len() >= 4 {
+        let total = data.len();
+        while data.len() >= 4 && data[0] == 0x9F {
             let Some((len, llen)) = decode_len(&data[3..]) else {
                 ms_log::log!(
                     "Invalid APDU length {:02X} {:02X} {:02X}",
@@ -1108,14 +1138,14 @@ impl CaDevice {
                     data.get(4).copied().unwrap_or(0),
                     data.get(5).copied().unwrap_or(0)
                 );
-                return;
+                break;
             };
             let tag = u32::from_be_bytes([0, data[0], data[1], data[2]]);
             let Some(body) = data.get(3 + llen..3 + llen + len) else {
-                return;
+                break;
             };
             let Some(session) = self.sessions[idx] else {
-                return;
+                break;
             };
             let number = session.number;
             ms_log::log!(
@@ -1134,6 +1164,7 @@ impl CaDevice {
             self.app_apdu(idx, tag, body);
             data = &data[3 + llen + len..];
         }
+        total - data.len()
     }
 
     /// `ca_timeout`, run every second: keepalive poll, DATE_TIME resend, watchdog.
@@ -2021,6 +2052,20 @@ pub const CAM_RECOVERY_MIN_GAP_MS: i64 = 600_000;
 pub const CAM_RECOVERY_LAG_MS: i64 = 2_000;
 /// The silent per-service path needs at least this long a stuck run (ms).
 pub const SILENT_MIN_RUN_MS: i64 = 30_000;
+
+fn apdu_chain_len(mut data: &[u8]) -> usize {
+    let total = data.len();
+    while data.len() >= 4 && data[0] == 0x9F {
+        let Some((len, llen)) = decode_len(&data[3..]) else {
+            break;
+        };
+        let Some(rest) = data.get(3 + llen + len..) else {
+            break;
+        };
+        data = rest;
+    }
+    total - data.len()
+}
 
 /// Hook the CAM transport (dvbca) uses to hand CA_PMT bodies to this CAM.
 pub trait CaPmtSink {

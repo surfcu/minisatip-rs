@@ -63,10 +63,10 @@ impl DerefMut for DdciGuard<'_> {
 
 impl Drop for DdciGuard<'_> {
     fn drop(&mut self) {
-        if let Some(guard) = self.guard.take()
+        if let Some(mut guard) = self.guard.take()
             && self.mutated
         {
-            DdciHub::sync_flags(&guard, self.flags);
+            DdciHub::sync_flags(&mut guard, self.flags);
         }
     }
 }
@@ -97,17 +97,28 @@ impl DdciHub {
         }
     }
 
-    fn sync_flags(state: &DdciState, flags: &DdciFlags) {
+    fn sync_flags(state: &mut DdciState, flags: &DdciFlags) {
         let enabled = state.ddci.devices.values().filter(|d| d.enabled).count();
         flags.enabled_devices.store(enabled, Ordering::Relaxed);
         for aid in 0..MAX_ADAPTERS {
             let is_ci = state.ddci.devices.contains_key(&aid);
-            let is_mapped = state.ddci.devices.values().any(|d| {
-                d.enabled
+            let mut is_mapped = false;
+            for d in state.ddci.devices.values_mut() {
+                let mapped = d.enabled
                     && d.mapping
                         .values()
-                        .any(|m| usize::from(m.ad) == aid && m.rewrite)
-            });
+                        .any(|m| usize::from(m.ad) == aid && m.rewrite);
+                if mapped {
+                    is_mapped = true;
+                } else {
+                    if let Some(ri) = d.read_index.get_mut(aid) {
+                        *ri = 0;
+                    }
+                    if let Some(init) = d.read_index_init.get_mut(aid) {
+                        *init = false;
+                    }
+                }
+            }
             flags.ci_adapter[aid].store(is_ci, Ordering::Relaxed);
             flags.mapped_adapter[aid].store(is_mapped, Ordering::Relaxed);
         }
@@ -1360,10 +1371,44 @@ mod growth_tests {
             0,
             "CAM output left in the FIFO"
         );
-        // All but two batches came back: the first reply predates the adapter's
-        // first read, which starts at the write index (ddci.cpp:1179), and the
-        // last batch is still at the CAM.
-        assert_eq!(delivered, BATCH * (BATCHES - 2));
+        // Startup batch 0 (`write_index` 0 -> N) is delivered too; only the last batch is at the CAM.
+        assert_eq!(delivered, BATCH * (BATCHES - 1));
+    }
+
+    #[test]
+    fn first_cam_output_batch_after_startup_is_not_discarded() {
+        let hub = DdciHub::new();
+        hub.open_device(
+            1,
+            Box::new(Loopback(Arc::new(Mutex::new(Vec::new())))),
+            true,
+        );
+        let mut stage = DdciStage::new(hub.clone(), 0);
+        hub.lock().ddci.devices.get_mut(&1).unwrap().enabled = true;
+        hub.lock().ddci.add_pid_mapping_table(0, 1000, 1, 1, false);
+
+        // First input batch warms `read_index_init` at `write_index == 0`; CAM reply starts at 0.
+        let mut tx = vec![0xFFu8; 188];
+        tx[0] = 0x47;
+        tx[3] = 0x10;
+        set_pid_ts(&mut tx, 1000);
+        stage.process_buf(&mut tx, 16 * 188);
+
+        let mut cam_reply = vec![0x5Au8; 188];
+        cam_reply[0] = 0x47;
+        cam_reply[3] = 0x10;
+        set_pid_ts(&mut cam_reply, 1000);
+        hub.lock().ddci.push_from_cam(1, &cam_reply);
+
+        let mut next = vec![0x11u8; 188];
+        next[0] = 0x47;
+        next[3] = 0x10;
+        set_pid_ts(&mut next, 500);
+        stage.process_buf(&mut next, 16 * 188);
+        assert!(
+            next.chunks(188).any(|p| p == cam_reply.as_slice()),
+            "startup CAM batch at write_index 0..188 must reach adapter buffer"
+        );
     }
 
     #[test]

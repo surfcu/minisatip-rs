@@ -197,6 +197,7 @@ pub struct DdciDevice {
     pub cat_processed: bool,
     pub cat_owner: Option<u16>,
     pub read_index: Vec<u64>,
+    pub read_index_init: Vec<bool>,
     pub last_pat: u64,
     pub last_sdt: u64,
     pub psi_changed: bool,
@@ -228,6 +229,7 @@ impl DdciDevice {
             cat_processed: false,
             cat_owner: None,
             read_index: vec![0; MAX_ADAPTERS],
+            read_index_init: vec![false; MAX_ADAPTERS],
             last_pat: 0,
             last_sdt: 0,
             psi_changed: false,
@@ -782,10 +784,19 @@ impl Ddci {
             self.release_mapping_entry(dev_id, ad, pmt, &m);
         }
         self.drop_orphan_emm(dev, ad);
-        if let Some(d) = self.devices.get_mut(&dev)
-            && !d.mapping.values().any(|m| m.ad == ad)
-        {
-            d.adapter_ecm_pkts.remove(&ad);
+        if let Some(d) = self.devices.get_mut(&dev) {
+            if !d.mapping.values().any(|m| m.ad == ad) {
+                d.adapter_ecm_pkts.remove(&ad);
+            }
+            if !d.mapping.values().any(|m| m.ad == ad && m.rewrite) {
+                let ad_idx = usize::from(ad);
+                if let Some(ri) = d.read_index.get_mut(ad_idx) {
+                    *ri = 0;
+                }
+                if let Some(init) = d.read_index_init.get_mut(ad_idx) {
+                    *init = false;
+                }
+            }
         }
         self.handover_cat_owner(dev, ad);
     }
@@ -1974,13 +1985,21 @@ impl Ddci {
             if let Some(ri) = d.read_index.get_mut(ad_idx) {
                 *ri = 0;
             }
+            if let Some(init) = d.read_index_init.get_mut(ad_idx) {
+                *init = false;
+            }
             return None;
         }
-        // Start at the write index so old FIFO data is not read.
-        if let Some(ri) = d.read_index.get_mut(ad_idx)
-            && *ri == 0
+        // Start at the write index once per mapping epoch so startup write 0..N is kept.
+        if let (Some(ri), Some(init)) = (
+            d.read_index.get_mut(ad_idx),
+            d.read_index_init.get_mut(ad_idx),
+        ) && !*init
         {
-            *ri = d.fifo.write_index;
+            if *ri == 0 {
+                *ri = d.fifo.write_index;
+            }
+            *init = true;
         }
         let mut ecm_pids = [0u64; 128];
         for program in programs.iter().filter(|p| p.adapter == aid) {

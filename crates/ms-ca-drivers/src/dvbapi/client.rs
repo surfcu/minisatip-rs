@@ -626,9 +626,9 @@ impl DvbapiClient {
                 self.events.push_back(CaEvent::StopFilter { id });
             }
             f.pid = -1;
-        }
-        if k.ecms > 0 {
-            k.ecms -= 1;
+            if k.ecms > 0 {
+                k.ecms -= 1;
+            }
         }
         k.last_dmx_stop = now;
     }
@@ -1302,6 +1302,23 @@ mod tests {
         assert_eq!(k.algo, CwAlgo::Des);
         set_algo(&mut k, CW_ALGO_CSA_ALT, 0);
         assert_eq!(k.algo, CwAlgo::Csa);
+    }
+
+    #[test]
+    fn dmx_stop_decrements_ecms_only_for_matched_filter() {
+        let mut client = DvbapiClient::new(DvbapiConfig::default());
+        client.keys.push(Key::default());
+        client.keys[0].enabled = true;
+        client.keys[0].ecms = 1;
+        client.keys[0].filters[0].pid = 0x100;
+        client.keys[0].filters[0].demux = 0;
+        client.keys[0].filters[0].filter = 2;
+
+        client.dmx_stop(client.cfg.offset as u8, 0, 9, 0x100, 100);
+        assert_eq!(client.keys[0].ecms, 1);
+
+        client.dmx_stop(client.cfg.offset as u8, 0, 2, 0x100, 101);
+        assert_eq!(client.keys[0].ecms, 0);
     }
 }
 

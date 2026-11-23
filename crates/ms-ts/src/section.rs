@@ -124,8 +124,12 @@ impl SectionAssembler {
             }
             return None;
         }
-        self.last_len = self.expected;
-        Some(&self.buf[..self.expected])
+        let len = self.expected;
+        self.last_len = len;
+        self.pos = 0;
+        self.expected = 0;
+        self.synced = false;
+        Some(&self.buf[..len])
     }
 
     /// Feeds one packet and emits every complete section through `on_section`.
@@ -274,5 +278,25 @@ mod tests {
         assert_eq!(sections, 0);
         let mut assembled = SectionAssembler::new(true);
         assert!(assembled.assemble_packet(&packet).is_none());
+    }
+
+    #[test]
+    fn assemble_packet_resets_after_completion_so_trailing_non_pusi_does_not_reemit() {
+        let mut p1 = [0xFFu8; 188];
+        p1[..5].copy_from_slice(&[0x47, 0x40, 0x10, 0x10, 0x00]);
+        let mut sec = [0x42u8, 0x80, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00];
+        let crc = crc32_mpeg2(&sec[..4]);
+        sec[4..8].copy_from_slice(&crc.to_be_bytes());
+        p1[5..13].copy_from_slice(&sec);
+
+        let mut p2 = [0xFFu8; 188];
+        p2[..4].copy_from_slice(&[0x47, 0x00, 0x10, 0x11]);
+
+        let mut asm = SectionAssembler::new(true);
+        assert_eq!(asm.assemble_packet(&p1), Some(&sec[..]));
+        assert_eq!(asm.data(), &sec[..]);
+        assert!(!asm.is_synced());
+        assert_eq!(asm.assemble_packet(&p2), None);
+        assert_eq!(asm.data(), &sec[..]);
     }
 }

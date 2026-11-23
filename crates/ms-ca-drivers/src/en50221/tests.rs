@@ -178,7 +178,7 @@ fn ca_teardown_releases_pmts() {
     assert_eq!(d.state, CaState::Inactive, "state reset");
     assert!(!d.has_link(), "fd reset");
     assert_eq!(d.sock(), None, "sock reset");
-    assert!(d.caids().is_empty(), "caids cleared");
+    assert_eq!(d.caids(), &[1, 2, 3], "forced caids survive teardown");
     assert_eq!(d.poll_fails, 0, "poll fails cleared");
     assert_eq!(d.datetime_next_send, 0, "datetime resend due");
     assert_eq!(d.pending_tag, 0, "pending tag cleared");
@@ -943,4 +943,101 @@ fn truncated_spdus_are_dropped() {
     d.sessions[0] = session(1, EN50221_APP_RM_RESOURCEID);
     d.handle_spdu(&[0x90, 0x02, 0x00, 0x01, 0x9F, 0x80, 0x10, 0x05, 0x00]);
     assert!(link.take_writes().is_empty());
+}
+
+#[test]
+fn forced_caids_survive_teardown_while_cam_caids_clear() {
+    let (_, mut d) = dev(0);
+    d.set_forced_caids(&[0x0B00, 0x0500]);
+    d.teardown();
+    assert_eq!(d.caids(), &[0x0B00, 0x0500]);
+
+    let (_, mut unforced) = dev(1);
+    unforced.caids.push(0x0B00);
+    unforced.teardown();
+    assert!(unforced.caids().is_empty());
+}
+
+#[test]
+fn find_session_for_resource_includes_slot_0() {
+    let (_, mut d) = dev(0);
+    d.sessions[0] = session(1, EN50221_APP_AI_RESOURCEID);
+    assert_eq!(
+        d.find_session_for_resource(EN50221_APP_AI_RESOURCEID),
+        Some(0)
+    );
+}
+
+#[test]
+fn read_tpdu_reassembles_t_data_more_across_separate_reads() {
+    let (_, mut d) = dev(0);
+    let m = Mock::default();
+    d.set_link(m.boxed());
+
+    // First read carries T_DATA_MORE + T_SB(0x80); second read carries T_DATA_LAST.
+    m.push_read(Ok(vec![0, 1, T_DATA_MORE, 3, 1, 9, 8, T_SB, 2, 1, 0x80]));
+    m.push_read(Ok(vec![0, 1, T_DATA_LAST, 2, 1, 7]));
+
+    assert_eq!(d.read_tpdu(), ReadOutcome::Data(Vec::new()));
+    assert_eq!(m.take_writes(), [vec![0, 1, T_RCV, 1, 1]]);
+    assert_eq!(d.read_tpdu(), ReadOutcome::Data(vec![9, 8, 7]));
+}
+
+#[test]
+fn handle_spdu_processes_concatenated_spdus_in_one_read() {
+    let (_, mut d) = dev(0);
+    let link = Mock::default();
+    d.set_link(link.boxed());
+    d.mode = LinkMode::Enigma;
+
+    // Concatenate two ST_OPEN_SESSION_REQUEST SPDUs (RM + AI).
+    let open_two = [
+        ST_OPEN_SESSION_REQUEST,
+        0x04,
+        0x00,
+        0x01,
+        0x00,
+        0x41,
+        ST_OPEN_SESSION_REQUEST,
+        0x04,
+        0x00,
+        0x02,
+        0x00,
+        0x41,
+    ];
+    d.handle_spdu(&open_two);
+    assert_eq!(
+        d.find_session_for_resource(EN50221_APP_RM_RESOURCEID),
+        Some(0)
+    );
+    assert_eq!(
+        d.find_session_for_resource(EN50221_APP_AI_RESOURCEID),
+        Some(1)
+    );
+    let writes = link.take_writes();
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|w| w.first() == Some(&ST_OPEN_SESSION_RESPONSE))
+            .count(),
+        2
+    );
+
+    // Concatenate ST_SESSION_NUMBER + APDU with ST_CLOSE_SESSION_REQUEST in one buffer.
+    let apdu_and_close = [
+        ST_SESSION_NUMBER,
+        0x02,
+        0x00,
+        0x02,
+        0x9F,
+        0x80,
+        0x20,
+        0x00,
+        ST_CLOSE_SESSION_REQUEST,
+        0x02,
+        0x00,
+        0x01,
+    ];
+    d.handle_spdu(&apdu_and_close);
+    assert_eq!(d.find_session_for_resource(EN50221_APP_RM_RESOURCEID), None);
 }

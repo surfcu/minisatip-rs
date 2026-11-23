@@ -2810,6 +2810,24 @@ fn diseqc_params(opts: &Options, aid: usize) -> DiseqcParams {
 
 /// Applies per-adapter state the backend reads but the scheduler does not.
 #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
+fn signal_force_bits(force: ms_config::SignalForce) -> u8 {
+    let mut bits = TUNER_FORCE_NO;
+    if force.strength_percent {
+        bits |= TUNER_FORCE_STRENGTH_PERCENT;
+    }
+    if force.strength_decibel {
+        bits |= TUNER_FORCE_STRENGTH_DECIBEL;
+    }
+    if force.snr_percent {
+        bits |= TUNER_FORCE_SNR_PERCENT;
+    }
+    if force.snr_decibel {
+        bits |= TUNER_FORCE_SNR_DECIBEL;
+    }
+    bits
+}
+
+#[cfg(all(feature = "linux-dvb", target_os = "linux"))]
 fn apply_tuner_options(
     opts: &Options,
     aid: usize,
@@ -2833,26 +2851,11 @@ fn apply_tuner_options(
     state.master_source = slave_masters(opts)[aid].map_or(-1, |master| master as i32);
     state.diseqc_multi = diseqc_multi;
     let (strength, snr, force) = match signal {
-        Some(entry) => {
-            let mut force = TUNER_FORCE_NO;
-            if entry.force.strength_percent {
-                force |= TUNER_FORCE_STRENGTH_PERCENT;
-            }
-            if entry.force.strength_decibel {
-                force |= TUNER_FORCE_STRENGTH_DECIBEL;
-            }
-            if entry.force.snr_percent {
-                force |= TUNER_FORCE_SNR_PERCENT;
-            }
-            if entry.force.snr_decibel {
-                force |= TUNER_FORCE_SNR_DECIBEL;
-            }
-            (entry.strength, entry.snr, force)
-        }
+        Some(entry) => (entry.strength, entry.snr, signal_force_bits(entry.force)),
         None => (
             opts.strength_multiplier,
             opts.snr_multiplier,
-            TUNER_FORCE_NO,
+            signal_force_bits(opts.signal_force),
         ),
     };
     state.strength_multiplier = strength;
@@ -3320,6 +3323,18 @@ mod tests {
         assert_eq!(settings.signal_multipliers(0), (1.0, 1.0));
         assert_eq!(settings.signal_multipliers(2), (0.0, 1.0));
         assert_eq!(settings.signal_multipliers(3), (0.0, 0.0));
+    }
+
+    #[cfg(all(feature = "linux-dvb", target_os = "linux"))]
+    #[test]
+    fn wildcard_signal_force_maps_to_tuner_bits() {
+        let bits = signal_force_bits(SignalForce {
+            strength_percent: true,
+            strength_decibel: false,
+            snr_percent: false,
+            snr_decibel: true,
+        });
+        assert_eq!(bits, TUNER_FORCE_STRENGTH_PERCENT | TUNER_FORCE_SNR_DECIBEL);
     }
 
     // src_satipc.cpp:605: only both-zero multipliers hide the server signal.

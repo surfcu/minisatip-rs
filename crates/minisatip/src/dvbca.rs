@@ -1165,7 +1165,7 @@ impl Worker {
                     }
                     let _ = self.notices.send(Notice::Caids(id, caids));
                 }
-                HostEvent::ReleasePmts => {
+                HostEvent::ReleasePmts | HostEvent::CaSessionClosed => {
                     capmt.state = ms_ca::CaState::Inactive;
                     let released = capmt.release_pmts();
                     dev.cam_recovery_pmts_changed();
@@ -1177,7 +1177,6 @@ impl Worker {
                         let _ = self.notices.send(Notice::Released(released));
                     }
                 }
-                HostEvent::CaSessionClosed => capmt.state = ms_ca::CaState::Inactive,
                 // The C++ MMI logs live in APP_MMI_handler (en50221/apps.rs).
                 // A requested page is no CAM error: no capture.
                 HostEvent::MmiMenu {
@@ -4539,6 +4538,64 @@ mod ciplus_worker_tests {
                     if pmts == &[(program.id, program.generation)]
             )),
             "a released PMT keeps its generation: {released:?}"
+        );
+    }
+
+    #[test]
+    fn ca_session_closed_releases_active_pmts() {
+        let cam = Arc::new(Mutex::new(FakeCam::new(
+            CamConfig::default(),
+            Arc::new(ms_fakecam::ManualClock::new(0)),
+        )));
+        let clock = Arc::new(ManualClock::new(0, UNIX));
+        let worker_clock: Arc<dyn Clock> = clock.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            DvbcaSettings::default(),
+            Box::new(CiOpener {
+                cam: Arc::clone(&cam),
+                cert_dir: PathBuf::new(),
+            }),
+            worker_clock,
+            tx,
+        );
+        worker.handle(Request::Init(AdapterInfo::dvb(0, 0, 0)));
+        worker.service();
+        let _ = drain(&rx);
+
+        let program = program_from_service(&service());
+        let mut offered = false;
+        for _ in 0..10 {
+            let (reply, answers) = mpsc::channel();
+            worker.handle(Request::AddPmt {
+                program: Box::new(program.clone()),
+                update: false,
+                reply,
+            });
+            if answers.recv().ok() == Some(TablesResult::Ok) {
+                offered = true;
+                break;
+            }
+            worker.service();
+        }
+        assert!(offered, "the CAM accepts the offered PMT");
+        let _ = drain(&rx);
+
+        assert!(
+            cam.lock()
+                .unwrap()
+                .request_close(ms_ca_drivers::en50221::consts::EN50221_APP_CA_RESOURCEID)
+        );
+        worker.registry.get_mut(0).unwrap().timeout();
+        worker.service();
+        let released = drain(&rx);
+        assert!(
+            released.iter().any(|notice| matches!(
+                notice,
+                Notice::Released(pmts)
+                    if pmts == &[(program.id, program.generation)]
+            )),
+            "closing the CA session must release offered PMTs: {released:?}"
         );
     }
 }

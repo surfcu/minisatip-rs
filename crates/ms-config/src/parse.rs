@@ -1518,27 +1518,18 @@ impl Parser<'_> {
     }
 
     fn parse_signal_multiplier(&mut self, value: &str) {
-        let mut force = SignalForce::default();
         for token in split_terms(value, ',') {
-            let wildcard = token.starts_with('*');
-            let adapter = if wildcard {
-                None
-            } else {
-                let adapter = parse_int(token, -1);
-                if !adapter_in_range(adapter) {
-                    continue;
-                }
-                self.mark_allocated(adapter);
-                Some(adapter as u8)
-            };
+            let mut force = SignalForce::default();
             let Some(colon) = token.find(':') else {
                 continue;
             };
-            let Some(dash) = token.find('-') else {
+            let ad_spec = &token[..colon];
+            let value_part = &token[colon + 1..];
+            let Some(rel_dash) = value_part.find('-') else {
                 continue;
             };
-            let strength_text = &token[colon + 1..];
-            let snr_text = &token[dash + 1..];
+            let strength_text = &value_part[..rel_dash];
+            let snr_text = &value_part[rel_dash + 1..];
             let strength = match strength_text.as_bytes().first() {
                 Some(b'%') => {
                     force.strength_percent = true;
@@ -1564,54 +1555,47 @@ impl Parser<'_> {
             if strength < 0.0 || snr < 0.0 {
                 continue;
             }
-            if let Some(adapter) = adapter {
-                upsert_by(
-                    &mut self.opts.signal_multipliers,
-                    adapter,
-                    SignalMultiplier {
-                        adapter,
-                        strength,
-                        snr,
-                        force,
-                    },
-                    |entry| entry.adapter,
-                );
-            } else {
+            if ad_spec.starts_with('*') {
                 self.opts.strength_multiplier = strength;
                 self.opts.snr_multiplier = snr;
+                apply_wildcard_signal_force(&mut self.opts.signal_force, force);
                 for entry in &mut self.opts.signal_multipliers {
                     entry.strength = strength;
                     entry.snr = snr;
+                    apply_wildcard_signal_force(&mut entry.force, force);
+                }
+                log_signal_multiplier(-1, force, strength, snr);
+            } else {
+                let range = if ad_spec.contains('-') {
+                    let (start, end) = adapter_range(ad_spec);
+                    if !adapter_in_range(start) || !adapter_in_range(end) || start > end {
+                        continue;
+                    }
+                    range_bounds(start, end)
+                } else {
+                    let adapter = parse_int(ad_spec, -1);
+                    if !adapter_in_range(adapter) {
+                        continue;
+                    }
+                    adapter..=adapter
+                };
+                for adapter in range {
+                    self.mark_allocated(adapter);
+                    let aid = adapter as u8;
+                    upsert_by(
+                        &mut self.opts.signal_multipliers,
+                        aid,
+                        SignalMultiplier {
+                            adapter: aid,
+                            strength,
+                            snr,
+                            force,
+                        },
+                        |entry| entry.adapter,
+                    );
+                    log_signal_multiplier(adapter, force, strength, snr);
                 }
             }
-            let mut force_text = String::new();
-            if force.strength_percent
-                || force.strength_decibel
-                || force.snr_percent
-                || force.snr_decibel
-            {
-                force_text.push_str(" (forcing driver:");
-                if force.strength_percent {
-                    force_text.push_str(" strength_in_percentage");
-                }
-                if force.strength_decibel {
-                    force_text.push_str(" strength_in_decibels");
-                }
-                if force.snr_percent {
-                    force_text.push_str(" snr_in_percentage");
-                }
-                if force.snr_decibel {
-                    force_text.push_str(" snr_in_decibels");
-                }
-                force_text.push(')');
-            }
-            ms_log::log!(
-                "Setting signal multipler for adapter {}{} strength_multiplier {:.2} snr_multiplier {:.2}",
-                adapter.map_or(-1, i32::from),
-                force_text,
-                strength,
-                snr
-            );
         }
     }
 
@@ -1832,6 +1816,44 @@ fn log_level(term: &str) -> Option<usize> {
         }
     }
     found
+}
+
+fn apply_wildcard_signal_force(dst: &mut SignalForce, src: SignalForce) {
+    if src.strength_percent || src.strength_decibel {
+        dst.strength_percent = src.strength_percent;
+        dst.strength_decibel = src.strength_decibel;
+    }
+    if src.snr_percent || src.snr_decibel {
+        dst.snr_percent = src.snr_percent;
+        dst.snr_decibel = src.snr_decibel;
+    }
+}
+
+fn log_signal_multiplier(adapter: i32, force: SignalForce, strength: f32, snr: f32) {
+    let mut force_text = String::new();
+    if force.strength_percent || force.strength_decibel || force.snr_percent || force.snr_decibel {
+        force_text.push_str(" (forcing driver:");
+        if force.strength_percent {
+            force_text.push_str(" strength_in_percentage");
+        }
+        if force.strength_decibel {
+            force_text.push_str(" strength_in_decibels");
+        }
+        if force.snr_percent {
+            force_text.push_str(" snr_in_percentage");
+        }
+        if force.snr_decibel {
+            force_text.push_str(" snr_in_decibels");
+        }
+        force_text.push(')');
+    }
+    ms_log::log!(
+        "Setting signal multipler for adapter {}{} strength_multiplier {:.2} snr_multiplier {:.2}",
+        adapter,
+        force_text,
+        strength,
+        snr
+    );
 }
 
 fn adapter_in_range(adapter: i32) -> bool {

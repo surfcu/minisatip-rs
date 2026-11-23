@@ -293,8 +293,8 @@ pub fn add_padding(buf: &mut Vec<u8>, len_from: usize, block: usize) {
 fn get_bin_from_nibble(nibble: u8) -> u8 {
     match nibble {
         b'0'..=b'9' => nibble - b'0',
-        b'A'..=b'Z' => nibble - b'A' + 10,
-        b'a'..=b'z' => nibble - b'a' + 10,
+        b'A'..=b'F' => nibble - b'A' + 10,
+        b'a'..=b'f' => nibble - b'a' + 10,
         _ => {
             ms_log::log!("fixme: unsupported chars in hostid");
             0
@@ -564,8 +564,10 @@ mod tests {
             str2bin(b"0123456789ABCDEF"),
             vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
         );
-        assert_eq!(str2bin(b"xy"), vec![0x32]);
-        assert_eq!(str2bin(b"zz"), vec![0x33]);
+        assert_eq!(str2bin(b"abcdef"), vec![0xab, 0xcd, 0xef]);
+        assert_eq!(str2bin(b"Gg"), vec![0]);
+        assert_eq!(str2bin(b"xy"), vec![0]);
+        assert_eq!(str2bin(b"zz"), vec![0]);
         assert_eq!(str2bin(b"??"), vec![0]);
     }
 

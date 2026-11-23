@@ -451,6 +451,8 @@ pub struct Options {
     pub strength_multiplier: f32,
     /// `-M` default SNR multiplier.
     pub snr_multiplier: f32,
+    /// `-M *:` signal display forcing flags.
+    pub signal_force: SignalForce,
     /// Enigma2 mode (default detection is not done by the parser).
     pub enigma: bool,
     /// `--hw-descrambler`.
@@ -621,6 +623,7 @@ impl Default for Options {
             use_demux_device: 0,
             strength_multiplier: 1.0,
             snr_multiplier: 1.0,
+            signal_force: SignalForce::default(),
             enigma: false,
             hw_descrambler: false,
             satip_servers: None,
