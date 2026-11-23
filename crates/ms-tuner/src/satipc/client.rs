@@ -620,22 +620,21 @@ impl Client {
     /// `satipc_rtcp_reply` signal part: parses the `SES1` APP payload.
     pub fn rtcp_reply(&mut self, b: &[u8]) {
         self.rtsp_socket_closed = false;
-        if b.len() >= 24 && b[0] == 0x80 && b[1] == 0xC8 {
-            let rp = u32::from_ne_bytes([b[20], b[21], b[22], b[23]]);
-            if self.transport == Transport::Udp {
-                self.repno = self.repno.wrapping_add(1);
-                if self.repno.is_multiple_of(100) {
-                    // satipc.cpp:642-646; ad->pid_err is not modelled.
-                    let missing = rp.wrapping_sub(self.rcvp) as i32;
-                    ms_log::log!(
-                        "satipc: rtp report, adapter {}: rtcp missing packets {}, rtp missing {}, rtp ooo {}, pid unknown {}",
-                        self.id,
-                        missing,
-                        self.rtp_miss,
-                        self.rtp_ooo,
-                        0
-                    );
-                }
+        if let Some(rp) = rtcp_sr_packet_count(b)
+            && self.transport == Transport::Udp
+        {
+            self.repno = self.repno.wrapping_add(1);
+            if self.repno.is_multiple_of(100) {
+                // satipc.cpp:642-646; ad->pid_err is not modelled.
+                let missing = rp.wrapping_sub(self.rcvp) as i32;
+                ms_log::log!(
+                    "satipc: rtp report, adapter {}: rtcp missing packets {}, rtp missing {}, rtp ooo {}, pid unknown {}",
+                    self.id,
+                    missing,
+                    self.rtp_miss,
+                    self.rtp_ooo,
+                    0
+                );
             }
         }
         let (mut sm, mut rp) = (0usize, 0usize);
@@ -1048,7 +1047,15 @@ impl Client {
             "mtype",
             tp.mtype_specified.then(|| modulation_name(tp.mtype)),
         );
-        fill_str(&mut url, "pol", pol_name(tp.pol));
+        fill_str(
+            &mut url,
+            "pol",
+            if tp.pol_specified && tp.pol == Polarization::None {
+                Some("none")
+            } else {
+                pol_name(tp.pol)
+            },
+        );
         if tp.sr != 0 {
             let _ = write!(url, "&sr={}", tp.sr / 1000);
         }
@@ -1528,6 +1535,11 @@ fn tmode_name(tmode: i32) -> &'static str {
         .unwrap_or("")
 }
 
+fn rtcp_sr_packet_count(b: &[u8]) -> Option<u32> {
+    (b.len() >= 24 && b[0] == 0x80 && b[1] == 0xC8)
+        .then(|| u32::from_be_bytes([b[20], b[21], b[22], b[23]]))
+}
+
 fn pls_mode_name(mode: i32) -> &'static str {
     match mode {
         0 => "root",
@@ -1540,6 +1552,26 @@ fn pls_mode_name(mode: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtcp_sr_packet_count_is_big_endian_and_s2_url_emits_pol_none() {
+        let mut sr = [0u8; 24];
+        sr[0] = 0x80;
+        sr[1] = 0xC8;
+        sr[20..24].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        assert_eq!(rtcp_sr_packet_count(&sr), Some(0x0102_0304));
+
+        let mut client = Client::new(0, "h", 554);
+        client.transport = Transport::Udp;
+        client.repno = 99;
+        client.rcvp = 0x0102_0300;
+        client.rtcp_reply(&sr);
+        assert_eq!(client.repno, 100);
+
+        client.tp.pol = Polarization::None;
+        client.tp.pol_specified = true;
+        assert!(client.s2_url().contains("pol=none"));
+    }
 
     #[test]
     fn c2_frequency_rounds_like_printf() {

@@ -57,15 +57,31 @@ pub struct Csa {
 unsafe impl Send for Csa {}
 
 impl Csa {
-    /// Allocates a key; `icam` selects `dvbcsa_bs_key_set_ecm` in `set_cw`.
-    pub fn new(icam: bool) -> Self {
-        // SAFETY: plain allocation without arguments; the result is checked on use.
+    /// Allocates a key; returns `None` if `libdvbcsa` allocation fails.
+    pub fn try_new(icam: bool) -> Option<Self> {
+        // SAFETY: plain allocation without arguments; checked for null before wrapping.
         let key = unsafe { dvbcsa_bs_key_alloc() };
-        assert!(!key.is_null(), "dvbcsa_bs_key_alloc failed");
-        Self { key, icam }
+        if key.is_null() {
+            return None;
+        }
+        Some(Self { key, icam })
+    }
+
+    /// Allocates a key; logs and leaves key unallocated on allocation failure.
+    pub fn new(icam: bool) -> Self {
+        Self::try_new(icam).unwrap_or_else(|| {
+            ms_log::log!("dvbcsa_bs_key_alloc failed");
+            Self {
+                key: std::ptr::null_mut(),
+                icam,
+            }
+        })
     }
 
     fn run(&self, payloads: &mut [&mut [u8]], encrypt: bool) {
+        if self.key.is_null() {
+            return;
+        }
         // SAFETY: no arguments; returns a constant of the library.
         let size = unsafe { dvbcsa_bs_batch_size() }.max(1) as usize;
         let mut batch = Vec::with_capacity(size + 1);
@@ -99,6 +115,9 @@ impl Csa {
 
 impl Cipher for Csa {
     fn set_cw(&mut self, key: &KeyMaterial) {
+        if self.key.is_null() {
+            return;
+        }
         let cw = key.cw.as_ptr();
         #[cfg(feature = "dvbcsa-icam")]
         if self.icam {
@@ -118,7 +137,9 @@ impl Cipher for Csa {
 
 impl Drop for Csa {
     fn drop(&mut self) {
-        // SAFETY: allocated by dvbcsa_bs_key_alloc and freed exactly once.
-        unsafe { dvbcsa_bs_key_free(self.key) };
+        if !self.key.is_null() {
+            // SAFETY: allocated by dvbcsa_bs_key_alloc and freed exactly once.
+            unsafe { dvbcsa_bs_key_free(self.key) };
+        }
     }
 }

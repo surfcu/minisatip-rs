@@ -334,10 +334,9 @@ impl CaSink for DdciSink {
 
     fn del_pmt(&mut self, service: &CaService) -> TablesResult {
         let program = crate::dvbca::program_from_service(service);
-        self.hub
-            .lock()
-            .ddci
-            .del_pmt(service.adapter as u16, &program);
+        let mut hub = self.hub.lock();
+        hub.ddci.del_pmt(service.adapter as u16, &program);
+        hub.programs.del(service.pmt_id as i32);
         TablesResult::Ok
     }
 }

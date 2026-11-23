@@ -49,12 +49,17 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
     for token in split_tokens(query, '&') {
         let (key, value) = token.split_once('=').unwrap_or((token, ""));
         match key {
-            "msys" => params.msys = delivery_system(value),
+            "msys" => {
+                if let Some(msys) = delivery_system_opt(value) {
+                    params.msys = msys;
+                }
+            }
             "freq" => params.freq = parse_float(value, 1_000.0),
             "pol" => {
-                params.pol = polarization(value);
-                params.pol_specified =
-                    matches!(value.to_ascii_lowercase().as_str(), "v" | "h" | "r" | "l");
+                if let Some(pol) = parse_polarization(value) {
+                    params.pol = pol;
+                    params.pol_specified = true;
+                }
             }
             "sr" => {
                 let sr = parse_int_prefix(value, 0);
@@ -71,7 +76,11 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
                 // `src=0` is unset, like `tp->diseqc = d ? optional(d) : nullopt`.
                 params.src_specified = src != 0;
             }
-            "ro" => params.ro = rolloff(value),
+            "ro" => {
+                if let Some(ro) = rolloff(value) {
+                    params.ro = Some(ro);
+                }
+            }
             "mtype" => {
                 if let Some(mtype) = modulation(value) {
                     params.mtype = mtype;
@@ -84,9 +93,21 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
                     params.fec_specified = true;
                 }
             }
-            "plts" => params.plts = pilot(value),
-            "gi" => params.gi = guard_interval(value),
-            "tmode" => params.tmode = transmission_mode(value),
+            "plts" => {
+                if let Some(plts) = pilot(value) {
+                    params.plts = Some(plts);
+                }
+            }
+            "gi" => {
+                if let Some(gi) = guard_interval(value) {
+                    params.gi = Some(gi);
+                }
+            }
+            "tmode" => {
+                if let Some(tmode) = transmission_mode(value) {
+                    params.tmode = Some(tmode);
+                }
+            }
             "bw" => params.bw = Some(bandwidth(value)),
             "specinv" => params.specinv = Some(parse_int_prefix(value, 0)),
             "c2tft" => params.c2tft = Some(parse_int_prefix(value, 0)),
@@ -94,7 +115,11 @@ fn apply_satip_url(url: &str, params: &mut TuneParams) -> ParseReport {
             "plp" | "isi" => params.plp = Some(parse_int_prefix(value, 0)),
             "t2id" => params.t2id = Some(parse_int_prefix(value, 0)),
             "sm" => params.sm = Some(parse_int_prefix(value, 0)),
-            "plsm" => params.plsm = pls_mode(value),
+            "plsm" => {
+                if let Some(plsm) = pls_mode(value) {
+                    params.plsm = Some(plsm);
+                }
+            }
             "plsc" => params.plsc = Some(parse_int_prefix(value, 0)),
             "x_pmt" => {
                 let pmt = parse_int_prefix(value, -1);
@@ -219,40 +244,40 @@ fn parse_pids_list(value: &str) -> PidSet {
     pids
 }
 
-fn delivery_system(value: &str) -> DeliverySystem {
+fn delivery_system_opt(value: &str) -> Option<DeliverySystem> {
     match value.to_ascii_lowercase().as_str() {
-        "undefined" => DeliverySystem::Undefined,
-        "dvbc" => DeliverySystem::DvbC,
-        "dvbcb" => DeliverySystem::Other(2),
-        "dvbt" => DeliverySystem::DvbT,
-        "dss" => DeliverySystem::Other(4),
-        "dvbs" => DeliverySystem::DvbS,
-        "dvbs2" => DeliverySystem::DvbS2,
-        "dvbh" => DeliverySystem::Other(7),
-        "isdbt" => DeliverySystem::Other(8),
-        "isdbs" => DeliverySystem::Other(9),
-        "isdbc" => DeliverySystem::Other(10),
-        "atsc" => DeliverySystem::Other(11),
-        "atscmh" => DeliverySystem::Other(12),
-        "dmbth" => DeliverySystem::Other(13),
-        "cmmb" => DeliverySystem::Other(14),
-        "dab" => DeliverySystem::Other(15),
-        "dvbt2" => DeliverySystem::DvbT2,
-        "turbo" => DeliverySystem::Other(17),
-        "dvbcc" => DeliverySystem::Other(18),
-        "dvbc2" => DeliverySystem::DvbC2,
-        _ => DeliverySystem::Undefined,
+        "undefined" => Some(DeliverySystem::Undefined),
+        "dvbc" => Some(DeliverySystem::DvbC),
+        "dvbcb" => Some(DeliverySystem::Other(2)),
+        "dvbt" => Some(DeliverySystem::DvbT),
+        "dss" => Some(DeliverySystem::Other(4)),
+        "dvbs" => Some(DeliverySystem::DvbS),
+        "dvbs2" => Some(DeliverySystem::DvbS2),
+        "dvbh" => Some(DeliverySystem::Other(7)),
+        "isdbt" => Some(DeliverySystem::Other(8)),
+        "isdbs" => Some(DeliverySystem::Other(9)),
+        "isdbc" => Some(DeliverySystem::Other(10)),
+        "atsc" => Some(DeliverySystem::Other(11)),
+        "atscmh" => Some(DeliverySystem::Other(12)),
+        "dmbth" => Some(DeliverySystem::Other(13)),
+        "cmmb" => Some(DeliverySystem::Other(14)),
+        "dab" => Some(DeliverySystem::Other(15)),
+        "dvbt2" => Some(DeliverySystem::DvbT2),
+        "turbo" => Some(DeliverySystem::Other(17)),
+        "dvbcc" => Some(DeliverySystem::Other(18)),
+        "dvbc2" => Some(DeliverySystem::DvbC2),
+        _ => None,
     }
 }
 
-fn polarization(value: &str) -> Polarization {
+fn parse_polarization(value: &str) -> Option<Polarization> {
     match value.to_ascii_lowercase().as_str() {
-        "v" => Polarization::Vertical,
-        "h" => Polarization::Horizontal,
-        "r" => Polarization::Right,
-        "l" => Polarization::Left,
-        "none" => Polarization::None,
-        _ => Polarization::None,
+        "v" => Some(Polarization::Vertical),
+        "h" => Some(Polarization::Horizontal),
+        "r" => Some(Polarization::Right),
+        "l" => Some(Polarization::Left),
+        "none" => Some(Polarization::None),
+        _ => None,
     }
 }
 
@@ -447,5 +472,30 @@ mod tests {
         );
         assert_eq!(params.src, 300);
         assert_eq!(params.src_value(), 300);
+    }
+
+    #[test]
+    fn merge_invalid_tokens_keep_existing_and_pol_none_marks_specified() {
+        let mut params = TuneParams::default();
+        parse_satip_url(
+            "rtsp://127.0.0.1/?freq=11727&pol=h&msys=dvbs2&ro=0.25&plts=on&gi=14&tmode=8k&plsm=gold",
+            &mut params,
+        );
+        merge_satip_url(
+            "rtsp://127.0.0.1/?msys=bogus&pol=bogus&ro=bogus&plts=bogus&gi=bogus&tmode=bogus&plsm=bogus",
+            &mut params,
+        );
+        assert_eq!(params.msys, DeliverySystem::DvbS2);
+        assert_eq!(params.pol, Polarization::Horizontal);
+        assert!(params.pol_specified);
+        assert_eq!(params.ro, Some(2));
+        assert_eq!(params.plts, Some(true));
+        assert_eq!(params.gi, Some(3));
+        assert_eq!(params.tmode, Some(1));
+        assert_eq!(params.plsm, Some(1));
+
+        merge_satip_url("rtsp://127.0.0.1/?pol=none", &mut params);
+        assert_eq!(params.pol, Polarization::None);
+        assert!(params.pol_specified);
     }
 }

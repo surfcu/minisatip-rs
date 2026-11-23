@@ -208,12 +208,19 @@ impl AesXcbcMac {
     }
 }
 
-/// `dh_gen_exp`: 256 random exponent bytes. A failed RNG leaves zeros; the
-/// OpenSSL RNG does not fail in practice and callers cannot distinguish it.
-pub fn dh_gen_exp(rng: &mut dyn Rng) -> [u8; 256] {
+/// `try_dh_gen_exp`: 256 random exponent bytes; returns `None` if the RNG fails.
+pub fn try_dh_gen_exp(rng: &mut dyn Rng) -> Option<[u8; 256]> {
     let mut out = [0u8; 256];
-    rng.fill(&mut out);
-    out
+    if !rng.fill(&mut out) {
+        wipe(&mut out);
+        return None;
+    }
+    Some(out)
+}
+
+/// `dh_gen_exp`: 256 random exponent bytes, zero-filled if the RNG fails.
+pub fn dh_gen_exp(rng: &mut dyn Rng) -> [u8; 256] {
+    try_dh_gen_exp(rng).unwrap_or([0u8; 256])
 }
 
 /// `dh_mod_exp`: `base ^ exp mod modulus`, left-padded to `out_len`.

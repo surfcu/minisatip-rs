@@ -133,10 +133,11 @@ impl Fifo {
             return (&[], &[]);
         }
         let start = self.read_index.saturating_add(relative_offset);
-        if start > self.write_index {
+        if start >= self.write_index {
             return (&[], &[]);
         }
-        let len = len.min((self.write_index - start) as usize);
+        let available = (self.write_index - start).min(size as u64) as usize;
+        let len = len.min(available);
         let offset = (start % size as u64) as usize;
         let first = len.min(size - offset);
         (
@@ -223,5 +224,8 @@ mod tests {
         assert_eq!(fifo.push(b"hello"), 5);
         assert_eq!(fifo.data().len(), 10 * 1024 * 1024);
         assert_eq!(fifo.peek(5, 0), (&b"hello"[..], &[][..]));
+        assert_eq!(fifo.peek(10, 5), (&[][..], &[][..]));
+        assert_eq!(fifo.peek(10, 8), (&[][..], &[][..]));
+        assert_eq!(fifo.peek(10, 2), (&b"llo"[..], &[][..]));
     }
 }

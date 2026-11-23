@@ -221,22 +221,30 @@ impl SatipXmlPoll {
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel);
-        self.fetched = Some(receiver);
-        self.started_at = Some(now);
-        self.cancel = Some(cancel);
-        thread::spawn(move || {
-            for url in urls {
-                if cancel_worker.load(Ordering::Relaxed) {
-                    break;
+        match thread::Builder::new()
+            .name("satip-xml".to_owned())
+            .spawn(move || {
+                for url in urls {
+                    if cancel_worker.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Ok((host, xml)) = fetch_satip_xml(&url)
+                        && (cancel_worker.load(Ordering::Relaxed)
+                            || sender.send((url, over_tcp, host, xml)).is_err())
+                    {
+                        break;
+                    }
                 }
-                if let Ok((host, xml)) = fetch_satip_xml(&url)
-                    && (cancel_worker.load(Ordering::Relaxed)
-                        || sender.send((url, over_tcp, host, xml)).is_err())
-                {
-                    break;
-                }
+            }) {
+            Ok(_) => {
+                self.fetched = Some(receiver);
+                self.started_at = Some(now);
+                self.cancel = Some(cancel);
             }
-        });
+            Err(error) => {
+                ms_log::log!("satip-xml thread spawn failed: {}", error);
+            }
+        }
     }
 }
 
@@ -697,6 +705,7 @@ impl Runtime {
                 .collect();
             for id in ids {
                 self.stop_output(id);
+                self.detach_stream_conns(id);
                 self.session.close_stream(id);
             }
             let stale: Vec<i32> = self
@@ -707,6 +716,7 @@ impl Runtime {
                 .collect();
             for id in stale {
                 self.stop_output(id);
+                self.detach_stream_conns(id);
                 self.session.close_stream(id);
             }
             if let Some(handle) = self.handles[aid].take() {
@@ -1833,7 +1843,12 @@ pub fn run(opts: &Options) -> Result<(), String> {
             bind_dev_ip,
         )
         .map_err(|error| format!("SSDP: {error}"))?;
-        Some(spawn_ssdp(ssdp_config, identity, io, Arc::clone(&shutdown)))
+        Some(spawn_ssdp(
+            ssdp_config,
+            identity,
+            io,
+            Arc::clone(&shutdown),
+        )?)
     };
 
     // minisatip.cpp:2018 writes the pid after initialisation; failures are
@@ -2998,7 +3013,7 @@ fn serve_connection(
     let mut chunk = [0u8; 4096];
     let mut reads = 0u64;
     let mut last_io = Instant::now();
-    while !shutdown.load(Ordering::SeqCst) {
+    'read: while !shutdown.load(Ordering::SeqCst) {
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
@@ -3024,7 +3039,7 @@ fn serve_connection(
                             };
                             buffer.drain(..consumed);
                             let Ok(writer) = stream.try_clone() else {
-                                return;
+                                break 'read;
                             };
                             let message = ConnectionRequest {
                                 conn_id,
@@ -3082,9 +3097,9 @@ fn spawn_ssdp(
     identity: SharedIdentity,
     io: UdpSsdpIo,
     shutdown: Arc<AtomicBool>,
-) -> BoundedThread {
+) -> Result<BoundedThread, String> {
     BoundedThread::spawn("ssdp", move || ssdp_loop(config, identity, io, shutdown))
-        .expect("spawn SSDP thread")
+        .map_err(|error| format!("SSDP: {error}"))
 }
 
 fn ssdp_loop(

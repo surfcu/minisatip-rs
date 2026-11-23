@@ -1246,7 +1246,7 @@ impl SessionManager {
         let mut selected = current.filter(|id| self.slot_index(*id).is_some());
         if let Some(position) = url.find("stream=") {
             do_all = false;
-            let number = parse_int_prefix(&url[position + "stream=".len()..], 0) - 1;
+            let number = parse_int_prefix(&url[position + "stream=".len()..], 0).saturating_sub(1);
             selected = self.slot_index(number).map(|index| index as StreamId);
             selected?;
         }

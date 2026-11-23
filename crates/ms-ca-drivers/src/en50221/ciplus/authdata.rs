@@ -62,10 +62,10 @@ impl fmt::Debug for Record {
     }
 }
 
-/// `get_authdata`: record `index` (0-based), `None` past `MAX_PAIRS` or when
-/// the file or a record up to `index` is missing, exactly like C++.
+/// `get_authdata`: record `index` (0-based), `None` past `MAX_PAIRS - 1` or when
+/// the file or a record up to `index` is missing, like C++.
 pub fn get_authdata(path: &Path, index: usize) -> Option<Record> {
-    if index > MAX_PAIRS {
+    if index >= MAX_PAIRS {
         return None;
     }
     let Ok(mut file) = File::open(path) else {
@@ -244,7 +244,12 @@ mod tests {
     #[test]
     fn index_past_max_pairs_is_none() {
         let path = temp_path("limit");
-        assert!(write_authdata(&path, &record(1)));
+        let mut data = Vec::with_capacity(RECORD_LEN * (MAX_PAIRS + 1));
+        for i in 0..=MAX_PAIRS {
+            data.extend_from_slice(&record(i as u8 + 1).as_bytes());
+        }
+        std::fs::write(&path, data).unwrap();
+        assert!(get_authdata(&path, MAX_PAIRS - 1).is_some());
         assert!(get_authdata(&path, MAX_PAIRS).is_none());
         assert!(get_authdata(&path, MAX_PAIRS + 1).is_none());
         std::fs::remove_file(path).ok();

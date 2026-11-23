@@ -319,6 +319,12 @@ pub fn stop() {
     FLUSH_STOP.store(true, Ordering::SeqCst);
     remote::stop();
     ring::stop();
+    if let Ok(mut started) = HEARTBEAT_STARTED.lock() {
+        *started = false;
+    }
+    if let Ok(mut started) = FLUSH_STARTED.lock() {
+        *started = false;
+    }
 }
 
 /// Stops everything and clears process-wide state; only for tests.

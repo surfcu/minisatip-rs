@@ -370,7 +370,7 @@ fn file_replay_to_udp_routes_only_subscribed_pids() {
     let mut stopped = None;
     while Instant::now() < deadline && stopped.is_none() {
         if let Ok(Event::OutputStopped(id, stats, _)) =
-            adapter.events().recv_timeout(Duration::from_millis(100))
+            adapter.recv_event_timeout(Duration::from_millis(100))
         {
             stopped = Some((id, stats));
         }
@@ -755,7 +755,7 @@ fn section_pids_are_tapped_and_stages_rewrite_the_batch() {
         if let Ok(Event::TablePackets {
             generation,
             packets,
-        }) = handle.events().recv_timeout(Duration::from_millis(100))
+        }) = handle.recv_event_timeout(Duration::from_millis(100))
         {
             tapped = Some((generation, packets));
         }

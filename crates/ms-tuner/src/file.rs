@@ -14,6 +14,7 @@ const MAX_PACING_LAG: Duration = Duration::from_millis(200);
 /// Fixed-bitrate reads return after this much audio/video time, so the caller
 /// can process commands (e.g. TEARDOWN) instead of blocking in `read`.
 const PACE_QUANTUM: Duration = Duration::from_millis(50);
+const MAX_SCAN_PACKETS: u64 = 8192;
 
 /// Pacing applied while replaying a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -193,6 +194,9 @@ impl Tuner for FileReplayTuner {
 
     fn read(&mut self, buf: &mut TsBuf) -> Result<usize> {
         let total_packets = self.file_len / TS_PACKET_SIZE as u64;
+        if total_packets == 0 {
+            return Ok(0);
+        }
         let mut written = 0;
         let mut scanned = 0u64;
         let mut packet = [0u8; TS_PACKET_SIZE];
@@ -204,7 +208,10 @@ impl Tuner for FileReplayTuner {
             _ => usize::MAX,
         };
 
-        while buf.remaining_bytes() >= TS_PACKET_SIZE && written < quantum {
+        while buf.remaining_bytes() >= TS_PACKET_SIZE
+            && written < quantum
+            && scanned < MAX_SCAN_PACKETS
+        {
             match read_packet(&mut self.file, &mut packet)? {
                 PacketRead::Full => {}
                 PacketRead::Eof => {
@@ -216,15 +223,15 @@ impl Tuner for FileReplayTuner {
                 }
             }
             scanned += 1;
+            if self.config.pacing == Pacing::Pcr {
+                self.pace_pcr(&packet);
+            }
             let pid = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
             if self.pids.contains(pid) {
                 if !buf.push_packet(&packet) {
                     break;
                 }
                 written += TS_PACKET_SIZE;
-                if self.config.pacing == Pacing::Pcr {
-                    self.pace_pcr(&packet);
-                }
             }
         }
 
@@ -266,4 +273,68 @@ fn pcr_base(packet: &[u8; TS_PACKET_SIZE]) -> Option<u64> {
             | (u64::from(packet[9]) << 1)
             | (u64::from(packet[10]) >> 7),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_ts_path(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ms-file-{tag}-{nanos}.ts"))
+    }
+
+    fn pcr_packet(pid: u16, pcr_base: u64) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = 0x47;
+        pkt[1] = ((pid >> 8) as u8) & 0x1F;
+        pkt[2] = pid as u8;
+        pkt[3] = 0x30;
+        pkt[4] = 7;
+        pkt[5] = 0x10;
+        pkt[6] = (pcr_base >> 25) as u8;
+        pkt[7] = (pcr_base >> 17) as u8;
+        pkt[8] = (pcr_base >> 9) as u8;
+        pkt[9] = (pcr_base >> 1) as u8;
+        pkt[10] = ((pcr_base & 1) as u8) << 7;
+        pkt
+    }
+
+    #[test]
+    fn empty_file_returns_zero_without_div_by_zero() {
+        let path = temp_ts_path("empty");
+        File::create(&path).unwrap();
+        let mut tuner = FileReplayTuner::open(&path, FileReplayConfig::default()).unwrap();
+        tuner.set_pids(&PidSet::from_pids([0])).unwrap();
+        let mut buf = TsBuf::with_packets(8);
+        assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn non_selected_pid_still_updates_pcr_and_scan_stops_at_bound() {
+        let path = temp_ts_path("bound");
+        let mut file = File::create(&path).unwrap();
+        let pkt0 = pcr_packet(99, 90_000);
+        for _ in 0..(MAX_SCAN_PACKETS + 5) {
+            file.write_all(&pkt0).unwrap();
+        }
+        file.flush().unwrap();
+
+        let cfg = FileReplayConfig {
+            looping: true,
+            pacing: Pacing::Pcr,
+        };
+        let mut tuner = FileReplayTuner::open(&path, cfg).unwrap();
+        tuner.set_pids(&PidSet::from_pids([0x100])).unwrap();
+        let mut buf = TsBuf::with_packets(8);
+        assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+        assert!(tuner.last_pcr.is_some());
+        let _ = std::fs::remove_file(path);
+    }
 }

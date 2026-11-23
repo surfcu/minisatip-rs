@@ -641,7 +641,7 @@ pub fn read_boot_id(
     uuid: &mut String,
 ) -> io::Result<(i32, i32)> {
     let path = cache_dir.join("bootid");
-    let mut bootid = 0;
+    let mut bootid: i32 = 0;
     let mut local_device_id = 0;
     // minisatip.cpp:2047-2048
     ms_log::log!(
@@ -659,7 +659,7 @@ pub fn read_boot_id(
             *uuid = stored_uuid.to_owned();
         }
     }
-    bootid += 1;
+    bootid = bootid.saturating_add(1);
     if local_device_id < 1 {
         local_device_id = 1;
     }

@@ -403,6 +403,7 @@ pub struct Ddci {
     pub adapters: BTreeMap<u16, AdapterState>,
     /// CAT section filters: id → (adapter, device index).
     pub filters: BTreeMap<usize, (u16, usize)>,
+    pmt_sids: BTreeMap<i32, u16>,
     next_filter: usize,
     /// `getTick()` in ms.
     pub now_ms: u64,
@@ -428,6 +429,7 @@ impl Ddci {
             caid_masks: BTreeMap::new(),
             adapters: BTreeMap::new(),
             filters: BTreeMap::new(),
+            pmt_sids: BTreeMap::new(),
             next_filter: 0,
             now_ms: 0,
             now_unix: None,
@@ -813,7 +815,9 @@ impl Ddci {
 
     /// `unmap_removed_pids`: unmap the pids an update dropped.
     fn unmap_removed_pids(&mut self, dev: usize, ad: u16, pmt: &Program) -> usize {
-        let d = self.devices.get_mut(&dev).expect("device");
+        let Some(d) = self.devices.get_mut(&dev) else {
+            return 0;
+        };
         let dev_id = d.id;
         let emm = d.emm_pids.clone();
         let still_needed = |pid: u16| {
@@ -1067,6 +1071,7 @@ impl Ddci {
         let slot_changed = d.pmt[pos].id != pmt.id;
         d.pmt[pos].id = pmt.id;
         d.pmt[pos].last_pmt = 0;
+        self.pmt_sids.insert(pmt.id, pmt.sid);
         if slot_changed {
             self.sync_version = self.sync_version.wrapping_add(1);
         }
@@ -1210,14 +1215,17 @@ impl Ddci {
             if freed {
                 self.bump_sync_version();
             }
+            self.prune_channel(pmt.id, pmt.sid);
             return;
         };
         if self.get_ddci(ddci).is_none() {
             ms_log::log!("ddci_del_pmt: ddci {} already disabled", ddci);
+            self.prune_channel(pmt.id, pmt.sid);
             return;
         }
         let dev = ddci as usize;
         let Some(d) = self.devices.get_mut(&dev) else {
+            self.prune_channel(pmt.id, pmt.sid);
             return;
         };
         d.bump_versions();
@@ -1247,7 +1255,18 @@ impl Ddci {
             d.channels
         );
         self.del_pmt_mapping_table(dev, ad, pmt.id);
+        self.prune_channel(pmt.id, pmt.sid);
         self.dump_mapping_table();
+    }
+
+    /// Drops an unlocked `channels` entry once no live PMT holds its SID.
+    fn prune_channel(&mut self, pmt_id: i32, fallback_sid: u16) {
+        let sid = self.pmt_sids.remove(&pmt_id).unwrap_or(fallback_sid);
+        if !self.pmt_sids.values().any(|&s| s == sid)
+            && self.channels.get(&sid).is_some_and(|c| !c.locked)
+        {
+            self.channels.remove(&sid);
+        }
     }
 
     // ---- generated tables ----
@@ -2009,34 +2028,10 @@ impl Ddci {
         self.push_ts_to_adapter(dev, ad, &maps.dd_ad);
     }
 
-    /// `ddci_ts`: every enabled DDCI processes a non-DDCI adapter's buffer.
-    pub fn ddci_ts(
-        &mut self,
-        ad: &mut TsBuffer,
-        programs: &mut ProgramTable,
-        ci: &mut dyn CiWriter,
-    ) {
-        if self.get_ddci(i32::from(ad.id)).is_some() {
-            return;
-        }
-        let devs: Vec<usize> = self
-            .devices
-            .iter()
-            .filter(|(_, d)| d.enabled)
-            .map(|(&i, _)| i)
-            .collect();
-        for dev in devs {
-            self.process_ts(ad, dev, programs, ci);
-        }
-    }
-
     /// `ddci_read_sec_data`: CAM output into the device FIFO.
     pub fn push_from_cam(&mut self, dev: usize, ts: &[u8]) {
         if let Some(d) = self.devices.get_mut(&dev) {
             let left = d.fifo.push(ts);
-            if left == 0 {
-                ms_log::log!("dropping {} bytes for ddci_adapter {}", left, d.id);
-            }
             ms_log::debugm_hot!(
                 "pushed {} bytes to the adapter buffer from {} [write_index {}]",
                 left,
@@ -2196,4 +2191,72 @@ fn parse_int(s: &str, default: i64) -> i64 {
         .find(|&(i, ch)| !(ch.is_ascii_digit() || (i == 0 && ch == '-')))
         .map_or(s.len(), |(i, _)| i);
     s[..end].parse().unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ms_ca::{CaDescriptor, EsStream};
+
+    #[test]
+    fn del_pmt_prunes_unlocked_channel_cache_but_keeps_locked_entries() {
+        let mut ddci = Ddci::new();
+        ddci.devices.insert(0, DdciDevice::opened(0));
+        ddci.cams.insert(
+            0,
+            CamInfo {
+                enabled: true,
+                initialized: true,
+                multiple_pmt: 1,
+                max_ca_pmt: 1,
+            },
+        );
+        ddci.caid_masks.insert(0, vec![(0x0B00, 0xFFFF)]);
+
+        let unlocked = Program {
+            id: 1,
+            adapter: 1,
+            sid: 100,
+            pid: 0x100,
+            caids: vec![CaDescriptor {
+                caid: 0x0B00,
+                pid: 0x150,
+                private_data: Vec::new(),
+            }],
+            streams: vec![EsStream {
+                pid: 0x101,
+                stream_type: 27,
+                is_audio: false,
+                is_video: true,
+                descriptors: Vec::new(),
+            }],
+            ..Program::default()
+        };
+        assert_eq!(ddci.process_pmt(1, &unlocked, false), TablesResult::Ok);
+        assert!(ddci.channels.contains_key(&100));
+        assert!(!ddci.channels[&100].locked);
+
+        ddci.channels.insert(
+            200,
+            Channel {
+                ddci: vec![0],
+                sid: 200,
+                name: "Locked".to_owned(),
+                locked: true,
+            },
+        );
+        let locked = Program {
+            id: 2,
+            adapter: 2,
+            sid: 200,
+            pid: 0x200,
+            ..unlocked.clone()
+        };
+        assert_eq!(ddci.process_pmt(2, &locked, false), TablesResult::Ok);
+
+        ddci.del_pmt(1, &unlocked);
+        assert!(!ddci.channels.contains_key(&100));
+        ddci.del_pmt(2, &locked);
+        assert!(ddci.channels.get(&200).is_some_and(|c| c.locked));
+    }
 }

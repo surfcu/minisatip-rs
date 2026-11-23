@@ -322,15 +322,16 @@ impl WriteQueue {
             Ok(None) | Ok(Some(0)) | Err(_) => 1,
             Ok(Some(written)) if written != prio_len => {
                 let elapsed = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+                let drained = written.min(prio_len);
                 // socketworks.cpp:1570-1576.
                 ms_log::log!(
                     "sock {} incomplete priority data write {} left {} in {} ms",
                     log_id,
                     written,
-                    prio_len - written,
+                    prio_len.saturating_sub(written),
                     elapsed
                 );
-                self.prio_data.drain(..written);
+                self.prio_data.drain(..drained);
                 1
             }
             Ok(Some(written)) => {

@@ -9,7 +9,8 @@ use super::authdata::{Record, get_authdata, write_authdata};
 use super::certs::{CertCtx, cert_der, hostid_from_cert, private_key_from_pem};
 use super::crypto::{
     DH_G, DH_P, OsRng, Rng, add_padding, dh_mod_exp, dhph_signature, generate_sak_sek,
-    key_from_precursor, sac_check_auth, sac_crypt, sac_gen_auth, sha256, uri_confirm,
+    key_from_precursor, sac_check_auth, sac_crypt, sac_gen_auth, sha256, try_dh_gen_exp,
+    uri_confirm,
 };
 use super::elements::Elements;
 use super::ffi::wipe;
@@ -354,10 +355,15 @@ impl CcState {
     }
 
     /// `generate_ns_host`: element 20 is a fresh 8-byte host nonce.
-    fn generate_ns_host(&mut self) {
+    fn generate_ns_host(&mut self) -> bool {
         let mut buf = [0u8; 8];
-        self.rng.fill(&mut buf);
+        if !self.rng.fill(&mut buf) {
+            wipe(&mut buf);
+            self.elements.invalidate(20);
+            return false;
+        }
         self.elements.set(20, &buf);
+        true
     }
 
     /// `generate_SAK_SEK`: the SAC keys from the key seed.
@@ -416,10 +422,10 @@ impl CcState {
         self.elements.invalidate(18);
         self.elements.invalidate(22);
 
-        let mut exp = [0u8; 256];
-        self.rng.fill(&mut exp);
+        let Some(exp) = try_dh_gen_exp(&mut *self.rng) else {
+            return -1;
+        };
         self.dh_exp = exp;
-        wipe(&mut exp);
         let Some(dhph) = dh_mod_exp(&DH_G, &self.dh_exp, &DH_P, 256) else {
             return -1;
         };
@@ -512,9 +518,13 @@ impl CcState {
                 }
             }
             21 => {
-                self.generate_ns_host();
-                self.generate_key_seed();
-                self.generate_sak_sek();
+                if self.generate_ns_host() {
+                    self.generate_key_seed();
+                    self.generate_sak_sek();
+                } else {
+                    self.sac_state("auth_failed");
+                    actions.push(CcAction::ForceCi);
+                }
             }
             28 => {
                 if let Some((parity, key, iv)) = self.check_new_key() {
@@ -591,7 +601,7 @@ impl CcState {
                     return None;
                 }
             }
-            if !self.elements.get_req(id, &mut out) {
+            if !self.elements.get_req(id, &mut out) || out.len() > 0xFFFF {
                 return None;
             }
         }

@@ -1080,7 +1080,10 @@ impl Scheduler {
         adapter.do_tune = false;
         if self.compare_tuning_parameters(aid, tp) {
             if self.enabled_adapter(aid).map(|a| a.master_sid) != Some(sid) {
-                let old = &self.enabled_adapter(aid).expect("adapter checked").params;
+                let Some(old_adapter) = self.enabled_adapter(aid) else {
+                    return Err(SetParamsError::MissingAdapter);
+                };
+                let old = &old_adapter.params;
                 ms_log::log!(
                     "secondary stream requested tune, not gonna happen ad: f:{} sr:{} pol:{} plp/isi:{} src:{} mod {} -> \t\t\tnew: f:{} sr:{} pol:{} plp/isi:{} src:{} mod {}",
                     old.freq,

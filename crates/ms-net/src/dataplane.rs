@@ -739,9 +739,13 @@ impl AdapterHandle {
         *lock_counter(&self.input_health)
     }
 
-    /// Event receiver.
-    pub fn events(&self) -> &Receiver<Event> {
-        &self.events
+    /// Receives one event within `timeout` and releases table-batch backpressure.
+    pub fn recv_event_timeout(&self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
+        let event = self.events.recv_timeout(timeout)?;
+        if matches!(event, Event::TablePackets { .. }) {
+            atomic_dec_sat(&self.pending_table_batches);
+        }
+        Ok(event)
     }
 
     /// Receives one event non-blockingly and releases table-batch backpressure.
@@ -1478,7 +1482,10 @@ impl DataPlane {
             self.poll_backoff = false;
         }
         // stream.cpp:1172,1193-1194: `bw_dmx += rlen`, `nsecs += ...`, `reads++`.
-        if let Some(bandwidth) = &self.bandwidth {
+        if read > 0
+            && !self.keep_reading
+            && let Some(bandwidth) = &self.bandwidth
+        {
             bandwidth.record_read(read, started.elapsed().as_micros() as i64);
         }
         let now = self.mono_us() / 1000;
@@ -1786,16 +1793,14 @@ impl DataPlane {
     }
 
     fn standby_if_idle(&mut self) {
-        if self.outputs.is_empty() {
+        if self.outputs.is_empty() && !self.keep_reading {
             self.tuner.standby();
-            if !self.keep_reading {
-                let cc = self.continuity.errors();
-                self.last_health_cc = cc;
-                let mut health = lock_counter(&self.input_health);
-                health.current_locked = None;
-                health.unlock_seq = health.unlock_seq.wrapping_add(1);
-                health.cc_errors = cc;
-            }
+            let cc = self.continuity.errors();
+            self.last_health_cc = cc;
+            let mut health = lock_counter(&self.input_health);
+            health.current_locked = None;
+            health.unlock_seq = health.unlock_seq.wrapping_add(1);
+            health.cc_errors = cc;
         }
     }
 }
@@ -2909,5 +2914,72 @@ mod tests {
         plane.bandwidth_marks.insert(4, (10, 1, 0, 0, 0));
         plane.handle(Command::StopOutput(4));
         assert!(!plane.bandwidth_marks.contains_key(&4));
+    }
+
+    struct StandbyRecordingTuner {
+        reads: usize,
+        standby_calls: Arc<AtomicUsize>,
+    }
+
+    impl Tuner for StandbyRecordingTuner {
+        fn tune(&mut self, _params: &TuneParams) -> TunerResult<()> {
+            Ok(())
+        }
+
+        fn set_pids(&mut self, _pids: &PidSet) -> TunerResult<()> {
+            Ok(())
+        }
+
+        fn status(&self) -> SignalStatus {
+            SignalStatus::default()
+        }
+
+        fn read(&mut self, buf: &mut TsBuf) -> TunerResult<usize> {
+            self.reads += 1;
+            if self.reads == 1 {
+                let mut pkt = [0u8; DVB_FRAME];
+                pkt[0] = 0x47;
+                pkt[1] = 0x01;
+                buf.with_vec(|v, _| v.extend_from_slice(&pkt));
+                Ok(DVB_FRAME)
+            } else {
+                Ok(0)
+            }
+        }
+
+        fn standby(&mut self) {
+            self.standby_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn keep_reading_skips_standby_and_bandwidth_record_read() {
+        let bw = Arc::new(Bandwidth::new());
+        let standby_calls = Arc::new(AtomicUsize::new(0));
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        drop(cmd_tx);
+        let mut plane = DataPlane::new(
+            Box::new(StandbyRecordingTuner {
+                reads: 0,
+                standby_calls: Arc::clone(&standby_calls),
+            }),
+            DataPlaneConfig::default(),
+            cmd_rx,
+            evt_tx,
+            Some(Arc::clone(&bw)),
+        );
+        plane.handle(Command::KeepReading(true));
+        plane.standby_if_idle();
+        assert_eq!(standby_calls.load(Ordering::Relaxed), 0);
+
+        plane.read_once();
+        assert_eq!(bw.snapshot().reads, 0);
+
+        plane.handle(Command::KeepReading(false));
+        plane.read_once();
+        assert_eq!(bw.snapshot().reads, 0, "zero-byte read does not record");
+        plane.standby_if_idle();
+        assert_eq!(standby_calls.load(Ordering::Relaxed), 1);
     }
 }

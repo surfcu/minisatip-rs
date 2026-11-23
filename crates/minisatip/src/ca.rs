@@ -45,6 +45,8 @@ const DECRYPT_WINDOW_MS: i64 = 10_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DVBAPI_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+/// Cap on queued non-blocking DVBAPI writes before tearing down the socket.
+const DVBAPI_MAX_TX_BUF: usize = 256 * 1024;
 /// PID that requests the whole transport stream.
 const PID_ALL: i32 = 8192;
 
@@ -114,7 +116,7 @@ pub struct CaRuntime {
     sync_dirty: bool,
     synced_sched_version: u64,
     synced_ddci_version: u64,
-    synced_handles_mask: u64,
+    synced_handles_mask: u128,
     #[cfg(test)]
     sync_runs: u64,
 }
@@ -975,9 +977,9 @@ impl CaRuntime {
             .ddci
             .as_ref()
             .map_or(0, |link| link.hub.lock().ddci.sync_version());
-        let handles_mask = handles.iter().enumerate().fold(0u64, |mask, (i, h)| {
-            if h.is_some() && i < 64 {
-                mask | (1u64 << i)
+        let handles_mask = handles.iter().enumerate().fold(0u128, |mask, (i, h)| {
+            if h.is_some() && i < 128 {
+                mask | (1u128 << i)
             } else {
                 mask
             }
@@ -1565,16 +1567,20 @@ impl CaRuntime {
     /// Drops filter mappings whose scheduler slot was freed or reused, e.g. by
     /// `clear_pmt_for_adapter` on a tune; C++ keeps dangling ids that never fire.
     fn forget_stale_filters(&mut self, sched: &Scheduler) -> bool {
-        let live = |fid: i32, aid: i32, pid: i32| {
+        let live = |fid: i32, aid: i32, pid: i32, expected_flags: i32| {
             sched.filter_slot(fid).is_some_and(|f| {
-                f.enabled && f.target == FilterTarget::Other && f.adapter == aid && f.pid == pid
+                f.enabled
+                    && f.target == FilterTarget::Other
+                    && f.adapter == aid
+                    && f.pid == pid
+                    && (f.flags & expected_flags) == expected_flags
             })
         };
         if let Some(dvbapi) = self.dvbapi.as_mut() {
             let stale: Vec<i32> = dvbapi
                 .filter_owner
                 .iter()
-                .filter(|(fid, (aid, pid))| !live(**fid, *aid, *pid))
+                .filter(|(fid, (aid, pid))| !live(**fid, *aid, *pid, FILTER_ADD_REMOVE))
                 .map(|(fid, _)| *fid)
                 .collect();
             for fid in stale {
@@ -1586,7 +1592,8 @@ impl CaRuntime {
         }
         if let Some(link) = self.ddci.as_mut() {
             let before = link.cat_filters.len();
-            link.cat_filters.retain(|fid, (_, aid)| live(*fid, *aid, 1));
+            link.cat_filters
+                .retain(|fid, (_, aid)| live(*fid, *aid, 1, FILTER_CRC));
             if link.cat_filters.len() != before {
                 return false;
             }
@@ -2027,6 +2034,9 @@ struct Dvbapi {
     /// Adapter and PID each scheduler filter was created for.
     filter_owner: BTreeMap<i32, (i32, i32)>,
     by_id: BTreeMap<FilterId, i32>,
+    tx_buf: Vec<u8>,
+    tx_offset: usize,
+    tx_stalled_since: Option<Instant>,
 }
 
 impl Dvbapi {
@@ -2042,6 +2052,9 @@ impl Dvbapi {
             filters: BTreeMap::new(),
             filter_owner: BTreeMap::new(),
             by_id: BTreeMap::new(),
+            tx_buf: Vec::new(),
+            tx_offset: 0,
+            tx_stalled_since: None,
         }
     }
 
@@ -2115,28 +2128,61 @@ impl Dvbapi {
         }
     }
 
-    /// Writes queued messages; a failed write or a close request ends the connection.
+    /// Writes queued messages without blocking the control thread.
     fn flush(&mut self, now: i64) {
-        loop {
-            let message = self.shared.borrow_mut().client.take_output();
-            let Some(message) = message else {
-                break;
-            };
-            let Some(conn) = self.conn.as_mut() else {
-                break;
-            };
-            if let Err(failure) = write_all(conn, &message) {
-                let sock = self.shared.borrow().client.socket_id();
-                ms_log::log!(
-                    "write to dvbapi socket failed ({} out of {}), closing socket {}, errno {}, error: {}",
-                    failure.written,
-                    failure.total,
-                    sock,
-                    ms_log::errno(&failure.error),
-                    ms_log::strerror(&failure.error)
-                );
+        let Some(conn) = self.conn.as_mut() else {
+            while self.shared.borrow_mut().client.take_output().is_some() {}
+            if self.shared.borrow().client.close_requested() {
+                self.close(now);
+            }
+            return;
+        };
+        let sock = self.shared.borrow().client.socket_id();
+        match flush_tx(
+            conn,
+            &mut self.tx_buf,
+            &mut self.tx_offset,
+            &mut self.tx_stalled_since,
+        ) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(failure) => {
+                log_write_failure(&failure, sock);
                 self.close(now);
                 return;
+            }
+        }
+        loop {
+            let Some(message) = self.shared.borrow_mut().client.take_output() else {
+                break;
+            };
+            if message.len() > DVBAPI_MAX_TX_BUF {
+                let failure = WriteFailure {
+                    written: 0,
+                    total: message.len(),
+                    error: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "dvbapi write buffer overflow",
+                    ),
+                };
+                log_write_failure(&failure, sock);
+                self.close(now);
+                return;
+            }
+            self.tx_buf.extend_from_slice(&message);
+            match flush_tx(
+                conn,
+                &mut self.tx_buf,
+                &mut self.tx_offset,
+                &mut self.tx_stalled_since,
+            ) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(failure) => {
+                    log_write_failure(&failure, sock);
+                    self.close(now);
+                    return;
+                }
             }
         }
         if self.shared.borrow().client.close_requested() {
@@ -2146,6 +2192,9 @@ impl Dvbapi {
 
     fn close(&mut self, now: i64) {
         self.conn = None;
+        self.tx_buf.clear();
+        self.tx_offset = 0;
+        self.tx_stalled_since = None;
         self.shared.borrow_mut().client.on_closed(now);
     }
 }
@@ -2157,38 +2206,62 @@ struct WriteFailure {
     error: io::Error,
 }
 
-fn write_all(conn: &mut Stream, data: &[u8]) -> Result<(), WriteFailure> {
-    let total = data.len();
-    let mut written = 0;
-    let deadline = Instant::now() + WRITE_TIMEOUT;
-    while written < total {
-        let outcome = conn.write(&data[written..]);
-        let error = match outcome {
-            Ok(0) => Some(io::ErrorKind::WriteZero.into()),
+fn log_write_failure(failure: &WriteFailure, sock: i32) {
+    ms_log::log!(
+        "write to dvbapi socket failed ({} out of {}), closing socket {}, errno {}, error: {}",
+        failure.written,
+        failure.total,
+        sock,
+        ms_log::errno(&failure.error),
+        ms_log::strerror(&failure.error)
+    );
+}
+
+fn flush_tx(
+    conn: &mut Stream,
+    tx_buf: &mut Vec<u8>,
+    tx_offset: &mut usize,
+    stalled_since: &mut Option<Instant>,
+) -> Result<bool, WriteFailure> {
+    while *tx_offset < tx_buf.len() {
+        match conn.write(&tx_buf[*tx_offset..]) {
+            Ok(0) => {
+                return Err(WriteFailure {
+                    written: *tx_offset,
+                    total: tx_buf.len(),
+                    error: io::ErrorKind::WriteZero.into(),
+                });
+            }
             Ok(n) => {
-                written += n;
-                None
+                *tx_offset += n;
+                *stalled_since = None;
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => None,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() > deadline {
-                    Some(io::ErrorKind::TimedOut.into())
-                } else {
-                    thread::sleep(Duration::from_millis(1));
-                    None
+                let now = Instant::now();
+                let since = *stalled_since.get_or_insert(now);
+                if now.saturating_duration_since(since) > WRITE_TIMEOUT {
+                    return Err(WriteFailure {
+                        written: *tx_offset,
+                        total: tx_buf.len(),
+                        error: io::ErrorKind::TimedOut.into(),
+                    });
                 }
+                return Ok(false);
             }
-            Err(e) => Some(e),
-        };
-        if let Some(error) = error {
-            return Err(WriteFailure {
-                written,
-                total,
-                error,
-            });
+            Err(error) => {
+                return Err(WriteFailure {
+                    written: *tx_offset,
+                    total: tx_buf.len(),
+                    error,
+                });
+            }
         }
     }
-    Ok(())
+    tx_buf.clear();
+    *tx_offset = 0;
+    *stalled_since = None;
+    Ok(true)
 }
 
 /// The DVBAPI `SCA_op` (`dvbapi_add_pmt`/`dvbapi_del_pmt`).
@@ -4158,5 +4231,100 @@ mod window_tests {
                 .find_pid(0, 100)
                 .is_some_and(|p| p.sids.contains(&DDCI_SID))
         );
+    }
+
+    #[test]
+    fn handles_mask_tracks_adapters_above_63() {
+        let mut sched = Scheduler::new();
+        let mut ca = CaRuntime::new(&Options::default());
+        let handle = AdapterHandle::spawn(
+            Box::new(ExitOnRunTuner),
+            ms_net::dataplane::DataPlaneConfig::default(),
+        )
+        .unwrap();
+        let mut handles: Vec<Option<AdapterHandle>> = (0..66).map(|_| None).collect();
+        handles[65] = Some(handle);
+        ca.after_scheduler(&mut sched, &handles);
+        let synced = ca.sync_runs;
+        assert_eq!(ca.synced_handles_mask, 1u128 << 65);
+        ca.after_scheduler(&mut sched, &handles);
+        assert_eq!(ca.sync_runs, synced);
+
+        if let Some(h) = handles[65].take() {
+            h.stop();
+        }
+        ca.after_scheduler(&mut sched, &handles);
+        assert_eq!(ca.synced_handles_mask, 0);
+        assert_eq!(ca.sync_runs, synced + 1);
+    }
+
+    #[test]
+    fn forget_stale_filters_discriminates_flags_on_cat_pid() {
+        let opts = Options {
+            dvbapi_host: "127.0.0.1".to_owned(),
+            dvbapi_port: 9000,
+            ..Options::default()
+        };
+        let mut sched = Scheduler::new();
+        sched.add_adapter(
+            0,
+            ms_sched::AdapterConfig::new(ms_tuner::DeliverySystem::DvbS2),
+            Box::new(NullSchedTuner),
+        );
+        let mut ca = CaRuntime::new(&opts);
+        ca.attach_ddci(&mut sched, DdciHub::new());
+        let fid = sched.add_filter(0, 1, FilterTarget::Other, FILTER_ADD_REMOVE);
+        let dvbapi = ca.dvbapi.as_mut().unwrap();
+        dvbapi.filters.insert(fid, FilterId(5));
+        dvbapi.filter_owner.insert(fid, (0, 1));
+        dvbapi.by_id.insert(FilterId(5), fid);
+
+        sched.del_filter(fid);
+        let reused = sched.add_filter(0, 1, FilterTarget::Other, FILTER_CRC);
+        assert_eq!(reused, fid);
+        assert!(ca.forget_stale_filters(&sched));
+        assert!(ca.dvbapi.as_ref().unwrap().filters.is_empty());
+
+        ca.ddci.as_mut().unwrap().cat_filters.insert(reused, (7, 0));
+        assert!(ca.forget_stale_filters(&sched));
+
+        sched.del_filter(reused);
+        let reused2 = sched.add_filter(0, 1, FilterTarget::Other, FILTER_ADD_REMOVE);
+        assert_eq!(reused2, reused);
+        assert!(!ca.forget_stale_filters(&sched));
+        assert!(ca.ddci.as_ref().unwrap().cat_filters.is_empty());
+    }
+
+    #[test]
+    fn dvbapi_flush_is_nonblocking_and_closes_after_stall_timeout() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut tx, _rx) = UnixStream::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        let filler = [0xAAu8; 4096];
+        while tx.write(&filler).is_ok() {}
+
+        let cfg = DvbapiConfig::from_options(&Options {
+            dvbapi_host: "127.0.0.1".to_owned(),
+            dvbapi_port: 9000,
+            ..Options::default()
+        });
+        let mut dvbapi = Dvbapi::new(cfg);
+        dvbapi.conn = Some(Stream::Unix(tx));
+        dvbapi.shared.borrow_mut().client.on_connected(0);
+
+        let started = Instant::now();
+        dvbapi.flush(0);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(dvbapi.conn.is_some());
+        assert!(!dvbapi.tx_buf.is_empty());
+        assert!(dvbapi.tx_stalled_since.is_some());
+
+        dvbapi.tx_stalled_since = Some(Instant::now() - WRITE_TIMEOUT - Duration::from_millis(5));
+        dvbapi.flush(1);
+        assert!(dvbapi.conn.is_none());
+        assert!(dvbapi.tx_buf.is_empty());
+        assert_eq!(dvbapi.tx_offset, 0);
+        assert!(dvbapi.tx_stalled_since.is_none());
     }
 }
