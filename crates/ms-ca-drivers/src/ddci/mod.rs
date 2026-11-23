@@ -195,6 +195,7 @@ pub struct DdciDevice {
     pub max_channels: usize,
     pub pmt: [DdciPmt; MAX_CHANNELS_ON_CI + 1],
     pub cat_processed: bool,
+    pub cat_owner: Option<u16>,
     pub read_index: Vec<u64>,
     pub last_pat: u64,
     pub last_sdt: u64,
@@ -225,6 +226,7 @@ impl DdciDevice {
             max_channels: max_channels.min(MAX_CHANNELS_ON_CI),
             pmt: [DdciPmt::default(); MAX_CHANNELS_ON_CI + 1],
             cat_processed: false,
+            cat_owner: None,
             read_index: vec![0; MAX_ADAPTERS],
             last_pat: 0,
             last_sdt: 0,
@@ -262,11 +264,19 @@ impl DdciDevice {
 
     /// `find_ddci_pid`: the first DDCI-side pid from `pid` up that is free.
     fn find_ddci_pid(&self, pid: u16) -> i32 {
-        if pid > 8191 {
-            ms_log::log_and_return!(-1, "pid {} invalid", pid);
+        if matches!(pid, 0 | 17) || pid > 8191 {
+            ms_log::log_and_return!(-1, "pid {} invalid or reserved", pid);
+        }
+        if matches!(pid, 1 | 20) {
+            let dpid = i32::from(pid);
+            return if self.get_ddci_pid(dpid).is_none() {
+                dpid
+            } else {
+                -1
+            };
         }
         (i32::from(pid)..8191)
-            .find(|&p| self.get_ddci_pid(p).is_none())
+            .find(|&p| !matches!(p, 0 | 1 | 17 | 20) && self.get_ddci_pid(p).is_none())
             .unwrap_or(-1)
     }
 
@@ -592,6 +602,9 @@ impl Ddci {
         dev: usize,
         force_add_pid: bool,
     ) -> i32 {
+        if matches!(pid, 0 | 17) {
+            ms_log::log_and_return!(-1, "pid {} reserved on DDCI", pid);
+        }
         let Some(d) = self.devices.get_mut(&dev) else {
             return -1;
         };
@@ -773,6 +786,65 @@ impl Ddci {
             && !d.mapping.values().any(|m| m.ad == ad)
         {
             d.adapter_ecm_pkts.remove(&ad);
+        }
+        self.handover_cat_owner(dev, ad);
+    }
+
+    /// Promotes a surviving adapter onto mandatory `PID 1`/`20` once `old_ad` leaves.
+    fn handover_cat_owner(&mut self, dev: usize, old_ad: u16) {
+        let (dev_id, next_ad, pmts) = {
+            let Some(d) = self.devices.get_mut(&dev) else {
+                return;
+            };
+            if d.cat_owner != Some(old_ad) || d.mapping.values().any(|m| m.ad == old_ad) {
+                return;
+            }
+            d.cat_owner = None;
+            d.cat_processed = false;
+            let next_ad = d
+                .slots()
+                .find_map(|i| {
+                    let id = d.pmt[i].id;
+                    (id >= 0).then(|| {
+                        d.mapping
+                            .values()
+                            .find(|m| m.ad != old_ad && m.pmt.contains(&id))
+                            .map(|m| m.ad)
+                    })?
+                })
+                .or_else(|| {
+                    d.mapping
+                        .values()
+                        .filter(|m| m.ad != old_ad)
+                        .map(|m| m.ad)
+                        .min()
+                });
+            let Some(next_ad) = next_ad else {
+                return;
+            };
+            let pmts: BTreeSet<i32> = d
+                .mapping
+                .values()
+                .filter(|m| m.ad == next_ad)
+                .flat_map(|m| m.pmt.iter().copied())
+                .collect();
+            if pmts.is_empty() {
+                return;
+            }
+            d.cat_owner = Some(next_ad);
+            d.cat_processed = false;
+            (d.id, next_ad, pmts)
+        };
+        ms_log::log!(
+            "Handing DDCI {} CAT/TDT ownership from adapter {} to adapter {}",
+            dev_id,
+            old_ad,
+            next_ad
+        );
+        for pid in [1u16, 20] {
+            for &pmt_id in &pmts {
+                self.add_pid_mapping_table(next_ad, pid, pmt_id, dev, true);
+            }
         }
     }
 
@@ -980,6 +1052,14 @@ impl Ddci {
             ms_log::log!("Skip processing pmt for ddci adapter {}", ad);
             return TablesResult::Ok;
         }
+        if matches!(pmt.pid, 0 | 17) {
+            ms_log::log_and_return!(
+                TablesResult::NoRetry,
+                "DDCI: ignoring PMT {} with reserved pid {}",
+                pmt.id,
+                pmt.pid
+            );
+        }
         let registered = self.find_registered_ddci(pmt.id);
         let mut ddid = registered;
         if ddid == -1 {
@@ -1083,23 +1163,33 @@ impl Ddci {
             d.channels += 1;
             d.psi_changed = true;
         }
+        if d.cat_owner.is_none() {
+            d.cat_owner = Some(ad);
+        }
+        let owns_cat = d.cat_owner == Some(ad);
         // C++ `count_new`: mappings this call creates, for the summary log.
         // `has_pid_mapping` only tells that the entry was absent entirely.
         let mut mapped = 0;
-        // Mandatory pids; some CAMs need the TDT to wake up. Pid 0 comes from post_tune.
-        for pid in [1u16, 20] {
-            if let Some(d) = self.devices.get_mut(&dev)
-                && !d.mapping.contains_key(&(pmt.adapter, pid))
-            {
-                ms_log::log!(
-                    "Mapping mandatory PID {} to PMT {} on DDCI {}",
-                    pid,
-                    pmt.id,
-                    d.id
-                );
-                mapped += 1;
-                if pid == 1 {
-                    d.cat_processed = false;
+        // Mandatory pids on the owning adapter; some CAMs need TDT to wake up.
+        if owns_cat {
+            for pid in [1u16, 20] {
+                let newly_mapped = self
+                    .devices
+                    .get(&dev)
+                    .is_some_and(|d| !d.mapping.contains_key(&(pmt.adapter, pid)));
+                if newly_mapped {
+                    ms_log::log!(
+                        "Mapping mandatory PID {} to PMT {} on DDCI {}",
+                        pid,
+                        pmt.id,
+                        d_id
+                    );
+                    mapped += 1;
+                    if pid == 1
+                        && let Some(d) = self.devices.get_mut(&dev)
+                    {
+                        d.cat_processed = false;
+                    }
                 }
                 self.add_pid_mapping_table(ad, pid, pmt.id, dev, true);
             }
@@ -1197,13 +1287,13 @@ impl Ddci {
                 pmt.id,
                 pmt.pid
             );
-            // No mapping: still free a slot this PMT holds, or it leaks.
-            let mut freed = false;
-            for d in self.devices.values_mut().filter(|d| d.enabled) {
+            // No mapping: still free a slot and clean up any mappings this PMT holds.
+            let mut freed_devs = Vec::new();
+            for (&dev, d) in self.devices.iter_mut().filter(|(_, d)| d.enabled) {
                 for j in d.slots() {
                     if d.pmt[j].id == pmt.id {
                         d.pmt[j].id = -1;
-                        freed = true;
+                        freed_devs.push(dev);
                         if d.channels > 0 {
                             d.channels -= 1;
                         }
@@ -1212,8 +1302,11 @@ impl Ddci {
                     }
                 }
             }
-            if freed {
+            if !freed_devs.is_empty() {
                 self.bump_sync_version();
+                for dev in freed_devs {
+                    self.del_pmt_mapping_table(dev, ad, pmt.id);
+                }
             }
             self.prune_channel(pmt.id, pmt.sid);
             return;
@@ -2059,6 +2152,9 @@ impl Ddci {
         if d.cat_processed || d.disable_cat || section.len() < 8 {
             return;
         }
+        if d.cat_owner.is_some_and(|owner| owner != ad) {
+            return;
+        }
         let cat_len = (usize::from(section[1] & 0x0F) << 8) | usize::from(section[2]);
         let cat_ver = (section[5] & 0x3E) >> 1;
         ms_log::log!("CAT DDCI {} ver {}, len {}", d.id, cat_ver, cat_len);
@@ -2258,5 +2354,130 @@ mod tests {
         assert!(!ddci.channels.contains_key(&100));
         ddci.del_pmt(2, &locked);
         assert!(ddci.channels.get(&200).is_some_and(|c| c.locked));
+    }
+
+    fn ca_program(id: i32, adapter: u16, sid: u16, pid: u16, es_pid: u16, ca_pid: u16) -> Program {
+        Program {
+            id,
+            adapter,
+            sid,
+            pid,
+            caids: vec![CaDescriptor {
+                caid: 0x0B00,
+                pid: ca_pid,
+                private_data: Vec::new(),
+            }],
+            streams: vec![EsStream {
+                pid: es_pid,
+                stream_type: 27,
+                is_audio: false,
+                is_video: true,
+                descriptors: Vec::new(),
+            }],
+            ..Program::default()
+        }
+    }
+
+    fn multi_pmt_ddci() -> Ddci {
+        let mut ddci = Ddci::new();
+        ddci.devices.insert(0, DdciDevice::opened(0));
+        ddci.cams.insert(
+            0,
+            CamInfo {
+                enabled: true,
+                initialized: true,
+                multiple_pmt: 1,
+                max_ca_pmt: 4,
+            },
+        );
+        ddci.caid_masks.insert(0, vec![(0x0B00, 0xFFFF)]);
+        ddci
+    }
+
+    #[test]
+    fn mandatory_pids_keep_same_adapter_multi_pmt_refcounts() {
+        let mut ddci = multi_pmt_ddci();
+        ddci.create_adapter(0);
+        ddci.create_adapter(1);
+        let p1 = ca_program(1, 1, 100, 0x100, 0x101, 0x150);
+        let p2 = ca_program(2, 1, 101, 0x110, 0x111, 0x160);
+        assert_eq!(ddci.process_pmt(1, &p1, false), TablesResult::Ok);
+        assert_eq!(ddci.process_pmt(1, &p2, false), TablesResult::Ok);
+
+        let d = &ddci.devices[&0];
+        assert_eq!(d.cat_owner, Some(1));
+        assert_eq!(d.mapping[&(1, 1)].ddci_pid, 1);
+        assert_eq!(d.mapping[&(1, 1)].pmt, [1, 2].into());
+        assert_eq!(d.mapping[&(1, 20)].ddci_pid, 20);
+        assert_eq!(d.mapping[&(1, 20)].pmt, [1, 2].into());
+
+        ddci.del_pmt(1, &p1);
+        let d = &ddci.devices[&0];
+        assert_eq!(d.cat_owner, Some(1));
+        assert_eq!(d.mapping[&(1, 1)].pmt, [2].into());
+        assert_eq!(d.mapping[&(1, 20)].pmt, [2].into());
+        assert_eq!(ddci.filters.values().filter(|&&(ad, _)| ad == 1).count(), 1);
+
+        ddci.del_pmt(1, &p2);
+        let d = &ddci.devices[&0];
+        assert_eq!(d.cat_owner, None);
+        assert!(d.mapping.is_empty());
+        assert!(ddci.filters.is_empty());
+    }
+
+    #[test]
+    fn mandatory_pids_do_not_spill_and_hand_over_all_surviving_pmts() {
+        let mut ddci = multi_pmt_ddci();
+        for a in [0, 1, 2] {
+            ddci.create_adapter(a);
+        }
+        let p1 = ca_program(1, 1, 100, 0x100, 0x101, 0x150);
+        let p2 = ca_program(2, 2, 200, 0x200, 0x201, 0x250);
+        let p3 = ca_program(3, 2, 201, 0x210, 0x211, 0x260);
+        assert_eq!(ddci.process_pmt(1, &p1, false), TablesResult::Ok);
+        assert_eq!(ddci.process_pmt(2, &p2, false), TablesResult::Ok);
+        assert_eq!(ddci.process_pmt(2, &p3, false), TablesResult::Ok);
+
+        {
+            let d = &ddci.devices[&0];
+            assert_eq!(d.cat_owner, Some(1));
+            assert!(!d.mapping.contains_key(&(2, 1)));
+            assert!(!d.mapping.contains_key(&(2, 20)));
+            assert!(d.get_ddci_pid(2).is_none());
+            assert!(d.get_ddci_pid(21).is_none());
+        }
+
+        ddci.del_pmt(1, &p1);
+        let d = &ddci.devices[&0];
+        assert_eq!(d.cat_owner, Some(2));
+        assert!(!d.cat_processed);
+        assert_eq!(d.mapping[&(2, 1)].ddci_pid, 1);
+        assert_eq!(d.mapping[&(2, 1)].pmt, [2, 3].into());
+        assert_eq!(d.mapping[&(2, 20)].ddci_pid, 20);
+        assert_eq!(d.mapping[&(2, 20)].pmt, [2, 3].into());
+        assert_eq!(ddci.filters.values().collect::<Vec<_>>(), vec![&(2, 0)]);
+    }
+
+    #[test]
+    fn issue_1565_rejects_pid_0_and_17_and_skips_reserved_pids() {
+        let mut ddci = Ddci::new();
+        ddci.devices.insert(0, DdciDevice::opened(0));
+        assert_eq!(ddci.add_pid_mapping_table(1, 0, 1, 0, false), -1);
+        assert_eq!(ddci.add_pid_mapping_table(1, 17, 1, 0, false), -1);
+        assert!(ddci.devices[&0].mapping.is_empty());
+
+        assert_eq!(ddci.add_pid_mapping_table(1, 1, 1, 0, false), 1);
+        assert_eq!(ddci.add_pid_mapping_table(2, 1, 2, 0, false), -1);
+
+        assert_eq!(ddci.add_pid_mapping_table(1, 16, 1, 0, false), 16);
+        assert_eq!(ddci.add_pid_mapping_table(2, 16, 2, 0, false), 18);
+
+        assert_eq!(ddci.add_pid_mapping_table(1, 19, 1, 0, false), 19);
+        assert_eq!(ddci.add_pid_mapping_table(2, 19, 2, 0, false), 21);
+
+        let mut pmt_bad = ca_program(10, 1, 900, 0, 0x301, 0x350);
+        assert_eq!(ddci.process_pmt(1, &pmt_bad, false), TablesResult::NoRetry);
+        pmt_bad.pid = 17;
+        assert_eq!(ddci.process_pmt(1, &pmt_bad, false), TablesResult::NoRetry);
     }
 }

@@ -25,7 +25,8 @@ fn create_pmt(
 ) -> i32 {
     let id = t.add(ad, sid, 1000);
     let p = t.get_mut(id).unwrap();
-    p.pid = (id * 1000) as u16;
+    // Avoid id == 0 colliding with DVB PAT PID 0 (#1565 reserves PID 0/17).
+    p.pid = ((id + 1) * 1000) as u16;
     p.add_stream(pid1, 2, false, true);
     p.add_stream(pid2, 6, true, false);
     p.add_caid(caid1, caid1, &[]);
@@ -1492,8 +1493,7 @@ fn test_multiple_pmt_maps_only_requested_pids() {
     );
 }
 
-// DEV-290: the CAT came in on adapter 2 while slot 0 held adapter 1's PMT, so C++
-// maps the EMM pids under that PMT; once both leave they stay and block every later CAT.
+// Single CAT/TDT owner holds mandatory PID 1/20 & EMMs until leaving, then hands over cleanly.
 #[test]
 fn test_emm_pids_leave_with_their_adapter() {
     let (mut x, mut t) = one_ddci(2);
@@ -1506,25 +1506,40 @@ fn test_emm_pids_leave_with_their_adapter() {
     assert_eq!(x.process_pmt(1, &prog(&t, a), false), TablesResult::Ok);
     assert_eq!(x.process_pmt(2, &prog(&t, b), false), TablesResult::Ok);
     assert_eq!(x.devices[&0].pmt[0].id, a, "adapter 1's PMT holds slot 0");
+    assert_eq!(x.devices[&0].cat_owner, Some(1));
+
+    // Adapter 2 is not CAT owner yet, so its CAT section is ignored while adapter 1's succeeds.
     x.process_cat(2, &CAT, 0);
-    assert!(mapped(&x, 2, 48), "EMM pid mapped for adapter 2");
+    assert!(!mapped(&x, 2, 48), "non-owner CAT must be ignored");
+    x.process_cat(1, &CAT, 0);
+    assert!(mapped(&x, 1, 48), "EMM pid mapped for owning adapter 1");
+
+    // Deleting adapter 1 drops its EMMs and hands PID 1/20 + CAT ownership over to adapter 2.
+    x.del_pmt(1, &prog(&t, a));
+    assert!(!mapped(&x, 1, 48), "adapter 1 is gone, so are its EMM pids");
+    assert!(x.devices[&0].emm_pids.is_empty());
+    assert_eq!(x.devices[&0].cat_owner, Some(2));
+    assert!(!x.devices[&0].cat_processed);
+    assert_eq!(
+        x.devices[&0].mapping.get(&(2, 1)).map(|m| m.ddci_pid),
+        Some(1)
+    );
+    assert_eq!(
+        x.devices[&0].mapping.get(&(2, 20)).map(|m| m.ddci_pid),
+        Some(20)
+    );
+    x.process_cat(2, &CAT, 0);
+    assert!(
+        mapped(&x, 2, 48),
+        "promoted adapter 2's next CAT section takes the EMM pids"
+    );
 
     x.del_pmt(2, &prog(&t, b));
-    assert!(!mapped(&x, 2, 48), "adapter 2 is gone, so are its EMM pids");
-    assert!(x.devices[&0].emm_pids.is_empty());
-    assert!(
-        x.find_pid(2, 48).is_none_or(|p| p.deleted),
-        "EMM pid off adapter 2"
-    );
-    x.process_cat(1, &CAT, 0);
-    assert!(
-        mapped(&x, 1, 48),
-        "adapter 1's next CAT section takes the EMM pids"
-    );
-    x.del_pmt(1, &prog(&t, a));
     assert!(x.devices[&0].mapping.is_empty(), "nothing left mapped");
+    assert_eq!(x.devices[&0].cat_owner, None);
 
     assert_eq!(x.process_pmt(3, &prog(&t, c), false), TablesResult::Ok);
+    assert_eq!(x.devices[&0].cat_owner, Some(3));
     x.process_cat(3, &CAT, 0);
     for pid in [48, 193, 194, 49] {
         assert!(mapped(&x, 3, pid), "the next CAT maps EMM pid {pid} again");
