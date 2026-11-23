@@ -470,9 +470,9 @@ Unvalidated rows must be called out in release notes.
     `forget_stale_filters` & non-blocking `Dvbapi::flush`, CI+ RNG/`encode_len`/`MAX_PAIRS`,
     fallible `Csa`, `AdapterHandle::recv_event_timeout` & `keep_reading` gates, bounded replay
     scan, `diag::stop` resets).
-  - DDCI mandatory `PID 1`/`20` single-owner handover + `#1565` `PID 0`/`17` reservation (`DEV-297`),
+  - DDCI mandatory `PID 1`/`20` single-owner handover + `#1565` `PID 0`/`17`/`18` reservation (`DEV-297`),
     explicit `read_index_init` tracking (`U-06`/`DEV-298`), and inherited C++ `28dfd78` fixes
-    `U-01`–`U-05` & `U-07`–`U-09` (`DEV-299`–`DEV-300`).
+    `U-01`–`U-05` & `U-07`–`U-09` (`DEV-299`–`DEV-301`).
 - **Prior session (2026-11-17):** merged:
   - DDCI synthetic `PID 18` EIT `start_time` encoded directly in EN 300 468 UTC 4-bit BCD
     (`DEV-293`), eliminating local-timezone forward shift and invalid raw-binary BCD nibbles.

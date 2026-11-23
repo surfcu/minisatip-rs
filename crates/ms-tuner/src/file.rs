@@ -77,6 +77,7 @@ pub struct FileReplayTuner {
     status: SignalStatus,
     pacing_start: Option<Instant>,
     pacing_bytes: u64,
+    pcr_pid: Option<u16>,
     last_pcr: Option<u64>,
     last_pcr_time: Option<Instant>,
 }
@@ -95,6 +96,7 @@ impl FileReplayTuner {
             status: REPLAY_STATUS,
             pacing_start: None,
             pacing_bytes: 0,
+            pcr_pid: None,
             last_pcr: None,
             last_pcr_time: None,
         })
@@ -153,10 +155,14 @@ impl FileReplayTuner {
         }
     }
 
-    fn pace_pcr(&mut self, packet: &[u8; TS_PACKET_SIZE]) {
+    fn pace_pcr(&mut self, pid: u16, packet: &[u8; TS_PACKET_SIZE]) {
         let Some(pcr) = pcr_base(packet) else {
             return;
         };
+        let target_pid = *self.pcr_pid.get_or_insert(pid);
+        if pid != target_pid {
+            return;
+        }
         let now = Instant::now();
         if let (Some(previous), Some(previous_time)) = (self.last_pcr, self.last_pcr_time) {
             let ticks = pcr.wrapping_sub(previous);
@@ -176,6 +182,9 @@ impl FileReplayTuner {
 impl Tuner for FileReplayTuner {
     fn tune(&mut self, params: &TuneParams) -> Result<()> {
         self.last_tune = Some(params.clone());
+        self.pcr_pid = None;
+        self.last_pcr = None;
+        self.last_pcr_time = None;
         // adapter.cpp:1092-1097: the first tune resets the status to -1 with
         // strength and snr 0. The replay adapter has no get_signal (the patch sets
         // it NULL), so nothing sets the reading again.
@@ -223,10 +232,10 @@ impl Tuner for FileReplayTuner {
                 }
             }
             scanned += 1;
-            if self.config.pacing == Pacing::Pcr {
-                self.pace_pcr(&packet);
-            }
             let pid = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
+            if self.config.pacing == Pacing::Pcr {
+                self.pace_pcr(pid, &packet);
+            }
             if self.pids.contains(pid) {
                 if !buf.push_packet(&packet) {
                     break;
@@ -335,6 +344,37 @@ mod tests {
         let mut buf = TsBuf::with_packets(8);
         assert_eq!(tuner.read(&mut buf).unwrap(), 0);
         assert!(tuner.last_pcr.is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pcr_pacing_ignores_other_program_pcr_pids() {
+        let path = temp_ts_path("multi-pcr");
+        let mut file = File::create(&path).unwrap();
+        let packets = [
+            pcr_packet(100, 90_000),
+            pcr_packet(200, 90_000 + 90_000 * 4),
+            pcr_packet(100, 90_090),
+            pcr_packet(200, 90_000 + 90_000 * 8),
+        ];
+        for pkt in &packets {
+            file.write_all(pkt).unwrap();
+        }
+        file.flush().unwrap();
+
+        let cfg = FileReplayConfig {
+            looping: false,
+            pacing: Pacing::Pcr,
+        };
+        let mut tuner = FileReplayTuner::open(&path, cfg).unwrap();
+        tuner.set_pids(&PidSet::from_pids([100, 200])).unwrap();
+        let mut buf = TsBuf::with_packets(8);
+        let started = Instant::now();
+        let read = tuner.read(&mut buf).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(read, 4 * TS_PACKET_SIZE);
+        assert_eq!(tuner.pcr_pid, Some(100));
+        assert_eq!(tuner.last_pcr, Some(90_090));
         let _ = std::fs::remove_file(path);
     }
 }

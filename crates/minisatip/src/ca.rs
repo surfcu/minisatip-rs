@@ -2145,7 +2145,12 @@ impl Dvbapi {
             &mut self.tx_stalled_since,
         ) {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => {
+                if self.shared.borrow().client.close_requested() {
+                    self.close(now);
+                }
+                return;
+            }
             Err(failure) => {
                 log_write_failure(&failure, sock);
                 self.close(now);
@@ -4321,6 +4326,37 @@ mod window_tests {
         assert!(dvbapi.tx_stalled_since.is_some());
 
         dvbapi.tx_stalled_since = Some(Instant::now() - WRITE_TIMEOUT - Duration::from_millis(5));
+        dvbapi.flush(1);
+        assert!(dvbapi.conn.is_none());
+        assert!(dvbapi.tx_buf.is_empty());
+        assert_eq!(dvbapi.tx_offset, 0);
+        assert!(dvbapi.tx_stalled_since.is_none());
+    }
+
+    #[test]
+    fn dvbapi_flush_closes_immediately_when_close_requested_while_stalled() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut tx, _rx) = UnixStream::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        let filler = [0xAAu8; 4096];
+        while tx.write(&filler).is_ok() {}
+
+        let cfg = DvbapiConfig::from_options(&Options {
+            dvbapi_host: "127.0.0.1".to_owned(),
+            dvbapi_port: 9000,
+            ..Options::default()
+        });
+        let mut dvbapi = Dvbapi::new(cfg);
+        dvbapi.conn = Some(Stream::Unix(tx));
+        dvbapi.shared.borrow_mut().client.on_connected(0);
+
+        dvbapi.flush(0);
+        assert!(dvbapi.conn.is_some());
+        assert!(!dvbapi.tx_buf.is_empty());
+        assert!(dvbapi.tx_stalled_since.is_some());
+
+        dvbapi.shared.borrow_mut().client.mark_close();
         dvbapi.flush(1);
         assert!(dvbapi.conn.is_none());
         assert!(dvbapi.tx_buf.is_empty());

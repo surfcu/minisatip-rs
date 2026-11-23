@@ -266,7 +266,7 @@ impl DdciDevice {
 
     /// `find_ddci_pid`: the first DDCI-side pid from `pid` up that is free.
     fn find_ddci_pid(&self, pid: u16) -> i32 {
-        if matches!(pid, 0 | 17) || pid > 8191 {
+        if matches!(pid, 0 | 17 | 18) || pid > 8191 {
             ms_log::log_and_return!(-1, "pid {} invalid or reserved", pid);
         }
         if matches!(pid, 1 | 20) {
@@ -278,7 +278,7 @@ impl DdciDevice {
             };
         }
         (i32::from(pid)..8191)
-            .find(|&p| !matches!(p, 0 | 1 | 17 | 20) && self.get_ddci_pid(p).is_none())
+            .find(|&p| !matches!(p, 0 | 1 | 17 | 18 | 20) && self.get_ddci_pid(p).is_none())
             .unwrap_or(-1)
     }
 
@@ -604,7 +604,7 @@ impl Ddci {
         dev: usize,
         force_add_pid: bool,
     ) -> i32 {
-        if matches!(pid, 0 | 17) {
+        if matches!(pid, 0 | 17 | 18) {
             ms_log::log_and_return!(-1, "pid {} reserved on DDCI", pid);
         }
         let Some(d) = self.devices.get_mut(&dev) else {
@@ -1063,7 +1063,7 @@ impl Ddci {
             ms_log::log!("Skip processing pmt for ddci adapter {}", ad);
             return TablesResult::Ok;
         }
-        if matches!(pmt.pid, 0 | 17) {
+        if matches!(pmt.pid, 0 | 17 | 18) {
             ms_log::log_and_return!(
                 TablesResult::NoRetry,
                 "DDCI: ignoring PMT {} with reserved pid {}",
@@ -2483,20 +2483,22 @@ mod tests {
         ddci.devices.insert(0, DdciDevice::opened(0));
         assert_eq!(ddci.add_pid_mapping_table(1, 0, 1, 0, false), -1);
         assert_eq!(ddci.add_pid_mapping_table(1, 17, 1, 0, false), -1);
+        assert_eq!(ddci.add_pid_mapping_table(1, 18, 1, 0, false), -1);
         assert!(ddci.devices[&0].mapping.is_empty());
 
         assert_eq!(ddci.add_pid_mapping_table(1, 1, 1, 0, false), 1);
         assert_eq!(ddci.add_pid_mapping_table(2, 1, 2, 0, false), -1);
 
         assert_eq!(ddci.add_pid_mapping_table(1, 16, 1, 0, false), 16);
-        assert_eq!(ddci.add_pid_mapping_table(2, 16, 2, 0, false), 18);
+        assert_eq!(ddci.add_pid_mapping_table(2, 16, 2, 0, false), 19);
 
-        assert_eq!(ddci.add_pid_mapping_table(1, 19, 1, 0, false), 19);
-        assert_eq!(ddci.add_pid_mapping_table(2, 19, 2, 0, false), 21);
+        assert_eq!(ddci.add_pid_mapping_table(1, 19, 1, 0, false), 21);
 
         let mut pmt_bad = ca_program(10, 1, 900, 0, 0x301, 0x350);
         assert_eq!(ddci.process_pmt(1, &pmt_bad, false), TablesResult::NoRetry);
         pmt_bad.pid = 17;
+        assert_eq!(ddci.process_pmt(1, &pmt_bad, false), TablesResult::NoRetry);
+        pmt_bad.pid = 18;
         assert_eq!(ddci.process_pmt(1, &pmt_bad, false), TablesResult::NoRetry);
     }
 }
