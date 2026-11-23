@@ -529,3 +529,26 @@ fn http_output_reports_broken_connection() {
             .is_err()
     );
 }
+
+#[test]
+fn poll_rtcp_caps_drain_per_tick() {
+    let (rx_rtp, rx_rtcp) = udp_pair();
+    let mut output = udp_output(rx_rtp.local_addr().unwrap(), 1);
+    let rtcp_dest = output
+        .udp_sockets()
+        .expect("UDP output")
+        .1
+        .local_addr()
+        .unwrap();
+    for i in 0..70u8 {
+        rx_rtcp.send_to(&[i; 8], rtcp_dest).unwrap();
+    }
+    // Wait briefly until all 70 datagrams are queued on the non-blocking socket.
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(output.poll_rtcp());
+    assert!(
+        output.poll_rtcp(),
+        "remaining 6 datagrams wait for next tick"
+    );
+    assert!(!output.poll_rtcp(), "socket is now empty");
+}

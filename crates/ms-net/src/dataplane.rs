@@ -612,17 +612,7 @@ impl AdapterHandle {
 
     /// Sends a raw command; `false` when the queue is full or the thread has exited.
     pub fn send(&self, command: Command) -> bool {
-        if matches!(command, Command::Stop) {
-            self.pending_commands.fetch_add(1, Ordering::Relaxed);
-        } else if !atomic_inc_below(&self.pending_commands, MAX_PENDING_COMMANDS) {
-            return false;
-        }
-        if self.commands.send(command).is_ok() {
-            true
-        } else {
-            atomic_dec_sat(&self.pending_commands);
-            false
-        }
+        send_budgeted_command(&self.commands, Some(&self.pending_commands), command)
     }
 
     /// Clone of the command sender, e.g. for an [`ms_sched::AdapterTuner`] bridge.
@@ -807,6 +797,60 @@ impl Drop for AdapterHandle {
     }
 }
 
+fn send_budgeted_command(
+    commands: &Sender<Command>,
+    pending: Option<&AtomicUsize>,
+    command: Command,
+) -> bool {
+    let exempt = matches!(
+        command,
+        Command::Stop
+            | Command::StopOutput(_)
+            | Command::StartOutput { .. }
+            | Command::ReplaceUdpSockets { .. }
+            | Command::SetSsrc { .. }
+            | Command::SetPids { .. }
+            | Command::SetBasePids(_)
+    );
+    if let Some(pending) = pending {
+        if exempt {
+            pending.fetch_add(1, Ordering::Relaxed);
+        } else if !atomic_inc_below(pending, MAX_PENDING_COMMANDS) {
+            return false;
+        }
+    }
+    if commands.send(command).is_ok() {
+        true
+    } else {
+        if let Some(pending) = pending {
+            atomic_dec_sat(pending);
+        }
+        false
+    }
+}
+
+fn fold_stream_bandwidth(
+    bandwidth: &Bandwidth,
+    mark: &mut (u32, u32, u32, u64, u64),
+    stats: &OutputStats,
+) {
+    // `bw`/`writes` advance with `sid->sb`/`sid->sp` (`u32` wraparound).
+    bandwidth.record_writes(
+        u64::from(stats.octets.wrapping_sub(mark.0)),
+        stats.packets.wrapping_sub(mark.1),
+    );
+    bandwidth.record_failed_writes(stats.failed_writes.wrapping_sub(mark.2));
+    bandwidth.record_buffered(stats.fifo_written.wrapping_sub(mark.3));
+    bandwidth.record_dropped(stats.fifo_dropped.wrapping_sub(mark.4));
+    *mark = (
+        stats.octets,
+        stats.packets,
+        stats.failed_writes,
+        stats.fifo_written,
+        stats.fifo_dropped,
+    );
+}
+
 /// [`AdapterTuner`] that forwards to an adapter's data-plane thread.
 ///
 /// Tuning blocks until the thread reports the backend result, matching the
@@ -850,18 +894,7 @@ impl DataPlaneTuner {
     }
 
     fn send_command(&self, command: Command) -> bool {
-        if let Some(pending) = &self.pending_commands {
-            if !atomic_inc_below(pending, MAX_PENDING_COMMANDS) {
-                return false;
-            }
-            if self.commands.send(command).is_ok() {
-                return true;
-            }
-            atomic_dec_sat(pending);
-            false
-        } else {
-            self.commands.send(command).is_ok()
-        }
+        send_budgeted_command(&self.commands, self.pending_commands.as_deref(), command)
     }
 }
 
@@ -948,7 +981,7 @@ struct DataPlane {
     running: bool,
     bandwidth: Option<Arc<Bandwidth>>,
     /// Last octets/packets/failed writes/FIFO-copied/FIFO-dropped per output.
-    bandwidth_marks: BTreeMap<StreamId, (u64, u32, u32, u64, u64)>,
+    bandwidth_marks: BTreeMap<StreamId, (u32, u32, u32, u64, u64)>,
     stages: Vec<Box<dyn TsStage>>,
     section_pids: PidSet,
     tune_generation: Arc<Mutex<u64>>,
@@ -1253,7 +1286,7 @@ impl DataPlane {
                 // Log lines use `sid->sid` (stream.cpp:785,838,845,...).
                 output.set_stream_id(stream_id);
                 let stats = output.stats();
-                self.outputs.insert(
+                if let Some(prev) = self.outputs.insert(
                     stream_id,
                     Subscriber {
                         epoch,
@@ -1261,7 +1294,10 @@ impl DataPlane {
                         pids,
                         last_timer_ms: now,
                     },
-                );
+                ) {
+                    self.fold_removed_output_bandwidth(stream_id, &prev.output.stats());
+                }
+                self.bandwidth_marks.remove(&stream_id);
                 self.latest_stats
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -1302,6 +1338,7 @@ impl DataPlane {
                     output.set_flush_enqueued_data();
                     let _ = output.flush_queue();
                     let stats = output.stats();
+                    self.fold_removed_output_bandwidth(stream_id, &stats);
                     let _ =
                         self.events
                             .send(Event::OutputStopped(stream_id, stats, subscriber.epoch));
@@ -1369,6 +1406,14 @@ impl DataPlane {
         }
     }
 
+    fn fold_removed_output_bandwidth(&mut self, stream_id: StreamId, stats: &OutputStats) {
+        if let Some(mut mark) = self.bandwidth_marks.remove(&stream_id)
+            && let Some(bandwidth) = &self.bandwidth
+        {
+            fold_stream_bandwidth(bandwidth, &mut mark, stats);
+        }
+    }
+
     /// Folds output counters into the process-wide bandwidth window and asks it
     /// to update the snapshot (`calculate_bw`, stream.cpp:1287-1327).
     fn sync_bandwidth(&mut self) {
@@ -1381,26 +1426,7 @@ impl DataPlane {
                 .bandwidth_marks
                 .entry(*stream_id)
                 .or_insert((0, 0, 0, 0, 0));
-            // `bw`/`writes` advance with `sid->sb`/`sid->sp`
-            // (stream.cpp:825-826, socketworks.cpp:1321).
-            bandwidth.record_writes(
-                u64::from(stats.octets).wrapping_sub(mark.0),
-                stats.packets.wrapping_sub(mark.1),
-            );
-            bandwidth.record_failed_writes(stats.failed_writes.wrapping_sub(mark.2));
-            // `buffered_bytes += copied` when data enters the FIFO and
-            // `dropped_bytes += len - offset` when it does not fit; both are
-            // per-window accumulators reset by `calculate_bw`
-            // (socketworks.cpp:1496,1505-1506; stream.cpp:1308-1309,1325-1326).
-            bandwidth.record_buffered(stats.fifo_written.wrapping_sub(mark.3));
-            bandwidth.record_dropped(stats.fifo_dropped.wrapping_sub(mark.4));
-            *mark = (
-                u64::from(stats.octets),
-                stats.packets,
-                stats.failed_writes,
-                stats.fifo_written,
-                stats.fifo_dropped,
-            );
+            fold_stream_bandwidth(&bandwidth, mark, &stats);
         }
         self.bandwidth_marks
             .retain(|stream_id, _| self.outputs.contains_key(stream_id));
@@ -1738,6 +1764,7 @@ impl DataPlane {
 
     fn close(&mut self, stream_id: StreamId) {
         if let Some(subscriber) = self.outputs.remove(&stream_id) {
+            self.fold_removed_output_bandwidth(stream_id, &subscriber.output.stats());
             self.latest_stats
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2776,5 +2803,111 @@ mod tests {
                 cc_errors: 1,
             }
         );
+    }
+
+    #[test]
+    fn exempt_commands_bypass_pending_cap_while_thresholds_are_bounded() {
+        let (tx, _rx) = mpsc::channel();
+        let pending = Arc::new(AtomicUsize::new(MAX_PENDING_COMMANDS));
+        assert!(!send_budgeted_command(
+            &tx,
+            Some(&pending),
+            Command::SetThreshold(10)
+        ));
+        assert!(send_budgeted_command(&tx, Some(&pending), Command::Stop));
+        assert!(send_budgeted_command(
+            &tx,
+            Some(&pending),
+            Command::StopOutput(0)
+        ));
+        assert!(send_budgeted_command(
+            &tx,
+            Some(&pending),
+            Command::SetPids {
+                stream_id: 0,
+                pids: PidSet::new()
+            }
+        ));
+        assert!(send_budgeted_command(
+            &tx,
+            Some(&pending),
+            Command::SetBasePids(PidSet::new())
+        ));
+        assert!(send_budgeted_command(
+            &tx,
+            Some(&pending),
+            Command::SetSsrc {
+                stream_id: 0,
+                ssrc: 1
+            }
+        ));
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(send_budgeted_command(
+            &tx,
+            Some(&pending),
+            Command::ReplaceUdpSockets {
+                stream_id: 0,
+                rtp: a,
+                rtcp: b,
+                send_buffer: 0,
+            }
+        ));
+        assert_eq!(pending.load(Ordering::Relaxed), MAX_PENDING_COMMANDS + 6);
+    }
+
+    #[test]
+    fn fold_stream_bandwidth_handles_u32_wraps_and_stop_output_folds_tail() {
+        use crate::output::OutputConfig;
+
+        let bw = Arc::new(Bandwidth::new());
+        let mut mark = (u32::MAX - 9, u32::MAX - 1, 0, 100, 10);
+        let stats = OutputStats {
+            stream_type: StreamType::Http,
+            seq: 0,
+            ssrc: 0,
+            packets: 3,
+            octets: 15,
+            failed_writes: 2,
+            overflow: 0,
+            buffered: 0,
+            fifo_written: 150,
+            fifo_dropped: 12,
+            remote: None,
+            started: true,
+        };
+        fold_stream_bandwidth(&bw, &mut mark, &stats);
+        assert_eq!(mark, (15, 3, 2, 150, 12));
+
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        drop(cmd_tx);
+        let mut plane = DataPlane::new(
+            Box::new(LockTuner),
+            DataPlaneConfig::default(),
+            cmd_rx,
+            evt_tx,
+            Some(Arc::clone(&bw)),
+        );
+        let out = StreamOutput::http(
+            Box::new(io::sink()),
+            None,
+            OutputConfig {
+                ssrc: 0,
+                seq: 0,
+                fifo_size: 4096,
+            },
+            0,
+        );
+        plane.handle(Command::StartOutput {
+            stream_id: 4,
+            epoch: 1,
+            output: Box::new(out),
+            pids: PidSet::new(),
+            setup_age_ms: 0,
+        });
+        plane.bandwidth_marks.insert(4, (10, 1, 0, 0, 0));
+        plane.handle(Command::StopOutput(4));
+        assert!(!plane.bandwidth_marks.contains_key(&4));
     }
 }

@@ -118,15 +118,10 @@ impl<A: McliReceiverApi> NetceiverTuner<A> {
         if self.err {
             return 0;
         }
-        let mut hit = false;
-        for i in 0..MAX_PIDS - 1 {
-            if self.npid[i] == pid || hit {
-                self.npid[i] = self.npid[i + 1];
-                hit = true;
-            }
-        }
-        if hit && self.lp > 0 {
+        if let Some(pos) = self.npid[..self.lp].iter().position(|&p| p == pid) {
+            self.npid.copy_within(pos + 1..self.lp, pos);
             self.lp -= 1;
+            self.npid[self.lp] = 0;
         }
         self.shared.set_active_pids(self.lp);
         self.want_commit = true;

@@ -3221,3 +3221,35 @@ fn add_ca_caps_at_u64_mask_width_and_reuses_freed_slots() {
     assert_eq!(sched.add_ca(Box::new(FakeCa(log.clone()))), 63);
     assert_eq!(sched.add_ca(Box::new(FakeCa(log.clone()))), -1);
 }
+
+#[test]
+fn malformed_pmt_update_preserves_caids_claims_and_version() {
+    let mut sched = test_sched(AdapterType::Dvb);
+    sched.mark_pid_add(0, 0, 817);
+    sched.mark_pid_add(0, 0, 0x1D30);
+    sched.update_pids(0);
+    let fid = sched.add_filter(0, 817, FilterTarget::Pmt(None), 0);
+    assert!(fid >= 0);
+
+    let good: [u8; 45] = [
+        0x02, 0xB0, 0x2A, 0x17, 0x9B, 0xE9, 0x00, 0x00, 0xFD, 0x30, 0xF0, 0x09, 0x09, 0x07, 0x18,
+        0x14, 0xE6, 0x43, 0x02, 0x52, 0x11, 0x1B, 0xFD, 0x30, 0xF0, 0x00, 0x0F, 0xFD, 0x31, 0xF0,
+        0x0A, 0x0A, 0x04, 0x70, 0x6F, 0x72, 0x00, 0x7C, 0x02, 0x00, 0x00, 0x43, 0x9A, 0x7E, 0xD6,
+    ];
+    assert_eq!(sched.process_pmt(fid, &good), 0);
+    let pmt_id = sched.get_pmt_for_sid_pid(0, 6043, 817).unwrap().id as i32;
+    let ver_before = sched.pmt(pmt_id).unwrap().version;
+    let caids_before = sched.pmt(pmt_id).unwrap().caids;
+    assert_ne!(caids_before, 0);
+
+    sched.pmt_slot_mut(pmt_id).unwrap().state = PmtState::Stopped;
+    sched.find_pid_mut(0, 0x1D30).unwrap().pmt = pmt_id;
+
+    // Truncated section with a bumped version byte (0xEB = version 21) fails parsing.
+    let bad: [u8; 10] = [0x02, 0xB0, 0x20, 0x17, 0x9B, 0xEB, 0x00, 0x00, 0xFD, 0x30];
+    assert_eq!(sched.process_pmt(fid, &bad), 0);
+    let pmt = sched.pmt(pmt_id).unwrap();
+    assert_eq!(pmt.version, ver_before);
+    assert_eq!(pmt.caids, caids_before);
+    assert_eq!(sched.find_pid(0, 0x1D30).unwrap().pmt, pmt_id);
+}

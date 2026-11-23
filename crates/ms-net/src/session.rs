@@ -26,8 +26,8 @@ use crate::satip::{merge_satip_url, parse_satip_url_new};
 use crate::srt::{LibSrtOps, SRT_INVALID_SOCK, SrtListener, SrtOps};
 use crate::web::{
     ADAPTER_CI, ADAPTER_DVB, ADAPTER_NETCV, ADAPTER_SATIP, AdapterState, CaDeviceState,
-    GUARD_INTERVAL_AUTO, KeyState, PmtState, QAM_AUTO, RuntimeState, StreamState, WebService,
-    WebSnapshot,
+    GUARD_INTERVAL_AUTO, KeyState, PmtState, QAM_AUTO, RuntimeState, SatipcState, StreamState,
+    WebService, WebSnapshot,
 };
 
 const STREAM_SLOTS: usize = MAX_STREAMS as usize;
@@ -194,7 +194,7 @@ impl Stream {
             srt_streamid: String::new(),
             touched: false,
             opened: false,
-            overflow: 0,
+            overflow: -1,
             buffered: 0,
         }
     }
@@ -264,6 +264,8 @@ pub struct SessionManager {
     web_keys: Vec<Option<KeyState>>,
     /// `ad_decerr` per adapter, pushed by the CA runtime.
     web_decerr: Vec<i32>,
+    /// SAT>IP client slots, pushed by the runtime.
+    web_satipc: Vec<Option<SatipcState>>,
     bandwidth: Arc<Bandwidth>,
     #[cfg(feature = "srt")]
     srt: Option<SrtListener<LibSrtOps>>,
@@ -311,6 +313,7 @@ impl SessionManager {
             web_ca: Vec::new(),
             web_keys: Vec::new(),
             web_decerr: Vec::new(),
+            web_satipc: Vec::new(),
             bandwidth: Arc::new(Bandwidth::new()),
             #[cfg(feature = "srt")]
             srt: None,
@@ -353,6 +356,11 @@ impl SessionManager {
     /// Installs the per-adapter decrypt errors shown as `ad_decerr`.
     pub fn set_web_decerr(&mut self, decerr: Vec<i32>) {
         self.web_decerr = decerr;
+    }
+
+    /// Installs the SAT>IP client slots shown as `ad_satip*`.
+    pub fn set_web_satipc(&mut self, satipc: Vec<Option<SatipcState>>) {
+        self.web_satipc = satipc;
     }
 
     /// Installs the process-wide counters reported by `/bandwidth.json`.
@@ -900,6 +908,8 @@ impl SessionManager {
             stream.do_play = false;
             stream.srt_sock = -1;
             stream.srt_streamid.clear();
+            stream.overflow = 0;
+            stream.buffered = 0;
         }
         self.udp_sockets.remove(&id);
     }
@@ -921,6 +931,8 @@ impl SessionManager {
             stream.do_play = false;
             stream.srt_sock = -1;
             stream.srt_streamid.clear();
+            stream.overflow = 0;
+            stream.buffered = 0;
         }
         if adapter >= 0 {
             self.sched.close_adapter_for_stream(id, adapter);
@@ -1197,6 +1209,16 @@ impl SessionManager {
         {
             stream.overflow = overflow.min(i32::MAX as u64) as i32;
             stream.buffered = buffered.min(i32::MAX as u64) as i32;
+        }
+    }
+
+    /// Resets output counters when a stream has no open output socket (`-1` while enabled).
+    pub fn clear_stream_output_stats(&mut self, id: StreamId) {
+        if let Some(index) = self.slot_index(id)
+            && let Some(stream) = self.streams[index].as_mut()
+        {
+            stream.overflow = if stream.enabled { -1 } else { 0 };
+            stream.buffered = 0;
         }
     }
 
@@ -1531,6 +1553,7 @@ impl SessionManager {
                     .unwrap_or(0)
                     .min(i32::MAX as u64) as i32,
                 decerr: self.web_decerr.get(aid).copied().unwrap_or(0),
+                name: adapter.config.name.clone(),
                 strength,
                 snr,
                 db,
@@ -1548,7 +1571,6 @@ impl SessionManager {
                         pid: pmt.pid,
                     })
                     .collect(),
-                ..AdapterState::default()
             };
         }
         snapshot.streams = vec![StreamState::default(); STREAM_SLOTS];
@@ -1566,12 +1588,13 @@ impl SessionManager {
                 protocol: protocol_name(stream.stream_type).to_owned(),
                 // get_stream_pids: the adapter's active pids carrying this stream.
                 pids: self.sched.stream_pids(stream.adapter, index as StreamId),
-                overflow: stream.overflow,
-                buffered: stream.buffered,
+                overflow: if stream.enabled { stream.overflow } else { 0 },
+                buffered: if stream.enabled { stream.buffered } else { 0 },
             };
         }
         snapshot.ca = self.web_ca.clone();
         snapshot.keys = self.web_keys.clone();
+        snapshot.satipc = self.web_satipc.clone();
         snapshot.runtime = self.web_runtime.at(SystemTime::now());
         self.bandwidth.calculate();
         snapshot.bandwidth = self.bandwidth.snapshot();
@@ -2016,15 +2039,57 @@ mod tests {
         let clock = Arc::new(ManualClock::new(0));
         let mut manager = manual_manager(&clock);
         let id = manager.add_stream().expect("slot");
-        manager.set_stream_output_stats(id, 123, 456);
+        assert_eq!(manager.web_snapshot().streams[id as usize].overflow, -1);
 
+        manager.set_stream_output_stats(id, 123, 456);
         let snapshot = manager.web_snapshot();
         assert_eq!(snapshot.streams[id as usize].overflow, 123);
         assert_eq!(snapshot.streams[id as usize].buffered, 456);
+
+        manager.clear_stream_output_stats(id);
+        let snapshot = manager.web_snapshot();
+        assert_eq!(snapshot.streams[id as usize].overflow, -1);
+        assert_eq!(snapshot.streams[id as usize].buffered, 0);
 
         manager.set_stream_output_stats(id, u64::MAX, u64::MAX);
         let snapshot = manager.web_snapshot();
         assert_eq!(snapshot.streams[id as usize].overflow, i32::MAX);
         assert_eq!(snapshot.streams[id as usize].buffered, i32::MAX);
+
+        manager.close_stream(id);
+        let snapshot = manager.web_snapshot();
+        assert_eq!(snapshot.streams[id as usize].overflow, 0);
+        assert_eq!(snapshot.streams[id as usize].buffered, 0);
+    }
+
+    #[test]
+    fn web_snapshot_exposes_adapter_name_and_satipc_slots() {
+        struct StubTuner;
+        impl ms_sched::AdapterTuner for StubTuner {
+            fn tune(&mut self, _: &TuneParams) -> Result<(), TuneError> {
+                Ok(())
+            }
+        }
+        let clock = Arc::new(ManualClock::new(0));
+        let mut manager = manual_manager(&clock);
+        let mut cfg = ms_sched::AdapterConfig::new(DeliverySystem::DvbS2);
+        cfg.name = "Mock Tuner".to_owned();
+        manager
+            .scheduler_mut()
+            .add_adapter(0, cfg, Box::new(StubTuner));
+        manager.set_web_satipc(vec![Some(SatipcState {
+            sip: "10.0.0.5".to_owned(),
+            transport_type: 1,
+        })]);
+
+        let snapshot = manager.web_snapshot();
+        assert_eq!(snapshot.adapters[0].name, "Mock Tuner");
+        assert_eq!(
+            snapshot.satipc[0],
+            Some(SatipcState {
+                sip: "10.0.0.5".to_owned(),
+                transport_type: 1,
+            })
+        );
     }
 }

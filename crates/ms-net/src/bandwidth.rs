@@ -37,7 +37,6 @@ pub struct BandwidthSnapshot {
 struct Window {
     bw: i64,
     bw_dmx: i64,
-    tbw: i64,
     reads: u32,
     writes: u32,
     failed_writes: u32,
@@ -49,6 +48,7 @@ struct Window {
 #[derive(Debug)]
 struct Inner {
     window: Window,
+    tbw: i64,
     snapshot: BandwidthSnapshot,
     /// `bwtt`: last time the window was folded into the snapshot.
     bwtt_ms: i64,
@@ -73,6 +73,7 @@ impl Bandwidth {
         Self {
             inner: Mutex::new(Inner {
                 window: Window::default(),
+                tbw: 0,
                 snapshot: BandwidthSnapshot::default(),
                 bwtt_ms: 0,
                 origin: Instant::now(),
@@ -151,8 +152,9 @@ impl Bandwidth {
                 return;
             }
             inner.bwtt_ms = now;
+            inner.tbw += inner.window.bw;
+            let total_written = inner.tbw;
             let window = &mut inner.window;
-            window.tbw += window.bw;
             if window.reads == 0 {
                 window.reads = 1;
             }
@@ -160,7 +162,7 @@ impl Bandwidth {
             let next = busy.then(|| BandwidthSnapshot {
                 bw: window.bw / 1024,
                 dmx: window.bw_dmx / 1024,
-                tbw: window.tbw / 1_024_576,
+                tbw: total_written / 1_024_576,
                 reads: window.reads,
                 writes: window.writes,
                 fwrites: window.failed_writes,
@@ -259,5 +261,19 @@ mod tests {
         // previous value, but the window was cleared (stream.cpp:1298-1326).
         assert_eq!(bandwidth.snapshot().bw, 0);
         assert_eq!(bandwidth.snapshot().tbw, 0);
+    }
+
+    #[test]
+    fn tbw_persists_across_window_resets() {
+        let bandwidth = Bandwidth::new();
+        bandwidth.record_write(700_000);
+        bandwidth.inner.lock().unwrap().bwtt_ms = -1_100;
+        bandwidth.calculate();
+        assert_eq!(bandwidth.snapshot().tbw, 0);
+
+        bandwidth.record_write(400_000);
+        bandwidth.inner.lock().unwrap().bwtt_ms = -1_100;
+        bandwidth.calculate();
+        assert_eq!(bandwidth.snapshot().tbw, 1);
     }
 }

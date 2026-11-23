@@ -315,3 +315,19 @@ fn discovery_atsc_and_unknown_types() {
     assert_eq!(d.adapters[0].fe_type, FE_ATSC);
     assert!(d.adapters[0].sys.is_empty());
 }
+
+#[test]
+fn del_pid_removes_last_slot_and_zeroes_stale_tail() {
+    let mut t = NetceiverTuner::new(FakeMcli::new(), 0);
+    for pid in 0..MAX_PIDS as u16 {
+        assert!(t.set_pid(100 + pid) >= 100);
+    }
+    assert_eq!(t.set_pid(999), -1);
+    let last_pid = 100 + (MAX_PIDS as u16 - 1);
+    assert_eq!(t.del_pid(last_pid), 0);
+    assert_eq!(t.active_pids().len(), MAX_PIDS - 1);
+    assert!(!t.active_pids().contains(&last_pid));
+    // Re-deleting a removed PID must not decrement `lp` from a stale tail copy.
+    assert_eq!(t.del_pid(last_pid), 0);
+    assert_eq!(t.active_pids().len(), MAX_PIDS - 1);
+}

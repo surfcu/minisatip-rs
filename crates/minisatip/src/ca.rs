@@ -437,15 +437,24 @@ impl CaRuntime {
         }
         let wanted: BTreeSet<(usize, u16)> = link.hub.ddci_pids().into_iter().collect();
         let mut touched = BTreeSet::new();
-        for &(aid, pid) in wanted.difference(&link.mirrored) {
-            sched.mark_pid_add(aid as i32, DDCI_SID, i32::from(pid));
-            touched.insert(aid);
-        }
-        for &(aid, pid) in link.mirrored.difference(&wanted) {
+        let removed: Vec<(usize, u16)> = link.mirrored.difference(&wanted).copied().collect();
+        for (aid, pid) in removed {
             sched.unmark_pid(aid, DDCI_SID, i32::from(pid));
+            link.mirrored.remove(&(aid, pid));
             touched.insert(aid);
         }
-        link.mirrored = wanted;
+        let added: Vec<(usize, u16)> = wanted.difference(&link.mirrored).copied().collect();
+        for (aid, pid) in added {
+            if sched.mark_pid_add(aid as i32, DDCI_SID, i32::from(pid)) >= 0 {
+                link.mirrored.insert((aid, pid));
+                touched.insert(aid);
+            } else if sched
+                .adapter(aid)
+                .is_some_and(|a| a.config.enabled && !sched.is_disabled(aid))
+            {
+                ok = false;
+            }
+        }
         let filters: BTreeMap<usize, u16> = link
             .hub
             .lock()
@@ -4109,5 +4118,45 @@ mod window_tests {
             "stale generation offer must be swept"
         );
         drop(recorder);
+    }
+
+    #[test]
+    fn sync_ddci_retries_failed_mark_pid_add_without_poisoning_mirrored() {
+        let mut sched = Scheduler::new();
+        let mut ca = CaRuntime::new(&Options::default());
+        let hub = DdciHub::new();
+        ca.attach_ddci(&mut sched, hub.clone());
+        hub.lock().ddci.create_adapter(0);
+        hub.lock().ddci.mark_pid_add(DDCI_SID, 0, 100);
+
+        // Missing adapter: not poisoned into `mirrored`, and doesn't spin `ok = false`.
+        assert!(ca.sync_ddci(&mut sched));
+        assert!(!ca.ddci.as_ref().unwrap().mirrored.contains(&(0, 100)));
+
+        // Enable adapter 0 and fill all `MAX_PIDS` slots so `mark_pid_add` returns -1.
+        sched.add_adapter(
+            0,
+            AdapterConfig::new(DeliverySystem::DvbS2),
+            Box::new(NullSchedTuner),
+        );
+        for p in 1..=ms_sched::MAX_PIDS as i32 {
+            assert_eq!(sched.mark_pid_add(0, 7, p + 500), 0);
+        }
+        assert!(!ca.sync_ddci(&mut sched), "full PID table sets ok = false");
+        assert!(
+            !ca.ddci.as_ref().unwrap().mirrored.contains(&(0, 100)),
+            "failed mark_pid_add must not poison mirrored set"
+        );
+
+        // Free one PID slot: next sync installs and mirrors PID 100.
+        sched.unmark_pid(0, 7, 501);
+        sched.update_adapter_pids(0);
+        assert!(ca.sync_ddci(&mut sched));
+        assert!(ca.ddci.as_ref().unwrap().mirrored.contains(&(0, 100)));
+        assert!(
+            sched
+                .find_pid(0, 100)
+                .is_some_and(|p| p.sids.contains(&DDCI_SID))
+        );
     }
 }

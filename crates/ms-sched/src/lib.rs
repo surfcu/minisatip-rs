@@ -255,6 +255,8 @@ pub struct AdapterConfig {
     pub phy_adapter: i32,
     /// `frontendM` number (`ad->fn`, `ad_phyfd`); 0 when not a DVB device.
     pub phy_frontend: i32,
+    /// Adapter name (`ad->name(i, 0)`), e.g. frontend name or `host @ TRANSPORT`.
+    pub name: String,
 }
 
 impl Default for AdapterConfig {
@@ -271,6 +273,7 @@ impl Default for AdapterConfig {
             adapter_type: AdapterType::Unknown,
             phy_adapter: 0,
             phy_frontend: 0,
+            name: String::new(),
         }
     }
 }

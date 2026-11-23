@@ -64,6 +64,10 @@ enum OpenPid {
 
 /// Largest section read from a section filter (`dvb_psi_read`).
 const SECTION_BUF: usize = 4096;
+/// Maximum section reads per demux fd in one `read()` call.
+const MAX_SECTIONS_PER_READ: usize = 64;
+/// Maximum queued section-TS backlog before pausing demux section reads.
+const MAX_PSI_BACKLOG_BYTES: usize = 64 * 1024;
 
 /// Frontend status timer period (`minisatip.cpp:1989`, `adapter.cpp:2262`).
 pub const STATUS_POLL_MS: i64 = 300;
@@ -642,7 +646,10 @@ impl<D: DvbDevice> LinuxDvbTuner<D> {
             })
             .collect();
         for (pid, fd) in open {
-            loop {
+            for _ in 0..MAX_SECTIONS_PER_READ {
+                if self.psi.len() >= MAX_PSI_BACKLOG_BYTES {
+                    return;
+                }
                 // section[0] is the pointer field ahead of the section bytes.
                 section[0] = 0;
                 match self.dev.read_demux(fd, &mut section[1..]) {
@@ -685,15 +692,24 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
         let prev_sid_cnt = self.state.sid_cnt;
         self.state.sid_cnt = 1;
         let ret = self.tune_with_registry(&tp);
-        if ret < 0 {
-            self.state.sid_cnt = prev_sid_cnt;
-            return Err(TunerError::Backend(ret));
-        }
         self.status = SignalStatus {
+            locked: false,
+            strength: 0,
+            snr: 0,
+            ber: 0,
+            db: SignalStatus::DB_UNKNOWN,
             status_valid: false,
-            ..SignalStatus::default()
         };
         self.status_refreshed = false;
+        // Partial packets and sections from the previous mux must not cross retunes.
+        self.psi.clear();
+        self.partial.clear();
+        if ret < 0 {
+            self.state.sid_cnt = prev_sid_cnt;
+            self.next_status_ms = None;
+            self.status_cnt = 0;
+            return Err(TunerError::Backend(ret));
+        }
         // Skip the first 300 ms tick after tune (`status_cnt`, adapter.cpp:1096, 2278).
         if self.state.tp.freq.unwrap_or(0) > 0 {
             let now = self.dev.now_ms();
@@ -708,8 +724,6 @@ impl<D: DvbDevice> Tuner for LinuxDvbTuner<D> {
             self.next_status_ms = None;
             self.status_cnt = 0;
         }
-        // Sections of the previous transponder are not delivered after a retune.
-        self.psi.clear();
         Ok(())
     }
 

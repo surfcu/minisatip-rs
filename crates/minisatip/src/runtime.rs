@@ -154,6 +154,7 @@ struct SatipAdapter {
     host: String,
     port: u16,
     delsys: DeliverySystem,
+    transport: ms_tuner::satipc::Transport,
 }
 
 /// Result of one background `--satip-xml` fetch: `(url, over_tcp, host, xml)`.
@@ -312,6 +313,7 @@ struct Runtime {
     config: ServerConfig,
     session: SessionManager,
     handles: Vec<Option<AdapterHandle>>,
+    thresholds: [Option<i64>; MAX_ADAPTERS],
     outputs: HashMap<i32, ActiveOutput>,
     conn_streams: HashMap<u64, i32>,
     conn_states: HashMap<u64, Arc<AtomicUsize>>,
@@ -461,9 +463,7 @@ impl Runtime {
         let satip = SatipSettings::from_options(opts, config.start_rtp);
         let mut satip_adapters = Vec::new();
         for server in satip_servers(opts)? {
-            let Some(aid) = (0..MAX_ADAPTERS)
-                .find(|aid| handles[*aid].is_none() && !satip.adapter_disabled(*aid))
-            else {
+            let Some(aid) = first_free_satip_slot(&scheduler, &handles, &satip) else {
                 // satipc.cpp:2009-2010 (LOG_AND_RETURN in add_satip_server).
                 ms_log::log!("MAX_ADAPTERS reached");
                 break;
@@ -483,6 +483,7 @@ impl Runtime {
                 host: server.host,
                 port: server.port,
                 delsys: server.delsys,
+                transport: server.transport,
             });
         }
         let xml_poll = opts.satip_xml.as_deref().and_then(|urls| {
@@ -569,11 +570,13 @@ impl Runtime {
         if let Some(listener) = start_srt_listener(&config) {
             session.set_srt_listener(listener);
         }
+        session.set_web_satipc(build_web_satipc(&satip_adapters));
 
         Ok(Self {
             config,
             session,
             handles,
+            thresholds: [None; MAX_ADAPTERS],
             outputs: HashMap::new(),
             conn_streams: HashMap::new(),
             conn_states: HashMap::new(),
@@ -642,8 +645,7 @@ impl Runtime {
 
     /// `add_satip_server`: installs one satipc adapter in the first free slot.
     fn add_satip_adapter(&mut self, server: SatipServer) -> Result<(), String> {
-        let Some(aid) = (0..MAX_ADAPTERS)
-            .find(|aid| self.handles[*aid].is_none() && !self.satip.adapter_disabled(*aid))
+        let Some(aid) = first_free_satip_slot(self.session.scheduler(), &self.handles, &self.satip)
         else {
             // satipc.cpp:2009-2010.
             ms_log::log_and_return!(Ok(()), "MAX_ADAPTERS reached");
@@ -664,12 +666,15 @@ impl Runtime {
         );
         self.ca.adapter_added(self.session.scheduler_mut(), aid);
         self.handles[aid] = Some(handle);
+        self.thresholds[aid] = None;
         self.satip_adapters.push(SatipAdapter {
             aid,
             host: server.host,
             port: server.port,
             delsys: server.delsys,
+            transport: server.transport,
         });
+        self.sync_web_satipc();
         Ok(())
     }
 
@@ -707,11 +712,18 @@ impl Runtime {
             if let Some(handle) = self.handles[aid].take() {
                 handle.stop();
             }
+            self.thresholds[aid] = None;
             self.session.scheduler_mut().remove_adapter(aid);
             self.ca.adapter_removed(aid);
         }
         self.satip_adapters
             .retain(|entry| entry.host != host || entry.port != port);
+        self.sync_web_satipc();
+    }
+
+    fn sync_web_satipc(&mut self) {
+        self.session
+            .set_web_satipc(build_web_satipc(&self.satip_adapters));
     }
 
     /// `satip_getxml`: drains background fetches and starts a new pass when due.
@@ -1277,27 +1289,27 @@ impl Runtime {
             return;
         }
         if let Some(handle) = self.handles.get(adapter as usize).and_then(Option::as_ref) {
-            if let Some((rtp, rtcp)) = sockets {
-                handle.send(Command::ReplaceUdpSockets {
+            if let Some((rtp, rtcp)) = sockets
+                && handle.send(Command::ReplaceUdpSockets {
                     stream_id: id,
                     rtp,
                     rtcp,
                     send_buffer: self.config.output_buffer,
-                });
-                if let Some(active) = self.outputs.get_mut(&id) {
-                    active.dest = dest;
-                }
+                })
+                && let Some(active) = self.outputs.get_mut(&id)
+            {
+                active.dest = dest;
             }
             // A re-SETUP Session header changes the SSRC of the live output
             // (stream.cpp:1409-1416).
-            if active_ssrc != ssrc {
-                handle.send(Command::SetSsrc {
+            if active_ssrc != ssrc
+                && handle.send(Command::SetSsrc {
                     stream_id: id,
                     ssrc,
-                });
-                if let Some(active) = self.outputs.get_mut(&id) {
-                    active.ssrc = ssrc;
-                }
+                })
+                && let Some(active) = self.outputs.get_mut(&id)
+            {
+                active.ssrc = ssrc;
             }
         }
         self.sync_pids(id);
@@ -1471,6 +1483,7 @@ impl Runtime {
         {
             handle.stop_output(id);
         }
+        self.session.clear_stream_output_stats(id);
     }
 
     fn close_connection(&mut self, conn_id: u64, fd: i32) {
@@ -1539,6 +1552,7 @@ impl Runtime {
                     ms_net::dataplane::Event::OutputClosed(id, epoch) => {
                         if self.outputs.get(&id).map(|active| active.epoch) == Some(epoch) {
                             self.outputs.remove(&id);
+                            self.session.clear_stream_output_stats(id);
                             self.session.close_stream(id);
                             closed_ids.push(id);
                         }
@@ -1580,31 +1594,15 @@ impl Runtime {
         }
     }
 
-    fn update_thresholds(&self) {
-        let any_live_udp = self
-            .outputs
-            .values()
-            .any(|active| active.stream_type == StreamType::RtspUdp);
-        for (aid, handle) in self.handles.iter().enumerate() {
-            let Some(handle) = handle else {
-                continue;
-            };
-            let Some(adapter) = self.session.scheduler().adapter(aid) else {
-                continue;
-            };
-            let master_type = self
-                .session
-                .stream(adapter.master_sid)
-                .map(|stream| stream.stream_type);
-            let threshold = ms_net::dataplane::adapter_threshold(
-                self.config.udp_threshold,
-                self.config.tcp_threshold,
-                adapter.sid_cnt.max(0) as usize,
-                master_type,
-                any_live_udp,
-            );
-            handle.send(Command::SetThreshold(threshold));
-        }
+    fn update_thresholds(&mut self) {
+        update_adapter_thresholds(
+            &mut self.thresholds,
+            &self.handles,
+            &self.session,
+            &self.outputs,
+            self.config.udp_threshold,
+            self.config.tcp_threshold,
+        );
     }
 
     fn shutdown(&mut self) {
@@ -2180,12 +2178,86 @@ fn adapter_config() -> AdapterConfig {
     config
 }
 
+fn first_free_adapter_slot(
+    scheduler: &Scheduler,
+    handles: &[Option<AdapterHandle>],
+) -> Option<usize> {
+    (0..MAX_ADAPTERS).find(|&aid| scheduler.adapter(aid).is_none() && handles[aid].is_none())
+}
+
+fn first_free_satip_slot(
+    scheduler: &Scheduler,
+    handles: &[Option<AdapterHandle>],
+    satip: &SatipSettings,
+) -> Option<usize> {
+    (0..MAX_ADAPTERS).find(|&aid| {
+        scheduler.adapter(aid).is_none() && handles[aid].is_none() && !satip.adapter_disabled(aid)
+    })
+}
+
+fn update_adapter_thresholds(
+    thresholds: &mut [Option<i64>; MAX_ADAPTERS],
+    handles: &[Option<AdapterHandle>],
+    session: &SessionManager,
+    outputs: &HashMap<i32, ActiveOutput>,
+    udp_threshold: i32,
+    tcp_threshold: i32,
+) {
+    let any_live_udp = outputs
+        .values()
+        .any(|active| active.stream_type == StreamType::RtspUdp);
+    for (aid, handle) in handles.iter().enumerate() {
+        let Some(handle) = handle else {
+            continue;
+        };
+        let Some(adapter) = session.scheduler().adapter(aid) else {
+            continue;
+        };
+        let master_type = session
+            .stream(adapter.master_sid)
+            .map(|stream| stream.stream_type);
+        let threshold = ms_net::dataplane::adapter_threshold(
+            udp_threshold,
+            tcp_threshold,
+            adapter.sid_cnt.max(0) as usize,
+            master_type,
+            any_live_udp,
+        );
+        if thresholds[aid] != Some(threshold) && handle.send(Command::SetThreshold(threshold)) {
+            thresholds[aid] = Some(threshold);
+        }
+    }
+}
+
+fn satipc_transport_code(transport: ms_tuner::satipc::Transport) -> i32 {
+    match transport {
+        ms_tuner::satipc::Transport::Udp => 0,
+        ms_tuner::satipc::Transport::Tcp => 1,
+        #[cfg(feature = "srt")]
+        ms_tuner::satipc::Transport::Srt => 2,
+    }
+}
+
+fn build_web_satipc(adapters: &[SatipAdapter]) -> Vec<Option<ms_net::web::SatipcState>> {
+    let mut slots = vec![None; MAX_ADAPTERS];
+    for entry in adapters {
+        if entry.aid < slots.len() {
+            slots[entry.aid] = Some(ms_net::web::SatipcState {
+                sip: entry.host.clone(),
+                transport_type: satipc_transport_code(entry.transport),
+            });
+        }
+    }
+    slots
+}
+
 fn satipc_adapter_config(server: &SatipServer) -> AdapterConfig {
     let [sys0, sys1] = server.systems();
     let mut config = AdapterConfig::new(sys0);
     config.sys[1] = sys1;
     // satipc.cpp:2027: `ad->type = ADAPTER_SATIP`, read by the status page as ad_type 2.
     config.adapter_type = ms_sched::AdapterType::Satip;
+    config.name = format!("{} @ {}", server.host, server.transport.name());
     config
 }
 
@@ -2372,6 +2444,7 @@ fn spawn_dvb_adapters(
                 DemuxMode::from_option(opts.use_demux_device),
             ) {
                 Ok(mut tuner) => {
+                    config.name = frontend.name.clone();
                     // adapter.cpp:300: enigma2 sources each demux from its frontend.
                     let dmx_source = if opts.enigma {
                         frontend.path_frontend as i32
@@ -2461,16 +2534,14 @@ fn spawn_ddci_adapters(
     ca: &mut CaRuntime,
 ) -> Result<(), String> {
     // `find_ddci_adapter` logs the index it starts allocating from.
-    let next = (0..MAX_ADAPTERS)
-        .find(|aid| handles[*aid].is_none())
-        .unwrap_or(MAX_ADAPTERS);
+    let next = first_free_adapter_slot(scheduler, handles).unwrap_or(MAX_ADAPTERS);
     ms_log::logl!(
         ms_log::LOG_DDCI,
         "Starting find_ddci_adapter with index {}",
         next
     );
     for node in nodes {
-        let Some(aid) = (0..MAX_ADAPTERS).find(|aid| handles[*aid].is_none()) else {
+        let Some(aid) = first_free_adapter_slot(scheduler, handles) else {
             break;
         };
         ms_log::logl!(
@@ -3388,5 +3459,144 @@ mod tests {
         assert!(poll.fetched.is_none());
         assert!(poll.started_at.is_none());
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn free_slot_helpers_skip_occupied_scheduler_and_handle_slots() {
+        struct StubTuner;
+        impl AdapterTuner for StubTuner {
+            fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+                Ok(())
+            }
+        }
+        struct NoopTuner;
+        impl Tuner for NoopTuner {
+            fn tune(&mut self, _p: &TuneParams) -> ms_tuner::Result<()> {
+                Ok(())
+            }
+            fn set_pids(&mut self, _p: &PidSet) -> ms_tuner::Result<()> {
+                Ok(())
+            }
+            fn status(&self) -> ms_tuner::SignalStatus {
+                ms_tuner::SignalStatus::default()
+            }
+            fn read(&mut self, _b: &mut ms_tuner::TsBuf) -> ms_tuner::Result<usize> {
+                Ok(0)
+            }
+        }
+        let mut sched = Scheduler::new();
+        sched.add_adapter(0, AdapterConfig::default(), Box::new(StubTuner));
+        let mut handles: Vec<Option<AdapterHandle>> = (0..MAX_ADAPTERS).map(|_| None).collect();
+        let h1 = AdapterHandle::spawn(
+            Box::new(NoopTuner),
+            DataPlaneConfig {
+                adapter_id: 1,
+                ..DataPlaneConfig::default()
+            },
+        )
+        .unwrap();
+        handles[1] = Some(h1);
+
+        assert_eq!(first_free_adapter_slot(&sched, &handles), Some(2));
+        let satip = SatipSettings::from_options(&Options::default(), 6500);
+        assert_eq!(first_free_satip_slot(&sched, &handles, &satip), Some(2));
+    }
+
+    #[test]
+    fn threshold_cache_deduplicates_and_retries_after_send_failure() {
+        struct StubTuner;
+        impl AdapterTuner for StubTuner {
+            fn tune(&mut self, _params: &TuneParams) -> Result<(), TuneError> {
+                Ok(())
+            }
+        }
+        struct BlockingTuner {
+            release: Option<Receiver<()>>,
+        }
+        impl Tuner for BlockingTuner {
+            fn tune(&mut self, _p: &TuneParams) -> ms_tuner::Result<()> {
+                if let Some(rx) = &self.release {
+                    let _ = rx.recv();
+                }
+                Ok(())
+            }
+            fn set_pids(&mut self, _p: &PidSet) -> ms_tuner::Result<()> {
+                Ok(())
+            }
+            fn status(&self) -> ms_tuner::SignalStatus {
+                ms_tuner::SignalStatus::default()
+            }
+            fn read(&mut self, _b: &mut ms_tuner::TsBuf) -> ms_tuner::Result<usize> {
+                Ok(0)
+            }
+        }
+        let mut sched = Scheduler::new();
+        sched.add_adapter(
+            0,
+            AdapterConfig::new(DeliverySystem::DvbS2),
+            Box::new(StubTuner),
+        );
+        let session = SessionManager::with_scheduler(sched);
+        let mut handles: Vec<Option<AdapterHandle>> = (0..MAX_ADAPTERS).map(|_| None).collect();
+        let (tx, rx) = mpsc::channel();
+        let h0 = AdapterHandle::spawn(
+            Box::new(BlockingTuner { release: Some(rx) }),
+            DataPlaneConfig::default(),
+        )
+        .unwrap();
+        // Hold AD0 inside `tune()` so the 4096 queued commands cannot drain yet.
+        assert!(h0.tune(TuneParams::default()));
+        thread::sleep(Duration::from_millis(10));
+        for _ in 0..4096 {
+            let _ = h0.send(Command::SetThreshold(10));
+        }
+        handles[0] = Some(h0);
+        let mut cache = [None; MAX_ADAPTERS];
+        let outputs = HashMap::new();
+        update_adapter_thresholds(&mut cache, &handles, &session, &outputs, 200, 100);
+        assert_eq!(
+            cache[0], None,
+            "failed SetThreshold must not populate cache"
+        );
+        drop(tx);
+
+        // With a fresh handle, cache updates once and stays populated.
+        let h_ok = AdapterHandle::spawn(
+            Box::new(BlockingTuner { release: None }),
+            DataPlaneConfig::default(),
+        )
+        .unwrap();
+        handles[0] = Some(h_ok);
+        update_adapter_thresholds(&mut cache, &handles, &session, &outputs, 200, 100);
+        assert!(cache[0].is_some());
+    }
+
+    #[test]
+    fn satipc_metadata_populates_adapter_name_and_web_satipc() {
+        let server = SatipServer {
+            host: "10.1.2.3".to_owned(),
+            port: 554,
+            fe: 0,
+            delsys: DeliverySystem::DvbS2,
+            source_ip: String::new(),
+            transport: ms_tuner::satipc::Transport::Tcp,
+            no_pids_all: false,
+        };
+        let cfg = satipc_adapter_config(&server);
+        assert_eq!(cfg.name, "10.1.2.3 @ TCP");
+        let slots = build_web_satipc(&[SatipAdapter {
+            aid: 2,
+            host: server.host.clone(),
+            port: server.port,
+            delsys: server.delsys,
+            transport: server.transport,
+        }]);
+        assert_eq!(
+            slots[2],
+            Some(ms_net::web::SatipcState {
+                sip: "10.1.2.3".to_owned(),
+                transport_type: 1,
+            })
+        );
     }
 }

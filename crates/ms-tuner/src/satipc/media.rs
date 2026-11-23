@@ -14,6 +14,8 @@ pub const MAX_UDP_PACKET_SIZE: usize = 7 * TS_PACKET_SIZE;
 pub const RTP_HEADER: usize = 12;
 /// `MAX_RTP_MSG`: datagrams read per call.
 pub const MAX_RTP_MSG: usize = 25;
+/// Largest accepted RTSP response (headers + body) before resetting the socket.
+pub const MAX_RTSP_MSG: usize = 64 * 1024;
 
 /// Applies one RTP datagram: sequence statistics, then whole TS packets into `out`.
 pub fn process_rtp_datagram(client: &mut Client, datagram: &[u8], out: &mut TsBuf) -> usize {
@@ -99,12 +101,18 @@ pub struct TcpDemux {
     /// one at a time, so the logged amount is tracked separately to keep the
     /// public total intact.
     logged_skipped: usize,
+    oversized: bool,
 }
 
 impl TcpDemux {
     /// Creates an empty demultiplexer.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns and clears whether an oversized or invalid RTSP response was seen.
+    pub fn take_oversized(&mut self) -> bool {
+        std::mem::take(&mut self.oversized)
     }
 
     /// Appends received bytes.
@@ -142,6 +150,7 @@ impl TcpDemux {
     pub fn reset(&mut self) {
         self.data.clear();
         self.pos = 0;
+        self.oversized = false;
     }
 
     /// The next complete frame, or `None` until more data arrives.
@@ -186,6 +195,11 @@ impl TcpDemux {
                 // satipc.cpp:1308-1311
                 log_skipped(self.skipped, &mut self.logged_skipped);
                 let Some(nlnl) = find_bytes(b, b"\r\n\r\n") else {
+                    if b.len() > MAX_RTSP_MSG {
+                        self.reset();
+                        self.oversized = true;
+                        return None;
+                    }
                     // satipc.cpp:1334-1337
                     ms_log::logm!(
                         "End of rtsp rtsp message not found in this block, pos {}, tcp_pos {}, len {}, size {}",
@@ -201,9 +215,24 @@ impl TcpDemux {
                 if let Some(cl) = find_ci(&b[..nlnl], b"content-length:") {
                     let value = String::from_utf8_lossy(&b[cl + 15..nlnl]);
                     icl = parse_int(&value, 0);
+                    if icl < 0 {
+                        self.reset();
+                        self.oversized = true;
+                        return None;
+                    }
                     end += i64::from(icl);
                 }
-                let total = usize::try_from(end + 4).unwrap_or(0).max(nlnl + 4);
+                let Some(total) = usize::try_from(end + 4).ok() else {
+                    self.reset();
+                    self.oversized = true;
+                    return None;
+                };
+                let total = total.max(nlnl + 4);
+                if total > MAX_RTSP_MSG {
+                    self.reset();
+                    self.oversized = true;
+                    return None;
+                }
                 if total > b.len() {
                     return None;
                 }
@@ -266,5 +295,30 @@ mod tests {
         );
         assert_eq!(demux.skipped, 4);
         assert_eq!(demux.buffered(), 0);
+    }
+
+    #[test]
+    fn oversized_rtsp_header_and_body_reset_demux() {
+        let mut demux = TcpDemux::new();
+        let mut big_hdr = b"RTSP/1.0 200 OK\r\nX-Pad: ".to_vec();
+        big_hdr.resize(MAX_RTSP_MSG + 16, b'a');
+        demux.push(&big_hdr);
+        assert_eq!(demux.next_frame(), None);
+        assert!(demux.take_oversized());
+        assert!(!demux.take_oversized());
+        assert_eq!(demux.buffered(), 0);
+
+        let big_cl = format!(
+            "RTSP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_RTSP_MSG + 1
+        );
+        demux.push(big_cl.as_bytes());
+        assert_eq!(demux.next_frame(), None);
+        assert!(demux.take_oversized());
+        assert_eq!(demux.buffered(), 0);
+
+        demux.push(b"RTSP/1.0 200 OK\r\nContent-Length: -5\r\n\r\n");
+        assert_eq!(demux.next_frame(), None);
+        assert!(demux.take_oversized());
     }
 }

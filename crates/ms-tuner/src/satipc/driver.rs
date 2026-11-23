@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use super::client::{Client, Op, ReplyOutcome, Transport};
 use super::config::SatipServer;
 use super::media::{
-    Frame, MAX_RTP_MSG, MAX_UDP_PACKET_SIZE, TcpDemux, process_rtp_datagram, push_packets,
+    Frame, MAX_RTP_MSG, MAX_RTSP_MSG, MAX_UDP_PACKET_SIZE, TcpDemux, process_rtp_datagram,
+    push_packets,
 };
 use super::sys;
 #[cfg(feature = "srt")]
@@ -108,6 +109,39 @@ pub struct Driver {
     connect_epoch: u64,
     deferred_reconnect: bool,
     defer_open_rtsp: bool,
+    #[cfg(feature = "srt")]
+    defer_open_srt: bool,
+    #[cfg(feature = "srt")]
+    pending_srt_connect: Option<SrtJobKind>,
+    #[cfg(feature = "srt")]
+    srt_connecting: bool,
+}
+
+#[cfg(feature = "srt")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrtJobKind {
+    Open,
+    Restart,
+    TuneOpen,
+}
+
+#[cfg(feature = "srt")]
+struct SrtConnectJob {
+    sock: i32,
+    udp_fd: i32,
+    streamid: String,
+    host: String,
+    port: u16,
+    ipv4: bool,
+    epoch: u64,
+    kind: SrtJobKind,
+}
+
+#[cfg(feature = "srt")]
+enum SrtPrep {
+    Ready,
+    Failed(i32),
+    Connect(SrtConnectJob),
 }
 
 struct ConnectTarget {
@@ -168,6 +202,12 @@ impl Driver {
             connect_epoch: 0,
             deferred_reconnect: false,
             defer_open_rtsp: false,
+            #[cfg(feature = "srt")]
+            defer_open_srt: false,
+            #[cfg(feature = "srt")]
+            pending_srt_connect: None,
+            #[cfg(feature = "srt")]
+            srt_connecting: false,
         }
     }
 
@@ -367,10 +407,22 @@ impl Driver {
     /// failure.
     #[cfg(feature = "srt")]
     pub fn open_srt(&mut self) -> i32 {
+        match self.prepare_srt_connect(SrtJobKind::TuneOpen) {
+            SrtPrep::Ready => 0,
+            SrtPrep::Failed(rv) => rv,
+            SrtPrep::Connect(job) => {
+                let connected = connect_srt_blocking(&job.host, job.port, job.sock, job.ipv4);
+                self.finish_srt_connect(job, connected, false)
+            }
+        }
+    }
+
+    #[cfg(feature = "srt")]
+    fn prepare_srt_connect(&mut self, kind: SrtJobKind) -> SrtPrep {
         use ms_srt::{SRT_INVALID_SOCK, SockOpt};
 
         if self.client.transport != Transport::Srt {
-            return 0;
+            return SrtPrep::Ready;
         }
         if self.srt_sock != SRT_INVALID_SOCK && ms_srt::is_connected(self.srt_sock) {
             // satipc.cpp:715-716
@@ -380,7 +432,7 @@ impl Driver {
                 self.client.id
             );
             self.client.srt_connected = true;
-            return 0;
+            return SrtPrep::Ready;
         }
         self.client.srt_connected = false;
         if self.srt_sock != SRT_INVALID_SOCK {
@@ -403,36 +455,54 @@ impl Driver {
         srt_startup_once();
         let Ok(udp) = sys::udp_bind(self.bind_dev_ip, 0) else {
             // satipc.cpp:746
-            ms_log::log_and_return!(2, "SRT UDP bind failed on ephemeral port");
+            ms_log::log_and_return!(SrtPrep::Failed(2), "SRT UDP bind failed on ephemeral port");
         };
         let sock = ms_srt::create_socket();
         if sock == SRT_INVALID_SOCK {
             // satipc.cpp:751-752
-            ms_log::log_and_return!(2, "srt_create_socket failed: {}", ms_srt::last_error());
+            ms_log::log_and_return!(
+                SrtPrep::Failed(2),
+                "srt_create_socket failed: {}",
+                ms_srt::last_error()
+            );
         }
-        self.srt_sock = sock;
         ms_srt::set_flag(sock, SockOpt::Latency, SRT_LATENCY_MS);
         // No SRTO_RENDEZVOUS: caller mode, blocking for the synchronous connect.
-        self.client.srt_streamid = random_u32().to_string();
-        ms_srt::set_streamid(sock, &self.client.srt_streamid);
+        let streamid = random_u32().to_string();
+        ms_srt::set_streamid(sock, &streamid);
         if !ms_srt::bind_acquire(sock, udp.as_raw_fd()) {
             // satipc.cpp:764
             ms_log::log!("srt_bind_acquire failed: {}", ms_srt::last_error());
             ms_srt::close(sock);
-            self.srt_sock = SRT_INVALID_SOCK;
-            self.client.srt_streamid.clear();
+            return SrtPrep::Failed(2);
+        }
+        let ipv4 = udp.local_addr().is_ok_and(|local| local.is_ipv4());
+        // SRT now owns the UDP descriptor.
+        let udp_fd = udp.into_raw_fd();
+        SrtPrep::Connect(SrtConnectJob {
+            sock,
+            udp_fd,
+            streamid,
+            host: self.client.host.clone(),
+            port: self.client.port,
+            ipv4,
+            epoch: self.connect_epoch,
+            kind,
+        })
+    }
+
+    #[cfg(feature = "srt")]
+    fn finish_srt_connect(&mut self, job: SrtConnectJob, connected: bool, stopped: bool) -> i32 {
+        use ms_srt::{SRT_INVALID_SOCK, SockOpt};
+
+        if stopped || self.connect_epoch != job.epoch {
+            ms_srt::close(job.sock);
+            if job.kind == SrtJobKind::Restart {
+                self.client.srt_restart_claimed = false;
+            }
             return 2;
         }
-
-        // fill_sockaddr: the server address in the family of the UDP socket.
-        let ipv4 = udp.local_addr().is_ok_and(|local| local.is_ipv4());
-        let address = (self.client.host.as_str(), self.client.port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addresses| addresses.find(|address| address.is_ipv4() == ipv4));
-        // SRT now owns the UDP descriptor.
-        self.srt_udp = udp.into_raw_fd();
-        if !address.is_some_and(|address| ms_srt::connect(sock, address)) {
+        if !connected {
             // satipc.cpp:786-787
             ms_log::log!(
                 "SRT connect to {}:{} failed: {}",
@@ -440,15 +510,20 @@ impl Driver {
                 self.client.port,
                 ms_srt::last_error()
             );
-            ms_srt::close(sock);
-            self.srt_sock = SRT_INVALID_SOCK;
-            self.client.srt_streamid.clear();
-            // srt_close also closed the acquired UDP descriptor.
-            self.srt_udp = -1;
+            ms_srt::close(job.sock);
+            if job.kind == SrtJobKind::Restart {
+                self.client.srt_restart_claimed = false;
+            }
             return 2;
         }
+        if self.srt_sock != SRT_INVALID_SOCK && self.srt_sock != job.sock {
+            ms_srt::close(self.srt_sock);
+        }
+        self.srt_sock = job.sock;
+        self.srt_udp = job.udp_fd;
+        self.client.srt_streamid = job.streamid;
         // Non-blocking reads after the connect.
-        ms_srt::set_flag(sock, SockOpt::RcvSyn, 0);
+        ms_srt::set_flag(job.sock, SockOpt::RcvSyn, 0);
         self.client.srt_connected = true;
         // satipc.cpp:804-805
         ms_log::log!(
@@ -457,8 +532,18 @@ impl Driver {
             self.client.host,
             self.client.port,
             self.client.srt_streamid,
-            sock
+            job.sock
         );
+        match job.kind {
+            SrtJobKind::Open => self.client.request(),
+            SrtJobKind::Restart => {
+                if !self.device_open {
+                    self.abort_srt(job.sock);
+                }
+                self.client.srt_restart_claimed = false;
+            }
+            SrtJobKind::TuneOpen => {}
+        }
         0
     }
 
@@ -494,6 +579,37 @@ impl Driver {
         self.client.srt_restart_claimed = false;
     }
 
+    #[cfg(feature = "srt")]
+    fn take_pending_srt(&mut self) -> Option<SrtConnectJob> {
+        let kind = self.pending_srt_connect.take()?;
+        if kind == SrtJobKind::Restart {
+            ms_log::log!(
+                "SRT connection lost for adapter {}. Restarting SRT.",
+                self.client.id
+            );
+        }
+        match self.prepare_srt_connect(kind) {
+            SrtPrep::Ready => {
+                match kind {
+                    SrtJobKind::Open => self.client.request(),
+                    SrtJobKind::Restart => self.client.srt_restart_claimed = false,
+                    SrtJobKind::TuneOpen => {}
+                }
+                None
+            }
+            SrtPrep::Failed(_) => {
+                if kind == SrtJobKind::Restart {
+                    self.client.srt_restart_claimed = false;
+                }
+                None
+            }
+            SrtPrep::Connect(job) => {
+                self.srt_connecting = true;
+                Some(job)
+            }
+        }
+    }
+
     // Mirrors the lock-free `srt_socket_is_connected` the C++ checks inline.
     fn sync_srt(&mut self) {
         #[cfg(feature = "srt")]
@@ -508,6 +624,7 @@ impl Driver {
         self.rtsp = None;
         self.rbuf.clear();
         self.demux.reset();
+        self.tcp_ts.clear();
         self.client.rtsp_connected = false;
         if self.client.transport == Transport::Tcp {
             self.client.data_open = false;
@@ -527,6 +644,18 @@ impl Driver {
         Ok(self.prepare_connect_target())
     }
 
+    fn finish_open_tail(&mut self) -> i32 {
+        if self.setup_rtp_udp_sockets().is_err() {
+            self.drop_rtsp_socket();
+            return -1;
+        }
+        self.client.data_open = true;
+        self.client.reset_for_open();
+        self.tcp_ts.clear();
+        self.device_open = true;
+        0
+    }
+
     fn finish_open_with_rtsp(&mut self, stream: TcpStream) -> i32 {
         if self.finish_rtsp_connect(stream, true).is_err() {
             self.drop_rtsp_socket();
@@ -540,15 +669,7 @@ impl Driver {
                 return rv;
             }
         }
-        if self.setup_rtp_udp_sockets().is_err() {
-            self.drop_rtsp_socket();
-            return -1;
-        }
-        self.client.data_open = true;
-        self.client.reset_for_open();
-        self.tcp_ts.clear();
-        self.device_open = true;
-        0
+        self.finish_open_tail()
     }
 
     /// `satipc_open_device`: 0 on success, else the C++ return code.
@@ -593,6 +714,8 @@ impl Driver {
         #[cfg(feature = "srt")]
         {
             self.client.srt_restart_claimed = false;
+            self.pending_srt_connect = None;
+            self.srt_connecting = false;
         }
         self.device_open = false;
         self.standby_since = None;
@@ -620,6 +743,7 @@ impl Driver {
                     self.rtsp = None;
                     self.rbuf.clear();
                     self.demux.reset();
+                    self.tcp_ts.clear();
                     self.client.rtsp_connected = false;
                 }
                 Op::CloseAdapter => {
@@ -638,12 +762,24 @@ impl Driver {
                 }
                 #[cfg(feature = "srt")]
                 Op::OpenSrt => {
-                    if self.open_srt() == 0 {
+                    if self.defer_open_srt {
+                        if !self.srt_connecting {
+                            self.pending_srt_connect = Some(SrtJobKind::Open);
+                        }
+                    } else if self.open_srt() == 0 {
                         self.client.request();
                     }
                 }
                 #[cfg(feature = "srt")]
-                Op::RestartSrt => self.restart_srt(),
+                Op::RestartSrt => {
+                    if self.defer_open_srt {
+                        if !self.srt_connecting {
+                            self.pending_srt_connect = Some(SrtJobKind::Restart);
+                        }
+                    } else {
+                        self.restart_srt();
+                    }
+                }
             }
         }
     }
@@ -700,6 +836,16 @@ impl Driver {
                 self.drain_demux();
             }
             _ => {
+                if self.rbuf.len().saturating_add(bytes.len()) > MAX_RTSP_MSG {
+                    ms_log::log!(
+                        "satipc: RTSP response exceeded {} bytes on adapter {}, closing",
+                        MAX_RTSP_MSG,
+                        self.client.id
+                    );
+                    self.rbuf.clear();
+                    self.rtsp_eof();
+                    return;
+                }
                 self.rbuf.extend_from_slice(bytes);
                 if self.client.reply(&self.rbuf) != ReplyOutcome::Incomplete {
                     self.rbuf.clear();
@@ -738,6 +884,9 @@ impl Driver {
             "satipc_tcp_read: returning {} bytes",
             self.tcp_ts.len() - before
         );
+        if self.demux.take_oversized() {
+            self.rtsp_eof();
+        }
     }
 
     /// One I/O pass: sockets, timers and queued ops; `true` when data arrived.
@@ -755,8 +904,13 @@ impl Driver {
             }
         }
         let mut buf = [0u8; 16 * 1024];
-        let room =
-            self.client.transport != Transport::Tcp || self.tcp_ts.len() + 65_536 <= TCP_TS_MAX;
+        let room = self.client.transport != Transport::Tcp
+            || self
+                .tcp_ts
+                .len()
+                .saturating_add(self.demux.buffered())
+                .saturating_add(65_536)
+                <= TCP_TS_MAX;
         if !room {
             // satipc.cpp:1249-1252; the interleaved buffer is `tcp_ts` here.
             ms_log::logm!(
@@ -879,6 +1033,9 @@ impl Driver {
                 total
             }
             Transport::Tcp => {
+                if self.client.ignore_packets {
+                    return 0;
+                }
                 let take =
                     self.tcp_ts.len().min(buf.remaining_bytes()) / TS_PACKET_SIZE * TS_PACKET_SIZE;
                 let appended = push_packets(&self.tcp_ts[..take], buf);
@@ -947,6 +1104,7 @@ impl Driver {
         self.client.tp = tp;
         self.client.sid_cnt = 1;
         self.standby_since = None;
+        self.tcp_ts.clear();
         self.client.tune();
         self.run_ops();
     }
@@ -982,6 +1140,7 @@ impl Driver {
             return;
         }
         self.sync_srt();
+        self.tcp_ts.clear();
         self.client.standby();
         self.client.tp = TuneParams {
             msys: self.client.sys0,
@@ -1012,6 +1171,15 @@ fn srt_startup_once() {
     });
 }
 
+#[cfg(feature = "srt")]
+fn connect_srt_blocking(host: &str, port: u16, sock: i32, ipv4: bool) -> bool {
+    let address = (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.find(|address| address.is_ipv4() == ipv4));
+    address.is_some_and(|address| ms_srt::connect(sock, address))
+}
+
 fn connect(host: &str, port: u16, source: Option<&str>) -> io::Result<TcpStream> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, format!("cannot resolve {host}"));
     for address in (host, port).to_socket_addrs()? {
@@ -1031,6 +1199,8 @@ fn is_transient(error: &io::Error) -> bool {
 }
 
 type ConnectFn = Arc<dyn Fn(&str, u16, Option<&str>) -> io::Result<TcpStream> + Send + Sync>;
+#[cfg(feature = "srt")]
+type SrtConnectFn = Arc<dyn Fn(&str, u16, i32, bool) -> bool + Send + Sync>;
 
 struct ExitSignal(Arc<(Mutex<bool>, Condvar)>);
 
@@ -1051,6 +1221,8 @@ pub struct SatipcTuner {
     exited: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<JoinHandle<()>>,
     connect_fn: ConnectFn,
+    #[cfg(feature = "srt")]
+    srt_connect_fn: SrtConnectFn,
 }
 
 impl SatipcTuner {
@@ -1060,8 +1232,25 @@ impl SatipcTuner {
     }
 
     fn new_with_connector(config: &SatipcConfig, connect_fn: ConnectFn) -> io::Result<Self> {
+        Self::new_with_connectors(
+            config,
+            connect_fn,
+            #[cfg(feature = "srt")]
+            Arc::new(connect_srt_blocking),
+        )
+    }
+
+    fn new_with_connectors(
+        config: &SatipcConfig,
+        connect_fn: ConnectFn,
+        #[cfg(feature = "srt")] srt_connect_fn: SrtConnectFn,
+    ) -> io::Result<Self> {
         let mut inner = Driver::new(config);
         inner.defer_open_rtsp = true;
+        #[cfg(feature = "srt")]
+        {
+            inner.defer_open_srt = true;
+        }
         let initial_status = inner.signal_status();
         let driver = Arc::new(Mutex::new(inner));
         let shared_status = Arc::new(Mutex::new(initial_status));
@@ -1073,9 +1262,21 @@ impl SatipcTuner {
             let stop = Arc::clone(&stop);
             let exited = Arc::clone(&exited);
             let connect_fn = Arc::clone(&connect_fn);
+            #[cfg(feature = "srt")]
+            let srt_connect_fn = Arc::clone(&srt_connect_fn);
             thread::Builder::new()
                 .name(format!("satipc{}", config.adapter_id))
-                .spawn(move || io_loop(&driver, &shared_status, &stop, &exited, &connect_fn))?
+                .spawn(move || {
+                    io_loop(
+                        &driver,
+                        &shared_status,
+                        &stop,
+                        &exited,
+                        &connect_fn,
+                        #[cfg(feature = "srt")]
+                        &srt_connect_fn,
+                    )
+                })?
         };
         Ok(Self {
             adapter_id: config.adapter_id,
@@ -1085,6 +1286,8 @@ impl SatipcTuner {
             exited,
             thread: Some(thread),
             connect_fn,
+            #[cfg(feature = "srt")]
+            srt_connect_fn,
         })
     }
 
@@ -1104,9 +1307,20 @@ fn io_loop(
     stop: &AtomicBool,
     exited: &Arc<(Mutex<bool>, Condvar)>,
     connect_fn: &ConnectFn,
+    #[cfg(feature = "srt")] srt_connect_fn: &SrtConnectFn,
 ) {
     let _exit_signal = ExitSignal(Arc::clone(exited));
     while !stop.load(Ordering::SeqCst) {
+        #[cfg(feature = "srt")]
+        let (work, status, reconnect, srt_job) = {
+            let mut guard = lock(driver);
+            let work = guard.poll();
+            let status = guard.signal_status();
+            let reconnect = guard.take_pending_reconnect();
+            let srt_job = guard.take_pending_srt();
+            (work, status, reconnect, srt_job)
+        };
+        #[cfg(not(feature = "srt"))]
         let (work, status, reconnect) = {
             let mut guard = lock(driver);
             let work = guard.poll();
@@ -1115,6 +1329,7 @@ fn io_loop(
             (work, status, reconnect)
         };
         *lock(shared_status) = status;
+        let has_reconnect = reconnect.is_some();
         if let Some(target) = reconnect {
             let connected = connect_fn(&target.host, target.port, target.source.as_deref());
             if !stop.load(Ordering::SeqCst) {
@@ -1149,7 +1364,23 @@ fn io_loop(
                     *lock(shared_status) = guard.signal_status();
                 }
             }
-        } else if !work {
+        }
+        #[cfg(feature = "srt")]
+        let has_srt_job = srt_job.is_some();
+        #[cfg(not(feature = "srt"))]
+        let has_srt_job = false;
+        #[cfg(feature = "srt")]
+        if let Some(job) = srt_job {
+            let connected = srt_connect_fn(&job.host, job.port, job.sock, job.ipv4);
+            let mut guard = lock(driver);
+            if guard.connect_epoch == job.epoch {
+                guard.srt_connecting = false;
+            }
+            guard.finish_srt_connect(job, connected, stop.load(Ordering::SeqCst));
+            guard.run_ops();
+            *lock(shared_status) = guard.signal_status();
+        }
+        if !has_reconnect && !has_srt_job && !work {
             thread::sleep(IO_IDLE);
         }
     }
@@ -1190,6 +1421,51 @@ impl Tuner for SatipcTuner {
             return Err(TunerError::Io(io::Error::other("satipc open cancelled")));
         }
         if !driver.device_open {
+            #[cfg(feature = "srt")]
+            let rv = if driver.client.transport == Transport::Srt {
+                if driver.finish_rtsp_connect(stream, true).is_err() {
+                    driver.drop_rtsp_socket();
+                    2
+                } else {
+                    match driver.prepare_srt_connect(SrtJobKind::TuneOpen) {
+                        SrtPrep::Ready => driver.finish_open_tail(),
+                        SrtPrep::Failed(rv) => {
+                            driver.drop_rtsp_socket();
+                            rv
+                        }
+                        SrtPrep::Connect(job) => {
+                            let host = driver.client.host.clone();
+                            let port = driver.client.port;
+                            drop(driver);
+                            let connected =
+                                (self.srt_connect_fn)(&job.host, job.port, job.sock, job.ipv4);
+                            driver = lock(&self.driver);
+                            if self.stop.load(Ordering::SeqCst) || driver.connect_epoch != job.epoch
+                            {
+                                ms_srt::close(job.sock);
+                                if driver.connect_epoch == job.epoch {
+                                    driver.drop_rtsp_socket();
+                                }
+                                return Err(TunerError::Io(io::Error::other(
+                                    "satipc open cancelled",
+                                )));
+                            }
+                            let rv = driver.finish_srt_connect(job, connected, false);
+                            if rv != 0 {
+                                driver.drop_rtsp_socket();
+                                *lock(&self.shared_status) = driver.signal_status();
+                                return Err(TunerError::Io(io::Error::other(format!(
+                                    "satipc: cannot open {host}:{port} (rc {rv})"
+                                ))));
+                            }
+                            driver.finish_open_tail()
+                        }
+                    }
+                }
+            } else {
+                driver.finish_open_with_rtsp(stream)
+            };
+            #[cfg(not(feature = "srt"))]
             let rv = driver.finish_open_with_rtsp(stream);
             if rv != 0 {
                 *lock(&self.shared_status) = driver.signal_status();
@@ -1384,5 +1660,117 @@ mod tests {
         let (lock, cvar) = &*release;
         *lock.lock().unwrap() = true;
         cvar.notify_all();
+    }
+
+    #[test]
+    fn tcp_ts_clears_on_state_transitions_and_gates_on_ignore_packets() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut d = Driver::new(&test_config(port));
+        d.device_open = true;
+        d.tcp_ts = vec![0x47; TS_PACKET_SIZE * 2];
+        d.client.ignore_packets = true;
+        let mut buf = TsBuf::with_packets(4);
+        assert_eq!(d.read_media(&mut buf), 0, "ignore_packets gates read_media");
+        assert_eq!(d.tcp_ts.len(), TS_PACKET_SIZE * 2);
+
+        d.client.ignore_packets = false;
+        d.drop_rtsp_socket();
+        assert!(d.tcp_ts.is_empty());
+
+        d.tcp_ts = vec![0x47; TS_PACKET_SIZE];
+        d.client.ops.push_back(Op::CloseData);
+        d.run_ops();
+        assert!(d.tcp_ts.is_empty());
+
+        d.tcp_ts = vec![0x47; TS_PACKET_SIZE];
+        d.tune_open(&TuneParams::default());
+        assert!(d.tcp_ts.is_empty());
+
+        d.tcp_ts = vec![0x47; TS_PACKET_SIZE];
+        d.standby();
+        assert!(d.tcp_ts.is_empty());
+    }
+
+    #[test]
+    fn oversized_rbuf_and_demux_trigger_rtsp_eof() {
+        let mut cfg = test_config(554);
+        cfg.server.transport = Transport::Udp;
+        let mut d = Driver::new(&cfg);
+        d.device_open = true;
+        d.client.rtsp_connected = true;
+        let big = vec![b'A'; MAX_RTSP_MSG + 1];
+        d.handle_rtsp_bytes(&big);
+        assert!(!d.client.rtsp_connected);
+        assert!(d.rbuf.is_empty());
+
+        let mut d_tcp = Driver::new(&test_config(554));
+        d_tcp.device_open = true;
+        d_tcp.client.rtsp_connected = true;
+        let mut hdr = b"RTSP/1.0 200 OK\r\nX-Pad: ".to_vec();
+        hdr.resize(MAX_RTSP_MSG + 16, b'a');
+        d_tcp.handle_rtsp_bytes(&hdr);
+        assert!(!d_tcp.client.rtsp_connected);
+        assert_eq!(d_tcp.demux.buffered(), 0);
+    }
+
+    #[cfg(feature = "srt")]
+    #[test]
+    fn srt_connect_releases_driver_lock_during_tune_and_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut cfg = test_config(port);
+        cfg.server.transport = Transport::Srt;
+        let driver_slot: Arc<Mutex<Option<Arc<Mutex<Driver>>>>> = Arc::new(Mutex::new(None));
+        let slot_ref = Arc::clone(&driver_slot);
+        let srt_lock_free = Arc::new(AtomicBool::new(false));
+        let srt_free_ref = Arc::clone(&srt_lock_free);
+
+        let tcp_conn: ConnectFn = Arc::new(|host, p, _src| TcpStream::connect((host, p)));
+        let srt_conn: SrtConnectFn = Arc::new(move |_, _, _, _| {
+            let free = slot_ref
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|drv| drv.try_lock().is_ok());
+            srt_free_ref.store(free, Ordering::SeqCst);
+            true
+        });
+        let mut tuner = SatipcTuner::new_with_connectors(&cfg, tcp_conn, srt_conn).unwrap();
+        *driver_slot.lock().unwrap() = Some(Arc::clone(&tuner.driver));
+        assert!(tuner.tune(&TuneParams::default()).is_ok());
+        assert!(
+            srt_lock_free.load(Ordering::SeqCst),
+            "Mutex<Driver> was held across SRT connect"
+        );
+    }
+
+    #[test]
+    fn demux_buffered_contributes_to_tcp_backpressure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut d = Driver::new(&test_config(port));
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        client.set_nonblocking(true).unwrap();
+        d.rtsp = Some(client);
+        d.device_open = true;
+
+        // With `tcp_ts` 8 KiB below the cap alone, adding 16 KiB in `demux` must trip backpressure.
+        d.tcp_ts = vec![0u8; TCP_TS_MAX - 65_536 - 8_192];
+        let mut partial_frame = vec![0x24, 0x00, 0x80, 0x00, 0x80, 0x21];
+        partial_frame.resize(16 * 1024, 0x47);
+        d.demux.push(&partial_frame);
+
+        let rtsp_msg = b"RTSP/1.0 200 OK\r\n\r\n";
+        peer.write_all(rtsp_msg).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!d.poll(), "poll should skip reading while backpressured");
+        assert_eq!(d.demux.buffered(), 16 * 1024);
+        let mut unread = [0u8; 32];
+        assert_eq!(
+            d.rtsp.as_ref().unwrap().peek(&mut unread).unwrap(),
+            rtsp_msg.len()
+        );
     }
 }

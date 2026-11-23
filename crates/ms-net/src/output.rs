@@ -732,12 +732,16 @@ impl StreamOutput {
 
     /// Reads pending RTCP receiver reports; `true` when one arrived (`rtcp_confirm`).
     pub fn poll_rtcp(&mut self) -> bool {
+        const MAX_RTCP_PACKETS_PER_TICK: usize = 64;
         let Transport::Udp { rtcp, .. } = &self.transport else {
             return false;
         };
         let mut buf = [0u8; 1500];
         let mut seen = false;
-        while rtcp.recv(&mut buf).is_ok() {
+        for _ in 0..MAX_RTCP_PACKETS_PER_TICK {
+            if rtcp.recv(&mut buf).is_err() {
+                break;
+            }
             seen = true;
         }
         seen

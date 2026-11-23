@@ -76,13 +76,17 @@ impl SrtOps for LibSrtOps {
 /// The pre-accept callback (`srt_accept_poll`, srt.cpp:100): queues `ns` under
 /// its stream id and closes the socket it replaces.
 fn pre_accept(pending: &Mutex<PendingPool>, streamid: Option<&str>, ns: i32) -> bool {
-    let mut pool = pending.lock().unwrap_or_else(PoisonError::into_inner);
-    match pool.accept(streamid, ns) {
+    // Configure before publishing `ns` and keep all libsrt calls outside `pending`.
+    let _ = ms_srt::set_flag(ns, ms_srt::SockOpt::SndTimeo, SRT_SEND_TIMEOUT_MS);
+    let decision = {
+        let mut pool = pending.lock().unwrap_or_else(PoisonError::into_inner);
+        pool.accept(streamid, ns)
+    };
+    match decision {
         AcceptDecision::Accepted { replaced } => {
             if replaced != SRT_INVALID_SOCK {
                 ms_srt::close(replaced);
             }
-            let _ = ms_srt::set_flag(ns, ms_srt::SockOpt::SndTimeo, SRT_SEND_TIMEOUT_MS);
             true
         }
         AcceptDecision::Rejected => false,

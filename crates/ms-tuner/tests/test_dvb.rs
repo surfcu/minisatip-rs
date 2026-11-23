@@ -2251,3 +2251,64 @@ fn master_registry_slave_unicable_sends_diseqc_on_master_sec_while_master_active
         0
     );
 }
+
+#[test]
+fn tune_clears_partial_packets_and_resets_status_on_failure() {
+    let mut dev = FakeDevice::new();
+    dev.v3(FE_HAS_LOCK, 0, 200, 150);
+    // 100 bytes: less than one 188-byte TS packet, buffered in `partial`.
+    dev.stream = vec![0x47; 100];
+    let mut tuner = LinuxDvbTuner::with_device(dev, backend_state());
+    let params = sat_tune_params(10_744_000, Polarization::Vertical, 1);
+    tuner.tune(&params).expect("first tune succeeds");
+    let mut buf = TsBuf::with_packets(4);
+    tuner.device_mut().now = 300;
+    assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+    tuner.device_mut().now = 600;
+    assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+    assert!(tuner.status().locked);
+    assert!(tuner.status().status_valid);
+
+    // Next tune succeeds: `partial` must be cleared so 88 bytes of new mux don't join 100 stale bytes.
+    tuner.device_mut().stream.extend_from_slice(&[0x55; 88]);
+    tuner.tune(&params).expect("second tune succeeds");
+    assert_eq!(tuner.read(&mut buf).unwrap(), 0);
+
+    // Failed tune must also clear stale lock/status.
+    tuner.device_mut().now = 900;
+    let _ = tuner.read(&mut buf);
+    tuner.device_mut().now = 1_200;
+    let _ = tuner.read(&mut buf);
+    assert!(tuner.status().locked);
+
+    tuner.device_mut().set_properties_fail = true;
+    assert!(tuner.tune(&params).is_err());
+    assert!(!tuner.status().locked);
+    assert!(!tuner.status().status_valid);
+    assert_eq!(tuner.status().strength, 0);
+}
+
+#[test]
+fn read_sections_caps_per_read_drains_and_backlog() {
+    let mut dev = FakeDevice::new();
+    for _ in 0..80 {
+        // 160-byte section -> packs into 1 TS packet (188 bytes) with pointer field.
+        let mut sec = vec![0u8; 160];
+        sec[0] = 0x00;
+        sec[1] = 0xB0;
+        sec[2] = 0x9D;
+        dev.sections.entry(DemuxFd(100)).or_default().push_back(sec);
+    }
+    let mut tuner = mode_tuner(DemuxMode::PesFiltersAndDvr, dev);
+    tuner.set_section_pids(&PidSet::from_pids([0u16]));
+    tuner.set_pids(&PidSet::from_pids([0u16])).unwrap();
+
+    // One packet capacity leaves 63 packets in `psi`, capping first drain at 64 sections.
+    let mut one_pkt = TsBuf::with_packets(1);
+    assert_eq!(tuner.read(&mut one_pkt).unwrap(), 188);
+    assert_eq!(
+        tuner.device().sections[&DemuxFd(100)].len(),
+        16,
+        "at most 64 sections drained in one read"
+    );
+}

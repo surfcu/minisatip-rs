@@ -2,14 +2,15 @@
 #![allow(unsafe_code)]
 
 use super::link::{CaLink, CaOpener, SlotInfo};
+use ms_tuner::linux_dvb::NATIVE;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// `_IO('o', 128)`.
-const CA_RESET: u32 = 0x6F80;
+const CA_RESET: u32 = NATIVE.io(b'o', 128);
 /// `_IOR('o', 130, ca_slot_info_t)`.
-const CA_GET_SLOT_INFO: u32 = 0x800C_6F82;
+const CA_GET_SLOT_INFO: u32 = NATIVE.ior(b'o', 130, std::mem::size_of::<CaSlotInfo>());
 
 /// `ca_slot_info_t`.
 #[repr(C)]
@@ -153,9 +154,14 @@ mod tests {
 
     #[test]
     fn ioctl_numbers_match_linux_dvb_ca_h() {
+        use ms_tuner::linux_dvb::{GENERIC, MIPS};
         assert_eq!(std::mem::size_of::<CaSlotInfo>(), 12);
-        assert_eq!(CA_GET_SLOT_INFO >> 16 & 0x3FFF, 12);
-        assert_eq!(CA_RESET, (u32::from(b'o') << 8) | 128);
+        assert_eq!(GENERIC.io(b'o', 128), 0x6F80);
+        assert_eq!(GENERIC.ior(b'o', 130, 12), 0x800C_6F82);
+        assert_eq!(MIPS.io(b'o', 128), 0x2000_6F80);
+        assert_eq!(MIPS.ior(b'o', 130, 12), 0x400C_6F82);
+        assert_eq!(CA_RESET, NATIVE.io(b'o', 128));
+        assert_eq!(CA_GET_SLOT_INFO, NATIVE.ior(b'o', 130, 12));
     }
 
     #[test]

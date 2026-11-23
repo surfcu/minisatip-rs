@@ -2225,6 +2225,10 @@ impl Scheduler {
         if self.find_pid(aid, pid).is_none() {
             return -1;
         }
+        let parsed = match ParsedPmt::parse(section, CrcCheck::Skip) {
+            Ok(parsed) => parsed,
+            Err(_) => return 0,
+        };
         let was_running = self
             .pmt(pmt_id)
             .is_some_and(|pmt| matches!(pmt.state, PmtState::Running | PmtState::Starting));
@@ -2237,10 +2241,6 @@ impl Scheduler {
         if let Some(pmt) = self.pmt_slot_mut(pmt_id) {
             pmt.caids = 0;
         }
-        let parsed = match ParsedPmt::parse(section, CrcCheck::Skip) {
-            Ok(parsed) => parsed,
-            Err(_) => return 0,
-        };
         let pmt_len = section.len() as i32 - 3;
         let pi_len = (i32::from(section[10] & 0x0F) << 8) | i32::from(section[11]);
         let old_ver = self.pmt(pmt_id).map_or(-1, |pmt| pmt.version);
